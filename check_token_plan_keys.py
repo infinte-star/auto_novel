@@ -7,7 +7,18 @@ import time
 from dataclasses import dataclass
 from typing import Iterable
 
-from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
+try:
+    from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
+except ModuleNotFoundError as exc:
+    OPENAI_IMPORT_ERROR = exc
+
+    class _MissingOpenAIError(Exception):
+        pass
+
+    APIConnectionError = APIError = APIStatusError = APITimeoutError = _MissingOpenAIError  # type: ignore[assignment]
+    OpenAI = None  # type: ignore[assignment]
+else:
+    OPENAI_IMPORT_ERROR = None
 
 
 DEFAULT_BASE_URLS = [
@@ -15,46 +26,7 @@ DEFAULT_BASE_URLS = [
     "https://token-plan-cn.xiaomimimo.com/v1",
 ]
 
-DEFAULT_KEYS = [
-    "tp-c7tf4dc4tcjqihzbgf4gxeowhre1puvjuzq6jujiacmtl89g",
-    "tp-cbngbpgso5k15fhgfdj7th0cz1lnvub4yazr97o9ek2fwmzn",
-    "tp-c4ncuopszt9d1xqi53xomryce4ovf1kzbq9yz21eryhdym63",
-    "tp-sbz20egchfb2pt10vxxu24xlmrpuh0ily9ki0y6z3f1ao1t9",
-    "tp-sgvnquz17psyyg2wbhz4x3dl4fnt1uzsx78j5t4eppcj31pv",
-    "tp-cj1uodq9mt5ewqj1hn2fzvghrme2bbracfkkns0hxfrcpde0",
-    "tp-shq2lvrd319s5czml8kfx8pp4o02kggik4mqw3avb25ib8fc",
-    "tp-cn4gp8wfzw188wv8tko6e2xv3o0lkpwus38e48qkhql5nyn4",
-    "tp-cxdksnfo646rghr9dnn8ov5neilt3nfc371o09c1wlrpz42e",
-    "tp-cmjv75smkeprvhaxferim1docvt50feh0ogmbnvrihuun1nz",
-    "tp-c4d16u7uceoi71w96iroav23evjn71l5nphyplumpev1x4cz",
-    "tp-cg02yumls4jgyb1cifqi2o94vviffgybwnkc5v9shiwmszr9",
-    "tp-cdfljltlwj93aie7ylea1yw2ls65omnbjg428cms3i1shtpq",
-    "tp-sxe7iiq3tqhbqszkub3y03bxeycjfs5mrz3kc0b76vaqqjhn",
-    "tp-smnl8944f3eqcfkwmtbeflw3y3jp9lsym0y3a70vzjrw1fey",
-    "tp-ccg7kir0ez6cfjc28j8ae1mlktldrml3nhf3bji414gwfw17",
-    "tp-cstfxavyq3q2q6mun7frz7i6ie80emav0z0kgz48tg7odyrd",
-    "tp-crh4kxm2lhpspb096vsoe5620rva7hm3la2h2h5664lhxlif",
-    "tp-c5otezemijw448of5eycvpw6qxr2wujzc9v5olz52gl0tjk8",
-    "tp-ccg7kir0ez6cfjc28j8ae1mlktldrml3nhf3bji414gwfw17",
-    "tp-cfsjk3qip63iw4bh16nyr6pf2kh82biay0h2hfs94ad7pur1",
-    "tp-cany1u6z7kvlsro1bvns4lxltq2oauza5gj8cwifhr2aq4ov",
-    "tp-cha0k3ethcflvzsglypazgimesg86n7onop4sedr0tn01ysh",
-    "tp-c9sp7c797gb21flxskvl6hh6z510hkqzf77kr8wp4zxadmsd",
-    "tp-cwfj9fg5qz8ufy8bf1rswlp6cj640mi6m0xttz8a0vce9yjy",
-    "tp-c0zunlz92jw2zmxthmzg4fvdtopbbvn03ud4gx3swafdvu26",
-    "tp-se8c5mmrf1hauy0qyutlk9bek2gdjoiyfn6sr68ug2ojfxbg",
-    "tp-cvhy3ebo25viv07y7qlnlh3u4sk8ltyfvfkzgxoomerxstov",
-    "tp-c6haieuwzhs3763206by8em1nmeixql89967966rpk3or9bf",
-    "tp-cphcwcftmrzgbo2560huu80x9ojognk3jpvpruiot25t2ahf",
-    "tp-smusanjj754dxky6fkyh07ffrtznrcmboc9td8ypml2xvech",
-    "tp-cxsrtcib8gfllm4hkrsxntdtt8hg67wefztdbhgi70264cv5",
-    "tp-cwzec7c52g1bpsf0enyrqa8aqx7lhgdnsqqgxcec5h9vaqv0",
-    "tp-s7g9npcud7h7zu9wst8om8bztv27idtnut0unr8pbxv86411",
-    "tp-c0bptuhm4rhbz5tdque8m7494nywj5aqz8dbc4tbpjk6jdm0",
-    "tp-s4k0utff4u18dcyx5zplvp6iywq7ttandz1zw1iew7luqw6p",
-    "tp-clkcaxu7epll3hcv1jee659dna0cjvq1jal5cuxfs3x4qdzv",
-    "tp-che3qx8gv7yb2ifhyhe8dnr4czm6zcss27sw5lq5z55nmcmb",
-]
+DEFAULT_KEYS: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -86,7 +58,12 @@ def unique_preserve_order(values: Iterable[str]) -> list[str]:
 
 def load_keys(path: str | None) -> list[str]:
     if not path:
-        return unique_preserve_order(DEFAULT_KEYS)
+        env_value = os.getenv("TOKEN_PLAN_KEYS", "")
+        values = [env_value] if env_value else DEFAULT_KEYS
+        keys = []
+        for value in values:
+            keys.extend(part.strip() for part in value.split(","))
+        return unique_preserve_order(keys)
 
     keys = []
     with open(path, "r", encoding="utf-8") as f:
@@ -134,6 +111,8 @@ def should_retry(exc: Exception) -> bool:
 
 
 def check_one(base_url: str, key: str, model: str, timeout: float, retries: int, retry_delay: float) -> CheckResult:
+    if OpenAI is None:
+        raise RuntimeError("Missing dependency: run `pip install -r requirements.txt` before checking keys.")
     started = time.perf_counter()
     client = OpenAI(base_url=base_url, api_key=key, timeout=timeout, max_retries=0)
     last_error = ""
@@ -180,8 +159,13 @@ def main() -> int:
     parser.add_argument("--show-full-key", action="store_true", help="print full keys instead of masked keys")
     args = parser.parse_args()
 
+    if OPENAI_IMPORT_ERROR is not None:
+        parser.error("missing dependency: run `pip install -r requirements.txt` before checking keys")
+
     keys = load_keys(args.keys_file)
     base_urls = parse_base_urls(args.base_url)
+    if not keys:
+        parser.error("no keys provided; set TOKEN_PLAN_KEYS or pass --keys-file")
     jobs = [(base_url, key) for base_url in base_urls for key in keys]
     ok_results: list[CheckResult] = []
 
