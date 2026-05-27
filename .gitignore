@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+.claude/
+logs/
+
+config.yaml
+*.db
+*.db-shm
+*.db-wal
+
+state.md.bak
