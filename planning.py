@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import memory_context, rhythm_diagnostics, structural_repetition_analysis
@@ -114,7 +115,7 @@ Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire.
                     config,
                     CANDIDATE_PLAN_SYSTEM,
                     json_prompt(base_user + f"\n\nCandidate index: {idx}. Use a distinct strategy."),
-                    max_tokens=16000,
+                    max_tokens=65000,
                     temperature=0.65 + idx * 0.05,
                 )
                 plan = load_json_with_repair(client, paths, config, raw)
@@ -164,7 +165,7 @@ Review chapter {chapter_num} plan."""
     def review_one(agent: str, system: str) -> dict[str, Any]:
         for retry in range(2):
             try:
-                raw = call_llm(client, paths, config, system, json_prompt(user), max_tokens=16000, temperature=0.2)
+                raw = call_llm(client, paths, config, system, json_prompt(user), max_tokens=65000, temperature=0.2)
                 report = load_json_with_repair(
                     client,
                     paths,
@@ -238,7 +239,7 @@ Review chapter {chapter_num} plan."""
         user = plan_users[plan_index]
         for retry in range(2):
             try:
-                raw = call_llm(client, paths, config, system, json_prompt(user), max_tokens=16000, temperature=0.2)
+                raw = call_llm(client, paths, config, system, json_prompt(user), max_tokens=65000, temperature=0.2)
                 report = load_json_with_repair(
                     client,
                     paths,
@@ -314,7 +315,7 @@ def arbitrate_plan(
 {json.dumps(reports_by_plan, ensure_ascii=False, indent=2)}
 
 Select and improve the best plan for chapter {chapter_num}."""
-    raw = call_llm(client, paths, config, ARBITER_SYSTEM, json_prompt(user), max_tokens=8000, temperature=0.25)
+    raw = call_llm(client, paths, config, ARBITER_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.25)
     decision = load_json_with_repair(client, paths, config, raw)
     plan = decision.get("merged_plan") or plans[int(decision.get("selected_index", 0))]
     db_event(conn, chapter_num, "plan_arbitration", {"decision": decision, "plans": plans})

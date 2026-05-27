@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import Paths, chapter_path, read_text, write_text
+from config import Paths, chapter_path, log, read_text, write_text
 
 CHECKPOINT_VERSION = 2
 CHAPTER_CURRENT_CHECKPOINT = f"chapter_current_v{CHECKPOINT_VERSION}.md"

@@ -5,7 +5,17 @@ import shutil
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from config import Paths, append_text, chapter_path, count_chars, normalize_chapter, normalize_text, read_text, write_text
+from config import (
+    Paths,
+    append_text,
+    chapter_path,
+    count_chars,
+    normalize_chapter,
+    normalize_text,
+    read_text,
+    safe_score,
+    write_text,
+)
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import memory_context
 from planning import plan_score
@@ -144,7 +154,7 @@ def extract_events(
 {chapter[:12000]}
 
 Extract durable state changes."""
-    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=8000, user=json_prompt(user), temperature=0.2)
+    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=65000, user=json_prompt(user), temperature=0.2)
     return load_json_with_repair(client, paths, config, raw)
 
 def update_structured_state(
@@ -302,7 +312,7 @@ def update_state_file(
 {chapter[:5000]}
 
 Update state.md after chapter {chapter_num}."""
-    new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=8000, temperature=0.25)
+    new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=65000, temperature=0.25)
     write_text(paths.state, normalize_text(new_state) + "\n")
 
 def save_chapter(paths: Paths, chapter_num: int, chapter: str, review: dict[str, Any], plan: dict[str, Any]) -> None:

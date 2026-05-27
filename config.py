@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent
 PROMPT_FILE = ROOT / "prompt.md"
 CONFIG_FILE = ROOT / "config.yaml"
 
+@dataclass(frozen=True)
 class Paths:
     book: Path
     state: Path

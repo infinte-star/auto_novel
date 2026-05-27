@@ -23,7 +23,7 @@ from llm import LLMClientPool
 from memory import bootstrap, compress_all_memory, should_compress_memory
 from planning import create_plan
 from review import adaptive_replan, review_chapter, should_replan, stage_review
-from store import init_db, validate_plan_continuity
+from store import db_event, init_db, validate_plan_continuity
 from writing import extract_events, revise_chapter, save_chapter, update_state_file, update_structured_state, write_chapter
 
 def generate_one_chapter(
