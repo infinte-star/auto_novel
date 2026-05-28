@@ -36,7 +36,28 @@ Requirements:
 - When logistics matter, show the time, route, handler, procedure, and institutional friction.
 - Keep causality, character agency, pressure-payoff rhythm, and hook strength.
 - Avoid summary-like prose, repetitive shock reactions, and cheap coincidence.
-- Output the chapter only, no explanation."""
+- Output the chapter only, no explanation.
+
+Structure template:
+- Opening hook (200-400字): 紧接上章末尾，建立本章核心问题或悬念
+- Scene 1 (1000-1500字): 主要冲突场景，含具体动作、对话与环境描写
+- Scene 2 (800-1200字): 转折或揭示场景，推进plan中的关键beats
+- Scene 3 (600-1000字): 决定或代价场景，呈现选择后果
+- Closing hook (200-400字): 制造下章悬念，不要用总结式收尾
+
+Sensory discipline:
+- 每个场景至少包含2种感官锚点（视觉/听觉/触觉/嗅觉/味觉）
+- 用具体细节代替抽象描述（"墨迹未干的公文" 而非 "重要文件"）
+
+Dialogue ratio:
+- 对话占全章30-50%，避免连续500字以上无对白的段落
+- 每个角色的语气、用词应反映其身份和性格
+
+Forbidden patterns:
+- 禁止"他突然意识到/恍然大悟"式的廉价顿悟
+- 禁止角色长段心理独白超过200字
+- 禁止用解释性叙述代替戏剧化呈现（show don't tell）
+- 禁止章末用"他知道，一切才刚刚开始"之类的空洞总结"""
 
 REVISE_SYSTEM = """You are a Chinese web novel revision writer.
 Revise the full chapter according to the final editor report.
@@ -89,6 +110,7 @@ def write_chapter(
     plan: dict[str, Any],
     decision: dict[str, Any],
     tail: str,
+    cached_memory: str | None = None,
 ) -> str:
     title = str(plan.get("title") or f"Chapter {chapter_num}").strip()
     system = WRITE_SYSTEM.format(
@@ -96,8 +118,9 @@ def write_chapter(
         chapter_num=chapter_num,
         title=title,
     )
+    mem = cached_memory or memory_context(paths, conn, config)
     user = f"""## Memory
-{memory_context(paths, conn, config)}
+{mem}
 
 ## Previous Tail
 {tail[-int(config["novel"]["recent_tail_chars"]):]}
@@ -118,12 +141,22 @@ Write chapter {chapter_num}."""
 def revise_chapter(
     client: OpenAI,
     paths: Paths,
+    conn: Any,
     config: dict[str, Any],
     chapter: str,
     review: dict[str, Any],
     plan: dict[str, Any],
+    tail: str,
+    cached_memory: str | None = None,
 ) -> str:
-    user = f"""## Plan JSON
+    mem = cached_memory or memory_context(paths, conn, config)
+    user = f"""## Memory
+{mem}
+
+## Previous Tail
+{tail[-1500:]}
+
+## Plan JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
 
 ## Recent Quality Feedback JSON
@@ -146,12 +179,14 @@ def extract_events(
     config: dict[str, Any],
     chapter_num: int,
     chapter: str,
+    cached_memory: str | None = None,
 ) -> dict[str, Any]:
+    mem = cached_memory or memory_context(paths, conn, config)
     user = f"""## Memory Before Chapter
-{memory_context(paths, conn, config)}
+{mem}
 
 ## Chapter {chapter_num}
-{chapter[:12000]}
+{chapter[:8000]}
 
 Extract durable state changes."""
     raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=65000, user=json_prompt(user), temperature=0.2)
@@ -283,7 +318,25 @@ def update_structured_state(
 def append_memory(path: Path, chapter_num: int, items: list[Any]) -> None:
     if not items:
         return
-    append_text(path, f"\n\n## Ch{chapter_num}\n" + "\n".join(f"- {item}" for item in items) + "\n")
+    existing = read_text(path)
+    section_header = f"## Ch{chapter_num}"
+    if section_header in existing:
+        return
+    existing_bullets = set()
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            existing_bullets.add(stripped[2:].strip())
+    fresh = []
+    for item in items:
+        text = str(item).strip()
+        if not text or text in existing_bullets:
+            continue
+        fresh.append(text)
+        existing_bullets.add(text)
+    if not fresh:
+        return
+    append_text(path, f"\n\n{section_header}\n" + "\n".join(f"- {t}" for t in fresh) + "\n")
 
 def update_state_file(
     client: OpenAI,
@@ -317,6 +370,11 @@ Update state.md after chapter {chapter_num}."""
 
 def save_chapter(paths: Paths, chapter_num: int, chapter: str, review: dict[str, Any], plan: dict[str, Any]) -> None:
     chapter = normalize_chapter(chapter)
+    if len(chapter.strip()) < 500:
+        raise RuntimeError(
+            f"Refusing to save Ch{chapter_num}: only {len(chapter.strip())} chars "
+            f"(likely provider refusal or empty response). Preview: {chapter[:200]!r}"
+        )
     write_text(chapter_path(paths, chapter_num), chapter)
     append_text(paths.book, "\n\n" + chapter)
     append_text(

@@ -20,7 +20,7 @@ from config import (
     tail_text,
 )
 from llm import LLMClientPool
-from memory import bootstrap, compress_all_memory, should_compress_memory
+from memory import bootstrap, compress_all_memory, memory_context, should_compress_memory
 from planning import create_plan
 from review import adaptive_replan, review_chapter, should_replan, stage_review
 from store import db_event, init_db, validate_plan_continuity
@@ -34,34 +34,37 @@ def generate_one_chapter(
     chapter_num: int,
 ) -> None:
     tail = tail_text(paths.book, int(config["novel"]["recent_tail_chars"]))
+    cached_memory = memory_context(paths, conn, config)
     final_payload = load_checkpoint(paths, chapter_num, "validated_plan.json")
     if isinstance(final_payload, dict) and final_payload.get("plan") and final_payload.get("decision"):
         log(paths, f"Resuming validated plan Ch{chapter_num}")
         plan = final_payload["plan"]
         decision = final_payload["decision"]
     else:
-        plan, decision = create_plan(client, paths, conn, config, chapter_num, tail)
-
-        # Pre-write continuity validation
-        violations = validate_plan_continuity(conn, plan, chapter_num)
-        if violations:
-            log(paths, f"Continuity violations Ch{chapter_num}: {violations}")
-            critical = [v for v in violations if v.startswith("CRITICAL")]
-            if critical:
-                log(paths, f"Critical violations found, re-planning Ch{chapter_num}")
-                decision.setdefault("required_constraints", []).extend(violations)
-                plan, decision = create_plan(
-                    client,
-                    paths,
-                    conn,
-                    config,
-                    chapter_num,
-                    tail,
-                    checkpoint_label="critical",
-                )
-            else:
-                decision.setdefault("required_constraints", []).extend(violations)
+        plan, decision = create_plan(client, paths, conn, config, chapter_num, tail, cached_memory=cached_memory)
         save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
+
+    # Continuity validation runs on both fresh and resumed plans
+    violations = validate_plan_continuity(conn, plan, chapter_num)
+    if violations:
+        log(paths, f"Continuity violations Ch{chapter_num}: {violations}")
+        critical = [v for v in violations if v.startswith("CRITICAL")]
+        if critical:
+            log(paths, f"Critical violations found, re-planning Ch{chapter_num}")
+            decision.setdefault("required_constraints", []).extend(violations)
+            plan, decision = create_plan(
+                client,
+                paths,
+                conn,
+                config,
+                chapter_num,
+                tail,
+                checkpoint_label="critical",
+                cached_memory=cached_memory,
+            )
+            save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
+        else:
+            decision.setdefault("required_constraints", []).extend(violations)
 
     existing_chapter = read_text(chapter_path(paths, chapter_num))
     chapter = load_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT) or existing_chapter
@@ -70,7 +73,7 @@ def generate_one_chapter(
         log(paths, f"Resuming cached chapter text Ch{chapter_num}")
     else:
         log(paths, f"Writing Ch{chapter_num}: {plan.get('title', '')}")
-        chapter = write_chapter(client, paths, conn, config, chapter_num, plan, decision, tail)
+        chapter = write_chapter(client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=cached_memory)
         save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
 
     threshold = float(config["novel"]["quality_threshold"])
@@ -106,7 +109,7 @@ def generate_one_chapter(
                         paths,
                         f"Revising Ch{chapter_num} round={round_num} because score={review.get('score')}/10 < {threshold}",
                     )
-                    chapter = revise_chapter(client, paths, config, chapter, review, plan)
+                    chapter = revise_chapter(client, paths, conn, config, chapter, review, plan, tail, cached_memory=cached_memory)
                     save_checkpoint(paths, chapter_num, revised_key, chapter)
                 save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
 
@@ -116,7 +119,7 @@ def generate_one_chapter(
                 review = cached_review
                 log(paths, f"Resuming cached review Ch{chapter_num} round={round_num} score={review.get('score')}/10")
             else:
-                review = review_chapter(client, paths, conn, config, chapter_num, plan, chapter, tail)
+                review = review_chapter(client, paths, conn, config, chapter_num, plan, chapter, tail, cached_memory=cached_memory)
                 save_checkpoint(paths, chapter_num, review_key, review)
                 log(paths, f"Reviewed Ch{chapter_num} round={round_num} score={review.get('score')}/10")
             previous_best_score = safe_score(best_review.get("score", 0))
@@ -163,7 +166,7 @@ def generate_one_chapter(
     if isinstance(extraction, dict):
         log(paths, f"Resuming cached extraction Ch{chapter_num}")
     else:
-        extraction = extract_events(client, paths, conn, config, chapter_num, chapter)
+        extraction = extract_events(client, paths, conn, config, chapter_num, chapter, cached_memory=cached_memory)
         save_checkpoint(paths, chapter_num, "extraction.json", extraction)
 
     if not load_checkpoint(paths, chapter_num, "structured_state_done.json"):
@@ -208,8 +211,9 @@ def main() -> None:
     api_endpoints, primary_endpoint_count = configured_api_endpoints(config)
     if not api_endpoints:
         raise RuntimeError("Missing API key: set api.api_key, api.api_keys, or api.api_key_groups in config.yaml")
+    stream_timeout = int(api_endpoints and config["api"].get("stream_timeout", 300))
     clients = [
-        OpenAI(base_url=base_url, api_key=api_key)
+        OpenAI(base_url=base_url, api_key=api_key, timeout=stream_timeout)
         for base_url, api_key in api_endpoints
     ]
     client: Any = LLMClientPool(clients, primary_endpoint_count) if len(clients) > 1 else clients[0]

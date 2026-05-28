@@ -277,6 +277,44 @@ def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]])
         )
     conn.commit()
 
+def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10, limit: int = 8) -> list[dict[str, Any]]:
+    if isinstance(conn, JsonStoryStore):
+        threads = conn._read().get("open_threads", {}).values()
+        out = []
+        for t in threads:
+            if t.get("status") != "open":
+                continue
+            updated = int(t.get("updated_chapter") or 0)
+            silence = chapter_num - updated
+            if silence >= silence_threshold:
+                out.append({
+                    "id": t.get("id"),
+                    "description": t.get("description", ""),
+                    "updated_chapter": updated,
+                    "silence_duration": silence,
+                })
+        out.sort(key=lambda x: -x["silence_duration"])
+        return out[:limit]
+    try:
+        rows = conn.execute(
+            """SELECT id, description, updated_chapter FROM open_threads
+               WHERE status='open' AND updated_chapter IS NOT NULL
+               AND (? - updated_chapter) >= ?
+               ORDER BY updated_chapter ASC LIMIT ?""",
+            (chapter_num, silence_threshold, limit),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "description": row["description"],
+                "updated_chapter": row["updated_chapter"],
+                "silence_duration": chapter_num - int(row["updated_chapter"]),
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
 def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
         return []

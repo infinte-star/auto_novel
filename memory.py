@@ -136,7 +136,7 @@ def compress_memory_file(
     old_text = "".join(old_sections)
     max_chars = 3000
     system = MEMORY_COMPRESS_SYSTEM.format(max_chars=max_chars)
-    compressed = call_llm(client, paths, config, system, old_text, max_tokens=8000, temperature=0.2)
+    compressed = call_llm(client, paths, config, system, old_text, max_tokens=65000, temperature=0.2)
     compressed = normalize_text(compressed)
     new_content = header.rstrip() + "\n\n## Consolidated\n" + compressed + "\n\n" + "".join(recent_sections)
     write_text(file_path, new_content)

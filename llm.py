@@ -53,6 +53,45 @@ class LLMClientPool:
             return int(status_code) in {401, 408, 409, 429, 500, 502, 503, 504}
         return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
 
+REFUSAL_PATTERNS = (
+    "request was rejected because it was considered high risk",
+    "i cannot fulfill",
+    "i can't fulfill",
+    "i cannot help with",
+    "i can't help with",
+    "i cannot assist",
+    "i can't assist",
+    "i cannot generate",
+    "i can't generate",
+    "i'm unable to",
+    "i am unable to",
+    "i cannot create",
+    "i can't create",
+    "violates our content policy",
+    "against my guidelines",
+    "against the content policy",
+    "我无法帮助",
+    "我无法生成",
+    "我不能生成",
+    "无法满足该请求",
+    "内容政策",
+)
+
+def _looks_like_refusal(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 600:
+        return False
+    lowered = stripped.lower()
+    return any(pat in lowered for pat in REFUSAL_PATTERNS)
+
+def _raw_starts_with_refusal(text: str) -> bool:
+    head = text.strip()[:600].lower()
+    if not head:
+        return False
+    return any(pat in head for pat in REFUSAL_PATTERNS)
+
 def _repair_truncated_json(text: str) -> str | None:
     start = text.find("{")
     if start < 0:
@@ -206,8 +245,16 @@ def call_llm(
                 reasoning_parts: list[str] = []
                 chunk_count = 0
                 finish_reason = None
+                stream_max = int(api.get("stream_timeout", 300))
                 for chunk in resp:
                     chunk_count += 1
+                    if chunk_count % 50 == 0:
+                        if time.perf_counter() - started > stream_max:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            raise TimeoutError(f"stream exceeded {stream_max}s total limit")
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
                         continue
@@ -252,6 +299,15 @@ def call_llm(
                 )
                 time.sleep(wait)
                 continue
+            if _looks_like_refusal(content):
+                wait = min(60, 2**attempt)
+                log(
+                    paths,
+                    f"LLM returned refusal-like response attempt={attempt + 1}/6 wait={wait}s "
+                    f"len={len(content.strip())} preview={content.strip()[:120]!r}",
+                )
+                time.sleep(wait)
+                continue
             return content
         except Exception as exc:
             if use_response_format and _looks_like_response_format_error(exc):
@@ -289,6 +345,11 @@ def load_json_with_repair(
         if fallback is not None:
             return fallback
         raise json.JSONDecodeError("Empty JSON response", raw, 0)
+    if _raw_starts_with_refusal(raw):
+        log(paths, f"JSON repair skipped: provider refusal detected. Preview: {raw.strip()[:200]!r}")
+        if fallback is not None:
+            return fallback
+        raise json.JSONDecodeError("Provider refusal, not malformed JSON", raw, 0)
     repair_prompt = f"""Repair this malformed JSON into one valid JSON object.
 
 ## Malformed JSON

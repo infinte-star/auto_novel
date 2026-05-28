@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 from typing import TYPE_CHECKING, Any
 
@@ -12,6 +11,7 @@ from store import (
     db_event,
     get_active_constraints,
     get_open_causal_requirements,
+    get_silent_threads,
     recent_metrics,
     recent_quality_feedback,
     store_stage_constraints,
@@ -29,32 +29,37 @@ Return exactly one valid JSON object and no other text:
   "fixes": [],
   "continuity_risks": [],
   "rhythm_risks": [],
-  "reader_fatigue_risks": []
+  "reader_fatigue_risks": [],
+  "beats_audit": [{"beat":"...", "status":"realized|partial|absent", "evidence":"quote or note"}]
 }
 Scoring rules:
 - Cap score at 8 if important selected-plan beats are missing from the chapter text.
 - Cap score at 8 if a timeline, money movement, message route, surveillance source, or procedure is hand-waved.
 - Cap score at 8 if the chapter repeats a recent scene shape or ending device without a clear new function.
 - Cap score at 7 if continuity risks from recent reviews are ignored again.
-- Award 9+ only when the chapter solves prior feedback on page while preserving tension and follow-up desire."""
+- Cap score at 7 if more than 30% of plan beats are "partial" or "absent" in beats_audit.
+- Cap score at 7 if a silent thread (>10 chapters without advancement) listed in the plan context could be advanced naturally but is ignored.
+- Award 9+ only when the chapter solves prior feedback on page while preserving tension and follow-up desire.
 
-STAGE_REVIEW_SYSTEM = """You are the long-cycle quality evaluator.
-Return markdown followed by a JSON block.
+Plan Beats Audit (REQUIRED):
+For each beat in the plan's "beats" array, add an entry to beats_audit:
+- "realized": the beat is fully executed on page with visible action
+- "partial": the beat is referenced but lacks concrete scene or sensory detail
+- "absent": the beat is missing or only implied off-page"""
 
-Markdown section:
-## Quality Trend
-## Continuity Risks
-## Rhythm and Payoff Risks
-## Repetition Risks
-## Next 20 Chapters Replan
-## Threads to Recover or Upgrade
-
-Then output a fenced JSON block with actionable constraints:
-```json
-{"constraints": [
-  {"type": "avoid|require|replan|recover_thread", "description": "...", "priority": 1-10, "expires_in_chapters": 20}
-]}
-```"""
+STAGE_REVIEW_SYSTEM = """You are the long-cycle quality evaluator for serialized Chinese web fiction.
+Return exactly one valid JSON object and no other text:
+{
+  "quality_trend": "summary of recent score and engagement trajectory",
+  "continuity_risks": ["specific continuity issues spanning multiple chapters"],
+  "rhythm_payoff_risks": ["pacing or pressure-payoff problems across the window"],
+  "repetition_risks": ["repeated structures, payoffs, or staging"],
+  "next_20_chapters_replan": ["concrete plan adjustments for the next 20 chapters"],
+  "threads_to_recover_or_upgrade": ["open threads that need attention or elevation"],
+  "constraints": [
+    {"type": "avoid|require|replan|recover_thread", "description": "...", "priority": 1-10, "expires_in_chapters": 20}
+  ]
+}"""
 
 REPLAN_SYSTEM = """You are the strategic replanner for a long-form fiction engine.
 The current volume plan has degraded in quality metrics. Analyze the current state,
@@ -77,9 +82,13 @@ def review_chapter(
     plan: dict[str, Any],
     chapter: str,
     tail: str,
+    cached_memory: str | None = None,
 ) -> dict[str, Any]:
+    mem = cached_memory or memory_context(paths, conn, config)
+    silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
+    silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
     user = f"""## Memory
-{memory_context(paths, conn, config)}
+{mem}
 
 ## Previous Tail
 {tail[-1500:]}
@@ -87,12 +96,15 @@ def review_chapter(
 ## Recent Quality Feedback JSON
 {json.dumps(recent_quality_feedback(paths), ensure_ascii=False, indent=2)}
 
+## Silent Threads JSON (silent >{silence_threshold} chapters; check whether the chapter advances any of these or has good reason to skip)
+{json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
+
 ## Selected Plan JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
 
 ## Chapter Text
 {chapter[:12000]}"""
-    raw = call_llm(client, paths, config, REVIEW_SYSTEM, json_prompt(user), max_tokens=16000, temperature=0.2)
+    raw = call_llm(client, paths, config, REVIEW_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.2)
     report = load_json_with_repair(
         client,
         paths,
@@ -138,21 +150,45 @@ def stage_review(
 {chr(10).join(recent)}
 
 Review long-cycle quality through chapter {chapter_num}."""
-    review_text = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, user, max_tokens=8000, temperature=0.3)
-    append_text(paths.logs_dir / "stage_reviews.md", f"\n\n# Ch{chapter_num} Stage Review\n\n{normalize_text(review_text)}\n")
-    db_event(conn, chapter_num, "stage_review", {"review": normalize_text(review_text)})
+    raw = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.3)
+    data = load_json_with_repair(
+        client,
+        paths,
+        config,
+        raw,
+        fallback={
+            "quality_trend": "JSON parse failed; fallback used.",
+            "continuity_risks": [],
+            "rhythm_payoff_risks": [],
+            "repetition_risks": [],
+            "next_20_chapters_replan": [],
+            "threads_to_recover_or_upgrade": [],
+            "constraints": [],
+        },
+    )
 
-    # Extract and store structured constraints from stage review
-    json_match = re.search(r"```json\s*(\{.*?\})\s*```", review_text, re.DOTALL)
-    if json_match:
-        try:
-            constraint_data = json.loads(json_match.group(1))
-            constraints = constraint_data.get("constraints", [])
-            if constraints:
-                store_stage_constraints(conn, chapter_num, constraints)
-                log(paths, f"Stored {len(constraints)} stage constraints from Ch{chapter_num} review")
-        except (json.JSONDecodeError, AttributeError):
-            pass
+    def render_section(title: str, content: Any) -> str:
+        if isinstance(content, list):
+            if not content:
+                return f"## {title}\n_(none)_\n"
+            return f"## {title}\n" + "\n".join(f"- {item}" for item in content) + "\n"
+        return f"## {title}\n{content}\n"
+
+    markdown = (
+        render_section("Quality Trend", data.get("quality_trend", ""))
+        + render_section("Continuity Risks", data.get("continuity_risks", []))
+        + render_section("Rhythm and Payoff Risks", data.get("rhythm_payoff_risks", []))
+        + render_section("Repetition Risks", data.get("repetition_risks", []))
+        + render_section("Next 20 Chapters Replan", data.get("next_20_chapters_replan", []))
+        + render_section("Threads to Recover or Upgrade", data.get("threads_to_recover_or_upgrade", []))
+    )
+    append_text(paths.logs_dir / "stage_reviews.md", f"\n\n# Ch{chapter_num} Stage Review\n\n{markdown}\n")
+    db_event(conn, chapter_num, "stage_review", {"review": data})
+
+    constraints = data.get("constraints") or []
+    if constraints:
+        store_stage_constraints(conn, chapter_num, constraints)
+        log(paths, f"Stored {len(constraints)} stage constraints from Ch{chapter_num} review")
 
 def should_replan(conn: Any, config: dict[str, Any]) -> bool:
     rows = recent_metrics(conn, 20)
@@ -192,6 +228,6 @@ def adaptive_replan(
 {json.dumps(get_active_constraints(conn, chapter_num), ensure_ascii=False, indent=2)}
 
 Current chapter: {chapter_num}. Replan the next 40-60 chapters."""
-    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=16000, temperature=0.5)
+    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=65000, temperature=0.5)
     write_text(paths.volume_plan, normalize_text(new_plan) + "\n")
     db_event(conn, chapter_num, "adaptive_replan", {"reason": "metrics_degradation"})

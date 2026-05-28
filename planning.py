@@ -9,7 +9,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, get_active_constraints, recent_quality_feedback
+from store import JsonStoryStore, db_event, get_active_constraints, get_silent_threads, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -39,6 +39,18 @@ Every plan must:
 - Specify visible actions, sensory anchors, and dialogue pressure, not only analysis or summary.
 - Avoid reusing the recent chapter-ending device, analysis posture, or emotional beat."""
 
+SCREEN_SYSTEM = """You are the fast screening layer for a long-form fiction engine.
+You receive multiple candidate chapter plans. Rank them by overall quality considering:
+- Causal coherence and continuity with established state
+- Novelty relative to recent chapters (avoid repetition)
+- Reader anticipation and hook strength
+- Character agency and cost visibility
+- Thread advancement and payoff freshness
+
+Return exactly one valid JSON object and no other text:
+{"ranking": [{"index": 0, "brief": "one-line reason"}, ...]}
+Order from best to worst. Be decisive — ties waste downstream resources."""
+
 ARBITER_SYSTEM = """You are the arbitration layer for a long-form fiction engine.
 Evaluate candidate plans against global state, recent metrics, repetition risk, causal value, character consistency,
 payoff freshness, and reader anticipation.
@@ -55,18 +67,102 @@ repeat the same physical staging, or contain unresolved timeline/logistics gaps.
 so the writer has concrete scene obligations rather than vague intentions."""
 
 AGENT_REVIEW_SYSTEMS = {
-    "world": """You are World Agent. Check world rules, power system, geography, institutions, and resource logic.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}.""",
-    "character": """You are Character Agent. Check character goals, agency, relationships, secrets, trauma, and OOC drift.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}.""",
-    "rhythm": """You are Rhythm Agent. Check pacing, compression/release cycle, scene variety, and reader fatigue.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}.""",
-    "payoff": """You are Payoff Agent. Check emotional payoff, pressure-payoff ratio, hook strength, and novelty.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}.""",
-    "foreshadowing": """You are Foreshadowing Agent. Check opened/advanced/recovered threads and long-term promises.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}.""",
-    "reader": """You are Reader-Simulation Agent. Simulate a serial reader after this chapter plan.
-Return exactly one valid JSON object and no other text. Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"follow_next_reason":"..."}.""",
+    "world": """You are World Agent for a Chinese historical/fantasy web novel.
+Check the chapter plan against established world rules. Specifically verify:
+1. Geography & travel: distances, routes, travel time consistency (京城到江南需数日, not instant)
+2. Power system: cultivation/combat/political power rules match established canon
+3. Institutions: official titles, bureaucratic procedures, hierarchy are period-appropriate
+4. Resources: money, materials, troops obey conservation (no unexplained refills)
+5. Calendar & seasons: dates align with established timeline, seasonal details consistent
+
+Score caps:
+- Cap at 7 if geography/travel time is violated
+- Cap at 6 if power system contradicts established rules
+- Cap at 5 if institutional procedures are anachronistic or impossible
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+
+    "character": """You are Character Agent for a Chinese historical/fantasy web novel.
+Check the chapter plan for character consistency and growth. Specifically verify:
+1. Goals & motivations: each character acts from established goals, not plot convenience
+2. Agency: characters make active choices with visible cost, not passive observers
+3. Relationships: interactions reflect established dynamics (allies, enemies, debts)
+4. Secrets & knowledge: characters only act on information they actually possess
+5. Growth arc: protagonist shows incremental change, not sudden personality shifts
+6. Dialogue voice: each character's speech pattern matches their background and status
+
+Score caps:
+- Cap at 6 if a character acts on information they shouldn't have
+- Cap at 7 if protagonist has no meaningful choice or cost in this chapter
+- Cap at 7 if a character behaves out-of-character without justification
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+
+    "rhythm": """You are Rhythm Agent for a Chinese historical/fantasy web novel.
+Check pacing and structural variety against recent chapters. Specifically verify:
+1. Scene structure: does this chapter use a different opening/closing device than the last 3?
+2. Compression/release: is there both tension buildup AND a release moment?
+3. Scene count & variety: at least 2 distinct scenes with different settings or dynamics
+4. Ending device: not the same type as the previous 2 chapters (cliffhanger/revelation/quiet)
+5. Information density: balanced between action, dialogue, and reflection (no 1000+ char monologues)
+
+Score caps:
+- Cap at 7 if chapter ending repeats the same device as the previous chapter
+- Cap at 6 if the entire chapter is a single extended scene with no shift
+- Cap at 7 if pacing is monotone (all high tension or all low tension)
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+
+    "payoff": """You are Payoff Agent for a Chinese historical/fantasy web novel.
+Check emotional payoff quality and pressure-payoff balance. Specifically verify:
+1. Pressure buildup: is there meaningful resistance/obstacle before the payoff?
+2. Payoff freshness: is the payoff_type different from the last 3 chapters?
+3. Cost visibility: does the payoff come with visible cost or trade-off?
+4. Earned resolution: is the resolution causally earned (not coincidence or deus ex machina)?
+5. Emotional texture: does the chapter evoke a distinct emotion, not generic tension?
+
+Score caps:
+- Cap at 6 if payoff relies on coincidence or unexplained luck
+- Cap at 7 if payoff_type repeats the same as the previous 2 chapters
+- Cap at 7 if there's no visible cost or trade-off for the protagonist
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+
+    "foreshadowing": """You are Foreshadowing Agent for a Chinese historical/fantasy web novel.
+Check thread management and long-term promise fulfillment. Specifically verify:
+1. Overdue threads: flag any open thread introduced >15 chapters ago that isn't advanced here
+2. Thread advancement: does this chapter advance at least one existing thread?
+3. New thread introduction: if opening a new thread, is the due_chapter realistic?
+4. Recovery opportunities: are there dropped threads that could be naturally recovered here?
+5. Promise density: not too many open threads (>8 active = reader confusion risk)
+
+Score caps:
+- Cap at 7 if there are overdue threads (>20 chapters) that could be addressed but aren't
+- Cap at 6 if no existing thread is advanced or recovered
+- Cap at 7 if opening a 9th+ concurrent thread without closing one
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+
+    "reader": """You are Reader-Simulation Agent for a Chinese historical/fantasy web novel.
+Simulate a serial reader finishing this chapter plan. Specifically evaluate:
+1. Follow-next desire: after this chapter, what 3 questions would make the reader click "next"?
+2. Satisfaction: does the chapter deliver at least one moment of satisfaction (not all setup)?
+3. Confusion risk: would a reader who skipped 2 chapters still follow the main thread?
+4. Fatigue signals: is the reader being asked to track too many simultaneous threads?
+5. Emotional hook: is there a character moment that creates empathy or investment?
+
+Score caps:
+- Cap at 7 if there's no clear "next chapter" question for the reader
+- Cap at 6 if the chapter is pure setup with zero payoff moments
+- Cap at 7 if the reader needs to remember >5 prior plot points to understand this chapter
+
+Return exactly one valid JSON object and no other text.
+Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"follow_next_reason":"..."}""",
 }
 
 def generate_candidate_plans(
@@ -76,13 +172,17 @@ def generate_candidate_plans(
     config: dict[str, Any],
     chapter_num: int,
     tail: str,
+    cached_memory: str | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = rhythm_diagnostics(conn, config)
     structural = structural_repetition_analysis(conn, config)
     constraints = get_active_constraints(conn, chapter_num)
     quality_feedback = recent_quality_feedback(paths)
+    silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
+    silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
+    mem = cached_memory or memory_context(paths, conn, config)
     base_user = f"""## Memory
-{memory_context(paths, conn, config)}
+{mem}
 
 ## Rhythm Diagnostics JSON
 {json.dumps(diagnostics, ensure_ascii=False, indent=2)}
@@ -96,12 +196,16 @@ def generate_candidate_plans(
 ## Active Stage Constraints (MUST OBEY)
 {json.dumps(constraints, ensure_ascii=False, indent=2) if constraints else "None"}
 
+## Silent Threads (HARD REQUIREMENT: advance at least one of these on page if narratively viable)
+{json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
+
 ## Previous Chapter Tail
 {tail[-2000:]}
 
 ## Request
 Create candidate plan for chapter {chapter_num}.
-Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire."""
+Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire.
+If silent threads exist above, the plan MUST either advance one in beats/thread_actions, or explicitly note in "risk" why none are viable this chapter."""
     num_candidates = int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
 
@@ -141,6 +245,45 @@ Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire.
     if not valid:
         raise RuntimeError(f"All {num_candidates} candidate plans failed for chapter")
     return valid
+
+def screen_candidates(
+    client: OpenAI,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    plans: list[dict[str, Any]],
+    top_n: int = 2,
+    cached_memory: str | None = None,
+) -> list[int]:
+    if len(plans) <= top_n:
+        return list(range(len(plans)))
+    mem = cached_memory or memory_context(paths, conn, config)
+    user = f"""## Memory (abbreviated)
+{mem[:8000]}
+
+## Candidate Plans JSON
+{json.dumps(plans, ensure_ascii=False, indent=2)}
+
+Rank all {len(plans)} candidates for chapter {chapter_num}."""
+    raw = call_llm(client, paths, config, SCREEN_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.2)
+    result = load_json_with_repair(
+        client, paths, config, raw, fallback={"ranking": [{"index": i} for i in range(len(plans))]}
+    )
+    ranking = result.get("ranking", [])
+    indices = []
+    for entry in ranking:
+        idx = int(entry.get("index", 0))
+        if 0 <= idx < len(plans) and idx not in indices:
+            indices.append(idx)
+    if len(indices) < top_n:
+        for i in range(len(plans)):
+            if i not in indices:
+                indices.append(i)
+            if len(indices) >= top_n:
+                break
+    return indices[:top_n]
+
 
 def agent_review_plan(
     client: OpenAI,
@@ -214,10 +357,11 @@ def review_candidate_plans(
     config: dict[str, Any],
     chapter_num: int,
     plans: list[dict[str, Any]],
+    cached_memory: str | None = None,
 ) -> list[list[dict[str, Any]]]:
     plan_users = []
     diagnostics_json = json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)
-    memory = memory_context(paths, conn, config)
+    memory = cached_memory or memory_context(paths, conn, config)
     for plan in plans:
         plan_users.append(
             f"""## Memory
@@ -298,9 +442,11 @@ def arbitrate_plan(
     chapter_num: int,
     plans: list[dict[str, Any]],
     reports_by_plan: list[list[dict[str, Any]]],
+    cached_memory: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    mem = cached_memory or memory_context(paths, conn, config)
     user = f"""## Memory
-{memory_context(paths, conn, config)}
+{mem}
 
 ## Rhythm Diagnostics JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
@@ -340,12 +486,14 @@ def create_plan(
     chapter_num: int,
     tail: str,
     checkpoint_label: str = "initial",
+    cached_memory: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     cached = load_checkpoint(paths, chapter_num, f"plan_{checkpoint_label}_selected.json")
     if isinstance(cached, dict) and cached.get("plan") and cached.get("decision"):
         log(paths, f"Resuming cached {checkpoint_label} plan Ch{chapter_num}")
         return cached["plan"], cached["decision"]
 
+    mem = cached_memory or memory_context(paths, conn, config)
     best_plan: dict[str, Any] | None = None
     best_decision: dict[str, Any] | None = None
     min_score = float(config["novel"]["min_plan_score"])
@@ -359,14 +507,26 @@ def create_plan(
         if isinstance(plans, list) and plans:
             log(paths, f"Resuming cached candidate plans Ch{chapter_num} attempt={attempt}")
         else:
-            plans = generate_candidate_plans(client, paths, conn, config, chapter_num, tail)
+            plans = generate_candidate_plans(client, paths, conn, config, chapter_num, tail, cached_memory=mem)
             save_checkpoint(paths, chapter_num, plans_key, plans)
+
+        screen_key = f"plan_{checkpoint_label}_attempt{attempt}_screen.json"
+        cached_screen = load_checkpoint(paths, chapter_num, screen_key)
+        if isinstance(cached_screen, list) and cached_screen:
+            top_indices = cached_screen
+            log(paths, f"Resuming cached screening Ch{chapter_num} attempt={attempt} top={top_indices}")
+        else:
+            top_indices = screen_candidates(client, paths, conn, config, chapter_num, plans, cached_memory=mem)
+            save_checkpoint(paths, chapter_num, screen_key, top_indices)
+            log(paths, f"Screened Ch{chapter_num} candidates: top={top_indices} from {len(plans)}")
+
+        screened_plans = [plans[i] for i in top_indices if i < len(plans)]
 
         reports = load_checkpoint(paths, chapter_num, reports_key)
         if isinstance(reports, list) and reports:
             log(paths, f"Resuming cached agent reports Ch{chapter_num} attempt={attempt}")
         else:
-            reports = review_candidate_plans(client, paths, conn, config, chapter_num, plans)
+            reports = review_candidate_plans(client, paths, conn, config, chapter_num, screened_plans, cached_memory=mem)
             save_checkpoint(paths, chapter_num, reports_key, reports)
 
         arbitration = load_checkpoint(paths, chapter_num, arbitration_key)
@@ -375,7 +535,7 @@ def create_plan(
             plan = arbitration["plan"]
             decision = arbitration["decision"]
         else:
-            plan, decision = arbitrate_plan(client, paths, conn, config, chapter_num, plans, reports)
+            plan, decision = arbitrate_plan(client, paths, conn, config, chapter_num, screened_plans, reports, cached_memory=mem)
             save_checkpoint(paths, chapter_num, arbitration_key, {"plan": plan, "decision": decision})
 
         score = plan_score(decision)

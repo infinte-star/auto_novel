@@ -1,14 +1,66 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
 
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude / tooling
 .claude/
 logs/
 
+# Local config & secrets
 config.yaml
+.env
+.env.*
+
+# Databases
 *.db
 *.db-shm
 *.db-wal
 
+# Backups & scratch
+*.bak
 state.md.bak
-
+_repair_backup/
 _smoke_pipeline/
+
+# Generated outputs
+book.md
+state.md
+chapters/
+memory/
+
+# One-off scripts
+check_token_plan_keys.py
+repair_stub_chapters.py
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
