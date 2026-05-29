@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from config import PROMPT_FILE, Paths, log, normalize_text, read_text, write_text
@@ -63,7 +66,14 @@ def memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
 
     creative_brief = read_text(PROMPT_FILE).strip()
     current_state = read_text(paths.state).strip()
-    tier1 = "## Creative Brief\n" + creative_brief + "\n\n## Current State\n" + current_state
+    voice_anchor = read_text(paths.voice).strip()
+    voices_table = read_text(paths.voices).strip()
+    style_block = ""
+    if voice_anchor:
+        style_block += "\n\n## Narrative Voice Anchor (MUST follow)\n" + voice_anchor
+    if voices_table:
+        style_block += "\n\n## Character Voices (MUST follow)\n" + voices_table
+    tier1 = "## Creative Brief\n" + creative_brief + "\n\n## Current State\n" + current_state + style_block
 
     volume_plan = read_text(paths.volume_plan).strip()
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
@@ -104,6 +114,207 @@ def memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
 
     return assembled
 
+# Module-level cache for the cacheable prefix so that subsequent calls in the
+# same process re-use the EXACT same string (byte-for-byte) when the underlying
+# files are unchanged. The cache key is a sha1 of the source file contents +
+# budget; when any source changes, the cache is rebuilt and a new prefix string
+# is returned (so prefix cache invalidation matches content change).
+#
+# This also implements task #9 (memory hash skip): the hash is computed over
+# bible/characters/voice/voices/prompt content; if all are unchanged since
+# last call, the cached string is returned in O(1) (no re-read, no re-format,
+# no truncation). Provider prefix caches see identical bytes -> ~free prefill.
+_CACHEABLE_PREFIX_CACHE: dict[str, tuple[str, str]] = {}
+_CACHEABLE_PREFIX_STATS = {"hits": 0, "misses": 0}
+
+
+def _files_hash(paths_list: list[Path]) -> str:
+    hasher = hashlib.sha1()
+    for p in paths_list:
+        try:
+            data = p.read_bytes() if p.exists() else b""
+        except OSError:
+            data = b""
+        hasher.update(str(p).encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(hashlib.sha1(data).digest())
+    return hasher.hexdigest()
+
+
+def file_hash_short(path: Path) -> str:
+    """Short sha1 (12 hex chars) of file content; '' if missing."""
+    try:
+        if not path.exists():
+            return ""
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return hashlib.sha1(data).hexdigest()[:12]
+
+
+def cacheable_prefix(
+    paths: Paths,
+    config: dict[str, Any],
+    log_fn: Any = None,
+) -> str:
+    """Build the EXACT-same-bytes prompt prefix shared across calls.
+
+    This prefix is included verbatim at the top of each LLM call's user message
+    (via call_llm's cacheable_prefix arg). Provider-side prefix caches will hit
+    as long as the bytes are identical, so we return the same cached string
+    when the source files have not changed. On change, the cache key changes
+    and downstream invocations naturally invalidate.
+    """
+    budget = int(config["novel"].get("cacheable_prefix_chars", 30000))
+    sources = [PROMPT_FILE, paths.voice, paths.voices, paths.bible, paths.characters]
+    key = f"{_files_hash(sources)}:{budget}"
+
+    cached = _CACHEABLE_PREFIX_CACHE.get("active")
+    if cached and cached[0] == key:
+        _CACHEABLE_PREFIX_STATS["hits"] += 1
+        return cached[1]
+    _CACHEABLE_PREFIX_STATS["misses"] += 1
+
+    creative_brief = read_text(PROMPT_FILE).strip()
+    voice_anchor = read_text(paths.voice).strip()
+    voices_table = read_text(paths.voices).strip()
+    bible = read_text(paths.bible).strip()
+    characters = read_text(paths.characters).strip()
+
+    sections: list[tuple[str, str, int]] = [
+        ("Creative Brief", creative_brief, 4000),
+        ("Narrative Voice Anchor", voice_anchor, 5000),
+        ("Character Voices", voices_table, 7000),
+        ("World Bible", bible, 7000),
+        ("Characters", characters, 7000),
+    ]
+    parts: list[str] = ["# Stable Reference (cacheable)"]
+    used = len(parts[0])
+    for title, body, cap in sections:
+        body = body.strip()
+        if not body:
+            continue
+        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
+        block = f"## {title}\n{snippet}"
+        if used + len(block) + 2 > budget:
+            remaining = budget - used - len(f"## {title}\n") - 2
+            if remaining > 400:
+                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
+            break
+        parts.append(block)
+        used += len(block) + 2
+    text = "\n\n".join(parts)
+    _CACHEABLE_PREFIX_CACHE["active"] = (key, text)
+    if log_fn is not None:
+        try:
+            stats = _CACHEABLE_PREFIX_STATS
+            total = stats["hits"] + stats["misses"]
+            hit_rate = (stats["hits"] / total * 100.0) if total else 0.0
+            log_fn(
+                f"cacheable_prefix rebuilt chars={len(text)} key={key[:12]} "
+                f"hits={stats['hits']} misses={stats['misses']} hit_rate={hit_rate:.1f}%"
+            )
+        except Exception:
+            pass
+    return text
+
+
+def cacheable_prefix_hit_rate() -> tuple[int, int]:
+    """Return (hits, misses) for diagnostics."""
+    return _CACHEABLE_PREFIX_STATS["hits"], _CACHEABLE_PREFIX_STATS["misses"]
+
+
+def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+    """Compact memory context for chapter writing.
+
+    Excludes the content that is already shipped via cacheable_prefix() (creative
+    brief, voice anchors, bible, characters). This keeps the variable portion
+    small so prefix cache hits more, and avoids duplication.
+
+    Sections (capped):
+    - Current State (full state.md)
+    - Threads (open)
+    - Recent Metrics
+    - Volume Plan (small)
+    """
+    char_budget = int(config["novel"].get("writing_memory_chars", 50000))
+
+    current_state = read_text(paths.state).strip()
+    threads_text = read_text(paths.threads).strip()
+    volume_plan = read_text(paths.volume_plan).strip()
+    metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
+
+    sections: list[tuple[str, str, int]] = [
+        ("Current State", current_state, 10000),
+        ("Threads", threads_text, 8000),
+        ("Recent Metrics JSON", metrics_5, 2500),
+        ("Volume Plan (head)", volume_plan, 6000),
+    ]
+    parts: list[str] = []
+    used = 0
+    for title, body, cap in sections:
+        body = body.strip()
+        if not body:
+            continue
+        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
+        block = f"## {title}\n{snippet}"
+        if used + len(block) + 2 > char_budget:
+            remaining = char_budget - used - len(f"## {title}\n") - 2
+            if remaining > 400:
+                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts)
+
+
+def _legacy_writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+    # Retained for reference only; not used after cacheable_prefix split.
+    return ""
+
+
+def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+    """Slim memory context for plan-review and screening calls.
+
+    Drops timeline, full events list, voices table, and recent_events from the
+    full memory_context. Keeps the creative brief, current state, voice anchor,
+    bible (capped), characters (capped), threads (capped), recent metrics 5 rows.
+    """
+    char_budget = int(config["novel"].get("plan_review_memory_chars", 10000))
+    creative_brief = read_text(PROMPT_FILE).strip()
+    current_state = read_text(paths.state).strip()
+    voice_anchor = read_text(paths.voice).strip()
+    bible = read_text(paths.bible).strip()
+    characters = read_text(paths.characters).strip()
+    threads_text = read_text(paths.threads).strip()
+    metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
+
+    sections: list[tuple[str, str, int]] = [
+        ("Creative Brief", creative_brief, 1500),
+        ("Current State", current_state, 2500),
+        ("Narrative Voice Anchor", voice_anchor, 1200),
+        ("Recent Metrics JSON", metrics_5, 1200),
+        ("Threads", threads_text, 1500),
+        ("Characters", characters, 1500),
+        ("World Bible", bible, 1200),
+    ]
+    parts: list[str] = []
+    used = 0
+    for title, body, cap in sections:
+        body = body.strip()
+        if not body:
+            continue
+        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
+        block = f"## {title}\n{snippet}"
+        if used + len(block) + 2 > char_budget:
+            remaining = char_budget - used - len(f"## {title}\n") - 2
+            if remaining > 400:
+                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts)
+
 def should_compress_memory(paths: Paths, config: dict[str, Any], chapter_num: int) -> bool:
     compress_every = int(config["novel"].get("memory_compress_every", 30))
     max_kb = int(config["novel"].get("memory_max_kb", 15))
@@ -136,15 +347,33 @@ def compress_memory_file(
     old_text = "".join(old_sections)
     max_chars = 3000
     system = MEMORY_COMPRESS_SYSTEM.format(max_chars=max_chars)
-    compressed = call_llm(client, paths, config, system, old_text, max_tokens=65000, temperature=0.2)
+    compressed = call_llm(client, paths, config, system, old_text, max_tokens=12000, temperature=0.2)
     compressed = normalize_text(compressed)
     new_content = header.rstrip() + "\n\n## Consolidated\n" + compressed + "\n\n" + "".join(recent_sections)
     write_text(file_path, new_content)
 
 def compress_all_memory(client: OpenAI, paths: Paths, config: dict[str, Any]) -> None:
-    for file_path in [paths.bible, paths.characters, paths.timeline, paths.threads]:
-        if file_path.exists() and read_text(file_path).strip():
+    targets = [
+        fp for fp in (paths.bible, paths.characters, paths.timeline, paths.threads)
+        if fp.exists() and read_text(fp).strip()
+    ]
+    if not targets:
+        return
+    max_workers = int(config["novel"].get("max_parallel_workers", 8))
+
+    def run_one(file_path: Path) -> tuple[Path, Exception | None]:
+        try:
             compress_memory_file(client, paths, config, file_path)
+            return file_path, None
+        except Exception as exc:
+            return file_path, exc
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as executor:
+        futures = {executor.submit(run_one, fp): fp for fp in targets}
+        for future in as_completed(futures):
+            fp, err = future.result()
+            if err is not None:
+                log(paths, f"compress_memory_file failed for {fp.name}: {err}")
 
 def rhythm_diagnostics(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
     window = int(config["novel"]["repeat_window"])

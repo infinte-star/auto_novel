@@ -5,6 +5,7 @@ import shutil
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from checkpoint import load_checkpoint
 from config import (
     Paths,
     append_text,
@@ -17,7 +18,7 @@ from config import (
     write_text,
 )
 from llm import call_llm, json_prompt, load_json_with_repair
-from memory import memory_context
+from memory import cacheable_prefix, memory_context, writing_memory_context
 from planning import plan_score
 from store import JsonStoryStore, db_event, recent_quality_feedback, store_causal_links
 
@@ -26,7 +27,20 @@ if TYPE_CHECKING:
 
 WRITE_SYSTEM = """You are a professional Chinese long-form web novel author.
 Write the chapter in Chinese.
-Requirements:
+
+## Internal self-critique protocol (MANDATORY before writing)
+Before producing the chapter, run this critique inside reasoning_content:
+1. List the 3 highest risks specific to this chapter:
+   - Repetition risk: which recent scene/staging/ending device this chapter might inadvertently copy.
+   - Shallow execution risk: which plan beat is most likely to become summary instead of scene.
+   - Hollow payoff risk: where the protagonist might get a win without visible cost.
+2. For each risk, write one concrete avoidance commitment (e.g. "use 茶寮 not 文渊阁", "show 户部 procedure on page", "let 朱由检 lose a piece of leverage").
+3. Sketch 2 candidate openings (1 sentence each). Pick the stronger one and justify in one phrase.
+4. Only after steps 1-3 begin the actual chapter output.
+
+Do NOT include the critique in the final chapter output. It belongs in reasoning only.
+
+## Output requirements
 - Around {chapter_words} Chinese characters.
 - Start exactly with: 第{chapter_num}章 {title}
 - Execute the selected plan and all constraints.
@@ -101,6 +115,145 @@ Requirements:
 - Keep recent chapter summaries compact.
 - Preserve hard continuity constraints."""
 
+def carried_over_partial_beats(paths: Paths, chapter_num: int, limit: int = 6) -> list[dict[str, Any]]:
+    """Return the previous chapter's partial/absent beats so the next writer can repair them.
+
+    Reads final_review.json -> review_round0.json -> review_round1.json in order
+    of preference, and returns up to `limit` entries containing
+    {"beat": str, "status": "partial|absent", "evidence": str}.
+    """
+    if chapter_num <= 1:
+        return []
+    prev = chapter_num - 1
+    for key in ("final_review.json", "review_round1.json", "review_round0.json"):
+        data = load_checkpoint(paths, prev, key)
+        if not isinstance(data, dict):
+            continue
+        beats = data.get("beats_audit") or []
+        partial: list[dict[str, Any]] = []
+        for entry in beats:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status", "")).lower()
+            if status not in ("partial", "absent"):
+                continue
+            partial.append({
+                "beat": str(entry.get("beat", ""))[:300],
+                "status": status,
+                "evidence": str(entry.get("evidence", ""))[:200],
+            })
+            if len(partial) >= limit:
+                break
+        if partial:
+            return partial
+    return []
+
+
+def writer_directives_for_chapter(paths: Paths, chapter_num: int, limit: int = 6) -> list[str]:
+    """Return directives carried from the previous chapter's review.
+
+    Reads the previous chapter's review (final_review.json preferred) and
+    extracts a flat list of imperative strings to inject at the top of the
+    current chapter's write prompt. This forms a review->writer feedback loop
+    that is more concrete than plan-level required_constraints (it speaks in
+    terms of execution, not strategy).
+    """
+    if chapter_num <= 1:
+        return []
+    prev = chapter_num - 1
+    directives: list[str] = []
+    for key in ("final_review.json", "review_round1.json", "review_round0.json"):
+        data = load_checkpoint(paths, prev, key)
+        if not isinstance(data, dict):
+            continue
+        for field in ("writer_directives_for_next_chapter", "writer_directives"):
+            for item in data.get(field, []) or []:
+                text = str(item).strip()
+                if text and text not in directives:
+                    directives.append(text)
+                if len(directives) >= limit:
+                    return directives
+        if directives:
+            return directives
+    return directives
+
+
+HOOK_REVISE_SYSTEM = """You are a Chinese web novel chapter-ending specialist.
+Rewrite ONLY the final 300-500 Chinese characters of the chapter so the ending hook is sharp, specific,
+and creates a clear next-chapter question for the reader.
+
+Constraints:
+- Do NOT change ANYTHING before the rewrite point. Output the FULL chapter with the original opening and middle preserved verbatim, and only the closing segment replaced.
+- The new ending must avoid the forbidden patterns: 廉价顿悟 ("他突然意识到"), 总结式收尾 ("一切才刚刚开始"), abstract foreshadowing.
+- The new ending should raise a specific, concrete question or set up a concrete obstacle that the next chapter must address.
+- Match the established narrative voice; do not introduce new characters or facts that aren't already established.
+- The replacement should be roughly the same length as the original ending (within 20%)."""
+
+
+def revise_hook_only(
+    client: OpenAI,
+    paths: Paths,
+    config: dict[str, Any],
+    chapter: str,
+    plan: dict[str, Any],
+    review: dict[str, Any],
+    tail_to_revise_chars: int = 400,
+) -> str:
+    """Rewrite only the last ~300-500 chars of the chapter to fix a weak ending hook.
+
+    This is a much cheaper alternative to a full revise: a single small LLM call
+    that the writer copies the head verbatim and only mutates the tail. Returns
+    the new full chapter text.
+    """
+    chapter = normalize_chapter(chapter)
+    n = len(chapter)
+    cut = max(0, n - tail_to_revise_chars)
+    # Snap cut point to a paragraph boundary if possible (look back up to 200 chars
+    # for double-newline; otherwise single newline).
+    snap_window = chapter[max(0, cut - 200): cut + 200]
+    for marker in ("\n\n", "\n"):
+        idx = snap_window.find(marker)
+        if idx >= 0:
+            cut = max(0, cut - 200) + idx + len(marker)
+            break
+    head = chapter[:cut]
+    original_tail = chapter[cut:]
+    user = f"""## Plan JSON (for context)
+{json.dumps(plan, ensure_ascii=False, indent=2)}
+
+## Reviewer Feedback (why the hook is weak)
+{json.dumps({
+    "hook_strength": review.get("hook_strength"),
+    "rhythm_risks": review.get("rhythm_risks", []),
+    "writer_directives": review.get("writer_directives_for_next_chapter", []),
+}, ensure_ascii=False, indent=2)}
+
+## Chapter Head (DO NOT MODIFY — copy verbatim)
+{head}
+
+## Current Tail to Rewrite (length {len(original_tail)} chars)
+{original_tail}
+
+Rewrite the chapter. Copy the head verbatim, then replace the tail with a sharper ending
+of similar length. Output the FULL chapter only."""
+    raw = call_llm(
+        client, paths, config, HOOK_REVISE_SYSTEM, user,
+        max_tokens=8000, temperature=0.55,
+        cacheable_prefix=cacheable_prefix(paths, config),
+    )
+    new_chapter = normalize_chapter(raw)
+    # Safety: if the model failed to preserve the head (e.g., truncated or
+    # rewrote opening), fall back to head + new tail by splicing.
+    if not new_chapter.startswith(head[: min(len(head), 200)]):
+        # Try to recover by extracting the model's "new tail" — assume it's
+        # the last paragraph in its output.
+        from config import log as _log
+        _log(paths, "hook revise: head verification failed; splicing head + model_tail")
+        model_tail = new_chapter.rsplit("\n\n", 1)[-1] if "\n\n" in new_chapter else new_chapter[-tail_to_revise_chars * 2:]
+        new_chapter = normalize_chapter(head.rstrip() + "\n\n" + model_tail.strip())
+    return new_chapter
+
+
 def write_chapter(
     client: OpenAI,
     paths: Paths,
@@ -111,6 +264,7 @@ def write_chapter(
     decision: dict[str, Any],
     tail: str,
     cached_memory: str | None = None,
+    temperature: float | None = None,
 ) -> str:
     title = str(plan.get("title") or f"Chapter {chapter_num}").strip()
     system = WRITE_SYSTEM.format(
@@ -118,10 +272,28 @@ def write_chapter(
         chapter_num=chapter_num,
         title=title,
     )
-    mem = cached_memory or memory_context(paths, conn, config)
+    mem = cached_memory or writing_memory_context(paths, conn, config)
+    partial_beats = carried_over_partial_beats(paths, chapter_num)
+    directives = writer_directives_for_chapter(paths, chapter_num)
+    carryover_block = ""
+    if partial_beats:
+        carryover_block += (
+            f"\n## CRITICAL CARRYOVER FROM CH{chapter_num - 1} (MUST address on page)\n"
+            f"The following beats were marked partial/absent in the previous chapter's review. "
+            f"You MUST realize these on page in this chapter when narratively viable. "
+            f"Do NOT leave them implied or off-page.\n"
+            f"{json.dumps(partial_beats, ensure_ascii=False, indent=2)}\n"
+        )
+    if directives:
+        carryover_block += (
+            f"\n## REVIEWER DIRECTIVES FOR CH{chapter_num} (MUST obey)\n"
+            f"These execution-level directives come from the previous chapter's reviewer. "
+            f"They override generic guidelines when in conflict.\n"
+            f"{json.dumps(directives, ensure_ascii=False, indent=2)}\n"
+        )
     user = f"""## Memory
 {mem}
-
+{carryover_block}
 ## Previous Tail
 {tail[-int(config["novel"]["recent_tail_chars"]):]}
 
@@ -135,8 +307,65 @@ def write_chapter(
 {json.dumps(decision.get("required_constraints", []), ensure_ascii=False, indent=2)}
 
 Write chapter {chapter_num}."""
-    raw = call_llm(client, paths, config, system, user, temperature=float(config["api"]["temperature"]))
+    temp = float(config["api"]["temperature"]) if temperature is None else temperature
+    prefix = cacheable_prefix(paths, config)
+    raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix)
     return normalize_chapter(raw)
+
+def apply_review_patches(chapter: str, patches: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """Apply review-provided patches to chapter text in-place.
+
+    Returns (new_chapter, applied_patches_with_status). Each patch entry gets an
+    "applied" boolean and optionally an "error" reason if it could not be applied.
+    Patches are applied in input order, each operating on the current text.
+    Locators that no longer match (because an earlier patch removed/replaced the
+    surrounding region) are skipped with applied=False.
+    """
+    text = chapter
+    results: list[dict[str, Any]] = []
+    for raw_patch in patches or []:
+        if not isinstance(raw_patch, dict):
+            results.append({"applied": False, "error": "non-dict patch", "patch": raw_patch})
+            continue
+        op = str(raw_patch.get("op", "")).strip().lower()
+        locator = str(raw_patch.get("locator", "")).strip()
+        before = str(raw_patch.get("before", "") or "").strip()
+        after = str(raw_patch.get("after", "") or "")
+        insert_text = str(raw_patch.get("insert", "") or "")
+        entry = {**raw_patch, "applied": False}
+        try:
+            if op == "replace":
+                target = before or locator
+                if not target:
+                    entry["error"] = "empty before/locator for replace"
+                elif target not in text:
+                    entry["error"] = "before/locator not found in chapter"
+                else:
+                    text = text.replace(target, after, 1)
+                    entry["applied"] = True
+            elif op == "insert_after":
+                if not locator or locator not in text:
+                    entry["error"] = "locator not found for insert_after"
+                else:
+                    idx = text.find(locator) + len(locator)
+                    glue_before = "" if text[idx:idx+1] in {"\n", ""} else "\n\n"
+                    glue_after = "" if text[idx:idx+2] == "\n\n" else "\n\n"
+                    text = text[:idx] + glue_before + insert_text + glue_after + text[idx:]
+                    entry["applied"] = True
+            elif op == "delete":
+                target = before or locator
+                if not target or target not in text:
+                    entry["error"] = "before/locator not found for delete"
+                else:
+                    text = text.replace(target, "", 1)
+                    entry["applied"] = True
+            else:
+                entry["error"] = f"unknown op: {op!r}"
+        except Exception as exc:
+            entry["error"] = f"exception: {exc}"
+        results.append(entry)
+    return text, results
+
 
 def revise_chapter(
     client: OpenAI,
@@ -149,7 +378,29 @@ def revise_chapter(
     tail: str,
     cached_memory: str | None = None,
 ) -> str:
-    mem = cached_memory or memory_context(paths, conn, config)
+    # Fast path: try applying review patches directly without a full LLM rewrite.
+    # Only fall back to LLM revision when patches are missing, incomplete, or fail.
+    patches = review.get("patches") if isinstance(review, dict) else None
+    use_patch_path = bool(config["novel"].get("revise_use_patches", True))
+    if use_patch_path and isinstance(patches, list) and patches:
+        patched, results = apply_review_patches(chapter, patches)
+        applied = sum(1 for r in results if r.get("applied"))
+        total = len(results)
+        # Relaxed threshold: 1/2 of patches applied counts as success.
+        # Surgical patch path is much faster than a full rewrite and the unapplied
+        # patches typically address minor issues; the next review round will pick
+        # up anything material that remains.
+        min_apply_frac = float(config["novel"].get("revise_patch_min_frac", 0.5))
+        threshold_hit = max(1, int(total * min_apply_frac + 0.999))
+        if applied >= threshold_hit:
+            from config import log as _log
+            _log(paths, f"Revise via patches applied={applied}/{total} (>= {threshold_hit}); skipping full rewrite")
+            return normalize_chapter(patched)
+        else:
+            from config import log as _log
+            _log(paths, f"Revise patches too few hit ({applied}/{total} < {threshold_hit}); falling back to LLM rewrite")
+
+    mem = cached_memory or writing_memory_context(paths, conn, config)
     user = f"""## Memory
 {mem}
 
@@ -169,7 +420,10 @@ def revise_chapter(
 {chapter}
 
 Revise the full chapter."""
-    raw = call_llm(client, paths, config, REVISE_SYSTEM, user, temperature=0.45)
+    raw = call_llm(
+        client, paths, config, REVISE_SYSTEM, user,
+        temperature=0.45, cacheable_prefix=cacheable_prefix(paths, config),
+    )
     return normalize_chapter(raw)
 
 def extract_events(
@@ -189,7 +443,7 @@ def extract_events(
 {chapter[:8000]}
 
 Extract durable state changes."""
-    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=65000, user=json_prompt(user), temperature=0.2)
+    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=12000, user=json_prompt(user), temperature=0.2)
     return load_json_with_repair(client, paths, config, raw)
 
 def update_structured_state(
@@ -338,6 +592,68 @@ def append_memory(path: Path, chapter_num: int, items: list[Any]) -> None:
         return
     append_text(path, f"\n\n{section_header}\n" + "\n".join(f"- {t}" for t in fresh) + "\n")
 
+STATE_DYNAMIC_SECTIONS_SYSTEM = """You generate ONLY the two dynamic sections of a long-form novel's working state.
+Return exactly one valid JSON object and no other text:
+{
+  "protagonist_state": "<=600 Chinese chars markdown: protagonist's current goals, resources, fears, secrets, ongoing pressure, and key decisions still pending. Reflect changes from this chapter.>",
+  "next_12_directions": ["10-12 concrete directives for upcoming chapters; each a single Chinese sentence specifying what concretely must happen, NOT abstract themes"]
+}
+Constraints:
+- protagonist_state must be self-sufficient (a new reader could pick up). Avoid vague phrases.
+- next_12_directions must be SPECIFIC executable directives, not plot themes."""
+
+
+def _render_state_md_template(
+    paths: Paths,
+    conn: Any,
+    chapter_num: int,
+    extraction: dict[str, Any],
+    protagonist_state: str,
+    next_directions: list[str],
+) -> str:
+    """Compose the new state.md deterministically.
+
+    The structure follows what readers expect: progress meta, recent chapter
+    summaries (5), key entity states, active threads (open), and the LLM-only
+    sections (protagonist_state, next_12_directions).
+    """
+    from store import recent_events, recent_metrics
+
+    total_chars = count_chars(paths.book)
+    metrics = recent_metrics(conn, 5)
+    threads_text = read_text(paths.threads).strip()
+
+    # Last 5 chapter title+key payoff
+    summary_lines: list[str] = []
+    for m in metrics:
+        ch = m.get("chapter")
+        title = m.get("title") or ""
+        score = m.get("score")
+        tone = m.get("emotional_tone") or ""
+        payoff = m.get("payoff_type") or ""
+        summary_lines.append(f"- Ch{ch} 「{title}」 score={score} payoff={payoff} tone={tone}")
+
+    # Pull events from this chapter's extraction
+    this_chapter_events: list[str] = []
+    for ev in extraction.get("events", [])[:8]:
+        s = str(ev.get("summary", "")).strip()
+        if s:
+            this_chapter_events.append(f"- {s[:200]}")
+
+    next_dir_lines = "\n".join(f"{i + 1}. {d}" for i, d in enumerate(next_directions[:12]))
+
+    parts: list[str] = [
+        f"# State Snapshot after Ch{chapter_num}",
+        f"\n## Progress\n- Total chars: {total_chars}\n- Last chapter: Ch{chapter_num} 「{extraction.get('title', '')}」",
+        "\n## Recent Chapters (newest first)\n" + ("\n".join(summary_lines) if summary_lines else "_(none)_"),
+        "\n## Latest Chapter Key Events\n" + ("\n".join(this_chapter_events) if this_chapter_events else "_(none)_"),
+        "\n## Protagonist State\n" + (protagonist_state.strip() or "_(empty)_"),
+        "\n## Next 12 Chapter Directions\n" + (next_dir_lines or "_(none)_"),
+        "\n## Active Threads\n" + (threads_text[:4000] if threads_text else "_(none)_"),
+    ]
+    return "\n".join(parts) + "\n"
+
+
 def update_state_file(
     client: OpenAI,
     paths: Paths,
@@ -349,7 +665,11 @@ def update_state_file(
 ) -> None:
     if paths.state.exists():
         shutil.copy2(paths.state, paths.state.with_suffix(".md.bak"))
-    user = f"""## Current State
+
+    template_mode = bool(config["novel"].get("state_template_mode", True))
+    if not template_mode:
+        # Legacy path: full LLM regeneration (kept as fallback).
+        user = f"""## Current State
 {read_text(paths.state)}
 
 ## Memory Context
@@ -365,8 +685,46 @@ def update_state_file(
 {chapter[:5000]}
 
 Update state.md after chapter {chapter_num}."""
-    new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=65000, temperature=0.25)
-    write_text(paths.state, normalize_text(new_state) + "\n")
+        new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=12000, temperature=0.25)
+        write_text(paths.state, normalize_text(new_state) + "\n")
+        return
+
+    # Template mode: only ask LLM for the 2 dynamic sections, then deterministically
+    # render the full state.md. This drops LLM output from ~12K tokens to ~2-3K.
+    current_state_excerpt = read_text(paths.state)
+    if len(current_state_excerpt) > 3000:
+        current_state_excerpt = current_state_excerpt[:3000] + "\n...[truncated]"
+    user = f"""## Previous Protagonist State (for continuity)
+{current_state_excerpt}
+
+## Extraction From Chapter {chapter_num}
+{json.dumps(extraction, ensure_ascii=False, indent=2)}
+
+## Latest Chapter Tail (last 2500 chars for fresh detail)
+{chapter[-2500:]}
+
+Produce ONLY the JSON with protagonist_state and next_12_directions."""
+    try:
+        raw = call_llm(
+            client, paths, config, STATE_DYNAMIC_SECTIONS_SYSTEM, json_prompt(user),
+            max_tokens=4000, temperature=0.25,
+            cacheable_prefix=cacheable_prefix(paths, config),
+        )
+        data = load_json_with_repair(
+            client, paths, config, raw,
+            fallback={"protagonist_state": "", "next_12_directions": []},
+        )
+    except Exception as exc:
+        from config import log as _log
+        _log(paths, f"State dynamic sections LLM failed (non-fatal); using empty fallback: {exc}")
+        data = {"protagonist_state": "", "next_12_directions": []}
+
+    protagonist_state = str(data.get("protagonist_state", "")).strip()
+    next_directions = [str(d).strip() for d in (data.get("next_12_directions") or []) if str(d).strip()]
+    new_state = _render_state_md_template(
+        paths, conn, chapter_num, extraction, protagonist_state, next_directions
+    )
+    write_text(paths.state, new_state)
 
 def save_chapter(paths: Paths, chapter_num: int, chapter: str, review: dict[str, Any], plan: dict[str, Any]) -> None:
     chapter = normalize_chapter(chapter)

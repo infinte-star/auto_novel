@@ -108,7 +108,7 @@ def init_db(paths: Paths) -> Any:
     if sqlite3 is None:
         return JsonStoryStore(paths.logs_dir / "story_state.json")
     try:
-        conn = sqlite3.connect(paths.database)
+        conn = sqlite3.connect(paths.database, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(
             """

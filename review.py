@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from config import Paths, append_text, chapter_path, log, normalize_text, read_text, safe_score, write_text
 from llm import call_llm, json_prompt, load_json_with_repair
-from memory import memory_context, rhythm_diagnostics, structural_repetition_analysis
+from memory import cacheable_prefix, memory_context, rhythm_diagnostics, structural_repetition_analysis, writing_memory_context
 from store import (
     db_event,
     get_active_constraints,
@@ -30,22 +30,67 @@ Return exactly one valid JSON object and no other text:
   "continuity_risks": [],
   "rhythm_risks": [],
   "reader_fatigue_risks": [],
-  "beats_audit": [{"beat":"...", "status":"realized|partial|absent", "evidence":"quote or note"}]
+  "hook_strength": 1-10,
+  "beats_audit": [{"beat":"...", "status":"realized|partial|absent", "evidence":"quote or note"}],
+  "patches": [
+    {"op":"replace", "locator":"quote 8-20 chars from current text", "before":"exact substring to replace", "after":"replacement text", "reason":"why"},
+    {"op":"insert_after", "locator":"quote 8-20 chars after which to insert", "insert":"new text", "reason":"why"},
+    {"op":"delete", "locator":"quote 8-20 chars identifying the segment", "before":"exact substring to delete", "reason":"why"}
+  ],
+  "writer_directives_for_next_chapter": [
+    "3-6 imperative directives the NEXT chapter writer must follow",
+    "Each directive must be concrete execution guidance, not abstract advice",
+    "Examples: '下一章必须用反转结构，最近 3 章都是 pressure-payoff', '户部官僚程序需要落到至少一段对话上', '主角必须在场景 2 做一次有可见代价的选择'"
+  ]
 }
-Scoring rules:
-- Cap score at 8 if important selected-plan beats are missing from the chapter text.
-- Cap score at 8 if a timeline, money movement, message route, surveillance source, or procedure is hand-waved.
-- Cap score at 8 if the chapter repeats a recent scene shape or ending device without a clear new function.
-- Cap score at 7 if continuity risks from recent reviews are ignored again.
-- Cap score at 7 if more than 30% of plan beats are "partial" or "absent" in beats_audit.
-- Cap score at 7 if a silent thread (>10 chapters without advancement) listed in the plan context could be advanced naturally but is ignored.
-- Award 9+ only when the chapter solves prior feedback on page while preserving tension and follow-up desire.
+
+## Scoring philosophy (CHANGED — DO NOT artificially cap at 8)
+The score must be a HONEST quality estimate on a 1-10 scale. Use the full range.
+A chapter that fully realizes its plan, is causally sound, varied in shape, and gives the reader fresh follow-up
+desire should score 9 or 10. Caps below were historically used as hard ceilings; they are now SOFT penalties
+that DEDUCT from a base score, but a strong chapter can still earn 9+.
+
+Start from a base score reflecting raw craft (writing quality, scene specificity, dialogue, emotional payoff).
+Then DEDUCT according to the following soft penalties (do NOT clip to 8; just subtract):
+- Missing important plan beats: -1.0 per fully absent beat; -0.5 per partial beat.
+- Hand-waved timeline/money/route/procedure: -1.0 per occurrence.
+- Repeats recent scene shape or ending device without new function: -1.0.
+- Ignores continuity risks called out in recent reviews: -1.0 per ignored risk (cap total at -2.0).
+- More than 30% of plan beats partial/absent: additional -0.5 (on top of per-beat deductions).
+- Silent thread (>10 chapters silent) listed in plan context could be advanced but ignored: -0.7.
+
+After deductions, apply bonuses (additive, max +1.5 total):
+- All plan beats realized with concrete on-page action: +0.5
+- Solves prior feedback on page while preserving tension and follow-up desire: +0.7
+- Distinct scene staging and ending device vs. last 3 chapters: +0.3
+- Visible cost / agency moment for protagonist with emotional texture: +0.3
+
+Clamp final score to [1.0, 10.0]. Score 9.0+ is reserved for chapters with no critical deductions.
 
 Plan Beats Audit (REQUIRED):
 For each beat in the plan's "beats" array, add an entry to beats_audit:
 - "realized": the beat is fully executed on page with visible action
 - "partial": the beat is referenced but lacks concrete scene or sensory detail
-- "absent": the beat is missing or only implied off-page"""
+- "absent": the beat is missing or only implied off-page
+
+Patches (REQUIRED when score < 9 OR there are any "partial"/"absent" beats):
+- Output 1-8 surgical patches that, when applied, would lift the chapter at least one band.
+- Each patch's insert/after content MUST be SHORT (<= 200 Chinese chars) and SELF-CONTAINED.
+- Prefer insert_after for adding missing scenes/details; prefer replace for fixing concrete wording.
+- Each patch's locator/before MUST quote text that exists verbatim in the chapter (a contiguous substring, 8-20 chars).
+- Each patch must be INDEPENDENT — applying any subset (or all) in any order must still produce valid prose.
+- Do NOT chain dependent patches; if you need a long insertion, split it into multiple independent inserts at different locators.
+- If the chapter is already at 9+ with no partial/absent beats, you MAY return "patches": [].
+
+Writer directives (REQUIRED): output 3-6 imperative directives the NEXT chapter writer must follow.
+- Be execution-level concrete (a specific scene type, structural choice, or character action), not abstract.
+- Each directive should be a single short Chinese sentence.
+- Prefer directives that REPAIR specific problems found in THIS chapter or compensate for recent repetition.
+
+Hook strength (REQUIRED): rate the chapter's ENDING-hook strength 1-10 independently.
+- 9-10: ending raises a sharp, specific question the reader will click "next" for.
+- 6-8: workable hook but generic or already used in recent chapters.
+- <=5: weak/summary-style ending — DO NOT use vague "他知道，一切才刚刚开始" style endings."""
 
 STAGE_REVIEW_SYSTEM = """You are the long-cycle quality evaluator for serialized Chinese web fiction.
 Return exactly one valid JSON object and no other text:
@@ -56,6 +101,7 @@ Return exactly one valid JSON object and no other text:
   "repetition_risks": ["repeated structures, payoffs, or staging"],
   "next_20_chapters_replan": ["concrete plan adjustments for the next 20 chapters"],
   "threads_to_recover_or_upgrade": ["open threads that need attention or elevation"],
+  "writer_directives_for_next_chapter": ["3-6 imperative concrete directives the immediate next chapter writer must follow"],
   "constraints": [
     {"type": "avoid|require|replan|recover_thread", "description": "...", "priority": 1-10, "expires_in_chapters": 20}
   ]
@@ -73,6 +119,26 @@ Produce a revised plan for the NEXT 40-60 chapters that:
 - Increases reader anticipation and follow-up desire
 Return the full revised volume_plan markdown only, no explanation."""
 
+VOICE_ANCHOR_SYSTEM = """You maintain the narrative voice anchor for a long-form serialized novel.
+You will receive: the current voice.md, the previous N chapters of actual prose, and a brief on what
+shifted in the storyline. Your job: produce an updated voice.md that PRESERVES at least 70% of
+existing constraints while INCORPORATING 1-3 new style features that the recent prose has stabilized
+on (e.g. new recurring imagery, new sentence-rhythm habits, new character speech patterns).
+
+Rules:
+- Output the FULL replacement voice.md in Chinese, markdown only.
+- Do not weaken existing forbidden-patterns list; you may add to it.
+- Keep sections: 时态/视角, 句长节奏, 词汇调性, 感官锚, 心境呈现, 章节结构惯例, 节奏禁忌.
+- Add a brief change log at the bottom: `## 修订日志\\n- Ch{chapter_num}: <one-line summary>`."""
+
+VOICES_TABLE_SYSTEM = """You maintain the character voice table for a long-form novel.
+You will receive: the current voices.md plus recent chapters featuring named characters.
+Update the voices.md to:
+- Refine each existing character's voice fingerprint based on what actually appeared in recent prose.
+- Add 1-2 NEW named characters who appeared in recent chapters and lack an entry.
+- Keep all existing characters; refine rather than delete.
+Output the full updated voices.md in Chinese, markdown only. Same section structure as input."""
+
 def review_chapter(
     client: OpenAI,
     paths: Paths,
@@ -84,7 +150,7 @@ def review_chapter(
     tail: str,
     cached_memory: str | None = None,
 ) -> dict[str, Any]:
-    mem = cached_memory or memory_context(paths, conn, config)
+    mem = cached_memory or writing_memory_context(paths, conn, config)
     silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
     silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
     user = f"""## Memory
@@ -104,7 +170,10 @@ def review_chapter(
 
 ## Chapter Text
 {chapter[:12000]}"""
-    raw = call_llm(client, paths, config, REVIEW_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.2)
+    raw = call_llm(
+        client, paths, config, REVIEW_SYSTEM, json_prompt(user),
+        max_tokens=32000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
+    )
     report = load_json_with_repair(
         client,
         paths,
@@ -118,6 +187,8 @@ def review_chapter(
             "continuity_risks": [],
             "rhythm_risks": [],
             "reader_fatigue_risks": [],
+            "hook_strength": 6,
+            "writer_directives_for_next_chapter": [],
         },
     )
     report["score"] = safe_score(report.get("score", 0))
@@ -150,7 +221,7 @@ def stage_review(
 {chr(10).join(recent)}
 
 Review long-cycle quality through chapter {chapter_num}."""
-    raw = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, json_prompt(user), max_tokens=65000, temperature=0.3)
+    raw = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, json_prompt(user), max_tokens=12000, temperature=0.3)
     data = load_json_with_repair(
         client,
         paths,
@@ -163,6 +234,7 @@ Review long-cycle quality through chapter {chapter_num}."""
             "repetition_risks": [],
             "next_20_chapters_replan": [],
             "threads_to_recover_or_upgrade": [],
+            "writer_directives_for_next_chapter": [],
             "constraints": [],
         },
     )
@@ -181,14 +253,88 @@ Review long-cycle quality through chapter {chapter_num}."""
         + render_section("Repetition Risks", data.get("repetition_risks", []))
         + render_section("Next 20 Chapters Replan", data.get("next_20_chapters_replan", []))
         + render_section("Threads to Recover or Upgrade", data.get("threads_to_recover_or_upgrade", []))
+        + render_section("Writer Directives For Next Chapter", data.get("writer_directives_for_next_chapter", []))
     )
     append_text(paths.logs_dir / "stage_reviews.md", f"\n\n# Ch{chapter_num} Stage Review\n\n{markdown}\n")
     db_event(conn, chapter_num, "stage_review", {"review": data})
+
+    # Persist stage-level writer_directives onto the most-recent chapter's
+    # final_review.json so the NEXT chapter writer prompt picks them up via
+    # writer_directives_for_chapter(). We append to the existing list (chapter
+    # review directives take precedence — we only add if the stage layer has
+    # surfaced something not already listed).
+    stage_directives = data.get("writer_directives_for_next_chapter") or []
+    if stage_directives:
+        try:
+            from checkpoint import load_checkpoint as _load, save_checkpoint as _save
+            existing = _load(paths, chapter_num, "final_review.json")
+            if isinstance(existing, dict):
+                merged = list(existing.get("writer_directives_for_next_chapter") or [])
+                for d in stage_directives:
+                    s = str(d).strip()
+                    if s and s not in merged:
+                        merged.append(s)
+                existing["writer_directives_for_next_chapter"] = merged[:10]
+                _save(paths, chapter_num, "final_review.json", existing)
+                log(paths, f"Merged {len(stage_directives)} stage directives into Ch{chapter_num} review")
+        except Exception as exc:
+            log(paths, f"Failed to merge stage directives into Ch{chapter_num} review: {exc}")
 
     constraints = data.get("constraints") or []
     if constraints:
         store_stage_constraints(conn, chapter_num, constraints)
         log(paths, f"Stored {len(constraints)} stage constraints from Ch{chapter_num} review")
+
+    # Refresh narrative voice anchors using the recent prose window.
+    try:
+        refresh_voice_anchors(client, paths, conn, config, chapter_num, recent_text="\n\n".join(recent))
+    except Exception as exc:
+        log(paths, f"Voice anchor refresh failed at Ch{chapter_num}: {exc}")
+
+
+def refresh_voice_anchors(
+    client: OpenAI,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    recent_text: str,
+) -> None:
+    """Update memory/voice.md and memory/voices.md based on actual recent prose.
+
+    Called from stage_review (every N chapters). Each refresh is best-effort:
+    if the LLM call fails, the existing files remain unchanged.
+    """
+    if not recent_text.strip():
+        return
+
+    current_voice = read_text(paths.voice)
+    voice_user = f"""## Current voice.md
+{current_voice if current_voice.strip() else "(empty — generate from prose)"}
+
+## Recent Chapters Prose
+{recent_text[:18000]}
+
+Refresh voice.md for Ch{chapter_num}."""
+    new_voice = call_llm(client, paths, config, VOICE_ANCHOR_SYSTEM, voice_user, max_tokens=8000, temperature=0.3)
+    new_voice = normalize_text(new_voice).strip()
+    if new_voice:
+        write_text(paths.voice, new_voice + "\n")
+        log(paths, f"Updated voice.md at Ch{chapter_num} (len={len(new_voice)})")
+
+    current_voices = read_text(paths.voices)
+    voices_user = f"""## Current voices.md
+{current_voices if current_voices.strip() else "(empty — generate from prose)"}
+
+## Recent Chapters Prose
+{recent_text[:18000]}
+
+Refresh voices.md for Ch{chapter_num}."""
+    new_voices = call_llm(client, paths, config, VOICES_TABLE_SYSTEM, voices_user, max_tokens=8000, temperature=0.3)
+    new_voices = normalize_text(new_voices).strip()
+    if new_voices:
+        write_text(paths.voices, new_voices + "\n")
+        log(paths, f"Updated voices.md at Ch{chapter_num} (len={len(new_voices)})")
 
 def should_replan(conn: Any, config: dict[str, Any]) -> bool:
     rows = recent_metrics(conn, 20)
@@ -228,6 +374,6 @@ def adaptive_replan(
 {json.dumps(get_active_constraints(conn, chapter_num), ensure_ascii=False, indent=2)}
 
 Current chapter: {chapter_num}. Replan the next 40-60 chapters."""
-    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=65000, temperature=0.5)
+    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=16000, temperature=0.5)
     write_text(paths.volume_plan, normalize_text(new_plan) + "\n")
     db_event(conn, chapter_num, "adaptive_replan", {"reason": "metrics_degradation"})

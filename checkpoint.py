@@ -64,8 +64,6 @@ def should_resume_existing_chapter(paths: Paths, chapter_num: int) -> bool:
         return False
     if not checkpoint_dir(paths, chapter_num).exists():
         return False
-    if checkpoint_path(paths, chapter_num, "chapter_saved.json").exists() or checkpoint_path(
-        paths, chapter_num, "chapter_completed.json"
-    ).exists():
+    if checkpoint_path(paths, chapter_num, "chapter_completed.json").exists():
         return False
-    return not bool(load_checkpoint(paths, chapter_num, "chapter_completed.json"))
+    return True

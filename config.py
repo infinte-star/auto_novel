@@ -19,6 +19,8 @@ class Paths:
     timeline: Path
     threads: Path
     volume_plan: Path
+    voices: Path
+    voice: Path
     chapters_dir: Path
     logs_dir: Path
     database: Path
@@ -158,6 +160,8 @@ def get_paths(config: dict[str, Any]) -> Paths:
         timeline=ROOT / str(raw["timeline"]),
         threads=ROOT / str(raw["threads"]),
         volume_plan=ROOT / str(raw["volume_plan"]),
+        voices=ROOT / str(raw.get("voices", "memory/voices.md")),
+        voice=ROOT / str(raw.get("voice", "memory/voice.md")),
         chapters_dir=ROOT / str(raw["chapters_dir"]),
         logs_dir=ROOT / str(raw["logs_dir"]),
         database=ROOT / str(raw["database"]),
@@ -227,6 +231,8 @@ def ensure_project(paths: Paths) -> None:
         (paths.timeline, "Timeline"),
         (paths.threads, "Threads"),
         (paths.volume_plan, "Volume Plan"),
+        (paths.voices, "Character Voices"),
+        (paths.voice, "Narrative Voice Anchor"),
     ]:
         if not path.exists():
             write_text(path, f"# {title}\n\n")

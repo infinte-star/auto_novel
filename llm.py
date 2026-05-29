@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from config import Paths, log, normalize_text
 
@@ -12,7 +13,13 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 class LLMClientPool:
-    def __init__(self, clients: list[OpenAI], primary_count: int | None = None) -> None:
+    def __init__(
+        self,
+        clients: list[OpenAI],
+        primary_count: int | None = None,
+        endpoints: list[tuple[str, str]] | None = None,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> None:
         if not clients:
             raise ValueError("LLMClientPool requires at least one client")
         self.clients = clients
@@ -21,8 +28,44 @@ class LLMClientPool:
             self.primary_count = len(clients)
         self.lock = threading.Lock()
         self.next_index = 0
+        self.dead: set[int] = set()
+        self.log_fn = log_fn
+        if endpoints is not None and len(endpoints) == len(clients):
+            self.endpoint_labels = [f"{base_url} ...{key[-4:]}" for base_url, key in endpoints]
+        else:
+            self.endpoint_labels = [f"client[{i}]" for i in range(len(clients))]
+
+    def _emit_log(self, msg: str) -> None:
+        if self.log_fn is not None:
+            try:
+                self.log_fn(msg)
+                return
+            except Exception:
+                pass
+        print(msg, file=sys.stderr)
+
+    def _mark_dead(self, idx: int, exc: Exception) -> None:
+        status_code = getattr(exc, "status_code", None)
+        with self.lock:
+            if idx in self.dead:
+                return
+            self.dead.add(idx)
+            alive_primary = sum(1 for i in range(self.primary_count) if i not in self.dead)
+            fallback_total = len(self.clients) - self.primary_count
+            alive_fallback = sum(
+                1 for i in range(self.primary_count, len(self.clients)) if i not in self.dead
+            )
+            label = self.endpoint_labels[idx]
+        self._emit_log(
+            f"API key marked invalid endpoint={label} status={status_code} "
+            f"alive={alive_primary}/{self.primary_count} primary, "
+            f"{alive_fallback}/{fallback_total} fallback"
+        )
 
     def create_completion(self, **kwargs: Any) -> Any:
+        with self.lock:
+            if len(self.dead) >= len(self.clients):
+                raise RuntimeError("All API keys marked invalid; rotate keys in config.yaml")
         attempts = self._attempt_order()
         first_error: Exception | None = None
         for index in attempts:
@@ -30,27 +73,39 @@ class LLMClientPool:
             try:
                 return client.chat.completions.create(**kwargs)
             except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code is not None and int(status_code) in {401, 403}:
+                    self._mark_dead(index, exc)
+                    continue
                 if first_error is None:
                     first_error = exc
                 if not self._should_try_next_client(exc):
                     raise
         if first_error is not None:
             raise first_error
-        raise RuntimeError("LLMClientPool has no clients to try")
+        raise RuntimeError("All API keys marked invalid; rotate keys in config.yaml")
 
     def _attempt_order(self) -> list[int]:
         with self.lock:
-            start = self.next_index % self.primary_count
-            self.next_index += 1
-        primary = [(start + offset) % self.primary_count for offset in range(self.primary_count)]
-        fallback = list(range(self.primary_count, len(self.clients)))
+            dead_snapshot = set(self.dead)
+            primary_alive = [i for i in range(self.primary_count) if i not in dead_snapshot]
+            if primary_alive:
+                start = self.next_index % len(primary_alive)
+                self.next_index += 1
+            else:
+                start = 0
+        if primary_alive:
+            primary = [primary_alive[(start + offset) % len(primary_alive)] for offset in range(len(primary_alive))]
+        else:
+            primary = []
+        fallback = [i for i in range(self.primary_count, len(self.clients)) if i not in dead_snapshot]
         return primary + fallback
 
     @staticmethod
     def _should_try_next_client(exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None)
         if status_code is not None:
-            return int(status_code) in {401, 408, 409, 429, 500, 502, 503, 504}
+            return int(status_code) in {401, 403, 408, 409, 429, 500, 502, 503, 504}
         return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
 
 REFUSAL_PATTERNS = (
@@ -210,10 +265,18 @@ def call_llm(
     max_tokens: int | None = None,
     temperature: float | None = None,
     json_mode: bool | None = None,
+    cacheable_prefix: str | None = None,
 ) -> str:
     api = config["api"]
     context_window = int(api.get("context_window", 1000000))
     max_input_chars = int(context_window * 1.8)
+    # Prepend cacheable_prefix verbatim at the very top of user message so that
+    # repeated invocations across chapters share an identical prefix and the
+    # provider's prefix cache can hit. The prefix should contain ONLY content
+    # that does not change call-to-call within a window (creative brief, bible,
+    # characters, voice anchors).
+    if cacheable_prefix:
+        user = cacheable_prefix.rstrip() + "\n\n" + user
     total_chars = len(system) + len(user)
     if total_chars > max_input_chars:
         user = emergency_truncate(user, max_input_chars - len(system) - 1000)
@@ -245,32 +308,80 @@ def call_llm(
                 reasoning_parts: list[str] = []
                 chunk_count = 0
                 finish_reason = None
-                stream_max = int(api.get("stream_timeout", 300))
-                for chunk in resp:
-                    chunk_count += 1
-                    if chunk_count % 50 == 0:
-                        if time.perf_counter() - started > stream_max:
+                stream_max = int(api.get("stream_timeout", 600))
+                idle_startup = int(api.get("stream_idle_startup", api.get("stream_idle_timeout", 90)))
+                idle_steady = int(api.get("stream_idle_steady", 15))
+                startup_grace_secs = int(api.get("stream_startup_grace_secs", 30))
+                # Phases:
+                #   - TTFB (chunk_count == 0): no idle check; bounded by httpx
+                #     read_timeout. Some providers take 60-300s to send the
+                #     first SSE event while the model "thinks".
+                #   - Pre-content (chunks arriving but no content yet):
+                #     idle_startup applies (loose, allows reasoning gaps).
+                #   - Steady (content has begun streaming): idle_steady
+                #     applies (tight, catches mid-stream stalls fast).
+                last_chunk_at = time.perf_counter()
+                stream_timeout_reason: str | None = None
+                first_content_at: float | None = None
+                try:
+                    for chunk in resp:
+                        now = time.perf_counter()
+                        chunk_count += 1
+                        in_steady = first_content_at is not None
+                        idle_max = idle_steady if in_steady else idle_startup
+                        if chunk_count > 1 and now - last_chunk_at > idle_max:
                             try:
                                 resp.close()
                             except Exception:
                                 pass
-                            raise TimeoutError(f"stream exceeded {stream_max}s total limit")
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    finish_reason = getattr(choice, "finish_reason", finish_reason)
-                    delta = getattr(choice, "delta", None)
-                    if delta is None:
-                        continue
-                    piece = getattr(delta, "content", None)
-                    if piece:
-                        parts.append(piece)
-                    reasoning_piece = getattr(delta, "reasoning_content", None)
-                    if reasoning_piece:
-                        reasoning_parts.append(reasoning_piece)
+                            stream_timeout_reason = (
+                                f"stream idle exceeded {idle_max}s "
+                                f"(phase={'steady' if in_steady else 'startup'}); chunks={chunk_count}"
+                            )
+                            break
+                        if now - started > stream_max:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            stream_timeout_reason = f"stream exceeded {stream_max}s total limit"
+                            break
+                        last_chunk_at = now
+                        choices = getattr(chunk, "choices", None) or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        finish_reason = getattr(choice, "finish_reason", finish_reason)
+                        delta = getattr(choice, "delta", None)
+                        if delta is None:
+                            continue
+                        piece = getattr(delta, "content", None)
+                        if piece:
+                            parts.append(piece)
+                            if first_content_at is None:
+                                first_content_at = now
+                        reasoning_piece = getattr(delta, "reasoning_content", None)
+                        if reasoning_piece:
+                            reasoning_parts.append(reasoning_piece)
+                except Exception as stream_exc:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    stream_timeout_reason = f"stream connection dropped: {stream_exc}"
                 content = "".join(parts)
                 elapsed = time.perf_counter() - started
+                min_salvage_chars = int(api.get("stream_salvage_min_chars", 800))
+                if stream_timeout_reason and len(content.strip()) >= min_salvage_chars:
+                    log(
+                        paths,
+                        f"Stream cut off but salvaging partial content "
+                        f"attempt={attempt + 1}/6 chunks={chunk_count} "
+                        f"content_chars={len(content)} elapsed={elapsed:.1f}s reason={stream_timeout_reason}",
+                    )
+                    stream_timeout_reason = None
+                if stream_timeout_reason:
+                    raise TimeoutError(stream_timeout_reason)
                 if not content.strip() and reasoning_parts:
                     log(
                         paths,
