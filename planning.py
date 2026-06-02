@@ -829,7 +829,8 @@ def create_plan(
     retry_score = float(config["novel"].get("plan_retry_score", min_score - 1.5))
     max_attempts = int(config["novel"].get("plan_max_attempts", 2))
     for attempt in range(max_attempts):
-        log(paths, f"Generating candidate plans Ch{chapter_num} attempt={attempt}")
+        from config import log as _log
+        _log(paths, f"Generating candidate plans Ch{chapter_num} attempt={attempt}")
         plans_key = f"plan_{checkpoint_label}_attempt{attempt}_candidates.json"
         reports_key = f"plan_{checkpoint_label}_attempt{attempt}_reports.json"
         arbitration_key = f"plan_{checkpoint_label}_attempt{attempt}_arbitration.json"
@@ -838,8 +839,11 @@ def create_plan(
         if isinstance(plans, list) and plans:
             log(paths, f"Resuming cached candidate plans Ch{chapter_num} attempt={attempt}")
         else:
+            _log(paths, f"Calling generate_candidate_plans Ch{chapter_num}...")
             plans = generate_candidate_plans(client, paths, conn, config, chapter_num, tail, cached_memory=mem)
+            _log(paths, f"Got {len(plans)} candidate plans, saving...")
             save_checkpoint(paths, chapter_num, plans_key, plans)
+            _log(paths, f"Saved candidates checkpoint Ch{chapter_num}")
 
         screen_key = f"plan_{checkpoint_label}_attempt{attempt}_screen.json"
         cached_screen = load_checkpoint(paths, chapter_num, screen_key)
@@ -871,8 +875,12 @@ def create_plan(
             plan = arbitration["plan"]
             decision = arbitration["decision"]
         else:
+            from config import log as _log
+            _log(paths, f"Calling arbitrate_plan Ch{chapter_num}...")
             plan, decision = arbitrate_plan(client, paths, conn, config, chapter_num, screened_plans, reports, cached_memory=mem)
+            _log(paths, f"Got arbitration result, saving Ch{chapter_num}...")
             save_checkpoint(paths, chapter_num, arbitration_key, {"plan": plan, "decision": decision})
+            _log(paths, f"Arbitration checkpoint saved Ch{chapter_num}")
 
         score = plan_score(decision)
         log(paths, f"Arbiter selected Ch{chapter_num} plan score={score}")

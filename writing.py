@@ -309,7 +309,10 @@ def write_chapter(
 Write chapter {chapter_num}."""
     temp = float(config["api"]["temperature"]) if temperature is None else temperature
     prefix = cacheable_prefix(paths, config)
+    from config import log
+    log(paths, f"write_chapter Ch{chapter_num} calling LLM with temp={temp:.2f} user_len={len(user)} system_len={len(system)}")
     raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix)
+    log(paths, f"write_chapter Ch{chapter_num} LLM returned {len(raw)} chars")
     return normalize_chapter(raw)
 
 def apply_review_patches(chapter: str, patches: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:

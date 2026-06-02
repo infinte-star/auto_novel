@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import sys
 import threading
@@ -11,6 +12,28 @@ from config import Paths, log, normalize_text
 
 if TYPE_CHECKING:
     from openai import OpenAI
+
+
+_STREAM_END = object()
+
+
+def _drain_stream_to_queue(resp: Any, q: "queue.Queue[Any]") -> None:
+    """Consume `resp` iterator in a daemon thread, pushing chunks to `q`.
+
+    Pushes raw chunks for normal items, an Exception instance on error, and
+    a sentinel `_STREAM_END` when the iterator completes. The main thread
+    can then use `q.get(timeout=...)` to enforce an idle deadline that
+    actually fires when the upstream stalls (the bare `for chunk in resp`
+    loop blocks indefinitely on slow chunked-encoding peers, defeating any
+    elapsed-time check that only runs when a new chunk arrives).
+    """
+    try:
+        for chunk in resp:
+            q.put(chunk)
+    except BaseException as exc:  # noqa: BLE001 - propagate to consumer
+        q.put(exc)
+    finally:
+        q.put(_STREAM_END)
 
 class LLMClientPool:
     def __init__(
@@ -320,55 +343,67 @@ def call_llm(
                 #     idle_startup applies (loose, allows reasoning gaps).
                 #   - Steady (content has begun streaming): idle_steady
                 #     applies (tight, catches mid-stream stalls fast).
-                last_chunk_at = time.perf_counter()
                 stream_timeout_reason: str | None = None
                 first_content_at: float | None = None
-                try:
-                    for chunk in resp:
-                        now = time.perf_counter()
-                        chunk_count += 1
-                        in_steady = first_content_at is not None
-                        idle_max = idle_steady if in_steady else idle_startup
-                        if chunk_count > 1 and now - last_chunk_at > idle_max:
-                            try:
-                                resp.close()
-                            except Exception:
-                                pass
-                            stream_timeout_reason = (
-                                f"stream idle exceeded {idle_max}s "
-                                f"(phase={'steady' if in_steady else 'startup'}); chunks={chunk_count}"
-                            )
-                            break
-                        if now - started > stream_max:
-                            try:
-                                resp.close()
-                            except Exception:
-                                pass
-                            stream_timeout_reason = f"stream exceeded {stream_max}s total limit"
-                            break
-                        last_chunk_at = now
-                        choices = getattr(chunk, "choices", None) or []
-                        if not choices:
-                            continue
-                        choice = choices[0]
-                        finish_reason = getattr(choice, "finish_reason", finish_reason)
-                        delta = getattr(choice, "delta", None)
-                        if delta is None:
-                            continue
-                        piece = getattr(delta, "content", None)
-                        if piece:
-                            parts.append(piece)
-                            if first_content_at is None:
-                                first_content_at = now
-                        reasoning_piece = getattr(delta, "reasoning_content", None)
-                        if reasoning_piece:
-                            reasoning_parts.append(reasoning_piece)
-                except Exception as stream_exc:
+                # Run the SSE iterator in a daemon thread so the main loop's
+                # idle/total timeouts always fire, even when the upstream
+                # connection is hanging mid-chunk (e.g. proxy buffering, slow
+                # peer that never closes). queue.get(timeout=) is the only
+                # reliable hard timeout for chunked iteration.
+                chunk_q: "queue.Queue[Any]" = queue.Queue()
+                reader = threading.Thread(
+                    target=_drain_stream_to_queue,
+                    args=(resp, chunk_q),
+                    daemon=True,
+                )
+                reader.start()
+                while True:
+                    now = time.perf_counter()
+                    if now - started > stream_max:
+                        stream_timeout_reason = f"stream exceeded {stream_max}s total limit"
+                        break
+                    in_steady = first_content_at is not None
+                    idle_max = idle_steady if in_steady else idle_startup
+                    # Cap the per-get wait so we re-check stream_max regularly.
+                    remaining_total = max(1.0, stream_max - (now - started))
+                    wait_secs = min(float(idle_max), remaining_total)
+                    try:
+                        item = chunk_q.get(timeout=wait_secs)
+                    except queue.Empty:
+                        stream_timeout_reason = (
+                            f"stream idle exceeded {idle_max}s "
+                            f"(phase={'steady' if in_steady else 'startup'}); chunks={chunk_count}"
+                        )
+                        break
+                    if item is _STREAM_END:
+                        # Iterator exhausted cleanly.
+                        break
+                    if isinstance(item, BaseException):
+                        stream_timeout_reason = f"stream connection dropped: {item}"
+                        break
+                    chunk = item
+                    chunk_count += 1
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    finish_reason = getattr(choice, "finish_reason", finish_reason)
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
+                        continue
+                    piece = getattr(delta, "content", None)
+                    if piece:
+                        parts.append(piece)
+                        if first_content_at is None:
+                            first_content_at = time.perf_counter()
+                    reasoning_piece = getattr(delta, "reasoning_content", None)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                if stream_timeout_reason is not None:
                     try:
                         resp.close()
                     except Exception:
                         pass
-                    stream_timeout_reason = f"stream connection dropped: {stream_exc}"
                 content = "".join(parts)
                 elapsed = time.perf_counter() - started
                 min_salvage_chars = int(api.get("stream_salvage_min_chars", 800))
