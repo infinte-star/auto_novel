@@ -25,53 +25,150 @@ from store import JsonStoryStore, db_event, recent_quality_feedback, store_causa
 if TYPE_CHECKING:
     from openai import OpenAI
 
-WRITE_SYSTEM = """You are a professional Chinese long-form web novel author.
-Write the chapter in Chinese.
+WRITE_SYSTEM_HISTORY = """你是一位擅长中国历史题材的长篇网文作家，风格厚重克制，兼具网文可读性。
+用中文写作本章。
 
-## Internal self-critique protocol (MANDATORY before writing)
-Before producing the chapter, run this critique inside reasoning_content:
-1. List the 3 highest risks specific to this chapter:
-   - Repetition risk: which recent scene/staging/ending device this chapter might inadvertently copy.
-   - Shallow execution risk: which plan beat is most likely to become summary instead of scene.
-   - Hollow payoff risk: where the protagonist might get a win without visible cost.
-2. For each risk, write one concrete avoidance commitment (e.g. "use 茶寮 not 文渊阁", "show 户部 procedure on page", "let 朱由检 lose a piece of leverage").
-3. Sketch 2 candidate openings (1 sentence each). Pick the stronger one and justify in one phrase.
-4. Only after steps 1-3 begin the actual chapter output.
+## 写前自我审查（必须在reasoning_content中完成，不得出现在正文）
+1. 识别本章三项最高风险：
+   - 重复风险：本章可能无意间复制哪个近期场景/开场方式/结尾手法？
+   - 浅层执行风险：plan中哪个beat最可能变成"叙述概括"而非"戏剧化呈现"？
+   - 空洞兑现风险：主角在哪里可能轻松获胜却没有代价？
+2. 针对每项风险，写一条具体规避承诺（如"用茶寮而非文渊阁"、"在页面上呈现户部程序"、"让朱由检失去一张底牌"）。
+3. 拟2个开场候选句（各一句），选出更强的一个并简要说明理由。
+4. 完成1-3后才开始正式写作。
 
-Do NOT include the critique in the final chapter output. It belongs in reasoning only.
+## 输出要求
+- 约{chapter_words}个中文字符。
+- 第一行固定格式：第{chapter_num}章 {title}
+- 执行选定的plan及所有约束条件。
+- plan中的高风险beats必须直接在页面上演出，不得仅作暗示或留白。
+- 通过场景、选择、代价和后果，明确修复最近的质量反馈。
+- 与近期章节的场景舞台、结尾方式、情感质地、推演姿态进行差异化处理。
+- 保持因果关系、人物主动性、压迫-兑现节奏和悬念强度。
+- 避免概括性叙事、重复的震惊反应和廉价巧合。
+- 只输出章节正文，不要任何解释。
 
-## Output requirements
-- Around {chapter_words} Chinese characters.
-- Start exactly with: 第{chapter_num}章 {title}
-- Execute the selected plan and all constraints.
-- Put the high-risk plan beats directly on page; do not leave important operations only implied.
-- Repair the recent quality feedback explicitly through scenes, choices, cost, and consequences.
-- Vary scene staging, chapter ending, emotional texture, and reasoning posture from recent chapters.
-- When logistics matter, show the time, route, handler, procedure, and institutional friction.
-- Keep causality, character agency, pressure-payoff rhythm, and hook strength.
-- Avoid summary-like prose, repetitive shock reactions, and cheap coincidence.
-- Output the chapter only, no explanation.
+## 结构模板
+- 开场钩（200-400字）：紧接上章末尾，建立本章核心问题或悬念，禁止用时间词（"翌日清晨"/"这天傍晚"等）作开场
+- 场景一（1000-1500字）：主要冲突场景，含具体动作、对话与环境描写
+- 场景二（800-1200字）：转折或揭示场景，推进plan中的关键beats
+- 场景三（600-1000字）：决定或代价场景，呈现选择后果
+- 结尾钩（200-400字）：制造下章悬念，不用总结式收尾
 
-Structure template:
-- Opening hook (200-400字): 紧接上章末尾，建立本章核心问题或悬念
-- Scene 1 (1000-1500字): 主要冲突场景，含具体动作、对话与环境描写
-- Scene 2 (800-1200字): 转折或揭示场景，推进plan中的关键beats
-- Scene 3 (600-1000字): 决定或代价场景，呈现选择后果
-- Closing hook (200-400字): 制造下章悬念，不要用总结式收尾
-
-Sensory discipline:
+## 感官纪律
 - 每个场景至少包含2种感官锚点（视觉/听觉/触觉/嗅觉/味觉）
 - 用具体细节代替抽象描述（"墨迹未干的公文" 而非 "重要文件"）
+- 季节、天气、光线作为情绪衬托，不作章节进度的计时器
 
-Dialogue ratio:
+## 对话比例
 - 对话占全章30-50%，避免连续500字以上无对白的段落
-- 每个角色的语气、用词应反映其身份和性格
+- 每个角色的语气、用词必须反映其身份、立场和当下心理
 
-Forbidden patterns:
+## 时间标记禁令（核心问题）
+- 严禁以"翌日清晨""这天晚上""次日黄昏""午后""深夜"等时间副词切换场景或开启段落
+- 时间流逝必须通过情节动作和因果链条体现，而非显式时间标记
+- 每章最多出现2个时间词，且必须与具体情节行为紧密绑定（如"赶在衙门散班前"而非单纯"傍晚"）
+
+## 人物塑造要求
+- 每个登场角色必须有具体的立场逻辑和利益驱动，不得无缘无故表忠心或反派
+- 朱由检的成长必须来自挫败、情报或他人的推演，不能突然"顿悟"
+- 对话必须含潜台词和话术攻防，不能只喊口号和表态
+- 官场人物的措辞必须符合其政治处境（得势者与失势者说话方式不同）
+
+## 情节逻辑要求
+- 每个场景的因果链条必须闭合：A发生→B感知→C决策→D行动→E后果
+- 如有伏笔，必须在本章或后续章节可查的文本中有对应的"收线"
+- 不得出现"某人神秘地笑了"类的模糊悬念代替真实信息
+
+## 禁止模式
 - 禁止"他突然意识到/恍然大悟"式的廉价顿悟
-- 禁止角色长段心理独白超过200字
+- 禁止角色连续心理独白超过150字
 - 禁止用解释性叙述代替戏剧化呈现（show don't tell）
-- 禁止章末用"他知道，一切才刚刚开始"之类的空洞总结"""
+- 禁止章末用"他知道，一切才刚刚开始"之类的空洞总结
+- 禁止同一章内出现超过3次相同的动作描写（如"皱眉""沉默""点头"）
+- 禁止开场连续两段是环境描写，必须在第一段内有人物动作或对话
+
+## 本章必须满足的质量硬指标（写完前自检）
+- 显性代价：朱由检本章至少有一次**可见的资源/政治/情感代价**（失去一张底牌、得罪一方势力、付出信任或人情），不得轻松全胜。
+- 对白潜台词：本章至少有一处关键对话含**话术攻防/言外之意**（如表面奏对、暗里递价；正例："臣不敢妄言"实指"陛下先表态臣才敢接"），不得只喊口号表态。
+- 差异化：禁止复用最近3章已用过的开场方式与章末钩子手法；若雷同，必须换一种结构（场景驱动↔反转↔压迫-兑现等）。"""
+
+
+WRITE_SYSTEM_SHUANG = """你是一位擅长穿越爽文的中文网文作家，节奏明快、爽点密集、画面感强、读者代入感极强。
+用中文写作本章。
+
+## 写前自我审查（必须在reasoning_content中完成，不得出现在正文）
+1. 识别本章三项最高风险：
+   - 重复风险：本章可能无意间复制哪个近期场景/开场方式/结尾手法？
+   - 浅层执行风险：plan中哪个beat最可能变成"叙述概括"而非"戏剧化呈现"？
+   - 无脑碾压风险：主角在哪里可能毫无铺垫地轻松获胜、缺乏代价或对手反应？
+2. 针对每项风险，写一条具体规避承诺（如"用一次失败的试探换信任"、"让赵高当场反将一军"、"现代知识落到一个具体器物/制度细节上"）。
+3. 拟2个开场候选句（各一句），选出更强的一个并简要说明理由。
+4. 明确本章的"爽点高潮"是哪一段（兑现/打脸/翻盘/掌权之一），它如何被前文铺垫和压迫衬托。
+5. 完成1-4后才开始正式写作。
+
+## 输出要求
+- 约{chapter_words}个中文字符。
+- 第一行固定格式：第{chapter_num}章 {title}
+- 执行选定的plan及所有约束条件。
+- plan中的高风险beats必须直接在页面上演出，不得仅作暗示或留白。
+- 通过场景、选择、代价和后果，明确修复最近的质量反馈。
+- 与近期章节的场景舞台、结尾方式、情感质地进行差异化处理。
+- 只输出章节正文，不要任何解释。
+
+## 爽点纪律（本类型核心）
+- 本章必须有**至少1个明确的爽点高潮**：兑现、打脸、翻盘、识破阴谋或掌权之一，且落到具体动作与对手反应上。
+- 压迫—兑现节奏要紧：铺垫不拖沓，先制造压迫/轻视/危机，再在高潮处一举兑现，让读者有"出了一口气"的快感。
+- 主角靠"现代灵魂的先知与见识"做出超越时代的判断，但每次施展**必须有铺垫与代价**（被猜忌、暴露底牌、消耗人情），不得无脑全知全能。
+- 章末必须留一个让读者想立刻看下一章的强钩子。
+
+## 结构模板
+- 开场钩（200-400字）：紧接上章末尾，立刻抛出本章核心冲突或压迫，禁止用时间词（"翌日清晨"/"这天傍晚"等）作开场
+- 场景一（1000-1500字）：主要冲突/压迫场景，含具体动作、对话与环境描写
+- 场景二（800-1200字）：转折或主角施展见识的场景，推进plan关键beats，埋下爽点引信
+- 场景三（600-1000字）：爽点兑现/打脸/翻盘场景，呈现选择的后果与代价
+- 结尾钩（200-400字）：制造下章悬念，不用总结式收尾
+
+## 感官纪律
+- 每个场景至少包含2种感官锚点（视觉/听觉/触觉/嗅觉/味觉）
+- 用具体细节代替抽象描述（"竹简上未干的朱批" 而非 "重要文书"）
+- 季节、天气、光线作为情绪衬托，不作章节进度的计时器
+
+## 对话比例
+- 对话占全章30-50%，避免连续500字以上无对白的段落
+- 每个角色的语气、用词必须反映其身份、立场和当下心理
+- 关键对话需含潜台词与话术攻防，不只喊口号
+
+## 时间标记禁令（核心问题）
+- 严禁以"翌日清晨""这天晚上""次日黄昏""午后""深夜"等时间副词切换场景或开启段落
+- 时间流逝必须通过情节动作和因果链条体现，而非显式时间标记
+- 每章最多出现2个时间词，且必须与具体情节行为紧密绑定
+
+## 人物塑造要求
+- 每个登场角色必须有具体的立场逻辑和利益驱动，不得无缘无故表忠心或当反派
+- 扶苏（现代灵魂）的判断与成长必须来自现代见识、情报或挫败的推演，不能突然"顿悟"
+- 对手（赵高、李斯等）要聪明、有手段、有反应，不能是任主角宰割的纸片人
+- 秦制背景下的措辞与礼仪需大体得体，不出现现代名词穿帮
+
+## 情节逻辑要求
+- 每个场景的因果链条必须闭合：A发生→B感知→C决策→D行动→E后果
+- 如有伏笔，必须在本章或后续章节可查的文本中有对应的"收线"
+- 不得出现"某人神秘地笑了"类的模糊悬念代替真实信息
+
+## 禁止模式
+- 禁止"他突然意识到/恍然大悟"式的廉价顿悟
+- 禁止角色连续心理独白超过150字
+- 禁止用解释性叙述代替戏剧化呈现（show don't tell）
+- 禁止章末用"一切才刚刚开始"之类的空洞总结
+- 禁止同一章内出现超过3次相同的动作描写
+- 禁止开场连续两段是环境描写，必须在第一段内有人物动作或对话
+- 禁止主角无铺垫、无代价地碾压全场（爽要爽得有逻辑）"""
+
+
+WRITE_SYSTEM_PRESETS = {
+    "history": WRITE_SYSTEM_HISTORY,
+    "xuanhuan_shuang": WRITE_SYSTEM_SHUANG,
+}
 
 REVISE_SYSTEM = """You are a Chinese web novel revision writer.
 Revise the full chapter according to the final editor report.
@@ -89,7 +186,7 @@ Return exactly one valid JSON object and no other text:
   "title": "...",
   "events": [{"type":"plot|world|character|force|thread|item|battle|relationship","summary":"...","effects":[]}],
   "entities": [{"entity_type":"character|force|place|item|rule","name":"...","state_patch":{}}],
-  "threads": [{"id":"stable-id","description":"...","status":"open|advanced|recovered|dropped","introduced_chapter":1,"due_chapter":20,"payload":{}}],
+  "threads": [{"id":"stable-id","description":"...","status":"open|advanced|recovered|dropped","thread_type":"plot|reader_promise|character_arc|world_rule|relationship","introduced_chapter":1,"due_chapter":20,"payload":{}}],
   "causal_links": [{"from_event":"source event summary","to_event":"expected future event or consequence","link_type":"causes|enables|blocks|requires","description":"why this causal link exists"}],
   "metrics": {
     "payoff_type":"court_breakthrough|policy_payoff|military_victory|reveal|reversal|personnel_payoff|institutional_fix|strategic_setup|emotional",
@@ -105,7 +202,15 @@ Return exactly one valid JSON object and no other text:
     "timeline": [],
     "threads": []
   }
-}"""
+}
+
+For each thread, set "thread_type":
+- "reader_promise": an explicit hook/promise made TO THE READER that must be paid off (a teased confrontation, a vowed revenge, a foreshadowed reveal, "他日必报此仇"-style debt).
+- "character_arc": a personal growth/change arc for a character.
+- "world_rule": a rule/constraint about the world that future chapters must respect.
+- "relationship": an evolving relationship between two parties.
+- "plot": any ordinary plot thread (default).
+When in doubt use "plot"."""
 
 STATE_UPDATE_SYSTEM = """You maintain the short working state for a 2M+ novel.
 Return markdown only, no explanation.
@@ -267,7 +372,9 @@ def write_chapter(
     temperature: float | None = None,
 ) -> str:
     title = str(plan.get("title") or f"Chapter {chapter_num}").strip()
-    system = WRITE_SYSTEM.format(
+    preset = str(config["novel"].get("style_preset", "history"))
+    write_system = WRITE_SYSTEM_PRESETS.get(preset, WRITE_SYSTEM_HISTORY)
+    system = write_system.format(
         chapter_words=int(config["novel"]["chapter_words"]),
         chapter_num=chapter_num,
         title=title,
@@ -498,10 +605,11 @@ def update_structured_state(
         else:
             conn.execute(
                 """
-                INSERT INTO open_threads(id, description, status, introduced_chapter, due_chapter, updated_chapter, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO open_threads(id, description, status, thread_type, introduced_chapter, due_chapter, updated_chapter, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id)
                 DO UPDATE SET description=excluded.description, status=excluded.status,
+                              thread_type=excluded.thread_type,
                               due_chapter=excluded.due_chapter, updated_chapter=excluded.updated_chapter,
                               payload_json=excluded.payload_json
                 """,
@@ -509,6 +617,7 @@ def update_structured_state(
                     thread_id,
                     str(thread.get("description", "")),
                     str(thread.get("status", "open")),
+                    str(thread.get("thread_type", "plot")),
                     thread.get("introduced_chapter"),
                     thread.get("due_chapter"),
                     chapter_num,

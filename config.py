@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,8 +8,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
-PROMPT_FILE = ROOT / "prompt.md"
-CONFIG_FILE = ROOT / "config.yaml"
+# PROMPT_FILE / CONFIG_FILE default to the root-level files (the long novel) so
+# `python run.py` behaves exactly as before. A separate novel run (e.g.
+# run_fusu.py) sets NOVEL_PROMPT / NOVEL_CONFIG env vars BEFORE importing any
+# module that imports config, redirecting both to its own files.
+PROMPT_FILE = ROOT / os.environ.get("NOVEL_PROMPT", "prompt.md")
+CONFIG_FILE = ROOT / os.environ.get("NOVEL_CONFIG", "config.yaml")
 
 @dataclass(frozen=True)
 class Paths:

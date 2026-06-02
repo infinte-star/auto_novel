@@ -204,7 +204,7 @@ def generate_one_chapter(
         save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
 
     # Continuity validation runs on both fresh and resumed plans
-    violations = validate_plan_continuity(conn, plan, chapter_num)
+    violations = validate_plan_continuity(conn, plan, chapter_num, config=config)
     if violations:
         log(paths, f"Continuity violations Ch{chapter_num}: {violations}")
         critical = [v for v in violations if v.startswith("CRITICAL")]
@@ -550,11 +550,17 @@ def main() -> None:
         rebuild_book(paths)
 
     target = int(config["novel"]["target_words"])
-    log(paths, f"Start target_chars={target} current_chars={count_chars(paths.book)}")
+    # Optional hard cap on chapter count (short-novel mode). 0/absent => no cap,
+    # so the long novel (which never sets this) keeps its char-target-only loop.
+    max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
+    log(paths, f"Start target_chars={target} current_chars={count_chars(paths.book)} max_chapters={max_chapters or 'none'}")
     background = BackgroundTasks(paths)
     try:
         while count_chars(paths.book) < target:
             last_chapter = find_last_chapter(paths)
+            if max_chapters and last_chapter >= max_chapters:
+                log(paths, f"Reached max_chapters={max_chapters}; stopping chapter loop")
+                break
             if should_resume_existing_chapter(paths, last_chapter):
                 chapter_num = last_chapter
                 log(paths, f"Resuming partially indexed Ch{chapter_num}")

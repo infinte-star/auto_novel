@@ -4,18 +4,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Automated long-form Chinese web novel generation pipeline. Targets 2M+ characters
-(`novel.target_words` in `config.yaml`) by repeatedly running plan → write → review →
-revise → extract loops until done. Optional post-completion `refine` pass rewrites in
-5-chapter groups under intensities chosen by a diagnose LLM call.
+Universal multi-novel AI writing framework. The core engine is an automated
+long-form Chinese web novel generation pipeline that targets a configurable
+character count (`novel.target_words`) by repeatedly running plan → write →
+review → revise → extract loops until done. Optional post-completion `refine`
+pass rewrites in 5-chapter groups under intensities chosen by a diagnose LLM call.
 
-The novel content (history-rewrite of late-Ming Chongzhen reign) is described in
-`prompt.md`; the pipeline itself is content-agnostic and only consumes that brief.
+The pipeline itself is **content-agnostic** — it only consumes a creative brief
+(`prompt.md`) and a config (`config.yaml`). Each novel lives in its own
+directory `novels/<name>/` and runs as an independent OS process, so multiple
+novels can be written simultaneously without colliding on the engine's
+process-level global state (`config.PROMPT_FILE`, `memory._CACHEABLE_PREFIX_CACHE`).
+
+The legacy root-level long novel (history-rewrite of late-Ming Chongzhen reign,
+described in the root `prompt.md`/`config.yaml` and launched via `run.py`) is
+preserved for backward compatibility and is NOT under `novels/`.
+
+## Multi-novel framework (`novel.py`)
+
+`novel.py` is the unified CLI that scaffolds and manages per-novel processes:
+
+```bash
+python novel.py create <name>            # scaffold novels/<name>/ from config_template.yaml + prompt_template.md
+python novel.py run <name>               # run the pipeline detached (log -> novels/<name>/logs/run.log)
+python novel.py run <name> --foreground  # run in the current console
+python novel.py list                     # list every novel: chapters / chars / running? / last log line
+python novel.py stop <name>              # kill ONLY this novel's process (token-exact `run <name>` match)
+python novel.py restart <name>           # stop + relaunch (resumes from checkpoint)
+```
+
+How it works (no engine changes — pure scaffolding around the existing pipeline):
+- `create` copies `config_template.yaml` replacing the `__NOVEL__` placeholder so
+  every `paths:` entry points inside `novels/<name>/`, and copies
+  `prompt_template.md` to `novels/<name>/prompt.md` for the user to fill in.
+- `run` sets `NOVEL_CONFIG`/`NOVEL_PROMPT` env vars **before** importing `pipeline`
+  (same ordering constraint as the legacy `run_fusu.py` pattern), since
+  `config.py` reads them at import time and `memory.py` captures `PROMPT_FILE` at
+  its own import. Detached background launch prefers the project venv
+  (`E:\pycharmproject\allvenv\novel\Scripts\python.exe`); override with the
+  `NOVEL_PYTHON` env var.
+- `stop`/`restart` find the process by the command-line token sequence
+  `run <name>` (so `run foo` never matches `run foobar`) confined to this project.
+
+Each novel's `story_state.db`, `logs/`, `checkpoints/`, `memory/` are isolated in
+its own directory, so concurrent novels never share SQLite/file writes. All novels
+read API keys from their own config's `api:` section — running many in parallel
+shares the same keys' RPM/TPM quota unless you give each novel distinct keys.
 
 ## Common commands
 
 ```bash
 pip install -r requirements.txt        # only dependency is openai>=1.0.0
+
+# Multi-novel framework (preferred for new novels):
+python novel.py create <name>          # scaffold novels/<name>/
+python novel.py run <name>             # run detached; resumes from checkpoint
+python novel.py list                   # progress + running state for all novels
+python novel.py stop|restart <name>    # per-novel process control
+
+# Legacy root long-novel entry points (still work, operate on root paths):
 python run.py                          # main entry; resumes automatically from last checkpoint
 python restart.py                      # kill any running pipeline + relaunch detached
 python restart.py --foreground         # attach restart to current console
@@ -31,10 +78,17 @@ There is no test suite, lint config, or build step.
 
 ## Configuration
 
-`config.yaml` is parsed by a hand-rolled YAML-subset reader in `config.py:load_config`
-(not real YAML — only `section:` headers and `key: value` pairs, no nested maps,
-no lists, no anchors). Adding new keys requires updating the `required` dict in
-`load_config` if they're mandatory.
+`config.yaml` (and each `novels/<name>/config.yaml`) is parsed by a hand-rolled
+YAML-subset reader in `config.py:load_config` (not real YAML — only `section:`
+headers and `key: value` pairs, no nested maps, no lists, no anchors). Adding new
+keys requires updating the `required` dict in `load_config` if they're mandatory.
+
+`config_template.yaml` is the scaffold copied by `novel.py create`; its `paths:`
+section uses the `__NOVEL__` placeholder. Because `config.py:get_paths` joins each
+`paths:` value onto `ROOT` (the project dir), a per-novel config simply sets
+`paths.book: novels/<name>/book.md` etc. and the whole engine becomes
+directory-isolated with zero code changes. `config.py:15-16` reads
+`NOVEL_PROMPT`/`NOVEL_CONFIG` from the environment (default: root `prompt.md`/`config.yaml`).
 
 Multi-endpoint, multi-key API access is configured via three keys in `api:`:
 - `api_key` — single primary key
@@ -124,7 +178,10 @@ Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-ch
 
 - **Don't add `cd <project>` before `git` commands** — bash already runs in the project root.
 - **`config.yaml` is not real YAML.** Anchors, lists, nested maps will silently fail to parse; values become strings. The parser only understands `section:` and indented `key: value`.
+- **`NOVEL_CONFIG`/`NOVEL_PROMPT` must be set before importing `pipeline`/`config`/`memory`.** `config.py` reads them at import time and `memory.py` captures `PROMPT_FILE` at its own import. `novel.py run` and `run_fusu.py` both rely on this ordering — set the env vars first, import second.
+- **Per-novel paths live entirely in each `config.yaml`'s `paths:` section**, joined onto `ROOT`. The engine has no hardcoded knowledge of `novels/`; isolation is purely a path convention. `config_template.yaml`'s `__NOVEL__` placeholder is what makes a new novel directory-isolated.
 - **Background-task ordering** is load-bearing. The barriers in `generate_one_chapter` (`wait_label("chapter_finalize_ch{n-1}")` and the prefetch wait) keep memory/threads consistent. Re-ordering them can cause the next plan to see stale state.
 - **`save_chapter` refuses to write chapters under 500 chars** (`writing.py:732`). This guards against provider refusals being persisted as legitimate chapters. `repair_stub_chapters.py` exists to fix older stubs (Ch29/Ch43) that pre-date this guard.
 - **`cacheable_prefix` content changes invalidate the prompt cache** for every subsequent chapter — only modify it when the cache cost is worth it.
-- **API keys are committed in `config.yaml`.** Do not assume new keys can be added there silently — they're visible in git history.
+- **API keys are committed in `config.yaml` / `config_template.yaml`.** Both are gitignored, but they hold live keys — don't echo them into tracked files or logs. New per-novel configs inherit the template's keys, so parallel novels share quota.
+- **`config_template.yaml` is gitignored but must exist on disk** for `novel.py create` to work. Don't delete it.

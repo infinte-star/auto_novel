@@ -58,13 +58,21 @@ DEFAULT_MIN_KEEP_RATIO = 0.6  # refined chapter cannot shrink below 60% of origi
 # ---------------------------------------------------------------------------
 
 def refined_dir(paths: Paths) -> Path:
-    return paths.chapters_dir.parent / REFINED_DIR_NAME
+    # Derive the refined-chapters dir from the configured chapters dir so that a
+    # separate novel (e.g. chapters_fusu/) refines into its own sibling
+    # (chapters_fusu_refined/) instead of clobbering the default chapters_refined/.
+    base = paths.chapters_dir
+    return base.parent / f"{base.name}_refined"
 
 def refined_chapter_path(paths: Paths, chapter_num: int) -> Path:
     return refined_dir(paths) / f"{chapter_num:04d}.md"
 
 def refined_book_path(paths: Paths) -> Path:
-    return paths.book.parent / REFINED_BOOK
+    # Derive the refined book name from the configured book file so a separate
+    # novel (book_fusu.md) refines into book_fusu_refined.md rather than the
+    # default book_refined.md.
+    book = paths.book
+    return book.parent / f"{book.stem}_refined{book.suffix}"
 
 def refine_checkpoint_dir(paths: Paths) -> Path:
     return paths.logs_dir / "refine"
@@ -107,40 +115,122 @@ def load_group_text(paths: Paths, start: int, end: int) -> list[tuple[int, str]]
 # Diagnose stage
 # ---------------------------------------------------------------------------
 
-DIAGNOSE_SYSTEM = """你是一位资深小说编辑。你的任务是诊断一组连续章节存在的问题，并决定每一章的精调强度。
+DIAGNOSE_SYSTEM_HISTORY = """你是一位资深历史题材网文编辑。你的任务是诊断一组连续章节存在的问题，并决定每一章的精调强度。
 
 精调强度等级（强度逐级提高）：
 - "polish"：仅修润：错别字、重复词、口癖、不通顺句、连贯性瑕疵。保留原情节/对话/结构。
 - "restructure"：允许重写段落、合并/拆分场景、调整节奏；不改变章节标题、关键情节点、人物决策。
 - "rewrite"：允许重新设计场景顺序、改写大段叙事、补充心理描写；保持每章核心目标和章末状态。
 
-你需要：
-1. 阅读这一组章节，识别问题（情节漏洞/重复/节奏/语言/逻辑矛盾）。
-2. 为每一章选择一个最适合的强度。
-3. 决定是否需要参考小说其他章节作为锚点（如某章引用了 Ch12 的事件，可拉 Ch12 进上下文）；指明章节号即可，最多 4 个。
+## 重点诊断维度（必须逐一检查）
+1. **时间词滥用**：是否用"翌日清晨""这天晚上""午后""次日黄昏"等时间词切换场景？是否每章出现3次以上时间标记？时间词是否脱离情节逻辑单独使用？
+2. **文笔和叙事风格**：是否过于白话或缺乏历史感？对话是否缺乏潜台词和话术攻防？是否有"show don't tell"问题？
+3. **情节逻辑**：因果链条是否完整？是否有情节跳跃或交代不清的转场？伏笔是否有对应收线？
+4. **人物塑造**：人物行为是否符合其立场和利益？主角的成长是否来自具体的挫败或推演？配角是否有独立的行动逻辑？
+5. **节奏问题**：章节是否过于碎片化（每次跳转都用时间词）？压迫与兑现的比例是否失衡？
 
-只输出 JSON，schema：
+你需要：
+1. 阅读这一组章节，针对上述5个维度识别具体问题。
+2. 为每一章选择一个最适合的强度。
+3. 决定是否需要参考小说其他章节作为锚点；指明章节号即可，最多4个。
+
+只输出JSON，schema：
 {
   "group_summary": "本组核心剧情概括（50字内）",
-  "issues": ["问题1", "问题2", ...],
+  "issues": ["问题1（注明维度和具体位置）", "问题2", ...],
   "per_chapter": [
-    {"chapter": <int>, "intensity": "polish|restructure|rewrite", "focus": "本章需要重点修改什么（30字内）"}
+    {"chapter": <int>, "intensity": "polish|restructure|rewrite", "focus": "本章需要重点修改什么（50字内，必须具体指出问题）"}
   ],
-  "extra_anchors": [<int>, ...]  // 可空数组，最多 4 个章节号
+  "extra_anchors": [<int>, ...]  // 可空数组，最多4个章节号
 }
 """
 
-REFINE_SYSTEM_BASE = """你是一位精调小说稿件的编辑兼作家。
-- 不要添加任何元注释、标题、解释。
-- 直接输出修改后的完整章节正文（中文），保持 markdown 风格。
-- 保留章节首行的标题（如有）。
-- 保留章末状态与下一章的连贯。
+DIAGNOSE_SYSTEM_SHUANG = """你是一位资深穿越爽文网文编辑。你的任务是诊断一组连续章节存在的问题，并决定每一章的精调强度。
+
+精调强度等级（强度逐级提高）：
+- "polish"：仅修润：错别字、重复词、口癖、不通顺句、连贯性瑕疵。保留原情节/对话/结构。
+- "restructure"：允许重写段落、合并/拆分场景、调整节奏；不改变章节标题、关键情节点、人物决策。
+- "rewrite"：允许重新设计场景顺序、改写大段叙事、补充心理与动作描写；保持每章核心目标和章末状态。
+
+## 重点诊断维度（必须逐一检查）
+1. **时间词滥用**：是否用"翌日清晨""这天晚上""午后""次日黄昏"等时间词切换场景？是否每章出现3次以上时间标记？
+2. **爽点密度与兑现**：本章是否有明确的爽点高潮（兑现/打脸/翻盘/识破阴谋/掌权）？爽点是否落到具体动作与对手反应上、还是流于概括？压迫—兑现的节奏是否够紧？
+3. **无脑碾压风险**：主角的胜利是否有铺垫与代价（被猜忌、暴露底牌、消耗人情）？是否存在毫无铺垫的全知全能或对手沦为纸片人？
+4. **现代灵魂代入**：主角的判断是否来自现代见识/情报/挫败的推演，而非"突然顿悟"？是否出现现代名词穿帮、破坏代入感？
+5. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有让读者想立刻看下一章的强钩子？
+
+你需要：
+1. 阅读这一组章节，针对上述5个维度识别具体问题。
+2. 为每一章选择一个最适合的强度。
+3. 决定是否需要参考小说其他章节作为锚点；指明章节号即可，最多4个。
+
+只输出JSON，schema：
+{
+  "group_summary": "本组核心剧情概括（50字内）",
+  "issues": ["问题1（注明维度和具体位置）", "问题2", ...],
+  "per_chapter": [
+    {"chapter": <int>, "intensity": "polish|restructure|rewrite", "focus": "本章需要重点修改什么（50字内，必须具体指出问题）"}
+  ],
+  "extra_anchors": [<int>, ...]  // 可空数组，最多4个章节号
+}
 """
 
+DIAGNOSE_SYSTEM_PRESETS = {
+    "history": DIAGNOSE_SYSTEM_HISTORY,
+    "xuanhuan_shuang": DIAGNOSE_SYSTEM_SHUANG,
+}
+
+REFINE_SYSTEM_BASE_HISTORY = """你是一位精调历史题材中文网文的资深编辑兼作家。
+- 不要添加任何元注释、标题、解释。
+- 直接输出修改后的完整章节正文（中文），保持markdown风格。
+- 保留章节首行的标题（如有）。
+- 保留章末状态与下一章的连贯。
+
+## 精调核心原则
+1. **消除时间词依赖**：删除或替换所有纯粹用于切换场景的时间词（"翌日清晨""这天晚上"等），改用情节动作和因果链条体现时间流逝。
+2. **强化文笔质感**：增加历史氛围感，对话必须有潜台词和话术攻防，避免直白说教。
+3. **修复人物逻辑**：每个角色的行动必须有具体的立场和利益驱动；主角的判断必须来自具体的信息或挫败，不能"突然顿悟"。
+4. **补全因果链条**：A→B→C的因果链必须在页面上清晰呈现，不得有跳跃式转场。
+5. **保持叙事密度**：不得大幅压缩原章节字数（保留80%以上），修改后的篇幅可适当扩展但不超过原文1.5倍。
+"""
+
+REFINE_SYSTEM_BASE_SHUANG = """你是一位精调穿越爽文的资深网文编辑兼作家。
+- 不要添加任何元注释、标题、解释。
+- 直接输出修改后的完整章节正文（中文），保持markdown风格。
+- 保留章节首行的标题（如有）。
+- 保留章末状态与下一章的连贯。
+
+## 精调核心原则
+1. **消除时间词依赖**：删除或替换所有纯粹用于切换场景的时间词（"翌日清晨""这天晚上"等），改用情节动作和因果链条体现时间流逝。
+2. **强化爽点兑现**：让本章的爽点高潮（兑现/打脸/翻盘/掌权）落到具体动作与对手反应上，压迫—兑现节奏要紧，铺垫不拖沓，给读者"出一口气"的快感。
+3. **修复无脑碾压**：主角每次施展现代见识都要有铺垫与代价；对手要聪明、有反应，不能是任人宰割的纸片人。
+4. **保住代入感**：主角的判断必须来自现代见识/情报/挫败的推演，不能"突然顿悟"；不得出现现代名词穿帮，秦制背景措辞需大体得体。
+5. **补全因果链条**：A→B→C的因果链必须在页面上清晰呈现，不得有跳跃式转场。
+6. **保持叙事密度**：不得大幅压缩原章节字数（保留80%以上），修改后的篇幅可适当扩展但不超过原文1.5倍。
+"""
+
+REFINE_SYSTEM_BASE_PRESETS = {
+    "history": REFINE_SYSTEM_BASE_HISTORY,
+    "xuanhuan_shuang": REFINE_SYSTEM_BASE_SHUANG,
+}
+
 INTENSITY_INSTRUCTIONS = {
-    "polish": "本轮精调强度=polish：仅修润错别字、重复词、口癖、不通顺句、连贯性瑕疵。保留原情节、对话顺序、段落结构。不得删减或扩写。",
-    "restructure": "本轮精调强度=restructure：允许重写段落、合并/拆分场景、调整节奏与描写比例，但不得改变本章标题、关键情节点、人物决策、章末状态。",
-    "rewrite": "本轮精调强度=rewrite：允许重新设计场景顺序、改写大段叙事、补充心理与环境描写。保持每章的核心目标（plan goal）和章末状态不变。",
+    "polish": (
+        "本轮精调强度=polish：修润错别字、重复词、口癖、不通顺句、连贯性瑕疵，"
+        "重点消除多余的时间词（翌日、傍晚等纯场景切换用法）。"
+        "保留原情节、对话顺序、段落结构。不得删减超过10%的字数。"
+    ),
+    "restructure": (
+        "本轮精调强度=restructure：允许重写段落、合并/拆分场景、调整节奏；"
+        "重点消除时间词切换、补强对话潜台词、修复人物行动逻辑。"
+        "不得改变本章标题、关键情节点、人物决策、章末状态。"
+    ),
+    "rewrite": (
+        "本轮精调强度=rewrite：允许重新设计场景顺序、改写大段叙事、补充心理与环境描写。"
+        "重点：1)消除所有时间词场景切换；2)重写对话使其有话术攻防；"
+        "3)为人物行动补充利益驱动；4)修复因果链断裂。"
+        "保持每章的核心目标和章末状态不变。"
+    ),
 }
 
 
@@ -180,11 +270,13 @@ def diagnose_group(
 ## 待诊断章节
 {chapters_text}
 """
+    preset = str(config["novel"].get("style_preset", "history"))
+    diagnose_system = DIAGNOSE_SYSTEM_PRESETS.get(preset, DIAGNOSE_SYSTEM_HISTORY)
     raw = call_llm(
         client,
         paths,
         config,
-        DIAGNOSE_SYSTEM,
+        diagnose_system,
         json_prompt(user),
         max_tokens=int(config["novel"].get("refine_diagnose_max_tokens", DEFAULT_DIAGNOSE_MAX_TOKENS)),
         temperature=0.3,
@@ -328,11 +420,13 @@ def refine_one_chapter(
 - 第一行保留章节标题（如原文有）。
 - 不要解释，不要 JSON，不要 markdown 围栏。
 """
+    preset = str(config["novel"].get("style_preset", "history"))
+    refine_system = REFINE_SYSTEM_BASE_PRESETS.get(preset, REFINE_SYSTEM_BASE_HISTORY)
     refined = call_llm(
         client,
         paths,
         config,
-        REFINE_SYSTEM_BASE,
+        refine_system,
         user,
         max_tokens=int(config["novel"].get("refine_chapter_max_tokens", DEFAULT_REFINE_MAX_TOKENS)),
         temperature=float(config["novel"].get("refine_temperature", 0.5)),

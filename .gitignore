@@ -35,7 +35,12 @@ htmlcov/
 logs/
 
 # Local config & secrets
+# config.yaml and config_template.yaml both embed live API keys -> never commit.
+# `novel.py create` copies config_template.yaml locally, so it must exist on disk
+# but stays out of git.
 config.yaml
+config_template.yaml
+novels/*/config.yaml
 .env
 .env.*
 
@@ -49,12 +54,27 @@ config.yaml
 state.md.bak
 _repair_backup/
 _smoke_pipeline/
+*_stdout*.log
+*_stderr*.log
+_check_keys_*.txt
 
-# Generated outputs
+# Generated outputs — root legacy long novel
 book.md
 state.md
 chapters/
 memory/
+book_refined.md
+chapters_refined/
+
+# Generated outputs — per-novel directories (keep prompt.md, drop the rest)
+novels/*/book.md
+novels/*/state.md
+novels/*/book_refined.md
+novels/*/chapters/
+novels/*/chapters_refined/
+novels/*/memory/
+novels/*/logs/
+novels/
 
 # One-off scripts
 check_token_plan_keys.py

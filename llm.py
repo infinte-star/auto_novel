@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import random
 import re
 import sys
 import threading
@@ -15,6 +16,48 @@ if TYPE_CHECKING:
 
 
 _STREAM_END = object()
+
+
+def _retry_after_secs(exc: Exception) -> float | None:
+    """Extract a Retry-After hint (seconds) from an HTTP 429/503 error, if present."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:
+        return None
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff_wait(attempt: int, exc: Exception | None = None) -> float:
+    """Exponential backoff with full jitter, longer for rate limits.
+
+    Without jitter, parallel candidate calls that all hit 429 at the same instant
+    retry in lockstep and re-trigger the limit (thundering herd). Full jitter
+    (random in [0, cap]) decorrelates them. Honor server Retry-After when given.
+    """
+    status_code = getattr(exc, "status_code", None) if exc is not None else None
+    is_rate_limit = status_code is not None and int(status_code) == 429
+    if exc is not None:
+        hinted = _retry_after_secs(exc)
+        if hinted is not None:
+            # Respect the server hint but add small jitter and a sane ceiling.
+            return min(120.0, hinted + random.uniform(0, 2.0))
+    if is_rate_limit:
+        # Base grows 4,8,16,... capped at 90s for 429 so we actually back off.
+        cap = min(90.0, 4.0 * (2 ** attempt))
+    else:
+        cap = min(60.0, 2.0 * (2 ** attempt))
+    # Full jitter: random point in [cap/2, cap] keeps a floor while decorrelating.
+    return random.uniform(cap / 2.0, cap)
+
 
 
 def _drain_stream_to_queue(resp: Any, q: "queue.Queue[Any]") -> None:
@@ -437,19 +480,19 @@ def call_llm(
                 content = resp.choices[0].message.content or ""
                 elapsed = time.perf_counter() - started
             if not content.strip():
-                wait = min(60, 2**attempt)
+                wait = _backoff_wait(attempt)
                 log(
                     paths,
-                    f"LLM returned empty response attempt={attempt + 1}/6 wait={wait}s "
+                    f"LLM returned empty response attempt={attempt + 1}/6 wait={wait:.1f}s "
                     f"stream={stream} elapsed={elapsed:.1f}s prompt_chars={total_chars} max_tokens={request['max_tokens']}",
                 )
                 time.sleep(wait)
                 continue
             if _looks_like_refusal(content):
-                wait = min(60, 2**attempt)
+                wait = _backoff_wait(attempt)
                 log(
                     paths,
-                    f"LLM returned refusal-like response attempt={attempt + 1}/6 wait={wait}s "
+                    f"LLM returned refusal-like response attempt={attempt + 1}/6 wait={wait:.1f}s "
                     f"len={len(content.strip())} preview={content.strip()[:120]!r}",
                 )
                 time.sleep(wait)
@@ -460,9 +503,9 @@ def call_llm(
                 use_response_format = False
                 log(paths, f"JSON response_format unsupported, retrying without it: {exc}")
                 continue
-            wait = min(60, 2**attempt)
+            wait = _backoff_wait(attempt, exc)
             elapsed = time.perf_counter() - started
-            log(paths, f"LLM call failed attempt={attempt + 1}/6 wait={wait}s elapsed={elapsed:.1f}s error={exc}")
+            log(paths, f"LLM call failed attempt={attempt + 1}/6 wait={wait:.1f}s elapsed={elapsed:.1f}s error={exc}")
             time.sleep(wait)
     raise RuntimeError("LLM call failed after 6 attempts")
 

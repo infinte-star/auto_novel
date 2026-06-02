@@ -9,7 +9,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, get_active_constraints, get_silent_threads, recent_quality_feedback
+from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_silent_threads, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -63,7 +63,9 @@ Return exactly one valid JSON object and no other text:
   "reader_expectation_delta": "why this improves or hurts follow-up desire"
 }
 Reject or downgrade plans that keep known review problems abstract, rely on off-page resolution,
-repeat the same physical staging, or contain unresolved timeline/logistics gaps. Improve the merged plan
+repeat the same physical staging, or contain unresolved timeline/logistics gaps. For a "reversal"-strategy
+candidate, downgrade it if the overturn has no setup (a fact/trust-source established and reinforced before being
+toppled) — a reversal without setup is an abrupt twist, not a payoff. Improve the merged plan
 so the writer has concrete scene obligations rather than vague intentions."""
 
 FUSED_PLAN_REVIEW_SYSTEM = """You are the multi-axis plan reviewer for a Chinese historical/fantasy web novel.
@@ -102,6 +104,7 @@ Axes and what they check:
 
 5. foreshadowing — Advances at least one open thread; recovers dropped threads when natural; new threads have realistic due_chapter; total active threads ≤ 8.
    Soft penalties: -1.0 if overdue threads (>20 chapters) ignored; -1.5 if no thread advanced/recovered; -1.0 if opening a 9th+ concurrent thread.
+   Reversal structure check: if the candidate's strategy is "reversal", verify the plan establishes a setup (a believed fact/trust-source) BEFORE overturning it — a reversal whose overturn has no on-page or prior setup is abrupt: -1.0.
 
 6. reader — A serial reader finishing the chapter has clear next-chapter questions, gets at least one satisfaction moment, isn't lost if 2 chapters were skipped, isn't asked to juggle too many threads, has at least one empathy moment.
    Soft penalties: -1.0 if no clear "next" hook; -1.5 if pure setup with zero payoff moments; -1.0 if reader must recall >5 prior plot points.
@@ -365,6 +368,8 @@ def generate_candidate_plans(
     quality_feedback = recent_quality_feedback(paths)
     silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
     silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
+    promise_grace = int(config["novel"].get("reader_promise_overdue_grace", 15))
+    overdue_promises = get_overdue_reader_promises(conn, chapter_num, grace=promise_grace)
     carried_over_risks = _carried_over_risks_from_prev(paths, chapter_num)
     mem = cached_memory or memory_context(paths, conn, config)
     base_user = f"""## Memory
@@ -385,6 +390,9 @@ def generate_candidate_plans(
 ## Silent Threads (HARD REQUIREMENT: advance at least one of these on page if narratively viable)
 {json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
 
+## Overdue Reader Promises (HARD: pay one off on page this chapter, or justify the delay in "risk")
+{json.dumps(overdue_promises, ensure_ascii=False, indent=2) if overdue_promises else "None"}
+
 ## Carried-over Risks from Ch{chapter_num - 1} (MUST address at least 2 of these on page)
 {json.dumps(carried_over_risks, ensure_ascii=False, indent=2) if carried_over_risks else "None"}
 
@@ -394,7 +402,8 @@ def generate_candidate_plans(
 ## Request
 Create candidate plan for chapter {chapter_num}.
 Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire.
-If silent threads exist above, the plan MUST either advance one in beats/thread_actions, or explicitly note in "risk" why none are viable this chapter."""
+If silent threads exist above, the plan MUST either advance one in beats/thread_actions, or explicitly note in "risk" why none are viable this chapter.
+If "Rhythm Diagnostics JSON" reports a 爽点拖欠 warning (chapters_since_payoff >= payoff_max_gap), this chapter's payoff_type MUST be a concrete reader payoff (court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix), NOT strategic_setup or emotional."""
     num_candidates = int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
 
@@ -411,7 +420,10 @@ If silent threads exist above, the plan MUST either advance one in beats/thread_
         ("institutional",
          "以制度/程序/官僚摩擦为核心：本章必须呈现一次具体的衙门程序（如送文、批红、查证、回禀），用程序细节制造张力。"),
         ("reversal",
-         "以认知反转为核心：本章某个既定事实被推翻，原信任的来源被证伪，导致主角不得不修正策略；hook 必须基于反转。"),
+         "以认知反转为核心，必须按 setup→misdirect→overturn 三段结构组织，并在 beats 中显式标注每一段："
+         "①setup：先建立一个被广泛相信的'事实/信任源/判断'；②misdirect：通过证据或他人之口强化它，让读者也信以为真；"
+         "③overturn：推翻它，证伪原信任源，给主角带来必须修正策略的新筹码或新危机。hook 必须基于 overturn。"
+         "禁止无 setup 的突兀反转（凭空冒出真相）。"),
         ("pressure-payoff",
          "以挤压-释放节奏为核心：前 60% 持续施压（资源/时间/信任三轴中至少 2 轴），后 40% 给一个小而可信的释放点。"),
     ]

@@ -9,8 +9,11 @@ from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, memory_context, rhythm_diagnostics, structural_repetition_analysis, writing_memory_context
 from store import (
     db_event,
+    entity_state_as_of,
     get_active_constraints,
+    get_character_voice_notes,
     get_open_causal_requirements,
+    get_overdue_reader_promises,
     get_silent_threads,
     recent_metrics,
     recent_quality_feedback,
@@ -32,6 +35,9 @@ Return exactly one valid JSON object and no other text:
   "reader_fatigue_risks": [],
   "hook_strength": 1-10,
   "beats_audit": [{"beat":"...", "status":"realized|partial|absent", "evidence":"quote or note"}],
+  "contradictions": [{"fact":"the established fact being contradicted", "prose":"quote 6-20 chars from the chapter that contradicts it", "severity":"hard|soft"}],
+  "hallucinated_entities": ["named person/place/item/force that appears in the chapter as if established but is NOT in Established Facts and was not introduced earlier"],
+  "character_voice_drift": [{"name":"character whose stance/voice contradicts their baseline", "prose":"quote 6-20 chars showing the drift", "note":"how it conflicts with the baseline stance"}],
   "patches": [
     {"op":"replace", "locator":"quote 8-20 chars from current text", "before":"exact substring to replace", "after":"replacement text", "reason":"why"},
     {"op":"insert_after", "locator":"quote 8-20 chars after which to insert", "insert":"new text", "reason":"why"},
@@ -58,6 +64,9 @@ Then DEDUCT according to the following soft penalties (do NOT clip to 8; just su
 - Ignores continuity risks called out in recent reviews: -1.0 per ignored risk (cap total at -2.0).
 - More than 30% of plan beats partial/absent: additional -0.5 (on top of per-beat deductions).
 - Silent thread (>10 chapters silent) listed in plan context could be advanced but ignored: -0.7.
+- Contradicts an Established Fact (see "## Established Facts" below): -2.0 per HARD contradiction (a stated fact is reversed: a dead character acts, a known location is wrong, a resource that was lost reappears), -0.5 per SOFT contradiction (tension/tone mismatch with established state). Record each in "contradictions".
+- Hallucinated entity (a named person/place/item treated as already-established but absent from Established Facts and not plausibly introduced this chapter): -0.7 each; record in "hallucinated_entities".
+- Character voice/stance drift (ONLY when a "## Character Voice Baseline" block is provided): a focus character acts or speaks in a way that contradicts their baseline stance/voice/goal without on-page justification: -0.5 each (cap total at -1.0); record each in "character_voice_drift". When no baseline block is provided, leave "character_voice_drift" empty.
 
 After deductions, apply bonuses (additive, max +1.5 total):
 - All plan beats realized with concrete on-page action: +0.5
@@ -90,7 +99,69 @@ Writer directives (REQUIRED): output 3-6 imperative directives the NEXT chapter 
 Hook strength (REQUIRED): rate the chapter's ENDING-hook strength 1-10 independently.
 - 9-10: ending raises a sharp, specific question the reader will click "next" for.
 - 6-8: workable hook but generic or already used in recent chapters.
-- <=5: weak/summary-style ending — DO NOT use vague "他知道，一切才刚刚开始" style endings."""
+- <=5: weak/summary-style ending — DO NOT use vague "他知道，一切才刚刚开始" style endings.
+
+Contradiction & hallucination check (REQUIRED when "## Established Facts" is provided):
+- Compare the chapter prose against EVERY established fact. A "hard" contradiction is a direct reversal of a stated fact (status/location/possession/relationship). Be conservative: only flag a contradiction you can point to with a verbatim prose quote. Plausible NEW developments that the chapter itself stages on-page are NOT contradictions.
+- If no contradictions exist, return "contradictions": [] and "hallucinated_entities": []."""
+
+def established_facts_for_chapter(
+    conn: Any,
+    plan: dict[str, Any],
+    chapter_num: int,
+    budget_chars: int = 3000,
+    promise_grace: int = 15,
+) -> str:
+    """Compact, budget-limited block of established facts the chapter must not
+    contradict: current state of plan-focused characters/entities, relevant open
+    threads, and overdue reader promises. Reuses store query helpers."""
+    from store import JsonStoryStore  # local import to avoid cycle at module load
+
+    lines: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_entity(etype: str, name: str) -> None:
+        key = (etype, str(name))
+        if not name or key in seen:
+            return
+        seen.add(key)
+        try:
+            state = entity_state_as_of(conn, etype, str(name), chapter_num)
+        except Exception:
+            state = {}
+        if state:
+            keep = {k: state[k] for k in list(state)[:6]}
+            lines.append(f"- [{etype}] {name}: {json.dumps(keep, ensure_ascii=False)}")
+
+    for char in plan.get("character_focus", []) or []:
+        add_entity("character", str(char))
+    for force in plan.get("forces", []) or []:
+        add_entity("force", str(force))
+
+    # Open threads referenced by the plan's thread_actions, plus overdue promises.
+    try:
+        if not isinstance(conn, JsonStoryStore):
+            rows = conn.execute(
+                "SELECT id, description, thread_type FROM open_threads WHERE status='open' ORDER BY updated_chapter DESC LIMIT 12",
+            ).fetchall()
+            for r in rows:
+                lines.append(f"- [thread:{r['thread_type']}] {r['id']}: {r['description']}")
+    except Exception:
+        pass
+
+    try:
+        promises = get_overdue_reader_promises(conn, chapter_num, grace=promise_grace)
+        for p in promises:
+            lines.append(f"- [overdue_promise] {p['id']} (due Ch{p['due_chapter']}): {p['description']}")
+    except Exception:
+        pass
+
+    if not lines:
+        return "None"
+    block = "\n".join(lines)
+    if len(block) > budget_chars:
+        block = block[:budget_chars] + "\n…(truncated)"
+    return block
 
 STAGE_REVIEW_SYSTEM = """You are the long-cycle quality evaluator for serialized Chinese web fiction.
 Return exactly one valid JSON object and no other text:
@@ -153,8 +224,47 @@ def review_chapter(
     mem = cached_memory or writing_memory_context(paths, conn, config)
     silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
     silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
-    user = f"""## Memory
+    preset = str(config["novel"].get("style_preset", "history"))
+    preset_hint = {
+        "xuanhuan_shuang": "本作为穿越爽文：payoff 维度应额外考量本章是否有明确的爽点兑现（兑现/打脸/翻盘/掌权），节奏是否够紧；但爽点须有铺垫与代价，无脑碾压应扣分。若下方 Rhythm Diagnostics 报告了爽点拖欠（chapters_since_payoff >= payoff_max_gap）而本章仍未给出兑现类 payoff，额外 -0.5。",
+        "history": "本作为历史厚重题材：重视制度细节、政治博弈的真实约束与因果链的严谨。",
+    }.get(preset, "")
+    factcheck_enabled = bool(config["novel"].get("factcheck_enabled", True))
+    if factcheck_enabled:
+        facts_block = established_facts_for_chapter(
+            conn,
+            plan,
+            chapter_num,
+            budget_chars=int(config["novel"].get("factcheck_facts_chars", 3000)),
+            promise_grace=int(config["novel"].get("reader_promise_overdue_grace", 15)),
+        )
+    else:
+        facts_block = "None"
+    # Character voice baseline: cross-chapter stance/voice consistency check.
+    # Enabled by default for the 爽文 preset; long novel opts in via config to
+    # avoid false positives until the signal is validated.
+    voice_check_default = preset == "xuanhuan_shuang"
+    voice_check = bool(config["novel"].get("character_voice_check", voice_check_default))
+    voice_block = "None"
+    if voice_check:
+        try:
+            focus = [str(c) for c in (plan.get("character_focus") or []) if c]
+            notes = get_character_voice_notes(conn, focus, limit=6)
+            if notes:
+                voice_block = json.dumps(notes, ensure_ascii=False, indent=2)
+        except Exception:
+            voice_block = "None"
+    user = f"""## Style preset: {preset}
+{preset_hint}
+
+## Memory
 {mem}
+
+## Established Facts (MUST NOT CONTRADICT — report any conflict in "contradictions")
+{facts_block}
+
+## Character Voice Baseline (cross-chapter stance/voice; report conflicts in "character_voice_drift")
+{voice_block}
 
 ## Previous Tail
 {tail[-1500:]}
@@ -164,6 +274,9 @@ def review_chapter(
 
 ## Silent Threads JSON (silent >{silence_threshold} chapters; check whether the chapter advances any of these or has good reason to skip)
 {json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
+
+## Rhythm Diagnostics JSON (note chapters_since_payoff vs payoff_max_gap for 爽点拖欠)
+{json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
 
 ## Selected Plan JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
@@ -188,11 +301,27 @@ def review_chapter(
             "rhythm_risks": [],
             "reader_fatigue_risks": [],
             "hook_strength": 6,
+            "contradictions": [],
+            "hallucinated_entities": [],
+            "character_voice_drift": [],
             "writer_directives_for_next_chapter": [],
         },
     )
     report["score"] = safe_score(report.get("score", 0))
+    report.setdefault("contradictions", [])
+    report.setdefault("hallucinated_entities", [])
+    report.setdefault("character_voice_drift", [])
     report.setdefault("accepted", report["score"] >= float(config["novel"]["quality_threshold"]))
+    # Optionally block acceptance when a HARD contradiction is detected, so the
+    # existing revise loop repairs it. Off by default while false-positive rate
+    # is being assessed.
+    if bool(config["novel"].get("factcheck_hard_blocks_accept", False)):
+        hard = [c for c in report.get("contradictions", []) if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
+        if hard:
+            report["accepted"] = False
+            report.setdefault("problems", []).append(
+                f"FACTCHECK: {len(hard)} hard contradiction(s) with established facts must be fixed."
+            )
     return report
 
 def stage_review(
@@ -337,8 +466,9 @@ Refresh voices.md for Ch{chapter_num}."""
         log(paths, f"Updated voices.md at Ch{chapter_num} (len={len(new_voices)})")
 
 def should_replan(conn: Any, config: dict[str, Any]) -> bool:
+    window = int(config["novel"].get("repeat_window", 24))
     rows = recent_metrics(conn, 20)
-    if len(rows) < 15:
+    if len(rows) < max(8, window // 2):
         return False
     threshold_score = float(config["novel"].get("replan_score_threshold", 6.5))
     threshold_novelty = float(config["novel"].get("replan_novelty_threshold", 5.5))
@@ -351,6 +481,10 @@ def should_replan(conn: Any, config: dict[str, Any]) -> bool:
         triggers += 1
     structural = structural_repetition_analysis(conn, config)
     if len(structural.get("warnings", [])) >= 3:
+        triggers += 1
+    # Emotional fatigue: a flat or monotonically-falling tension curve is its own
+    # replan trigger — readers disengage when intensity never varies or only sags.
+    if structural.get("tension_shape") in {"flat", "monotone_fall"}:
         triggers += 1
     return triggers >= 2
 

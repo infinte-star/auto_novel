@@ -386,6 +386,7 @@ def rhythm_diagnostics(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
             "avg_tension": None,
             "avg_novelty": None,
             "avg_hook": None,
+            "chapters_since_payoff": None,
         }
 
     payoff_counts: dict[str, int] = {}
@@ -403,6 +404,22 @@ def rhythm_diagnostics(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
         if row.get("hook_strength") is not None:
             hooks.append(int(row["hook_strength"]))
 
+    # Payoff gap: distance (in chapters) from the most recent chapter back to the
+    # last chapter whose payoff_type is a concrete reader payoff (not setup/emotional).
+    # rows are ordered most-recent-first. 0 means the latest chapter itself paid off.
+    payoff_realized = {
+        "court_breakthrough", "policy_payoff", "military_victory", "reveal",
+        "reversal", "personnel_payoff", "institutional_fix",
+    }
+    chapters_since_payoff: int | None = None
+    for offset, row in enumerate(rows):
+        if (row.get("payoff_type") or "") in payoff_realized:
+            chapters_since_payoff = offset
+            break
+    if chapters_since_payoff is None:
+        # No realized payoff anywhere in the window — treat the whole window as the gap.
+        chapters_since_payoff = len(rows)
+
     warnings = []
     dominant_payoff = max(payoff_counts.items(), key=lambda x: x[1])
     dominant_conflict = max(conflict_counts.items(), key=lambda x: x[1])
@@ -416,6 +433,11 @@ def rhythm_diagnostics(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Novelty is low across recent chapters.")
     if avg_hook is not None and avg_hook < 6:
         warnings.append("Hook strength is low across recent chapters.")
+    payoff_max_gap = int(config["novel"].get("payoff_max_gap", 99))
+    if chapters_since_payoff >= payoff_max_gap:
+        warnings.append(
+            f"爽点拖欠：已 {chapters_since_payoff} 章无明确兑现（阈值 {payoff_max_gap}）；下一章 payoff_type 应为兑现类。"
+        )
 
     return {
         "warnings": warnings,
@@ -424,6 +446,8 @@ def rhythm_diagnostics(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
         "avg_tension": sum(tensions) / len(tensions) if tensions else None,
         "avg_novelty": avg_novelty,
         "avg_hook": avg_hook,
+        "chapters_since_payoff": chapters_since_payoff,
+        "payoff_max_gap": payoff_max_gap,
     }
 
 def structural_repetition_analysis(conn: Any, config: dict[str, Any]) -> dict[str, Any]:
