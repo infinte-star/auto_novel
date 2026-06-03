@@ -9,7 +9,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
+from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -410,8 +410,18 @@ def generate_candidate_plans(
     silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
     promise_grace = int(config["novel"].get("reader_promise_overdue_grace", 15))
     overdue_promises = get_overdue_reader_promises(conn, chapter_num, grace=promise_grace)
+    active_promises = get_reader_promises(conn, chapter_num, limit=12)
     carried_over_risks = _carried_over_risks_from_prev(paths, chapter_num)
     mem = cached_memory or memory_context(paths, conn, config)
+    platform_block = ""
+    benchmark_block = ""
+    try:
+        from benchmark import benchmark_context, platform_guidance
+
+        platform_block = platform_guidance(config)
+        benchmark_block = benchmark_context(paths, config, tail + "\n" + json.dumps(quality_feedback, ensure_ascii=False))
+    except Exception:
+        pass
     # Scene-skeleton dedupe: list the conflict/payoff/beats of recent selected
     # plans so the generator avoids re-running the same micro-scene.
     dedupe_block = "None"
@@ -433,6 +443,11 @@ def generate_candidate_plans(
     base_user = f"""## 记忆
 {mem}
 
+## 平台/读者画像
+{platform_block or "通用网文读者：开篇卖点清晰、章节推进稳定、承诺及时兑现。"}
+
+{benchmark_block}
+
 ## 节奏诊断JSON
 {json.dumps(diagnostics, ensure_ascii=False, indent=2)}
 
@@ -451,6 +466,9 @@ def generate_candidate_plans(
 ## 逾期的读者承诺（硬性：本章在页面上兑现其中之一，或在 "risk" 中说明延迟理由）
 {json.dumps(overdue_promises, ensure_ascii=False, indent=2) if overdue_promises else "None"}
 
+## 活跃读者承诺账本（追读心理核心：不要只开不还）
+{json.dumps(active_promises, ensure_ascii=False, indent=2) if active_promises else "None"}
+
 ## 从 Ch{chapter_num - 1} 遗留的风险（必须在页面上处理其中至少 2 项）
 {json.dumps(carried_over_risks, ensure_ascii=False, indent=2) if carried_over_risks else "None"}
 
@@ -465,6 +483,15 @@ def generate_candidate_plans(
 避免近期重复。保留因果债务。提升读者追读欲。
 若上方存在沉默伏线，大纲必须在 beats/thread_actions 中推进其中之一，或在 "risk" 中明确说明为何本章均不可行。
 若 "节奏诊断JSON" 报告了爽点拖欠警告（chapters_since_payoff >= payoff_max_gap），本章的 payoff_type 必须是一个具体的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），而非 strategic_setup 或 emotional。"""
+    from config import is_final_chapter
+    if is_final_chapter(config, chapter_num):
+        base_user += """
+
+## 终章要求（硬性：这是全书最后一章，必须规划成结局而非过渡章）
+- 本章 payoff_type 必须是一个真正的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），严禁 strategic_setup。
+- goal/payoff 必须正面解决全书主线矛盾，把已开启的关键伏线在本章收束。
+- "hook" 字段不再是抛给读者的新悬念，而是一句收束/余韵/主题升华；严禁以全新未解决危机作结。
+- beats 的最后 1-2 拍必须落在"结局兑现 + 情绪落点"，而非开启新冲突。"""
     num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
 
@@ -1007,6 +1034,7 @@ def create_plan(
 
         score = plan_score(decision)
         log(paths, f"Arbiter selected Ch{chapter_num} plan score={score}")
+        duplicate_blocked = False
         # Scene-skeleton similarity diagnostic: warn (and nudge a retry) when the
         # selected plan is near-identical to a recent one — the signature of the
         # engine slicing the same micro-scene over and over.
@@ -1025,8 +1053,29 @@ def create_plan(
                     decision.setdefault("required_constraints", []).append(
                         "本章场景骨架与近期高度雷同，必须切换到不同的冲突场景/推进到新的局面，不得继续纠缠同一僵局。"
                     )
+                block_threshold = float(config["novel"].get("scene_dedupe_sim_block", 0.82))
+                if (
+                    bool(config["novel"].get("scene_dedupe_force_retry", True))
+                    and sim.get("max_sim", 0.0) >= block_threshold
+                ):
+                    duplicate_blocked = True
+                    decision.setdefault("required_constraints", []).append(
+                        "硬性重规划：上一版大纲与近期场景骨架重复度过高。本章必须更换信息来源、物理场地、冲突参与者或兑现类型中的至少两项。"
+                    )
             except Exception:
                 pass
+        if duplicate_blocked and attempt < max_attempts - 1:
+            db_event(
+                conn,
+                chapter_num,
+                "scene_dedupe_retry",
+                {"score": score, "decision": decision, "plan": plan},
+            )
+            log(
+                paths,
+                f"Scene-dedupe BLOCK Ch{chapter_num}: retrying plan attempt {attempt + 1}/{max_attempts - 1}",
+            )
+            continue
         if score > best_score:
             best_plan, best_decision, best_score = plan, decision, score
         if score >= min_score:

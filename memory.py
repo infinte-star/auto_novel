@@ -52,6 +52,21 @@ BOOTSTRAP_SYSTEM = """你是一部 200 万字以上中文网文的总设计师�
 
 创作原创素材，不要模仿现有作品。以长期因果与读者期待为优化目标。"""
 
+CREATIVE_BOOST_SYSTEM = """你是一位顶尖网文创意策划，擅长跨题材、跨领域联想，把平庸的创作简报升级成有记忆点、有差异化的爆款雏形。
+读取下方创作简报，结合多领域知识（历史、科技、神话、社会学、游戏机制、商业、悬疑结构等）做一次创意增强。
+要求：具体、可执行、避免烂大街套路；不偏离简报的题材与核心设定，只在其骨架上注入新意。
+
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
+{
+  "golden_finger": "新颖的金手指/核心能力机制：一句话点明它与同类套路的不同，并给出其代价或限制",
+  "character_hooks": ["主角及关键人物的记忆点人设梗（反差、怪癖、信念、隐秘动机），3-5 条，每条具体可演"],
+  "opening_hook": "差异化的开篇钩子：用一句话描述第一章如何在极短篇幅内抛出核心冲突/悬念并展示卖点",
+  "world_novelty": ["世界观或设定上的新意点，2-4 条，避免常见模板"],
+  "differentiation": "与同类热门作品的核心区隔点：读者为什么要读这一本而不是别的（一两句话）"
+}
+
+强调：每一条都要具体到能直接落地写作，禁止空泛口号和万能套话。"""
+
 MEMORY_COMPRESS_SYSTEM = """你负责压缩长篇小说引擎的记忆条目。
 输入：一个含逐章条目（## ChN 小节）的记忆文件。
 输出：一份整合后的 markdown，须保留：
@@ -85,9 +100,62 @@ def _as_markdown(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2)
     return str(value or "").strip()
 
+def creative_boost(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+    """One-time AI creative enhancement of the brief, run before bootstrap.
+
+    Reads prompt.md and asks the LLM for novel golden-finger/character/opening
+    ideas, returned as a markdown block to inject into the bootstrap user message.
+    Fail-degrades to "" so it can never block book creation.
+    """
+    if not bool(config["novel"].get("creative_boost_enabled", True)):
+        return ""
+    try:
+        raw = call_llm(
+            client, paths, config, CREATIVE_BOOST_SYSTEM,
+            json_prompt(read_text(PROMPT_FILE)), temperature=0.9,
+        )
+        boost = load_json_with_repair(client, paths, config, raw, fallback={})
+        if not isinstance(boost, dict) or not boost:
+            return ""
+        db_event(conn, 0, "creative_boost", boost)
+        lines = ["## 创意增强（请将以下新意自然融入设定，避免平庸化）"]
+        gf = _as_markdown(boost.get("golden_finger"))
+        if gf:
+            lines.append(f"- 金手指/核心机制：{gf}")
+        hooks = boost.get("character_hooks") or []
+        if isinstance(hooks, list) and hooks:
+            lines.append("- 人物记忆点：")
+            for h in hooks:
+                t = _as_markdown(h)
+                if t:
+                    lines.append(f"  - {t}")
+        oh = _as_markdown(boost.get("opening_hook"))
+        if oh:
+            lines.append(f"- 开篇钩子：{oh}")
+        wn = boost.get("world_novelty") or []
+        if isinstance(wn, list) and wn:
+            lines.append("- 世界观新意：")
+            for w in wn:
+                t = _as_markdown(w)
+                if t:
+                    lines.append(f"  - {t}")
+        diff = _as_markdown(boost.get("differentiation"))
+        if diff:
+            lines.append(f"- 差异化区隔：{diff}")
+        if len(lines) <= 1:
+            return ""
+        return "\n".join(lines)
+    except Exception as e:  # never block bootstrap
+        log(paths, f"creative_boost skipped: {e}")
+        return ""
+
 def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -> None:
     log(paths, "Bootstrapping layered memory")
-    raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(read_text(PROMPT_FILE)), temperature=0.7)
+    boost_block = creative_boost(client, paths, conn, config)
+    brief = read_text(PROMPT_FILE)
+    if boost_block:
+        brief = brief + "\n\n" + boost_block
+    raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7)
     data = load_json_with_repair(client, paths, config, raw)
     title = str(data.get("title") or "").strip()
     if not title:
@@ -118,32 +186,47 @@ def truncate_section(text: str, max_chars: int) -> str:
         return text
     return text[:max_chars] + "\n...[truncated]"
 
+
+def _read_memory_file(path: Path, cap: int) -> str:
+    text = read_text(path).strip()
+    if cap > 0 and len(text) > cap:
+        return text[:cap] + "\n...[truncated]"
+    return text
+
+
+def opening_route_text(paths: Paths, cap: int = 6000) -> str:
+    path = paths.volume_plan.parent / "opening_route.md"
+    return _read_memory_file(path, cap) if path.exists() else ""
+
 def memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
     budget = estimate_chars_budget(config)
     fatigue_window = int(config["novel"]["fatigue_window"])
 
     creative_brief = read_text(PROMPT_FILE).strip()
-    current_state = read_text(paths.state).strip()
-    voice_anchor = read_text(paths.voice).strip()
-    voices_table = read_text(paths.voices).strip()
+    current_state = _read_memory_file(paths.state, int(config["novel"].get("memory_state_chars", 12000)))
+    voice_anchor = _read_memory_file(paths.voice, int(config["novel"].get("memory_voice_chars", 8000)))
+    voices_table = _read_memory_file(paths.voices, int(config["novel"].get("memory_voices_chars", 12000)))
+    opening_route = opening_route_text(paths, int(config["novel"].get("memory_opening_route_chars", 6000)))
     style_block = ""
     if voice_anchor:
         style_block += "\n\n## 叙事声音锚（必须遵循）\n" + voice_anchor
     if voices_table:
         style_block += "\n\n## 人物声音（必须遵循）\n" + voices_table
+    if opening_route:
+        style_block += "\n\n## 已采纳开篇路线（优先级高于临场发散）\n" + opening_route
     tier1 = "## 创作纲要\n" + creative_brief + "\n\n## 当前状态\n" + current_state + style_block
 
-    volume_plan = read_text(paths.volume_plan).strip()
+    volume_plan = _read_memory_file(paths.volume_plan, int(config["novel"].get("memory_volume_plan_chars", 16000)))
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
-    threads_text = read_text(paths.threads).strip()
+    threads_text = _read_memory_file(paths.threads, int(config["novel"].get("memory_threads_chars", 12000)))
     tier2 = "## 卷纲\n" + volume_plan + "\n\n## 关键指标JSON\n" + metrics_5 + "\n\n## 伏线\n" + threads_text
 
-    characters = read_text(paths.characters).strip()
-    bible = read_text(paths.bible).strip()
+    characters = _read_memory_file(paths.characters, int(config["novel"].get("memory_characters_chars", 16000)))
+    bible = _read_memory_file(paths.bible, int(config["novel"].get("memory_bible_chars", 16000)))
     events_20 = json.dumps(recent_events(conn, 20), ensure_ascii=False, indent=2)
     tier3 = "## 人物\n" + characters + "\n\n## 世界设定\n" + bible + "\n\n## 近期事件JSON\n" + events_20
 
-    timeline = read_text(paths.timeline).strip()
+    timeline = _read_memory_file(paths.timeline, int(config["novel"].get("memory_timeline_chars", 10000)))
     metrics_full = json.dumps(recent_metrics(conn, fatigue_window), ensure_ascii=False, indent=2)
     events_full = json.dumps(recent_events(conn, 40), ensure_ascii=False, indent=2)
     tier4 = "## 时间线\n" + timeline + "\n\n## 完整指标JSON\n" + metrics_full + "\n\n## 完整事件JSON\n" + events_full
@@ -224,7 +307,7 @@ def cacheable_prefix(
     and downstream invocations naturally invalidate.
     """
     budget = int(config["novel"].get("cacheable_prefix_chars", 30000))
-    sources = [PROMPT_FILE, paths.voice, paths.voices, paths.bible, paths.characters]
+    sources = [PROMPT_FILE, paths.volume_plan.parent / "opening_route.md", paths.voice, paths.voices, paths.bible, paths.characters]
     key = f"{_files_hash(sources)}:{budget}"
 
     cached = _CACHEABLE_PREFIX_CACHE.get("active")
@@ -233,14 +316,16 @@ def cacheable_prefix(
         return cached[1]
     _CACHEABLE_PREFIX_STATS["misses"] += 1
 
-    creative_brief = read_text(PROMPT_FILE).strip()
-    voice_anchor = read_text(paths.voice).strip()
-    voices_table = read_text(paths.voices).strip()
-    bible = read_text(paths.bible).strip()
-    characters = read_text(paths.characters).strip()
+    creative_brief = _read_memory_file(PROMPT_FILE, 6000)
+    voice_anchor = _read_memory_file(paths.voice, 8000)
+    voices_table = _read_memory_file(paths.voices, 12000)
+    opening_route = opening_route_text(paths, 6000)
+    bible = _read_memory_file(paths.bible, 16000)
+    characters = _read_memory_file(paths.characters, 16000)
 
     sections: list[tuple[str, str, int]] = [
         ("创作纲要", creative_brief, 4000),
+        ("已采纳开篇路线", opening_route, 5000),
         ("叙事声音锚", voice_anchor, 5000),
         ("人物声音", voices_table, 7000),
         ("世界设定", bible, 7000),
@@ -297,13 +382,15 @@ def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> s
     """
     char_budget = int(config["novel"].get("writing_memory_chars", 50000))
 
-    current_state = read_text(paths.state).strip()
-    threads_text = read_text(paths.threads).strip()
-    volume_plan = read_text(paths.volume_plan).strip()
+    current_state = _read_memory_file(paths.state, int(config["novel"].get("memory_state_chars", 12000)))
+    threads_text = _read_memory_file(paths.threads, int(config["novel"].get("memory_threads_chars", 12000)))
+    volume_plan = _read_memory_file(paths.volume_plan, int(config["novel"].get("memory_volume_plan_chars", 16000)))
+    opening_route = opening_route_text(paths, int(config["novel"].get("memory_opening_route_chars", 6000)))
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
 
     sections: list[tuple[str, str, int]] = [
         ("当前状态", current_state, 10000),
+        ("已采纳开篇路线", opening_route, 5000),
         ("伏线", threads_text, 8000),
         ("近期指标JSON", metrics_5, 2500),
         ("卷纲（节选）", volume_plan, 6000),
@@ -339,17 +426,19 @@ def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
     bible (capped), characters (capped), threads (capped), recent metrics 5 rows.
     """
     char_budget = int(config["novel"].get("plan_review_memory_chars", 10000))
-    creative_brief = read_text(PROMPT_FILE).strip()
-    current_state = read_text(paths.state).strip()
-    voice_anchor = read_text(paths.voice).strip()
-    bible = read_text(paths.bible).strip()
-    characters = read_text(paths.characters).strip()
-    threads_text = read_text(paths.threads).strip()
+    creative_brief = _read_memory_file(PROMPT_FILE, 3000)
+    current_state = _read_memory_file(paths.state, 3500)
+    voice_anchor = _read_memory_file(paths.voice, 2000)
+    opening_route = opening_route_text(paths, 2500)
+    bible = _read_memory_file(paths.bible, 2500)
+    characters = _read_memory_file(paths.characters, 2500)
+    threads_text = _read_memory_file(paths.threads, 2500)
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
 
     sections: list[tuple[str, str, int]] = [
         ("创作纲要", creative_brief, 1500),
         ("当前状态", current_state, 2500),
+        ("已采纳开篇路线", opening_route, 2000),
         ("叙事声音锚", voice_anchor, 1200),
         ("近期指标JSON", metrics_5, 1200),
         ("伏线", threads_text, 1500),

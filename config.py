@@ -202,10 +202,28 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 def normalize_chapter(text: str) -> str:
-    return normalize_text(text) + "\n"
+    text = normalize_text(text)
+    # LLM sometimes emits markdown heading for the title line
+    # ("# 第N章 …" instead of "第N章 …"). Strip it so the title format
+    # stays consistent across chapters.
+    text = re.sub(r"^#{1,6}\s+", "", text)
+    return text + "\n"
 
 def count_chars(path: Path) -> int:
     return len(read_text(path))
+
+def is_final_chapter(config: dict[str, Any], chapter_num: int) -> bool:
+    """True when chapter_num is the deterministic final chapter of the book.
+
+    Only meaningful in short-novel mode where `max_chapters` is set. In pure
+    char-target mode (max_chapters absent/0) there is no deterministic finale,
+    so this always returns False and the engine's per-chapter behaviour is
+    unchanged. Gated by `ending_aware` (default True).
+    """
+    if not bool(config["novel"].get("ending_aware", True)):
+        return False
+    max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
+    return max_chapters > 0 and chapter_num == max_chapters
 
 def tail_text(path: Path, n_chars: int) -> str:
     text = read_text(path)

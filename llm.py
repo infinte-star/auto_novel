@@ -16,6 +16,57 @@ if TYPE_CHECKING:
 
 
 _STREAM_END = object()
+_REQUEST_THROTTLE_LOCK = threading.Lock()
+_LAST_REQUEST_STARTED_AT = 0.0
+
+
+def _configured_min_request_interval(api: dict[str, Any]) -> float:
+    explicit = api.get("min_request_interval_secs")
+    if explicit is not None and str(explicit).strip() != "":
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            return 0.0
+    rpm = api.get("max_rpm")
+    if rpm is None or str(rpm).strip() == "":
+        return 0.0
+    try:
+        rpm_value = float(rpm)
+    except (TypeError, ValueError):
+        return 0.0
+    if rpm_value <= 0:
+        return 0.0
+    return 60.0 / rpm_value
+
+
+def _throttle_request_start(paths: Paths, api: dict[str, Any]) -> None:
+    interval = _configured_min_request_interval(api)
+    if interval <= 0:
+        return
+    global _LAST_REQUEST_STARTED_AT
+    with _REQUEST_THROTTLE_LOCK:
+        now = time.perf_counter()
+        wait = (_LAST_REQUEST_STARTED_AT + interval) - now
+        if wait > 0:
+            log(paths, f"LLM throttle sleeping {wait:.1f}s min_interval={interval:.1f}s")
+            time.sleep(wait)
+        _LAST_REQUEST_STARTED_AT = time.perf_counter()
+
+
+def _effective_max_tokens(api: dict[str, Any], requested: int | None) -> int:
+    value = requested or int(api["max_tokens"])
+    cap = api.get("max_output_tokens_cap")
+    if cap is None or str(cap).strip() == "":
+        cap = api.get("max_tokens_cap")
+    if cap is None or str(cap).strip() == "":
+        return int(value)
+    try:
+        cap_value = int(cap)
+    except (TypeError, ValueError):
+        return int(value)
+    if cap_value <= 0:
+        return int(value)
+    return min(int(value), cap_value)
 
 
 def _retry_after_secs(exc: Exception) -> float | None:
@@ -348,7 +399,8 @@ def call_llm(
         user = emergency_truncate(user, max_input_chars - len(system) - 1000)
     wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
     use_response_format = wants_json and bool(api.get("json_response_format", True))
-    for attempt in range(6):
+    max_attempts = int(api.get("max_attempts", 6))
+    for attempt in range(max_attempts):
         started = time.perf_counter()
         try:
             request = {
@@ -357,14 +409,26 @@ def call_llm(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "max_tokens": max_tokens or int(api["max_tokens"]),
+                "max_tokens": _effective_max_tokens(api, max_tokens),
                 "temperature": float(api["temperature"]) if temperature is None else temperature,
             }
+            extra_body: dict[str, Any] = {}
+            if api.get("group"):
+                extra_body["group"] = str(api.get("group"))
+            if api.get("top_p") is not None:
+                request["top_p"] = float(api.get("top_p"))
+            if api.get("frequency_penalty") is not None:
+                request["frequency_penalty"] = float(api.get("frequency_penalty"))
+            if api.get("presence_penalty") is not None:
+                request["presence_penalty"] = float(api.get("presence_penalty"))
+            if extra_body:
+                request["extra_body"] = extra_body
             if use_response_format:
                 request["response_format"] = {"type": "json_object"}
             stream = bool(api.get("stream", False))
             if stream:
                 request["stream"] = True
+            _throttle_request_start(paths, api)
             if hasattr(client, "create_completion"):
                 resp = client.create_completion(**request)
             else:
@@ -454,7 +518,7 @@ def call_llm(
                     log(
                         paths,
                         f"Stream cut off but salvaging partial content "
-                        f"attempt={attempt + 1}/6 chunks={chunk_count} "
+                        f"attempt={attempt + 1}/{max_attempts} chunks={chunk_count} "
                         f"content_chars={len(content)} elapsed={elapsed:.1f}s reason={stream_timeout_reason}",
                     )
                     stream_timeout_reason = None
@@ -464,7 +528,7 @@ def call_llm(
                     log(
                         paths,
                         "LLM content empty but reasoning_content present, using reasoning fallback "
-                        f"attempt={attempt + 1}/6 chunks={chunk_count} finish={finish_reason} "
+                        f"attempt={attempt + 1}/{max_attempts} chunks={chunk_count} finish={finish_reason} "
                         f"reasoning_chars={sum(len(p) for p in reasoning_parts)} "
                         f"elapsed={elapsed:.1f}s prompt_chars={total_chars} max_tokens={request['max_tokens']}",
                     )
@@ -473,7 +537,7 @@ def call_llm(
                     log(
                         paths,
                         "LLM returned empty streamed response "
-                        f"attempt={attempt + 1}/6 chunks={chunk_count} finish={finish_reason} "
+                        f"attempt={attempt + 1}/{max_attempts} chunks={chunk_count} finish={finish_reason} "
                         f"elapsed={elapsed:.1f}s prompt_chars={total_chars} max_tokens={request['max_tokens']}",
                     )
             else:
@@ -483,7 +547,7 @@ def call_llm(
                 wait = _backoff_wait(attempt)
                 log(
                     paths,
-                    f"LLM returned empty response attempt={attempt + 1}/6 wait={wait:.1f}s "
+                    f"LLM returned empty response attempt={attempt + 1}/{max_attempts} wait={wait:.1f}s "
                     f"stream={stream} elapsed={elapsed:.1f}s prompt_chars={total_chars} max_tokens={request['max_tokens']}",
                 )
                 time.sleep(wait)
@@ -492,7 +556,7 @@ def call_llm(
                 wait = _backoff_wait(attempt)
                 log(
                     paths,
-                    f"LLM returned refusal-like response attempt={attempt + 1}/6 wait={wait:.1f}s "
+                    f"LLM returned refusal-like response attempt={attempt + 1}/{max_attempts} wait={wait:.1f}s "
                     f"len={len(content.strip())} preview={content.strip()[:120]!r}",
                 )
                 time.sleep(wait)
@@ -503,11 +567,15 @@ def call_llm(
                 use_response_format = False
                 log(paths, f"JSON response_format unsupported, retrying without it: {exc}")
                 continue
+            if _looks_like_nonretryable_block(exc):
+                elapsed = time.perf_counter() - started
+                log(paths, f"LLM call blocked by provider; not retrying elapsed={elapsed:.1f}s error={exc}")
+                raise RuntimeError(f"LLM provider blocked the request: {exc}") from exc
             wait = _backoff_wait(attempt, exc)
             elapsed = time.perf_counter() - started
-            log(paths, f"LLM call failed attempt={attempt + 1}/6 wait={wait:.1f}s elapsed={elapsed:.1f}s error={exc}")
+            log(paths, f"LLM call failed attempt={attempt + 1}/{max_attempts} wait={wait:.1f}s elapsed={elapsed:.1f}s error={exc}")
             time.sleep(wait)
-    raise RuntimeError("LLM call failed after 6 attempts")
+    raise RuntimeError(f"LLM call failed after {max_attempts} attempts")
 
 def _looks_like_response_format_error(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
@@ -517,6 +585,16 @@ def _looks_like_response_format_error(exc: Exception) -> bool:
         and "response_format" in text
         or "response_format" in text
         and any(word in text for word in ["unsupported", "not support", "unknown", "invalid", "extra"])
+    )
+
+def _looks_like_nonretryable_block(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    return (
+        status_code in {401, 403}
+        or "request was blocked" in text
+        or "permissiondenied" in text
+        or "permission denied" in text
     )
 
 def load_json_with_repair(

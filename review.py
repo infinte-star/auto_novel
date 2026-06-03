@@ -27,6 +27,12 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
 {
   "score": 1-10,
+  "readthrough_score": 1-10,
+  "hook_score": 1-10,
+  "payoff_score": 1-10,
+  "novelty_score": 1-10,
+  "prose_score": 1-10,
+  "continuity_score": 1-10,
   "accepted": true,
   "problems": [],
   "fixes": [],
@@ -34,6 +40,7 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
   "rhythm_risks": [],
   "reader_fatigue_risks": [],
   "hook_strength": 1-10,
+  "aesthetic_score": 1-10,
   "style_audit": {"em_dash_per_kchar": 0.0, "fragment_line_ratio": 0.0, "has_full_dialogue": true},
   "beats_audit": [{"beat":"...", "status":"realized|partial|absent", "evidence":"引文或备注"}],
   "contradictions": [{"fact":"被违背的既定事实", "prose":"引用章节中违背它的 6-20 字原文", "severity":"hard|soft"}],
@@ -61,12 +68,32 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
 - 5.5-7：可读但有明显短板（节拍缺失、兑现空洞、文体偏弱）。
 - <=5：存在结构性或可读性问题，需要重写。
 
+## 爆款/追读拆分评分（必须先于总分）
+除总分 score 外，必须单独给出以下 5 个维度，后续流程会用它们判断是否需要重规划，而不是只相信综合分：
+- readthrough_score：读者读完本章后继续点下一章的欲望；看具体未解问题、情绪悬念、下一章承诺。
+- payoff_score：本章是否给了清晰、挣来的兑现/爽点/情绪收益，而不是纯铺垫。
+- novelty_score：相对最近章节，场景、信息源、冲突类型、章末手法是否有新鲜变化。
+- prose_score：正文可读性、语言质感、对话、意象、节奏；不要把设定正确当作文笔好。
+- continuity_score：事实、时间线、人物知识、资源流转、因果闭合程度。
+hook_score 与 hook_strength 可以相同，但若章末问题笼统或近期重复，hook_score 必须低于 7。
+score 是综合质量，不得掩盖 readthrough/payoff/novelty 的短板；若任一追读相关维度低于 6.5，score 原则上不应超过 8。
+
 ## 文风客观自检（必填，且必须先于评分）
 在打分之前，先填写 "style_audit"：逐字统计本章正文，给出
 - em_dash_per_kchar：破折号（——）出现次数 ÷（正文字数/1000），保留一位小数；
 - fragment_line_ratio：不含主谓宾的碎片化短句/断行 占全部句行的比例（0-1）；
 - has_full_dialogue：本章是否含有正常成句的人物对话（true/false）。
 **硬上限规则（不可通过任何加分绕过）**：若正文出现"句子——状态——状态"式破折号串联碎句、单词短句堆叠、无标点舞台提示式断行，或 em_dash_per_kchar≥6，或 fragment_line_ratio≥0.35，或 has_full_dialogue=false，则本章 base 分上限为 5.5，且最终 score 禁止给出 7 以上。这是严重的"非小说"文风缺陷，不是风格。
+
+## 审美与品味评估（必填 aesthetic_score，独立于 score 单列 1-10）
+在打分前，独立评估本章的文学审美水准，给出 aesthetic_score：
+- 语言质感：动词是否精准有力？是否依赖程度副词（"非常""极其"）和贴标签式形容词（"震撼""绝望"）撑场面？
+- 意象与潜台词：是否有承载情绪的具体物象/意象？对白是否有言外之意，还是直白喊话？
+- 克制与留白：情绪点是否点到为止、给读者回味？还是把话说尽、替读者下结论？
+- 比喻新鲜度：比喻是否贴切且未被用滥？是否出现"时间仿佛静止""心如刀绞""美得像画"等陈词滥调？
+- 节奏韵律：长短句、缓急段是否有呼吸感？还是通篇一个语速、句式单调？
+- 腔调统一与辨识度：叙事声音是否稳定、有"只此一处"的质感？还是泛泛的网文流水账？
+aesthetic_score 锚点：9-10 文笔出众有记忆点；7-8 干净有质感但不惊艳；5-6 通顺但平庸、套话偏多；<=4 文笔粗糙、陈词滥调成堆。
 
 先从一个反映原始功力（写作质量、场景具体度、对话、情感兑现、**文风是否流畅可读**）的基础分起步。
 然后按以下软性惩罚扣分：
@@ -80,12 +107,14 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
 - 幻觉实体（被当作已确立、却不在既定事实中、且本章也未合理引入的人名/地名/物品）：每个 -0.7；记入 "hallucinated_entities"。
 - 人物口吻/立场偏移（仅当提供了 "## 人物声音基线" 区块时）：某个焦点人物在无页面理由的情况下其行为或言语与基线立场/口吻/目标矛盾：每个 -0.5（总计上限 -1.0）；逐条记入 "character_voice_drift"。未提供基线区块时，"character_voice_drift" 留空。
 - 文体退化：正文出现破折号（——）串联碎句、单词短句堆叠、无标点舞台提示式断行、几乎无完整对话等"非小说"文风：每类 -1.0（总计上限 -3.0）。这是严重缺陷，不是风格。
+- 审美贫乏（依据上方 aesthetic_score）：陈词滥调/万能比喻成堆、贴标签式形容词与程度副词撑场面、句式单调无韵律、叙事腔调泛泛如流水账——视严重程度 -0.3 到 -1.0（总计上限 -1.5）。
 
 扣分后再施加加分（叠加，总计上限 +1.5）：
 - 所有大纲节拍都以具体的页面动作实现：+0.5
 - 在页面上解决了先前反馈、同时保持张力与追读欲：+0.7
 - 场景调度与章末手法相对最近 3 章有区分度：+0.3
 - 主角有可见代价/能动时刻且带情感质地：+0.3
+- 文笔出众（aesthetic_score≥8.5）：语言有质感、意象精准、克制有留白、比喻新鲜、有辨识度：+0.5
 
 最终分数钳制到 [1.0, 10.0]。9.0+ 仅保留给没有关键扣分项的章节。
 
@@ -191,6 +220,33 @@ STAGE_REVIEW_SYSTEM = """你是连载中文网文的长周期质量评估者。
   ]
 }"""
 
+PACK_REVIEW_SYSTEM = """你是连载网文的 10 章包追读编辑。
+只返回恰好一个合法 JSON 对象，不要输出其它内容。
+你评估的不是单章文笔，而是这个窗口是否形成可持续追读。
+
+schema:
+{
+  "window_summary": "这组章节的读者体验概括",
+  "readthrough_curve": "追读曲线：哪里上升、哪里掉速",
+  "payoff_ledger": {
+    "opened_promises": ["新开的读者承诺"],
+    "paid_off_promises": ["已经兑现的承诺"],
+    "overdue_promises": ["拖欠或快拖欠的承诺"]
+  },
+  "repetition_patterns": ["重复的场景/信息源/章末手法/解决方式"],
+  "drop_off_risks": ["会导致读者弃书的具体风险"],
+  "next_10_directives": ["接下来10章必须执行的具体指令"],
+  "constraints": [
+    {"type": "avoid|require|replan|recover_thread", "description": "...", "priority": 1-10, "expires_in_chapters": 10}
+  ]
+}
+
+评审重点：
+- 这10章是否每 2-3 章至少有一次明确情绪收益/爽点兑现。
+- 是否出现只开承诺、不兑现承诺。
+- 是否同一场景、同一信息源、同一章末手法反复使用。
+- 接下来10章应该关闭哪些账、升级哪些冲突、换哪些场景。"""
+
 REPLAN_SYSTEM = """你是长篇小说引擎的战略重规划者。
 当前卷纲在质量指标上已经下滑。请分析当前状态、近期走势、已开启伏线与重复模式。
 为接下来的 40-60 章产出一份修订后的 volume_plan，要求：
@@ -238,6 +294,15 @@ VOICES_TABLE_SYSTEM = """你负责维护一部长篇小说的人物声音表。
 - 保留所有既有人物；细化而非删除。
 输出完整更新版 voices.md，用中文，仅 markdown。小节结构与输入一致。"""
 
+
+def _platform_guidance(config: dict[str, Any]) -> str:
+    try:
+        from benchmark import platform_guidance
+
+        return platform_guidance(config)
+    except Exception:
+        return "通用网文读者：开篇卖点清晰、章节推进稳定、承诺及时兑现、重复模式不过度。"
+
 def review_chapter(
     client: OpenAI,
     paths: Paths,
@@ -256,6 +321,10 @@ def review_chapter(
     preset_hint = {
         "xuanhuan_shuang": "本作为穿越爽文：payoff 维度应额外考量本章是否有明确的爽点兑现（兑现/打脸/翻盘/掌权），节奏是否够紧；但爽点须有铺垫与代价，无脑碾压应扣分。若下方 Rhythm Diagnostics 报告了爽点拖欠（chapters_since_payoff >= payoff_max_gap）而本章仍未给出兑现类 payoff，额外 -0.5。",
         "history": "本作为历史厚重题材：重视制度细节、政治博弈的真实约束与因果链的严谨。",
+        "system_stream": "本作为系统流：payoff 维度应额外考量本章是否有可见的系统反馈（面板/任务/奖励/数值升级/解锁），成长是否有节奏感与成就感；同时审查系统能力是否有代价与限制，是否出现无脑刷数值或金手指降智解题，若有应扣分。若本章完全没有任何系统侧反馈，hook 与 payoff 维度各 -0.5。",
+        "urban_ability": "本作为都市异能/重生题材：payoff 维度应额外考量本章是否有打脸/资源碾压/身份反差的爽点兑现，且打脸须有铺垫与对手的合理反应；若对手或配角降智捧哏、爽点凭空降临、缺乏代入感，应扣分。",
+        "romance_female": "本作为女频言情/宠文：核心是情绪张力与关系弧推进（拉近/误会/和解/甜虐节奏）。审查男女主对手戏是否有潜台词与化学反应，情绪是否由具体事件支撑而非悬浮；若出现工具人配角、情绪空转或关系毫无推进，应扣分。",
+        "wanzu_xuanhuan": "本作为现代玄幻/万族争锋：审查境界/战力体系是否清晰可预期，斗法是否有画面感与天骄争锋的张力；力量解题须正比于此前规则铺垫（Sanderson 第一/二定律），凭空开挂或体系自相矛盾应扣分。",
     }.get(preset, "")
     factcheck_enabled = bool(config["novel"].get("factcheck_enabled", True))
     if factcheck_enabled:
@@ -271,7 +340,7 @@ def review_chapter(
     # Character voice baseline: cross-chapter stance/voice consistency check.
     # Enabled by default for the 爽文 preset; long novel opts in via config to
     # avoid false positives until the signal is validated.
-    voice_check_default = preset == "xuanhuan_shuang"
+    voice_check_default = preset in {"xuanhuan_shuang", "romance_female", "urban_ability"}
     voice_check = bool(config["novel"].get("character_voice_check", voice_check_default))
     voice_block = "None"
     if voice_check:
@@ -282,8 +351,24 @@ def review_chapter(
                 voice_block = json.dumps(notes, ensure_ascii=False, indent=2)
         except Exception:
             voice_block = "None"
+    opening_chapters = int(config["novel"].get("opening_chapters", 3))
+    opening_strict = bool(config["novel"].get("opening_review_strict", True))
+    opening_block = ""
+    if opening_strict and chapter_num <= opening_chapters:
+        opening_block = (
+            "## 开篇专项评审（黄金三章，弃书率最高）\n"
+            "本章属于开篇前几章，请额外按以下要点严格评审，并把不足写入 problems / writer_directives_for_next_chapter：\n"
+            "- 钩子是否够快够强：核心冲突或悬念是否在开篇极短篇幅内抛出，而非缓慢铺垫。\n"
+            "- 金手指/主角核心反差是否已经亮相或强烈预示，读者能否立刻感知本书卖点。\n"
+            "- 代入感：主角目标、处境、情绪是否清晰，读者是否有理由继续读。\n"
+            "- 信息密度：是否在抓人的同时高效给出信息，而非堆砌世界观设定拖慢节奏。\n"
+            "- 若钩子偏弱、金手指迟迟不亮相、或开篇大段铺设定，hook_strength 应明显压低并在 problems 指出。\n\n"
+        )
     user = f"""## 风格预设：{preset}
 {preset_hint}
+
+{opening_block}## 平台/读者画像
+{_platform_guidance(config)}
 
 ## 记忆
 {mem}
@@ -329,6 +414,13 @@ def review_chapter(
             "rhythm_risks": [],
             "reader_fatigue_risks": [],
             "hook_strength": 6,
+            "readthrough_score": 5,
+            "hook_score": 6,
+            "payoff_score": 5,
+            "novelty_score": 5,
+            "prose_score": 5,
+            "continuity_score": 5,
+            "aesthetic_score": 6,
             "style_audit": {"em_dash_per_kchar": 0.0, "fragment_line_ratio": 0.0, "has_full_dialogue": True},
             "contradictions": [],
             "hallucinated_entities": [],
@@ -337,6 +429,25 @@ def review_chapter(
         },
     )
     report["score"] = safe_score(report.get("score", 0))
+    report["aesthetic_score"] = safe_score(report.get("aesthetic_score", report["score"]))
+    report["hook_strength"] = safe_score(report.get("hook_strength", 0))
+    report["readthrough_score"] = safe_score(report.get("readthrough_score", report.get("reader_score", report["score"])))
+    report["hook_score"] = safe_score(report.get("hook_score", report.get("hook_strength", report["score"])))
+    report["payoff_score"] = safe_score(report.get("payoff_score", report["score"]))
+    report["novelty_score"] = safe_score(report.get("novelty_score", report.get("novelty", report["score"])))
+    report["prose_score"] = safe_score(report.get("prose_score", report.get("aesthetic_score", report["score"])))
+    report["continuity_score"] = safe_score(report.get("continuity_score", report["score"]))
+    market_floor = min(
+        report["readthrough_score"],
+        report["hook_score"],
+        report["payoff_score"],
+        report["novelty_score"],
+    )
+    if market_floor < 6.5 and report["score"] > 8.0:
+        report["score"] = 8.0
+        report.setdefault("problems", []).append(
+            "MARKET: 追读/兑现/新鲜度存在短板，综合分已按爆款维度上限压低。"
+        )
     report.setdefault("contradictions", [])
     report.setdefault("hallucinated_entities", [])
     report.setdefault("character_voice_drift", [])
@@ -484,6 +595,73 @@ def stage_review(
         refresh_voice_anchors(client, paths, conn, config, chapter_num, recent_text="\n\n".join(recent))
     except Exception as exc:
         log(paths, f"Voice anchor refresh failed at Ch{chapter_num}: {exc}")
+
+
+def pack_review(
+    client: OpenAI,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+) -> None:
+    pack_size = int(config["novel"].get("pack_review_every", 10))
+    start = max(1, chapter_num - pack_size + 1)
+    recent = []
+    for num in range(start, chapter_num + 1):
+        text = read_text(chapter_path(paths, num))
+        if text:
+            recent.append(f"## Ch{num}\n{text[:2200]}")
+    if not recent:
+        return
+    try:
+        from store import get_reader_promises
+
+        promises = get_reader_promises(conn, chapter_num, limit=20)
+    except Exception:
+        promises = []
+    user = f"""## 平台/读者画像
+{_platform_guidance(config)}
+
+## 记忆
+{memory_context(paths, conn, config)}
+
+## 读者承诺账本
+{json.dumps(promises, ensure_ascii=False, indent=2) if promises else "None"}
+
+## 近期指标
+{json.dumps(recent_metrics(conn, pack_size), ensure_ascii=False, indent=2)}
+
+## 待评审章节 Ch{start}-{chapter_num}
+{chr(10).join(recent)}
+"""
+    raw = call_llm(client, paths, config, PACK_REVIEW_SYSTEM, json_prompt(user), max_tokens=16000, temperature=0.25)
+    data = load_json_with_repair(client, paths, config, raw, fallback={})
+    append_text(
+        paths.logs_dir / "pack_reviews.md",
+        f"\n\n# 第{start}-{chapter_num}章 10章包追读审校\n\n{json.dumps(data, ensure_ascii=False, indent=2)}\n",
+    )
+    db_event(conn, chapter_num, "pack_review", {"review": data})
+    directives = data.get("next_10_directives") if isinstance(data, dict) else []
+    if isinstance(directives, list) and directives:
+        try:
+            from checkpoint import load_checkpoint as _load, save_checkpoint as _save
+
+            existing = _load(paths, chapter_num, "final_review.json")
+            if isinstance(existing, dict):
+                merged = list(existing.get("writer_directives_for_next_chapter") or [])
+                for d in directives:
+                    s = str(d).strip()
+                    if s and s not in merged:
+                        merged.append(s)
+                existing["writer_directives_for_next_chapter"] = merged[:12]
+                _save(paths, chapter_num, "final_review.json", existing)
+                log(paths, f"Merged {len(directives)} pack directives into Ch{chapter_num} review")
+        except Exception as exc:
+            log(paths, f"Failed to merge pack directives into Ch{chapter_num} review: {exc}")
+    constraints = data.get("constraints") if isinstance(data, dict) else []
+    if isinstance(constraints, list) and constraints:
+        store_stage_constraints(conn, chapter_num, constraints)
+        log(paths, f"Stored {len(constraints)} pack constraints from Ch{chapter_num} review")
 
 
 def refresh_voice_anchors(

@@ -8,6 +8,7 @@ simultaneously without sharing the engine's process-level global state
 
 Subcommands:
     python novel.py create <name>            scaffold novels/<name>/ from templates
+    python novel.py trial <name>             generate opening trial variants without touching chapters/book
     python novel.py run <name>               run the pipeline (background, detached)
     python novel.py run <name> --foreground  run in the current console
     python novel.py list                     list all novels + progress + running state
@@ -21,6 +22,7 @@ another novel's process.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -123,6 +125,127 @@ def _run_inprocess(name: str) -> int:
     from pipeline import main  # noqa: E402  (must import after env vars are set)
 
     main()
+    return 0
+
+
+def _set_novel_env(name: str) -> tuple[Path, Path]:
+    target = novel_dir(name)
+    config_path = target / "config.yaml"
+    prompt_path = target / "prompt.md"
+    if not config_path.exists():
+        print(f"[novel] ERROR: {config_path} not found. Run `python novel.py create {name}` first.")
+        raise SystemExit(2)
+    os.environ["NOVEL_CONFIG"] = str(config_path.relative_to(PROJECT_DIR))
+    os.environ["NOVEL_PROMPT"] = str(prompt_path.relative_to(PROJECT_DIR))
+    return config_path, prompt_path
+
+
+def cmd_trial(name: str, variants: int | None, chapters: int | None) -> int:
+    _validate_name(name)
+    _set_novel_env(name)
+    from trial import run_opening_trial  # noqa: E402
+
+    out = run_opening_trial(variants=variants, chapters=chapters)
+    print(f"[novel] opening trial complete: {out}")
+    print(f"[novel] best route: {out / 'best_opening_route.md'}")
+    return 0
+
+
+def cmd_adopt_trial(name: str, trial_id: str | None) -> int:
+    _validate_name(name)
+    target = novel_dir(name)
+    trials_dir = target / "logs" / "opening_trials"
+    if not trials_dir.exists():
+        print(f"[novel] ERROR: no opening_trials found for '{name}'. Run `python novel.py trial {name}` first.")
+        return 2
+    if trial_id:
+        trial_root = trials_dir / trial_id
+    else:
+        trials = sorted((p for p in trials_dir.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not trials:
+            print(f"[novel] ERROR: no trial directories found under {trials_dir}")
+            return 2
+        trial_root = trials[0]
+    summary_path = trial_root / "summary.json"
+    best_md_path = trial_root / "best_opening_route.md"
+    if not summary_path.exists() or not best_md_path.exists():
+        print(f"[novel] ERROR: incomplete trial output: {trial_root}")
+        return 2
+    memory_dir = target / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    adopted = memory_dir / "opening_route.md"
+    adopted.write_text(best_md_path.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        (memory_dir / "opening_route.json").write_text(
+            json.dumps(summary.get("best_variant", summary), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    print(f"[novel] adopted trial route: {trial_root}")
+    print(f"[novel] wrote: {adopted}")
+    return 0
+
+
+def _benchmark_root() -> Path:
+    return PROJECT_DIR / "benchmarks"
+
+
+def cmd_benchmark_list(platform: str | None, style: str | None) -> int:
+    root = _benchmark_root()
+    if platform:
+        root = root / platform
+    if style:
+        root = root / style
+    if not root.exists():
+        print(f"[benchmark] no samples under {root}")
+        return 0
+    files = sorted(
+        p for p in root.rglob("*")
+        if p.suffix.lower() in {".json", ".md", ".txt"} and not p.name.lower().startswith("readme.")
+    )
+    if not files:
+        print(f"[benchmark] no samples under {root}")
+        return 0
+    for p in files:
+        rel = p.relative_to(_benchmark_root())
+        print(f"{rel}\t{p.stat().st_size} bytes")
+    return 0
+
+
+def cmd_benchmark_add(platform: str, style: str, source: str, title: str | None) -> int:
+    src = Path(source)
+    if not src.exists() or not src.is_file():
+        print(f"[benchmark] ERROR: source file not found: {src}")
+        return 2
+    out_dir = _benchmark_root() / platform / style
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in (title or src.stem)).strip("_") or src.stem
+    if src.suffix.lower() == ".json":
+        try:
+            data = json.loads(src.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[benchmark] ERROR: invalid json: {exc}")
+            return 2
+        data.setdefault("title", title or src.stem)
+        out = out_dir / f"{safe_name}.json"
+        out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        text = src.read_text(encoding="utf-8", errors="replace")
+        out = out_dir / f"{safe_name}.json"
+        payload = {
+            "title": title or src.stem,
+            "summary": "",
+            "opening": "",
+            "chapter_1": "",
+            "chapter_3": "",
+            "payoff_pattern": "",
+            "notes": text[:4000],
+            "source_note": f"Imported structural notes from {src.name}; keep this as summary/analysis, not full copyrighted prose.",
+        }
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[benchmark] added: {out}")
     return 0
 
 
@@ -450,6 +573,26 @@ def main() -> int:
     p_create = sub.add_parser("create", help="scaffold a new novel directory")
     p_create.add_argument("name")
 
+    p_trial = sub.add_parser("trial", help="generate opening trial variants without touching chapters/book")
+    p_trial.add_argument("name")
+    p_trial.add_argument("--variants", type=int, default=None, help="number of opening variants to generate")
+    p_trial.add_argument("--chapters", type=int, default=None, help="chapters per variant")
+
+    p_adopt = sub.add_parser("adopt-trial", help="adopt a trial's best opening route into memory/opening_route.md")
+    p_adopt.add_argument("name")
+    p_adopt.add_argument("trial_id", nargs="?", help="trial directory id; defaults to latest")
+
+    p_bench = sub.add_parser("benchmark", help="manage local benchmark samples")
+    bench_sub = p_bench.add_subparsers(dest="benchmark_command", required=True)
+    p_bench_list = bench_sub.add_parser("list", help="list local benchmark samples")
+    p_bench_list.add_argument("--platform", default=None)
+    p_bench_list.add_argument("--style", default=None)
+    p_bench_add = bench_sub.add_parser("add", help="add a structured benchmark sample")
+    p_bench_add.add_argument("platform")
+    p_bench_add.add_argument("style")
+    p_bench_add.add_argument("source")
+    p_bench_add.add_argument("--title", default=None)
+
     p_run = sub.add_parser("run", help="run the pipeline for a novel")
     p_run.add_argument("name")
     p_run.add_argument("--foreground", action="store_true", help="run in the current console instead of detaching")
@@ -468,6 +611,15 @@ def main() -> int:
 
     if args.command == "create":
         return cmd_create(args.name)
+    if args.command == "trial":
+        return cmd_trial(args.name, variants=args.variants, chapters=args.chapters)
+    if args.command == "adopt-trial":
+        return cmd_adopt_trial(args.name, trial_id=args.trial_id)
+    if args.command == "benchmark":
+        if args.benchmark_command == "list":
+            return cmd_benchmark_list(platform=args.platform, style=args.style)
+        if args.benchmark_command == "add":
+            return cmd_benchmark_add(args.platform, args.style, args.source, title=args.title)
     if args.command == "run":
         return cmd_run(args.name, foreground=args.foreground)
     if args.command == "list":

@@ -35,6 +35,9 @@ python novel.py list
 | 命令 | 说明 |
 | --- | --- |
 | `python novel.py create <名字>` | 从模板创建 `novels/<名字>/`，含 `config.yaml`（路径已自动指向本目录）和待填写的 `prompt.md` |
+| `python novel.py trial <名字>` | 生成多条开篇试写路线（默认 3 条 × 3 章），输出到 `logs/opening_trials/`，不污染正式 `chapters/` / `book.md` |
+| `python novel.py adopt-trial <名字> [trial_id]` | 采纳某次 trial 的最佳开篇路线，写入 `memory/opening_route.md`，正式生成时优先遵循 |
+| `python novel.py benchmark list/add ...` | 管理本地爆款样本库，样本用于结构召回，不复制正文 |
 | `python novel.py run <名字>` | 后台分离进程运行流水线，自动从上次断点续写 |
 | `python novel.py run <名字> --foreground` | 前台运行（attach 当前控制台，便于调试） |
 | `python novel.py list` | 列出所有小说：章节数 / 字数 / 是否在跑 / 最新日志行 |
@@ -135,7 +138,16 @@ run.py  restart.py  start_pipeline.bat  restart.bat
 - `max_chapters` — 章节数硬上限（0 或不写 = 不限，仅按字数停）
 - `quality_threshold` — 章节质量分阈值（评审低于此分会触发修订）
 - `candidate_plans` / `candidate_chapters` — 并行候选方案/草稿数（择优）
-- `style_preset` — 文风预设（如 `history` / `xuanhuan_shuang`）
+- `style_preset` — 题材预设，驱动写作/评审/精调的题材化提示词：`history`（历史厚重）/ `xuanhuan_shuang`（穿越爽文）/ `system_stream`（系统流）/ `urban_ability`（都市异能·重生）/ `romance_female`（女频言情·宠文）/ `wanzu_xuanhuan`（现代玄幻·万族）
+- `creative_boost_enabled` — bootstrap 阶段一次性 AI 创意增强（跨题材联想注入新颖金手指/人设梗/开篇钩子，默认开）
+- `opening_chapters` / `opening_hook_strength_min` / `opening_review_strict` — 开篇黄金三章特化（写作注入强钩子规则 + 更高 hook 阈值 + 更严评审）
+- `opening_trial_variants` / `opening_trial_chapters` — `trial` 命令的默认开篇试写数量与每条路线章数
+- `replan_on_low_quality` — 章节低于阈值时，先重做大纲并重写一次，而不是只补丁修到勉强通过
+- `platform_preset` — 平台/读者画像：`general` / `qidian_male` / `fanqie_free` / `jinjiang_female` / `qimao_free`
+- `benchmark_enabled` / `benchmark_dir` / `benchmark_top_k` — 本地爆款样本库召回，默认读取 `benchmarks/`
+- `pack_review_enabled` / `pack_review_every` — 10章包追读审校，检查承诺账本、爽点兑现、重复疲劳
+- `pack_review_barrier` / `stage_review_barrier` — 上一包/上一阶段审校未完成时，下一章规划前等待其完成
+- `memory_*_chars` — 各记忆层读取上限，避免长期文件膨胀污染上下文
 - `refine_after_complete` — 是否完成后自动精修
 
 **质量护栏开关（`novel:` 段，默认开启）**
@@ -145,9 +157,26 @@ run.py  restart.py  start_pipeline.bat  restart.bat
 - `cold_reader_enabled` / `cold_reader_every` — 独立冷读者频率
 - `macro_progress_enabled` / `macro_progress_every` / `macro_progress_stall_threshold` — 宏观推进度量
 - `scene_dedupe_enabled` / `scene_dedupe_sim_warn` — 场景去重相似度阈值
+- `scene_dedupe_sim_block` / `scene_dedupe_force_retry` — 场景骨架高度重复时硬性触发重规划
 - `rag_enabled` / `rag_top_k` / `rag_exclude_recent` — 检索式记忆
 - `voice_refresh_skip_penalty` — 检出塌缩时跳过 voice 刷新的扣分阈值
 - `adaptive_downshift_enabled` / `_score` / `_window` / `_warmup` — 自适应降档
+
+**爆款样本库**
+- 样本放到 `benchmarks/<platform>/<style>/`，支持 `.md` / `.txt` / `.json`
+- 只放结构摘要、开篇模式、兑现节奏、禁忌，不要放未经授权的整章正文
+- 生成大纲/正文时会自动召回相近样本，作为结构参照而非文本模仿
+- 可用 `python novel.py benchmark add qidian_male history path/to/sample.json` 导入结构化样本
+
+**读者承诺账本**
+- 事件抽取会把 `thread_type: reader_promise` 同步到独立账本
+- 后续规划会看到活跃/逾期承诺，减少“只开钩子不兑现”
+- 每 `pack_review_every` 章会做一次包评审，输出到 `logs/pack_reviews.md`
+
+**开篇路线采纳**
+- `trial` 只试写，不污染正式正文
+- `adopt-trial` 会把最佳路线写到 `memory/opening_route.md`
+- 后续规划/写作会把该路线作为高优先级约束，并自动刷新 prompt cache
 
 **`api:` 段**
 - `base_url` / `model` — 端点与模型

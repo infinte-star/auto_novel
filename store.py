@@ -25,6 +25,7 @@ class JsonStoryStore:
                     "chapter_metrics": {},
                     "entities": {},
                     "open_threads": {},
+                    "reader_promises": {},
                     "agent_reports": [],
                 }
             )
@@ -99,6 +100,22 @@ class JsonStoryStore:
         }
         self._write(data)
 
+    def upsert_reader_promise(self, promise_id: str, promise: dict[str, Any], chapter: int) -> None:
+        data = self._read()
+        data.setdefault("reader_promises", {})[promise_id] = {
+            "id": promise_id,
+            "description": str(promise.get("description", "")),
+            "status": str(promise.get("status", "open")),
+            "opened_chapter": int(promise.get("opened_chapter") or promise.get("introduced_chapter") or chapter),
+            "due_chapter": promise.get("due_chapter"),
+            "emotional_type": str(promise.get("emotional_type", promise.get("thread_type", "plot"))),
+            "payoff_status": str(promise.get("payoff_status", "pending")),
+            "risk_level": int(promise.get("risk_level", 5) or 5),
+            "updated_chapter": chapter,
+            "payload": promise.get("payload", {}),
+        }
+        self._write(data)
+
     def upsert_metrics(self, chapter: int, metrics: dict[str, Any]) -> None:
         data = self._read()
         data.setdefault("chapter_metrics", {})[str(chapter)] = metrics
@@ -125,6 +142,12 @@ def init_db(paths: Paths) -> Any:
                 chapter INTEGER PRIMARY KEY,
                 title TEXT,
                 score REAL,
+                readthrough_score REAL,
+                hook_score REAL,
+                payoff_score REAL,
+                novelty_score REAL,
+                prose_score REAL,
+                continuity_score REAL,
                 plan_score REAL,
                 payoff_type TEXT,
                 conflict_type TEXT,
@@ -150,6 +173,19 @@ def init_db(paths: Paths) -> Any:
                 due_chapter INTEGER,
                 updated_chapter INTEGER,
                 payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reader_promises (
+                id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                opened_chapter INTEGER NOT NULL,
+                due_chapter INTEGER,
+                emotional_type TEXT,
+                payoff_status TEXT,
+                risk_level INTEGER DEFAULT 5,
+                updated_chapter INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agent_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +225,19 @@ def init_db(paths: Paths) -> Any:
             conn.commit()
         except Exception:
             pass
+        for column in (
+            "readthrough_score REAL",
+            "hook_score REAL",
+            "payoff_score REAL",
+            "novelty_score REAL",
+            "prose_score REAL",
+            "continuity_score REAL",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
+                conn.commit()
+            except Exception:
+                pass
         return conn
     except Exception:
         return JsonStoryStore(paths.logs_dir / "story_state.json")
@@ -284,6 +333,79 @@ def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]])
             ),
         )
     conn.commit()
+
+def upsert_reader_promise(conn: Any, chapter_num: int, promise: dict[str, Any]) -> None:
+    promise_id = str(
+        promise.get("id")
+        or promise.get("thread_id")
+        or f"promise-ch{chapter_num}-{abs(hash(json.dumps(promise, ensure_ascii=False))) % 100000}"
+    )
+    if isinstance(conn, JsonStoryStore):
+        conn.upsert_reader_promise(promise_id, promise, chapter_num)
+        return
+    conn.execute(
+        """
+        INSERT INTO reader_promises(
+            id, description, status, opened_chapter, due_chapter, emotional_type,
+            payoff_status, risk_level, updated_chapter, payload_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            description=excluded.description,
+            status=excluded.status,
+            due_chapter=excluded.due_chapter,
+            emotional_type=excluded.emotional_type,
+            payoff_status=excluded.payoff_status,
+            risk_level=excluded.risk_level,
+            updated_chapter=excluded.updated_chapter,
+            payload_json=excluded.payload_json
+        """,
+        (
+            promise_id,
+            str(promise.get("description", "")),
+            str(promise.get("status", "open")),
+            int(promise.get("opened_chapter") or promise.get("introduced_chapter") or chapter_num),
+            promise.get("due_chapter"),
+            str(promise.get("emotional_type", promise.get("thread_type", "plot"))),
+            str(promise.get("payoff_status", "pending")),
+            int(promise.get("risk_level", 5) or 5),
+            chapter_num,
+            json.dumps(promise.get("payload", {}), ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+
+def get_reader_promises(conn: Any, chapter_num: int, limit: int = 12) -> list[dict[str, Any]]:
+    if isinstance(conn, JsonStoryStore):
+        rows = []
+        for p in conn._read().get("reader_promises", {}).values():
+            if str(p.get("status", "open")) not in {"open", "advanced"}:
+                continue
+            due = p.get("due_chapter")
+            overdue_by = chapter_num - int(due) if due is not None and int(due) < chapter_num else 0
+            rows.append({**p, "overdue_by": overdue_by})
+        rows.sort(key=lambda x: (-(int(x.get("risk_level", 5) or 5)), -int(x.get("overdue_by", 0) or 0)))
+        return rows[:limit]
+    try:
+        rows = conn.execute(
+            """SELECT id, description, status, opened_chapter, due_chapter, emotional_type,
+                      payoff_status, risk_level, updated_chapter
+               FROM reader_promises
+               WHERE status IN ('open','advanced')
+               ORDER BY risk_level DESC, COALESCE(due_chapter, 999999) ASC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            due = item.get("due_chapter")
+            item["overdue_by"] = chapter_num - int(due) if due is not None and int(due) < chapter_num else 0
+            out.append(item)
+        return out
+    except Exception:
+        return []
 
 def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10, limit: int = 8) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
@@ -385,6 +507,21 @@ def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, lim
     """Open threads explicitly typed as reader promises whose due_chapter has
     passed (plus an optional grace window). Sibling of get_silent_threads."""
     cutoff = chapter_num - max(0, int(grace))
+    ledger = [
+        p for p in get_reader_promises(conn, chapter_num, limit=limit * 2)
+        if p.get("due_chapter") is not None and int(p.get("due_chapter")) < cutoff
+    ]
+    if ledger:
+        return [
+            {
+                "id": p.get("id"),
+                "description": p.get("description", ""),
+                "due_chapter": int(p.get("due_chapter")),
+                "overdue_by": chapter_num - int(p.get("due_chapter")),
+                "source": "reader_promises",
+            }
+            for p in ledger[:limit]
+        ]
     if isinstance(conn, JsonStoryStore):
         out = []
         for t in conn._read().get("open_threads", {}).values():
