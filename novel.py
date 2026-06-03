@@ -392,6 +392,20 @@ def _last_chapter(chapters_dir: Path) -> int:
     return max(nums) if nums else 0
 
 
+def _read_title(nd: Path, max_len: int = 20) -> str:
+    path = nd / "title.txt"
+    if not path.exists():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            t = line.strip()
+            if t:
+                return t if len(t) <= max_len else t[:max_len] + "..."
+    except OSError:
+        return ""
+    return ""
+
+
 def cmd_list() -> int:
     if not NOVELS_DIR.exists():
         print("[novel] no novels/ directory yet. Use `python novel.py create <name>`.")
@@ -400,15 +414,16 @@ def cmd_list() -> int:
     if not novels:
         print("[novel] no novels found under novels/.")
         return 0
-    print(f"{'NAME':<24} {'CHAPTERS':>8} {'CHARS':>10}  {'RUNNING':<8} LAST LOG")
-    print("-" * 96)
+    print(f"{'NAME':<24} {'TITLE':<22} {'CHAPTERS':>8} {'CHARS':>10}  {'RUNNING':<8} LAST LOG")
+    print("-" * 112)
     for nd in novels:
         name = nd.name
+        title = _read_title(nd)
         chars = _count_chars(nd / "book.md")
         chapters = _last_chapter(nd / "chapters")
         running = "yes" if find_novel_pids(name) else "no"
         last_log = _tail_line(nd / "logs" / "run.log")
-        print(f"{name:<24} {chapters:>8} {chars:>10}  {running:<8} {last_log}")
+        print(f"{name:<24} {title:<22} {chapters:>8} {chars:>10}  {running:<8} {last_log}")
     return 0
 
 

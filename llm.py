@@ -272,34 +272,34 @@ def safe_json_loads(text: str) -> dict[str, Any]:
         return json.loads(repaired)
     raise json.JSONDecodeError(f"Could not recover JSON. Preview: {cleaned[:300]!r}", cleaned, 0)
 
-JSON_REPAIR_SYSTEM = """You repair malformed JSON from an LLM response.
-Return valid JSON only. Do not add explanations. Preserve the intended fields and values."""
+JSON_REPAIR_SYSTEM = """你负责修复 LLM 返回的格式错误的 JSON。
+只输出合法 JSON，不要添加任何解释。保留原本的字段与取值。"""
 
-JSON_OUTPUT_CONTRACT = """Output contract:
-- Return exactly one valid JSON object and nothing else.
-- The first non-whitespace character must be `{` and the last non-whitespace character must be `}`.
-- Do not use markdown headings, bullet lists, code fences, explanations, or prefaces.
-- Use double quotes for every key and string value.
-- Escape quotes inside string values.
-- Do not use trailing commas, comments, NaN, Infinity, or Python-style booleans.
-- Keep the schema keys exactly as requested; do not translate key names.
-- If uncertain, still return the requested schema with conservative values and short Chinese strings."""
+JSON_OUTPUT_CONTRACT = """输出约定：
+- 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+- 第一个非空白字符必须是 `{`，最后一个非空白字符必须是 `}`。
+- 不要使用 markdown 标题、项目符号、代码围栏、解释或开场白。
+- 每一个键名和字符串值都用英文双引号包裹。
+- 转义字符串值内部的引号。
+- 不要使用末尾逗号、注释、NaN、Infinity，或 Python 风格的布尔值。
+- 严格保留所要求的 schema 键名，键名一律用英文原样输出，不得翻译。
+- 若不确定，仍要返回所要求的 schema，取保守值，字符串用简短中文。"""
 
 def json_prompt(user: str) -> str:
-    return user.rstrip() + "\n\n## Mandatory JSON Output Contract\n" + JSON_OUTPUT_CONTRACT
+    return user.rstrip() + "\n\n## 强制 JSON 输出格式\n" + JSON_OUTPUT_CONTRACT
 
 def emergency_truncate(user_text: str, max_chars: int) -> str:
     if len(user_text) <= max_chars:
         return user_text
     sections = re.split(r"(?=^## )", user_text, flags=re.MULTILINE)
-    priority_keywords = ["Creative Brief", "Current State", "Selected Plan", "Arbitration"]
+    priority_keywords = ["创作纲要", "当前状态", "选定大纲", "仲裁约束"]
     high = []
     medium = []
     low = []
     for section in sections:
         if any(kw in section[:80] for kw in priority_keywords):
             high.append(section)
-        elif any(kw in section[:80] for kw in ["Characters", "Bible", "Volume Plan", "Threads"]):
+        elif any(kw in section[:80] for kw in ["人物", "世界设定", "卷纲", "伏线"]):
             medium.append(section)
         else:
             low.append(section)
@@ -346,7 +346,7 @@ def call_llm(
     total_chars = len(system) + len(user)
     if total_chars > max_input_chars:
         user = emergency_truncate(user, max_input_chars - len(system) - 1000)
-    wants_json = json_mode if json_mode is not None else "Mandatory JSON Output Contract" in user
+    wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
     use_response_format = wants_json and bool(api.get("json_response_format", True))
     for attempt in range(6):
         started = time.perf_counter()
@@ -539,9 +539,9 @@ def load_json_with_repair(
         if fallback is not None:
             return fallback
         raise json.JSONDecodeError("Provider refusal, not malformed JSON", raw, 0)
-    repair_prompt = f"""Repair this malformed JSON into one valid JSON object.
+    repair_prompt = f"""将下面这段格式错误的 JSON 修复为一个合法的 JSON 对象。
 
-## Malformed JSON
+## 格式错误的 JSON
 {raw[:20000]}"""
     try:
         repaired = call_llm(

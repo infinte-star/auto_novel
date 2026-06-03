@@ -24,7 +24,7 @@ from config import (
 from llm import LLMClientPool
 from memory import bootstrap, cacheable_prefix, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
 from planning import create_plan
-from review import adaptive_replan, review_chapter, should_replan, stage_review
+from review import adaptive_replan, cold_reader_review, macro_progress_check, review_chapter, should_replan, stage_review
 from store import db_event, init_db, validate_plan_continuity
 from writing import extract_events, revise_chapter, save_chapter, update_state_file, update_structured_state, write_chapter
 
@@ -441,6 +441,45 @@ def generate_one_chapter(
         stage_review(client, paths, conn, config, chapter_num)
         log(paths, f"Completed stage review Ch{chapter_num}")
 
+    def _do_cold_reader() -> None:
+        try:
+            cr = cold_reader_review(client, paths, config, chapter_num, chapter)
+            log(
+                paths,
+                f"Cold-reader Ch{chapter_num} prose={cr.get('readable_prose')}/10 "
+                f"progression={cr.get('plot_progression')}/10 verdict={cr.get('verdict')} "
+                f"problem={str(cr.get('worst_problem'))[:80]!r}",
+            )
+            db_event(conn, chapter_num, "cold_reader", cr)
+            # If the cold reader flags broken prose/progression, push a corrective
+            # directive into this chapter's review so the NEXT chapter improves.
+            bad = (
+                str(cr.get("verdict")) == "broken"
+                or safe_score(cr.get("readable_prose", 10)) < 6
+                or safe_score(cr.get("plot_progression", 10)) < 5
+            )
+            if bad:
+                try:
+                    from checkpoint import load_checkpoint as _load, save_checkpoint as _save
+                    existing = _load(paths, chapter_num, "final_review.json")
+                    if isinstance(existing, dict):
+                        wd = list(existing.get("writer_directives_for_next_chapter") or [])
+                        msg = f"冷读者警示（陌生读者视角）：{cr.get('worst_problem','')}。下一章必须针对性修正。"
+                        if msg not in wd:
+                            wd.append(msg)
+                        existing["writer_directives_for_next_chapter"] = wd[:12]
+                        _save(paths, chapter_num, "final_review.json", existing)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log(paths, f"Cold-reader review failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    def _do_macro_progress() -> None:
+        try:
+            macro_progress_check(client, paths, conn, config, chapter_num)
+        except Exception as exc:
+            log(paths, f"Macro-progress check failed (non-fatal) Ch{chapter_num}: {exc}")
+
     def _do_memory_compress() -> None:
         log(paths, f"Compressing memory files at Ch{chapter_num}")
         compress_all_memory(client, paths, config)
@@ -453,6 +492,17 @@ def generate_one_chapter(
     if background is not None:
         if run_stage_review:
             background.submit(f"stage_review_ch{chapter_num}", _do_stage_review)
+        cold_every = int(config["novel"].get("cold_reader_every", 10))
+        if bool(config["novel"].get("cold_reader_enabled", True)) and cold_every > 0 and chapter_num % cold_every == 0:
+            background.submit(f"cold_reader_ch{chapter_num}", _do_cold_reader)
+        macro_every = int(config["novel"].get("macro_progress_every", 10))
+        if (
+            bool(config["novel"].get("macro_progress_enabled", True))
+            and macro_every > 0
+            and chapter_num % macro_every == 0
+            and chapter_num >= 20
+        ):
+            background.submit(f"macro_progress_ch{chapter_num}", _do_macro_progress)
         if should_compress_memory(paths, config, chapter_num):
             background.submit(f"memory_compress_ch{chapter_num}", _do_memory_compress)
         if run_replan:
@@ -503,6 +553,17 @@ def generate_one_chapter(
     else:
         if run_stage_review:
             _do_stage_review()
+        cold_every = int(config["novel"].get("cold_reader_every", 10))
+        if bool(config["novel"].get("cold_reader_enabled", True)) and cold_every > 0 and chapter_num % cold_every == 0:
+            _do_cold_reader()
+        macro_every = int(config["novel"].get("macro_progress_every", 10))
+        if (
+            bool(config["novel"].get("macro_progress_enabled", True))
+            and macro_every > 0
+            and chapter_num % macro_every == 0
+            and chapter_num >= 20
+        ):
+            _do_macro_progress()
         if should_compress_memory(paths, config, chapter_num):
             _do_memory_compress()
         if run_replan:

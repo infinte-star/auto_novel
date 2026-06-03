@@ -16,9 +16,8 @@ directory `novels/<name>/` and runs as an independent OS process, so multiple
 novels can be written simultaneously without colliding on the engine's
 process-level global state (`config.PROMPT_FILE`, `memory._CACHEABLE_PREFIX_CACHE`).
 
-The legacy root-level long novel (history-rewrite of late-Ming Chongzhen reign,
-described in the root `prompt.md`/`config.yaml` and launched via `run.py`) is
-preserved for backward compatibility and is NOT under `novels/`.
+Every novel lives under `novels/<name>/` and is created and managed through the
+unified `novel.py` CLI — there is no other entry point.
 
 ## Multi-novel framework (`novel.py`)
 
@@ -38,7 +37,7 @@ How it works (no engine changes — pure scaffolding around the existing pipelin
   every `paths:` entry points inside `novels/<name>/`, and copies
   `prompt_template.md` to `novels/<name>/prompt.md` for the user to fill in.
 - `run` sets `NOVEL_CONFIG`/`NOVEL_PROMPT` env vars **before** importing `pipeline`
-  (same ordering constraint as the legacy `run_fusu.py` pattern), since
+  (same ordering constraint described in "Things to be careful with"), since
   `config.py` reads them at import time and `memory.py` captures `PROMPT_FILE` at
   its own import. Detached background launch prefers the project venv
   (`E:\pycharmproject\allvenv\novel\Scripts\python.exe`); override with the
@@ -56,23 +55,12 @@ shares the same keys' RPM/TPM quota unless you give each novel distinct keys.
 ```bash
 pip install -r requirements.txt        # only dependency is openai>=1.0.0
 
-# Multi-novel framework (preferred for new novels):
 python novel.py create <name>          # scaffold novels/<name>/
 python novel.py run <name>             # run detached; resumes from checkpoint
+python novel.py run <name> --foreground  # run in the current console
 python novel.py list                   # progress + running state for all novels
 python novel.py stop|restart <name>    # per-novel process control
-
-# Legacy root long-novel entry points (still work, operate on root paths):
-python run.py                          # main entry; resumes automatically from last checkpoint
-python restart.py                      # kill any running pipeline + relaunch detached
-python restart.py --foreground         # attach restart to current console
-python restart.py --kill-only          # stop the pipeline without relaunching
-python repair_stub_chapters.py         # regenerate provider-refusal stubs (run while pipeline is stopped)
-python check_token_plan_keys.py --keys-file keys.txt   # validate which api keys still work
 ```
-
-Windows shortcuts: `start_pipeline.bat` (foreground) and `restart.bat` (uses
-`E:\pycharmproject\allvenv\novel\Scripts\python.exe` if present, else PATH `python`).
 
 There is no test suite, lint config, or build step.
 
@@ -88,7 +76,7 @@ section uses the `__NOVEL__` placeholder. Because `config.py:get_paths` joins ea
 `paths:` value onto `ROOT` (the project dir), a per-novel config simply sets
 `paths.book: novels/<name>/book.md` etc. and the whole engine becomes
 directory-isolated with zero code changes. `config.py:15-16` reads
-`NOVEL_PROMPT`/`NOVEL_CONFIG` from the environment (default: root `prompt.md`/`config.yaml`).
+`NOVEL_PROMPT`/`NOVEL_CONFIG` from the environment (default: `prompt.md`/`config.yaml` in the project root, used only if the env vars are unset).
 
 Multi-endpoint, multi-key API access is configured via three keys in `api:`:
 - `api_key` — single primary key
@@ -127,8 +115,55 @@ Critical invariant in `pipeline.py:413-422`: `chapter_completed.json` must be wr
 
 ### Writing & revision (`writing.py`)
 - `write_chapter_with_candidates` generates `candidate_chapters` parallel drafts at spread temperatures (`base ± 0.08·offset`), reviews each, keeps the highest-scoring
+- `write_chapter` injects a RAG `retrieval_block` (see below) into the writer prompt so early concrete facts that summary compression erased are back in context
 - `revise_chapter` first tries surgical `apply_review_patches` (replace/insert_after/delete by literal substring locator); only falls back to a full LLM rewrite when fewer than `revise_patch_min_frac` of patches apply cleanly
 - `revise_hook_only` rewrites only the last ~400 chars when `hook_strength < hook_strength_min`, copying the head verbatim
+
+### Quality control (`quality.py`, `retrieval.py`, plus checks in `review.py`)
+The pipeline's biggest failure mode is **style collapse**: prose drifts into
+telegraphic em-dash fragments (`句子——状态——状态`) that the model's own
+self-review happily rates 9+, because its voice has drifted with the prose. The
+following layers exist specifically because LLM self-assessment can't be trusted
+to catch its own degeneration.
+
+- **`quality.py:style_health(text, config)`** — deterministic, non-LLM prose
+  metrics: em-dash density per kchar (`style_em_dash_per_kchar_warn`/`_bad`), avg
+  sentence length (`style_min_avg_sentence_chars`), fragment-line ratio
+  (`style_fragment_line_ratio_max`), dialogue presence. Returns a `penalty`
+  (capped at `style_penalty_cap`), `flags`, and writer `directives`. Wired into
+  `review.py:review_chapter`, which **subtracts the penalty from the LLM score**,
+  blocks accept when penalty ≥ `style_penalty_block`, and injects the directives
+  into the next chapter's writer prompt. Gated by `style_health_enabled`.
+- **`quality.py:scene_similarity(plan, recent_plans)`** — Jaccard similarity of a
+  plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent selected
+  plans. `planning.py:create_plan` warns and appends `required_constraints` when
+  similarity exceeds `scene_dedupe_sim_warn`, stopping the engine from endlessly
+  slicing one micro-scene. Gated by `scene_dedupe_enabled`.
+- **`retrieval.py`** — dependency-free TF-IDF char-bigram RAG (no embeddings — the
+  only dependency is `openai`). `index_chapter` is called idempotently from
+  `save_chapter` and writes `logs/retrieval_index.json`; `retrieval_block` builds
+  a "## 相关历史原文（检索…）" section from the plan's fields for the writer prompt.
+  `backfill_index` indexes a finished book. Gated by `rag_enabled` (`rag_top_k`,
+  `rag_exclude_recent`).
+- **`review.py:cold_reader_review`** — an independent terminal review run every
+  `cold_reader_every` chapters that **deliberately omits the cacheable_prefix**, so
+  it cannot ratify the drifting voice the way the main reviewer (which shares the
+  drifted context) does. Gated by `cold_reader_enabled`.
+- **`review.py:macro_progress_check`** — every `macro_progress_every` chapters
+  (from Ch20), measures plot advancement against `volume_plan` anchors and persists
+  acceleration directives into `final_review.json` when stalled past
+  `macro_progress_stall_threshold`. Gated by `macro_progress_enabled`.
+- **`review.py:refresh_voice_anchors`** — anchors to a frozen `voice_baseline.md`
+  (captured the first time it runs) instead of re-deriving voice from recent prose,
+  and **skips the refresh entirely** when recent prose shows collapse
+  (`voice_refresh_skip_penalty`). This closes the voice.md self-feeding loop where
+  degraded prose became "the book's voice."
+
+### Adaptive cost control (`planning.py`)
+- `_effective_candidate_count` downshifts the number of candidate plans (overriding
+  `candidate_plans`) once quality is stably high — min score ≥ `adaptive_downshift_score`
+  over an `adaptive_downshift_window`-chapter window, after `adaptive_downshift_warmup`
+  chapters. Gated by `adaptive_downshift_enabled`.
 
 ### Memory layers (`memory.py`)
 Two distinct context builders feed different LLM calls:
@@ -146,6 +181,12 @@ SQLite (`story_state.db`, WAL mode) is the primary store with tables `events`,
 as a fallback — most code branches on `isinstance(conn, JsonStoryStore)` and a few
 features (stage constraints, causal links, plan-continuity validation, silent-thread
 detection) are SQLite-only.
+
+The RAG index (`logs/retrieval_index.json`) and the frozen voice anchor
+(`memory/voice_baseline.md`) are separate per-novel artifacts written outside the
+SQLite store; both are safe to delete and will be rebuilt (the index by
+`retrieval.backfill_index` / on the next `save_chapter`, the baseline on the next
+`refresh_voice_anchors`).
 
 ### Checkpoints (`checkpoint.py`)
 Every stage in `generate_one_chapter` writes a checkpoint under `logs/checkpoints/ch{NNNN}/`:
@@ -178,10 +219,13 @@ Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-ch
 
 - **Don't add `cd <project>` before `git` commands** — bash already runs in the project root.
 - **`config.yaml` is not real YAML.** Anchors, lists, nested maps will silently fail to parse; values become strings. The parser only understands `section:` and indented `key: value`.
-- **`NOVEL_CONFIG`/`NOVEL_PROMPT` must be set before importing `pipeline`/`config`/`memory`.** `config.py` reads them at import time and `memory.py` captures `PROMPT_FILE` at its own import. `novel.py run` and `run_fusu.py` both rely on this ordering — set the env vars first, import second.
+- **`NOVEL_CONFIG`/`NOVEL_PROMPT` must be set before importing `pipeline`/`config`/`memory`.** `config.py` reads them at import time and `memory.py` captures `PROMPT_FILE` at its own import. `novel.py run` relies on this ordering — set the env vars first, import second.
 - **Per-novel paths live entirely in each `config.yaml`'s `paths:` section**, joined onto `ROOT`. The engine has no hardcoded knowledge of `novels/`; isolation is purely a path convention. `config_template.yaml`'s `__NOVEL__` placeholder is what makes a new novel directory-isolated.
 - **Background-task ordering** is load-bearing. The barriers in `generate_one_chapter` (`wait_label("chapter_finalize_ch{n-1}")` and the prefetch wait) keep memory/threads consistent. Re-ordering them can cause the next plan to see stale state.
-- **`save_chapter` refuses to write chapters under 500 chars** (`writing.py:732`). This guards against provider refusals being persisted as legitimate chapters. `repair_stub_chapters.py` exists to fix older stubs (Ch29/Ch43) that pre-date this guard.
+- **`save_chapter` refuses to write chapters under 500 chars** (`writing.py:843`). This guards against provider refusals being persisted as legitimate chapters.
 - **`cacheable_prefix` content changes invalidate the prompt cache** for every subsequent chapter — only modify it when the cache cost is worth it.
+- **`cold_reader_review` must NOT use the cacheable_prefix.** Its entire value is being an independent judge that hasn't been steeped in the (possibly drifted) book context — sharing the prefix would defeat the point and re-introduce the rating inflation it exists to catch.
+- **`style_health` is the objective anchor against score inflation.** Don't relax its thresholds to make chapters "pass"; the model's self-review already over-rates fragmented prose. The penalty is meant to fight that, not be tuned away.
+- **`voice_baseline.md` is frozen on purpose.** `refresh_voice_anchors` anchors to it rather than re-deriving voice from recent prose; re-deriving from drifted prose is exactly the self-feeding loop that caused style collapse.
 - **API keys are committed in `config.yaml` / `config_template.yaml`.** Both are gitignored, but they hold live keys — don't echo them into tracked files or logs. New per-novel configs inherit the template's keys, so parallel novels share quota.
 - **`config_template.yaml` is gitignored but must exist on disk** for `novel.py create` to work. Don't delete it.

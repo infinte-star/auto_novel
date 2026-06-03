@@ -19,6 +19,7 @@ CONFIG_FILE = ROOT / os.environ.get("NOVEL_CONFIG", "config.yaml")
 class Paths:
     book: Path
     state: Path
+    title: Path
     bible: Path
     characters: Path
     timeline: Path
@@ -160,6 +161,7 @@ def get_paths(config: dict[str, Any]) -> Paths:
     return Paths(
         book=ROOT / str(raw["book"]),
         state=ROOT / str(raw["state"]),
+        title=ROOT / str(raw.get("title", "title.txt")),
         bible=ROOT / str(raw["bible"]),
         characters=ROOT / str(raw["characters"]),
         timeline=ROOT / str(raw["timeline"]),

@@ -15,39 +15,97 @@ from store import db_event, recent_events, recent_metrics
 if TYPE_CHECKING:
     from openai import OpenAI
 
-BOOTSTRAP_SYSTEM = """You are the chief architect for a 2M+ Chinese web novel.
-Return exactly one valid JSON object and no other text. Keys:
+BOOTSTRAP_SYSTEM = """你是一部 200 万字以上中文网文的总设计师。
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
 {
-  "state": "short current-state markdown, <=5000 Chinese chars",
-  "bible": "world rules, power system, social order, hard constraints",
-  "characters": "major character state machines: goal, fear, resources, relationships, secrets",
-  "timeline": "initial chronology and planned historical pressure",
-  "threads": "open foreshadowing ledger with introduced/due/status",
-  "volume_plan": "at least 3 volumes, 60-80 chapters each, with major event anchors"
+  "title": "一个原创中文书名，<=15字，契合类型与核心命题，不照搬现有作品",
+  "state": "简短的当前状态 markdown，<=5000 个中文字符",
+  "voice": "叙事声音宪章 markdown，<=2500 个中文字符，见下述强制内容",
+  "bible": "世界规则、力量体系、社会秩序、硬性约束，<=6000 个中文字符",
+  "characters": "主要人物的状态机：目标、恐惧、资源、关系、秘密，<=6000 个中文字符",
+  "timeline": "初始时间线与计划中的历史压力，<=3000 个中文字符",
+  "threads": "已开启的伏线台账，含 introduced/due/status，<=3000 个中文字符",
+  "volume_plan": "结构化卷纲，至少 3 卷，每卷 60-80 章，详见下述强制结构"
 }
-Create original material. Do not imitate existing works. Optimize for long-term causality and reader anticipation."""
 
-MEMORY_COMPRESS_SYSTEM = """You compress memory entries for a long-form fiction engine.
-Input: a memory file with per-chapter entries (## ChN sections).
-Output: a consolidated markdown that preserves:
-- All entity names and their CURRENT state (not historical intermediate states)
-- All unresolved constraints and open threads
-- All causal dependencies still relevant to future chapters
-- Key turning points and irreversible changes
-Remove: superseded states, routine confirmations, resolved items, redundant updates.
-Keep output under {max_chars} Chinese characters.
-Output the consolidated content only, no explanation."""
+## voice 强制内容（这是全书文风基线，奠定整本书的句子质感，必须健康可读）
+用 markdown 输出，必须显式包含以下"健康文风护栏"，且给出 2-3 段示范正文片段：
+- 以完整的主谓宾句子叙事；破折号（——）每千字不超过 3 个，只用作正常插入语，绝不用来粘连碎片。
+- 平均句长保持在正常小说水平（约 15-40 字），不得通篇单词短句，禁止"句子——状态——状态"式破折号短句链。
+- 段落是连贯成句的叙事，不是无标点断行的舞台提示。
+- 保留有潜台词、有话术攻防的人物对话。
+- 另列：时态/视角、词汇调性、感官锚使用习惯、章节结构惯例。
+
+## volume_plan 强制结构（这是本书的长期大纲，必须详尽且可执行）
+用 markdown 输出。每一卷用 `## 第N卷：<卷名>（第X-Y章）` 作标题，章节区间必须明确（如 第1-70章）。
+每卷内部必须包含以下小节，缺一不可：
+- **卷主题**：本卷在讲什么、读者情绪主轴。
+- **核心矛盾**：本卷要解决的那一组主要矛盾（与上一卷的遗留危机衔接）。
+- **阶段高潮**：每 15-25 章一个，列出本卷的 2-4 个阶段高潮及其触发条件。
+- **大事件锚点**：至少 2-3 个不可回避的剧情锚点（具体事件，不是抽象目标）。
+- **本卷兑现**：本卷解决的主要矛盾 / 给读者的核心爽点兑现。
+- **重大代价**：本卷重大胜利必须付出的可见代价（资源/关系/信任/身份等）。
+- **遗留危机**：卷末开启的、比本卷更高层级的新危机，作为下一卷钩子。
+全书层面要求：保持卷与卷之间的因果递进（上一卷遗留危机 = 下一卷核心矛盾的来源），
+主角能力边界逐卷扩张但始终有约束，不得出现「主角一开始就全知全能」。
+为控制 token，先详写前 2 卷，其余各卷给 1 段概要即可。
+
+创作原创素材，不要模仿现有作品。以长期因果与读者期待为优化目标。"""
+
+MEMORY_COMPRESS_SYSTEM = """你负责压缩长篇小说引擎的记忆条目。
+输入：一个含逐章条目（## ChN 小节）的记忆文件。
+输出：一份整合后的 markdown，须保留：
+- 所有实体名称及其当前状态（而非历史中间状态）
+- 所有未解决的约束与已开启的伏线
+- 所有对后续章节仍然相关的因果依赖
+- 关键转折点与不可逆的变化
+删除：已被取代的状态、例行确认、已解决项、冗余更新。
+输出控制在 {max_chars} 个中文字符以内。
+不要输出任何 `## ChN`（逐章）标题——只输出整合后的状态描述。
+只输出整合后的内容，不要任何解释。"""
+
+def _as_markdown(value: Any) -> str:
+    """Coerce a bootstrap field to markdown text.
+
+    The model is asked for markdown strings, but occasionally returns a list
+    (one entry per character/thread) or a dict. Flatten those to text instead
+    of crashing on .strip().
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, (dict, list)):
+                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                parts.append(str(item))
+        return "\n\n".join(p.strip() for p in parts if p and p.strip())
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value or "").strip()
 
 def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -> None:
     log(paths, "Bootstrapping layered memory")
     raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(read_text(PROMPT_FILE)), temperature=0.7)
     data = load_json_with_repair(client, paths, config, raw)
-    write_text(paths.state, data["state"].strip() + "\n")
-    write_text(paths.bible, data["bible"].strip() + "\n")
-    write_text(paths.characters, data["characters"].strip() + "\n")
-    write_text(paths.timeline, data["timeline"].strip() + "\n")
-    write_text(paths.threads, data["threads"].strip() + "\n")
-    write_text(paths.volume_plan, data["volume_plan"].strip() + "\n")
+    title = str(data.get("title") or "").strip()
+    if not title:
+        # Fallback to the novel directory name (parent of state.md), else placeholder.
+        title = paths.state.parent.name or "未命名"
+    write_text(paths.title, title + "\n")
+    write_text(paths.state, _as_markdown(data["state"]) + "\n")
+    write_text(paths.bible, _as_markdown(data["bible"]) + "\n")
+    write_text(paths.characters, _as_markdown(data["characters"]) + "\n")
+    write_text(paths.timeline, _as_markdown(data["timeline"]) + "\n")
+    write_text(paths.threads, _as_markdown(data["threads"]) + "\n")
+    write_text(paths.volume_plan, _as_markdown(data["volume_plan"]) + "\n")
+    # Narrative-voice charter: this is the strongest anti-style-collapse anchor and
+    # must exist from chapter 1. Only write it when the model produced one; an empty
+    # value falls back to the placeholder created by ensure_project().
+    voice_charter = _as_markdown(data.get("voice"))
+    if voice_charter:
+        write_text(paths.voice, voice_charter + "\n")
     db_event(conn, 0, "bootstrap", data)
 
 def estimate_chars_budget(config: dict[str, Any]) -> int:
@@ -70,25 +128,25 @@ def memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
     voices_table = read_text(paths.voices).strip()
     style_block = ""
     if voice_anchor:
-        style_block += "\n\n## Narrative Voice Anchor (MUST follow)\n" + voice_anchor
+        style_block += "\n\n## 叙事声音锚（必须遵循）\n" + voice_anchor
     if voices_table:
-        style_block += "\n\n## Character Voices (MUST follow)\n" + voices_table
-    tier1 = "## Creative Brief\n" + creative_brief + "\n\n## Current State\n" + current_state + style_block
+        style_block += "\n\n## 人物声音（必须遵循）\n" + voices_table
+    tier1 = "## 创作纲要\n" + creative_brief + "\n\n## 当前状态\n" + current_state + style_block
 
     volume_plan = read_text(paths.volume_plan).strip()
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
     threads_text = read_text(paths.threads).strip()
-    tier2 = "## Volume Plan\n" + volume_plan + "\n\n## Key Metrics JSON\n" + metrics_5 + "\n\n## Threads\n" + threads_text
+    tier2 = "## 卷纲\n" + volume_plan + "\n\n## 关键指标JSON\n" + metrics_5 + "\n\n## 伏线\n" + threads_text
 
     characters = read_text(paths.characters).strip()
     bible = read_text(paths.bible).strip()
     events_20 = json.dumps(recent_events(conn, 20), ensure_ascii=False, indent=2)
-    tier3 = "## Characters\n" + characters + "\n\n## World Bible\n" + bible + "\n\n## Recent Events JSON\n" + events_20
+    tier3 = "## 人物\n" + characters + "\n\n## 世界设定\n" + bible + "\n\n## 近期事件JSON\n" + events_20
 
     timeline = read_text(paths.timeline).strip()
     metrics_full = json.dumps(recent_metrics(conn, fatigue_window), ensure_ascii=False, indent=2)
     events_full = json.dumps(recent_events(conn, 40), ensure_ascii=False, indent=2)
-    tier4 = "## Timeline\n" + timeline + "\n\n## Full Metrics JSON\n" + metrics_full + "\n\n## Full Events JSON\n" + events_full
+    tier4 = "## 时间线\n" + timeline + "\n\n## 完整指标JSON\n" + metrics_full + "\n\n## 完整事件JSON\n" + events_full
 
     assembled = tier1
     remaining = budget - len(assembled)
@@ -182,13 +240,13 @@ def cacheable_prefix(
     characters = read_text(paths.characters).strip()
 
     sections: list[tuple[str, str, int]] = [
-        ("Creative Brief", creative_brief, 4000),
-        ("Narrative Voice Anchor", voice_anchor, 5000),
-        ("Character Voices", voices_table, 7000),
-        ("World Bible", bible, 7000),
-        ("Characters", characters, 7000),
+        ("创作纲要", creative_brief, 4000),
+        ("叙事声音锚", voice_anchor, 5000),
+        ("人物声音", voices_table, 7000),
+        ("世界设定", bible, 7000),
+        ("人物", characters, 7000),
     ]
-    parts: list[str] = ["# Stable Reference (cacheable)"]
+    parts: list[str] = ["# 稳定参照（可缓存）"]
     used = len(parts[0])
     for title, body, cap in sections:
         body = body.strip()
@@ -245,10 +303,10 @@ def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> s
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
 
     sections: list[tuple[str, str, int]] = [
-        ("Current State", current_state, 10000),
-        ("Threads", threads_text, 8000),
-        ("Recent Metrics JSON", metrics_5, 2500),
-        ("Volume Plan (head)", volume_plan, 6000),
+        ("当前状态", current_state, 10000),
+        ("伏线", threads_text, 8000),
+        ("近期指标JSON", metrics_5, 2500),
+        ("卷纲（节选）", volume_plan, 6000),
     ]
     parts: list[str] = []
     used = 0
@@ -290,13 +348,13 @@ def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
 
     sections: list[tuple[str, str, int]] = [
-        ("Creative Brief", creative_brief, 1500),
-        ("Current State", current_state, 2500),
-        ("Narrative Voice Anchor", voice_anchor, 1200),
-        ("Recent Metrics JSON", metrics_5, 1200),
-        ("Threads", threads_text, 1500),
-        ("Characters", characters, 1500),
-        ("World Bible", bible, 1200),
+        ("创作纲要", creative_brief, 1500),
+        ("当前状态", current_state, 2500),
+        ("叙事声音锚", voice_anchor, 1200),
+        ("近期指标JSON", metrics_5, 1200),
+        ("伏线", threads_text, 1500),
+        ("人物", characters, 1500),
+        ("世界设定", bible, 1200),
     ]
     parts: list[str] = []
     used = 0
@@ -345,7 +403,10 @@ def compress_memory_file(
     archive_path = archive_dir / f"{file_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     write_text(archive_path, "".join(old_sections))
     old_text = "".join(old_sections)
-    max_chars = 3000
+    # Derive the compression budget from memory_max_kb so a long book can keep
+    # more live entity state instead of being clamped to a flat 3000 chars.
+    mem_max_kb = int(config["novel"].get("memory_max_kb", 15))
+    max_chars = max(3000, mem_max_kb * 1024 // 3)
     system = MEMORY_COMPRESS_SYSTEM.format(max_chars=max_chars)
     compressed = call_llm(client, paths, config, system, old_text, max_tokens=12000, temperature=0.2)
     compressed = normalize_text(compressed)

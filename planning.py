@@ -9,14 +9,14 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_silent_threads, recent_quality_feedback
+from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
 
-CANDIDATE_PLAN_SYSTEM = """You are a chapter-planning agent in an industrial long-form fiction engine.
-Return exactly one valid JSON object and no other text. Create one candidate plan for the requested chapter.
-Schema:
+CANDIDATE_PLAN_SYSTEM = """你是工业化长篇小说引擎中的章节规划 agent。
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。为所请求的章节生成一份候选大纲。
+schema：
 {
   "title": "...",
   "goal": "...",
@@ -24,92 +24,93 @@ Schema:
   "conflict_type": "court|finance|military|border|famine|faction|intelligence|personnel|institution|diplomacy|civil_unrest|logistics|other",
   "payoff": "...",
   "payoff_type": "court_breakthrough|policy_payoff|military_victory|reveal|reversal|personnel_payoff|institutional_fix|strategic_setup|emotional",
-  "pressure": "what suppresses the protagonist/readers before payoff",
-  "beats": ["5-9 concrete beats"],
-  "character_focus": ["characters who get agency or emotional movement"],
-  "world_state_changes": ["state changes if this chapter happens"],
-  "thread_actions": ["foreshadowing opened/advanced/recovered"],
-  "hook": "chapter-end reader question",
-  "risk": "main continuity or repetition risk"
+  "pressure": "在兑现之前用什么来压制主角/读者",
+  "beats": ["5-9 个具体节拍；每个节拍必须是一句完整的主谓宾句，含一个可见的动作，禁止用破折号堆叠状态短语"],
+  "character_focus": ["在本章获得能动性或情感推进的人物"],
+  "world_state_changes": ["若本章发生，会带来哪些状态变化"],
+  "thread_actions": ["开启/推进/找回的伏线"],
+  "hook": "章末抛给读者的问题",
+  "risk": "主要的连续性或重复风险"
 }
-The chapter must advance long-term causality, not merely create local excitement.
-Every plan must:
-- Convert at least one stale review problem into a concrete on-page scene.
-- Include causal bridges for travel time, message delivery, money movement, and surveillance if they matter.
-- Specify visible actions, sensory anchors, and dialogue pressure, not only analysis or summary.
-- Avoid reusing the recent chapter-ending device, analysis posture, or emotional beat."""
+本章必须推进长期因果，而不只是制造局部的兴奋点。
+每一份大纲都必须：
+- 把至少一个遗留的审校问题转化为一个具体的、落在页面上的场景。
+- 当旅行时间、消息送达、资金流动、监视等要素重要时，给出对应的因果桥梁。
+- 给出可见的动作、感官锚点与对话张力，而非只有分析或概括。
+- 避免复用最近章节的章末手法、分析姿态或情感节拍。"""
 
-SCREEN_SYSTEM = """You are the fast screening layer for a long-form fiction engine.
-You receive multiple candidate chapter plans. Rank them by overall quality considering:
-- Causal coherence and continuity with established state
-- Novelty relative to recent chapters (avoid repetition)
-- Reader anticipation and hook strength
-- Character agency and cost visibility
-- Thread advancement and payoff freshness
+SCREEN_SYSTEM = """你是长篇小说引擎中快速初筛的一层。
+你会收到多份候选章节大纲。请按整体质量排序，考量以下方面：
+- 与既有状态的因果一致性和连续性
+- 相对近期章节的新颖度（避免重复）
+- 读者的期待感与钩子强度
+- 人物的能动性与代价的可见性
+- 伏线推进与兑现的新鲜度
 
-Return exactly one valid JSON object and no other text:
-{"ranking": [{"index": 0, "brief": "one-line reason"}, ...]}
-Order from best to worst. Be decisive — ties waste downstream resources."""
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
+{"ranking": [{"index": 0, "brief": "一句话理由"}, ...]}
+从最好到最差排序。要果断——并列会浪费下游资源。"""
 
-ARBITER_SYSTEM = """You are the arbitration layer for a long-form fiction engine.
-Evaluate candidate plans against global state, recent metrics, repetition risk, causal value, character consistency,
-payoff freshness, and reader anticipation.
-Return exactly one valid JSON object and no other text:
+ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
+请结合全局状态、近期指标、重复风险、因果价值、人物一致性、兑现新鲜度与读者期待，评估各份候选大纲。
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
 {
   "selected_index": 0,
   "scores": [{"index": 0, "score": 1-10, "pros": [], "cons": []}],
-  "merged_plan": {same schema as candidate, improved if needed},
-  "required_constraints": ["hard constraints the writer must obey"],
-  "reader_expectation_delta": "why this improves or hurts follow-up desire"
+  "merged_plan": {
+    "title": "...", "goal": "...", "conflict": "...", "conflict_type": "...",
+    "payoff": "...", "payoff_type": "...", "pressure": "...",
+    "beats": ["..."], "character_focus": ["..."], "world_state_changes": ["..."],
+    "thread_actions": ["..."], "hook": "...", "risk": "..."
+  },
+  "required_constraints": ["作者必须遵守的硬性约束"],
+  "reader_expectation_delta": "为何这样能提升或损害读者的追读欲"
 }
-Reject or downgrade plans that keep known review problems abstract, rely on off-page resolution,
-repeat the same physical staging, or contain unresolved timeline/logistics gaps. For a "reversal"-strategy
-candidate, downgrade it if the overturn has no setup (a fact/trust-source established and reinforced before being
-toppled) — a reversal without setup is an abrupt twist, not a payoff. Improve the merged plan
-so the writer has concrete scene obligations rather than vague intentions."""
+merged_plan 必须包含上述全部键，不得缺字段。改写 beats 时，每个 beat 仍须是完整主谓宾句子，禁止破折号状态短语堆叠。
+对以下大纲予以否决或降分：把已知审校问题停留在抽象层面、依赖在页面之外解决、重复相同的物理调度、或留有未解决的时间线/物流漏洞。
+若候选采用 "reversal"（反转）策略，当其反转没有铺垫（事先建立并强化过一个事实/信任源，再将其推翻）时降分——
+没有铺垫的反转只是突兀的转折，而非兑现。请改进 merged_plan，让作者拿到的是具体的场景任务，而非含糊的意图。"""
 
-FUSED_PLAN_REVIEW_SYSTEM = """You are the multi-axis plan reviewer for a Chinese historical/fantasy web novel.
-Evaluate the candidate plan along 6 INDEPENDENT axes. Do NOT let a strong axis lift a weak one — each axis is scored on its own.
+FUSED_PLAN_REVIEW_SYSTEM = """你是一部中国历史/玄幻网文的多维度大纲审校者。
+请沿 6 个相互独立的维度评估候选大纲。不要让某个强项拉高弱项——每个维度都单独评分。
 
-## Scoring philosophy (CHANGED — use the FULL 1-10 range, do not artificially cap at 8)
-Each axis score must reflect HONEST quality on a 1-10 scale. The "score_caps_triggered" field below is now informational —
-it records which soft penalties fire, but does NOT clip the axis score to a ceiling. Reviewers historically defaulted to 7-8
-across the board, suppressing useful signal. A plan with strong execution on its strongest axes can earn 9 or 10 on those axes
-even if other axes are weak.
+## 评分理念（诚实分布——拒绝分数通胀）
+每个维度的分数都必须诚实反映其在 1-10 区间内的真实质量。**默认假设各维度有缺陷**：从 6.5 起步，逐项检查后只有确实通过的维度才上浮。
+如果你的维度分长期聚集在 8 附近，说明你在通胀，这会让候选区分失效。"score_caps_triggered" 字段记录哪些软性惩罚被触发。
+9+ 必须只保留给"几乎无缺陷"的维度，全书各维度拿到 9+ 的比例应当很低；不要因为某个维度执行力强就让它拉高其它弱维度。
 
-Use this rubric per axis:
-- 10: exemplary, no risks, novel angle, clear long-range payoff
-- 9: very strong, only minor cosmetic concerns
-- 8: solid, one or two specific fixable issues
-- 7: workable, needs targeted revision on a known weakness
-- 6: significant concern that could damage reader experience
-- <=5: structural problem requiring redesign
+每个维度的评分标准：
+- 9.5-10：典范，无风险，角度新颖，长线兑现清晰
+- 8.5-9：很强，仅有轻微的表面问题
+- 7-8.5：扎实可用，有一两个具体且可修复的问题（最常见区间）
+- 5.5-7：存在可能损害读者体验的明显隐患
+- <=5：存在需要重新设计的结构性问题
 
-When a "score cap" condition below is met, record it in score_caps_triggered AND DEDUCT a soft penalty
-from the axis score (typically -1.0 to -1.5 per trigger), but do not clamp the result.
+当下文某个 "score cap"（评分上限）条件被触发时，将其记入 score_caps_triggered，并从该维度分数中扣除一项软性惩罚
+（通常每次触发 -1.0 到 -1.5），但不要把结果钳制到上限。
 
-Axes and what they check:
+各维度及检查要点：
 
-1. world — Geography, travel time (京城到江南需数日), power system canon, institution/title accuracy, resource conservation, calendar/season consistency.
-   Soft penalties: -1.5 if geography/travel violated; -2.0 if power system contradicted; -2.5 if institutional procedures anachronistic.
+1. world（世界）— 地理、旅行时间（京城到江南需数日）、力量体系设定、机构/官职准确性、资源守恒、历法/季节一致性。
+   软性惩罚：违反地理/旅行 -1.5；与力量体系矛盾 -2.0；机构程序时代错置 -2.5。
 
-2. character — Each character acts on goals (not plot convenience); has agency with visible cost; uses only knowledge they possess; growth is incremental; dialogue voice fits status.
-   Soft penalties: -2.0 if a character acts on info they shouldn't have; -1.0 if protagonist has no meaningful choice/cost; -1.5 if any character is out-of-character without justification.
+2. character（人物）— 每个人物都依目标行动（而非剧情便利）；有能动性且代价可见；只使用其所拥有的知识；成长是渐进的；对话口吻契合身份。
+   软性惩罚：人物依据其不应拥有的信息行动 -2.0；主角没有有意义的选择/代价 -1.0；任何人物无理由地脱离人设 -1.5。
 
-3. rhythm — Variety vs. recent chapters in opening/closing device, scene count (≥2 distinct scenes), compression-then-release, balanced action/dialogue/reflection.
-   Soft penalties: -1.0 if ending device repeats the previous chapter; -1.5 if the chapter is one extended scene; -1.0 if pacing is monotone.
+3. rhythm（节奏）— 相对近期章节在开场/收场手法上的变化、场景数量（≥2 个不同场景）、先压缩后释放、动作/对话/反思的平衡。
+   软性惩罚：章末手法与上一章重复 -1.0；整章只是一个拉长的场景 -1.5；节奏单调 -1.0。
 
-4. payoff — Pressure→payoff causality; payoff_type fresh vs last 3 chapters; visible cost; earned resolution (no coincidence/deus-ex-machina); distinct emotional texture.
-   Soft penalties: -2.0 if payoff is coincidence/luck; -1.0 if payoff_type repeats prior 2 chapters; -1.0 if there's no visible cost.
+4. payoff（兑现）— 压迫→兑现的因果；payoff_type 相对最近 3 章是否新鲜；代价可见；兑现是挣来的（无巧合/天降救星）；情感质地有区分度。
+   软性惩罚：兑现靠巧合/运气 -2.0；payoff_type 与前 2 章重复 -1.0；没有可见代价 -1.0。
 
-5. foreshadowing — Advances at least one open thread; recovers dropped threads when natural; new threads have realistic due_chapter; total active threads ≤ 8.
-   Soft penalties: -1.0 if overdue threads (>20 chapters) ignored; -1.5 if no thread advanced/recovered; -1.0 if opening a 9th+ concurrent thread.
-   Reversal structure check: if the candidate's strategy is "reversal", verify the plan establishes a setup (a believed fact/trust-source) BEFORE overturning it — a reversal whose overturn has no on-page or prior setup is abrupt: -1.0.
+5. foreshadowing（伏线）— 至少推进一条已开启的伏线；自然时找回被丢弃的伏线；新伏线设有现实的 due_chapter；活跃伏线总数 ≤ 8。
+   软性惩罚：忽视逾期伏线（>20 章） -1.0；未推进/找回任何伏线 -1.5；在不闭合旧伏线的情况下开启第 9 条及以上并发伏线 -1.0。
+   反转结构检查：若候选策略为 "reversal"，须确认大纲在推翻之前先建立了铺垫（一个被相信的事实/信任源）——反转的推翻若没有页面上或在先的铺垫则属突兀：-1.0。
 
-6. reader — A serial reader finishing the chapter has clear next-chapter questions, gets at least one satisfaction moment, isn't lost if 2 chapters were skipped, isn't asked to juggle too many threads, has at least one empathy moment.
-   Soft penalties: -1.0 if no clear "next" hook; -1.5 if pure setup with zero payoff moments; -1.0 if reader must recall >5 prior plot points.
+6. reader（读者）— 一名连载读者读完本章后有清晰的下一章问题、至少获得一个满足时刻、即使跳读 2 章也不会迷失、不被要求同时记忆过多伏线、至少有一个共情时刻。
+   软性惩罚：没有清晰的"下一章"钩子 -1.0；纯铺垫、零兑现时刻 -1.5；读者需回忆 >5 个先前情节点 -1.0。
 
-Return exactly one valid JSON object and no other text:
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
 {
   "axes": {
     "world":         {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"score_caps_triggered":[]},
@@ -119,112 +120,112 @@ Return exactly one valid JSON object and no other text:
     "foreshadowing": {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"score_caps_triggered":[]},
     "reader":        {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"score_caps_triggered":[],"follow_next_reason":"..."}
   },
-  "overall_score": 1-10,
+  "overall_score": 0,
   "merged_required_fixes": []
 }
 
-Rules:
-- score_caps_triggered records which soft-penalty conditions matched, for diagnostics. Apply the deductions but do NOT clamp.
-- overall_score = average of the 6 axis scores, rounded to the nearest 0.5.
-- Be decisive — vague risks waste downstream tokens. Each axis's risks/required_fixes must be specific and actionable."""
+规则：
+- score_caps_triggered 记录哪些软性惩罚条件被命中，用于诊断。请施加扣分，但不要钳制（clamp）。
+- overall_score 由引擎根据 6 个维度分数自动计算，你可以填 0 或省略，无需自己做算术。
+- 要果断——含糊的风险只会浪费下游 token。每个维度的 risks/required_fixes 都必须具体、可执行。"""
 
 AGENT_REVIEW_SYSTEMS = {
-    "world": """You are World Agent for a Chinese historical/fantasy web novel.
-Check the chapter plan against established world rules. Specifically verify:
-1. Geography & travel: distances, routes, travel time consistency (京城到江南需数日, not instant)
-2. Power system: cultivation/combat/political power rules match established canon
-3. Institutions: official titles, bureaucratic procedures, hierarchy are period-appropriate
-4. Resources: money, materials, troops obey conservation (no unexplained refills)
-5. Calendar & seasons: dates align with established timeline, seasonal details consistent
+    "world": """你是一部中国历史/玄幻网文的「世界 Agent」。
+请对照既定世界规则审查章节大纲。具体核查：
+1. 地理与旅行：距离、路线、旅行时间是否一致（京城到江南需数日，而非瞬移）
+2. 力量体系：修炼/战斗/政治权力规则是否符合既定设定
+3. 机构：官职、官僚程序、等级是否符合时代
+4. 资源：金钱、物资、兵力是否守恒（无无故补充）
+5. 历法与季节：日期是否与既定时间线对齐，季节细节是否一致
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -1.5 if geography/travel time is violated
-- -2.0 if power system contradicts established rules
-- -2.5 if institutional procedures are anachronistic or impossible
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 违反地理/旅行时间 -1.5
+- 与既定规则矛盾的力量体系 -2.0
+- 机构程序时代错置或不可能 -2.5
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
 
-    "character": """You are Character Agent for a Chinese historical/fantasy web novel.
-Check the chapter plan for character consistency and growth. Specifically verify:
-1. Goals & motivations: each character acts from established goals, not plot convenience
-2. Agency: characters make active choices with visible cost, not passive observers
-3. Relationships: interactions reflect established dynamics (allies, enemies, debts)
-4. Secrets & knowledge: characters only act on information they actually possess
-5. Growth arc: protagonist shows incremental change, not sudden personality shifts
-6. Dialogue voice: each character's speech pattern matches their background and status
+    "character": """你是一部中国历史/玄幻网文的「人物 Agent」。
+请审查章节大纲的人物一致性与成长。具体核查：
+1. 目标与动机：每个人物都依据既定目标行动，而非剧情便利
+2. 能动性：人物做出有可见代价的主动选择，而非被动旁观
+3. 关系：互动反映既定的人物关系（盟友、敌人、人情债）
+4. 秘密与知识：人物只依据其确实拥有的信息行动
+5. 成长弧线：主角呈现渐进式变化，而非突然的性格突变
+6. 对话口吻：每个人物的说话方式契合其出身与身份
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -2.0 if a character acts on information they shouldn't have
-- -1.0 if protagonist has no meaningful choice or cost in this chapter
-- -1.5 if a character behaves out-of-character without justification
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 人物依据其不应拥有的信息行动 -2.0
+- 主角在本章没有有意义的选择或代价 -1.0
+- 人物无理由地脱离人设 -1.5
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
 
-    "rhythm": """You are Rhythm Agent for a Chinese historical/fantasy web novel.
-Check pacing and structural variety against recent chapters. Specifically verify:
-1. Scene structure: does this chapter use a different opening/closing device than the last 3?
-2. Compression/release: is there both tension buildup AND a release moment?
-3. Scene count & variety: at least 2 distinct scenes with different settings or dynamics
-4. Ending device: not the same type as the previous 2 chapters (cliffhanger/revelation/quiet)
-5. Information density: balanced between action, dialogue, and reflection (no 1000+ char monologues)
+    "rhythm": """你是一部中国历史/玄幻网文的「节奏 Agent」。
+请对照近期章节审查节奏与结构变化。具体核查：
+1. 场景结构：本章的开场/收场手法是否不同于最近 3 章？
+2. 压缩/释放：是否既有张力积累又有释放时刻？
+3. 场景数量与变化：至少 2 个设定或动态不同的场景
+4. 章末手法：不与前 2 章相同类型（悬念/揭示/平静收尾）
+5. 信息密度：动作、对话与反思之间是否平衡（无 1000 字以上的独白）
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -1.0 if chapter ending repeats the same device as the previous chapter
-- -1.5 if the entire chapter is a single extended scene with no shift
-- -1.0 if pacing is monotone (all high tension or all low tension)
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 章末与上一章重复同一手法 -1.0
+- 整章是单一拉长场景、毫无切换 -1.5
+- 节奏单调（全程高张力或全程低张力） -1.0
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
 
-    "payoff": """You are Payoff Agent for a Chinese historical/fantasy web novel.
-Check emotional payoff quality and pressure-payoff balance. Specifically verify:
-1. Pressure buildup: is there meaningful resistance/obstacle before the payoff?
-2. Payoff freshness: is the payoff_type different from the last 3 chapters?
-3. Cost visibility: does the payoff come with visible cost or trade-off?
-4. Earned resolution: is the resolution causally earned (not coincidence or deus ex machina)?
-5. Emotional texture: does the chapter evoke a distinct emotion, not generic tension?
+    "payoff": """你是一部中国历史/玄幻网文的「兑现 Agent」。
+请审查情感兑现质量与压迫-兑现的平衡。具体核查：
+1. 压迫积累：兑现之前是否有有意义的阻力/障碍？
+2. 兑现新鲜度：payoff_type 是否不同于最近 3 章？
+3. 代价可见：兑现是否伴随可见的代价或取舍？
+4. 挣来的解决：解决是否由因果挣来（而非巧合或天降救星）？
+5. 情感质地：本章是否唤起一种有区分度的情感，而非泛泛的紧张？
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -2.0 if payoff relies on coincidence or unexplained luck
-- -1.0 if payoff_type repeats the same as the previous 2 chapters
-- -1.0 if there's no visible cost or trade-off for the protagonist
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 兑现依赖巧合或无解释的运气 -2.0
+- payoff_type 与前 2 章相同 -1.0
+- 主角没有可见的代价或取舍 -1.0
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
 
-    "foreshadowing": """You are Foreshadowing Agent for a Chinese historical/fantasy web novel.
-Check thread management and long-term promise fulfillment. Specifically verify:
-1. Overdue threads: flag any open thread introduced >15 chapters ago that isn't advanced here
-2. Thread advancement: does this chapter advance at least one existing thread?
-3. New thread introduction: if opening a new thread, is the due_chapter realistic?
-4. Recovery opportunities: are there dropped threads that could be naturally recovered here?
-5. Promise density: not too many open threads (>8 active = reader confusion risk)
+    "foreshadowing": """你是一部中国历史/玄幻网文的「伏线 Agent」。
+请审查伏线管理与长线承诺的兑现。具体核查：
+1. 逾期伏线：标记任何 >20 章前引入、却未在此推进的已开启伏线
+2. 伏线推进：本章是否至少推进一条已有伏线？
+3. 新伏线引入：若开启新伏线，其 due_chapter 是否现实？
+4. 找回机会：是否有被丢弃、可在此自然找回的伏线？
+5. 承诺密度：已开启伏线不要过多（>8 条活跃 = 读者混乱风险）
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -1.0 if there are overdue threads (>20 chapters) that could be addressed but aren't
-- -1.5 if no existing thread is advanced or recovered
-- -1.0 if opening a 9th+ concurrent thread without closing one
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 存在可处理却未处理的逾期伏线（>20 章） -1.0
+- 没有推进或找回任何已有伏线 -1.5
+- 在不闭合旧伏线的情况下开启第 9 条及以上并发伏线 -1.0
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
 
-    "reader": """You are Reader-Simulation Agent for a Chinese historical/fantasy web novel.
-Simulate a serial reader finishing this chapter plan. Specifically evaluate:
-1. Follow-next desire: after this chapter, what 3 questions would make the reader click "next"?
-2. Satisfaction: does the chapter deliver at least one moment of satisfaction (not all setup)?
-3. Confusion risk: would a reader who skipped 2 chapters still follow the main thread?
-4. Fatigue signals: is the reader being asked to track too many simultaneous threads?
-5. Emotional hook: is there a character moment that creates empathy or investment?
+    "reader": """你是一部中国历史/玄幻网文的「读者模拟 Agent」。
+请模拟一名连载读者读完本章大纲。具体评估：
+1. 追读欲：读完本章后，哪 3 个问题会让读者点击"下一章"？
+2. 满足感：本章是否提供至少一个满足时刻（而非全是铺垫）？
+3. 混乱风险：跳读了 2 章的读者是否仍能跟上主线？
+4. 疲劳信号：读者是否被要求同时追踪过多伏线？
+5. 情感钩子：是否有一个能引发共情或投入的人物时刻？
 
-Use the full 1-10 range. Strong plans can score 9+. Apply soft penalties (deduct, do not clamp):
-- -1.0 if there's no clear "next chapter" question for the reader
-- -1.5 if the chapter is pure setup with zero payoff moments
-- -1.0 if the reader needs to remember >5 prior plot points to understand this chapter
+使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
+- 没有清晰的"下一章"问题 -1.0
+- 本章是纯铺垫、零兑现时刻 -1.5
+- 读者需要记住 >5 个先前情节点才能看懂本章 -1.0
 
-Return exactly one valid JSON object and no other text.
-Schema: {"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"follow_next_reason":"..."}""",
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
+schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"follow_next_reason":"..."}""",
 }
 
 def _carried_over_risks_from_prev(paths: Paths, chapter_num: int) -> list[str]:
@@ -353,6 +354,44 @@ def _select_strategies_bandit(
     return picked
 
 
+def _recent_selected_plans(conn: Any, lookback: int = 8) -> list[dict[str, Any]]:
+    """Return the most recent arbiter-selected (merged) plans, newest first.
+
+    Used for scene-skeleton dedupe: the candidate generator is told to avoid
+    re-running the same conflict/payoff/beats that recent chapters already used,
+    which is the engine's main defense against "infinitely slicing one scene".
+    """
+    if isinstance(conn, JsonStoryStore):
+        events = conn.recent_events(lookback * 3)
+    else:
+        try:
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE event_type='plan_arbitration' "
+                "ORDER BY id DESC LIMIT ?",
+                (lookback,),
+            ).fetchall()
+            events = [{"payload": json.loads(r["payload"])} for r in rows]
+        except Exception:
+            return []
+    plans: list[dict[str, Any]] = []
+    for ev in events:
+        payload = ev.get("payload") if isinstance(ev, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        decision = payload.get("decision") or {}
+        merged = decision.get("merged_plan")
+        cand = payload.get("plans") or []
+        if isinstance(merged, dict) and merged:
+            plans.append(merged)
+        elif cand:
+            sel = int(decision.get("selected_index", 0))
+            if 0 <= sel < len(cand) and isinstance(cand[sel], dict):
+                plans.append(cand[sel])
+        if len(plans) >= lookback:
+            break
+    return plans
+
+
 def generate_candidate_plans(
     client: OpenAI,
     paths: Paths,
@@ -361,6 +400,7 @@ def generate_candidate_plans(
     chapter_num: int,
     tail: str,
     cached_memory: str | None = None,
+    num_candidates_override: int | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = rhythm_diagnostics(conn, config)
     structural = structural_repetition_analysis(conn, config)
@@ -372,39 +412,60 @@ def generate_candidate_plans(
     overdue_promises = get_overdue_reader_promises(conn, chapter_num, grace=promise_grace)
     carried_over_risks = _carried_over_risks_from_prev(paths, chapter_num)
     mem = cached_memory or memory_context(paths, conn, config)
-    base_user = f"""## Memory
+    # Scene-skeleton dedupe: list the conflict/payoff/beats of recent selected
+    # plans so the generator avoids re-running the same micro-scene.
+    dedupe_block = "None"
+    if bool(config["novel"].get("scene_dedupe_enabled", True)):
+        try:
+            window = int(config["novel"].get("scene_dedupe_window", 8))
+            recent_sel = _recent_selected_plans(conn, lookback=window)
+            skeletons = []
+            for rp in recent_sel:
+                skeletons.append({
+                    "conflict": str(rp.get("conflict", ""))[:120],
+                    "payoff": str(rp.get("payoff", ""))[:120],
+                    "payoff_type": rp.get("payoff_type", ""),
+                })
+            if skeletons:
+                dedupe_block = json.dumps(skeletons, ensure_ascii=False, indent=2)
+        except Exception:
+            dedupe_block = "None"
+    base_user = f"""## 记忆
 {mem}
 
-## Rhythm Diagnostics JSON
+## 节奏诊断JSON
 {json.dumps(diagnostics, ensure_ascii=False, indent=2)}
 
-## Structural Repetition Analysis JSON
+## 结构重复分析JSON
 {json.dumps(structural, ensure_ascii=False, indent=2)}
 
-## Recent Quality Feedback JSON (MUST REPAIR, DO NOT REPEAT)
+## 近期质量反馈JSON（必须修复，不得重复）
 {json.dumps(quality_feedback, ensure_ascii=False, indent=2) if quality_feedback else "None"}
 
-## Active Stage Constraints (MUST OBEY)
+## 当前生效的阶段约束（必须遵守）
 {json.dumps(constraints, ensure_ascii=False, indent=2) if constraints else "None"}
 
-## Silent Threads (HARD REQUIREMENT: advance at least one of these on page if narratively viable)
+## 沉默伏线（硬性要求：若叙事上可行，至少在页面上推进其中之一）
 {json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
 
-## Overdue Reader Promises (HARD: pay one off on page this chapter, or justify the delay in "risk")
+## 逾期的读者承诺（硬性：本章在页面上兑现其中之一，或在 "risk" 中说明延迟理由）
 {json.dumps(overdue_promises, ensure_ascii=False, indent=2) if overdue_promises else "None"}
 
-## Carried-over Risks from Ch{chapter_num - 1} (MUST address at least 2 of these on page)
+## 从 Ch{chapter_num - 1} 遗留的风险（必须在页面上处理其中至少 2 项）
 {json.dumps(carried_over_risks, ensure_ascii=False, indent=2) if carried_over_risks else "None"}
 
-## Previous Chapter Tail
+## 近期已用过的场景骨架（硬性：本章的 conflict / payoff 不得与下列任何一条实质重复，必须推进到新的局面，禁止把同一个僵局/同一份公文/同一场对峙再切一刀）
+{dedupe_block}
+
+## 上章结尾
 {tail[-2000:]}
 
-## Request
-Create candidate plan for chapter {chapter_num}.
-Avoid recent repetition. Preserve causal debt. Increase reader follow-up desire.
-If silent threads exist above, the plan MUST either advance one in beats/thread_actions, or explicitly note in "risk" why none are viable this chapter.
-If "Rhythm Diagnostics JSON" reports a 爽点拖欠 warning (chapters_since_payoff >= payoff_max_gap), this chapter's payoff_type MUST be a concrete reader payoff (court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix), NOT strategic_setup or emotional."""
-    num_candidates = int(config["novel"]["candidate_plans"])
+## 请求
+为第 {chapter_num} 章生成候选大纲。
+避免近期重复。保留因果债务。提升读者追读欲。
+若上方存在沉默伏线，大纲必须在 beats/thread_actions 中推进其中之一，或在 "risk" 中明确说明为何本章均不可行。
+若 "节奏诊断JSON" 报告了爽点拖欠警告（chapters_since_payoff >= payoff_max_gap），本章的 payoff_type 必须是一个具体的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），而非 strategic_setup 或 emotional。"""
+    num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
 
     # Explicit differentiation strategies — each candidate is told to attack the
@@ -439,12 +500,12 @@ If "Rhythm Diagnostics JSON" reports a 爽点拖欠 warning (chapters_since_payo
         last_exc: Exception | None = None
         strategy_name, strategy_desc = chosen_strategies[idx % len(chosen_strategies)]
         strategy_block = (
-            f"\n\n## Candidate Strategy (MANDATORY)\n"
-            f"Candidate index: {idx}\n"
-            f"Strategy: {strategy_name}\n"
-            f"Definition: {strategy_desc}\n"
-            f"You MUST design this candidate plan around this strategy. "
-            f"Other candidates use different strategies — do not converge."
+            f"\n\n## 候选策略（强制）\n"
+            f"候选编号：{idx}\n"
+            f"策略：{strategy_name}\n"
+            f"定义：{strategy_desc}\n"
+            f"你必须围绕这一策略来设计本候选大纲。"
+            f"其它候选采用不同策略——不要趋同。"
         )
         for retry in range(2):
             try:
@@ -496,13 +557,13 @@ def screen_candidates(
     if len(plans) <= top_n:
         return list(range(len(plans)))
     mem = lite_memory_context(paths, conn, config)
-    user = f"""## Memory (abbreviated)
+    user = f"""## 记忆（节选）
 {mem}
 
-## Candidate Plans JSON
+## 候选大纲JSON
 {json.dumps(plans, ensure_ascii=False, indent=2)}
 
-Rank all {len(plans)} candidates for chapter {chapter_num}."""
+为第 {chapter_num} 章的全部 {len(plans)} 份候选排序。"""
     raw = call_llm(
         client, paths, config, SCREEN_SYSTEM, json_prompt(user),
         max_tokens=12000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
@@ -534,11 +595,14 @@ def _explode_fused_axes(fused: dict[str, Any]) -> list[dict[str, Any]]:
     """
     axes = fused.get("axes") or {}
     reports: list[dict[str, Any]] = []
+    axis_scores: list[float] = []
     for axis_name in ("world", "character", "rhythm", "payoff", "foreshadowing", "reader"):
         axis = axes.get(axis_name) or {}
+        sc = safe_score(axis.get("score", 5))
+        axis_scores.append(sc)
         report = {
             "agent": axis_name,
-            "score": safe_score(axis.get("score", 5)),
+            "score": sc,
             "risks": axis.get("risks") or [],
             "required_fixes": axis.get("required_fixes") or [],
             "state_patch": axis.get("state_patch") or [],
@@ -547,6 +611,11 @@ def _explode_fused_axes(fused: dict[str, Any]) -> list[dict[str, Any]]:
         if axis_name == "reader" and axis.get("follow_next_reason"):
             report["follow_next_reason"] = axis["follow_next_reason"]
         reports.append(report)
+    # Compute overall_score in Python (mean of axes) instead of asking the model
+    # to do arithmetic it is unreliable at. Written back onto the fused dict so
+    # checkpoints stay meaningful.
+    if axis_scores:
+        fused["overall_score"] = round(sum(axis_scores) / len(axis_scores) * 2) / 2
     return reports
 
 
@@ -562,7 +631,7 @@ def _fused_review_one_plan(
         name: {"score": 5, "risks": [], "required_fixes": [], "state_patch": [], "score_caps_triggered": []}
         for name in ("world", "character", "rhythm", "payoff", "foreshadowing", "reader")
     }
-    fallback = {"axes": fallback_axes, "overall_score": 5, "merged_required_fixes": []}
+    fallback = {"axes": fallback_axes, "overall_score": 0, "merged_required_fixes": []}
     for retry in range(2):
         try:
             raw = call_llm(
@@ -593,16 +662,16 @@ def agent_review_plan(
     chapter_num: int,
     plan: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    user = f"""## Memory
+    user = f"""## 记忆
 {lite_memory_context(paths, conn, config)}
 
-## Rhythm Diagnostics JSON
+## 节奏诊断JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
 
-## Candidate Plan JSON
+## 候选大纲JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
 
-Review chapter {chapter_num} plan."""
+审校第 {chapter_num} 章大纲。"""
 
     fused_enabled = bool(config["novel"].get("fused_plan_review", True))
     if fused_enabled:
@@ -673,16 +742,16 @@ def review_candidate_plans(
     memory = lite_memory_context(paths, conn, config)
     for plan in plans:
         plan_users.append(
-            f"""## Memory
+            f"""## 记忆
 {memory}
 
-## Rhythm Diagnostics JSON
+## 节奏诊断JSON
 {diagnostics_json}
 
-## Candidate Plan JSON
+## 候选大纲JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
 
-Review chapter {chapter_num} plan."""
+审校第 {chapter_num} 章大纲。"""
         )
 
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
@@ -782,22 +851,22 @@ def arbitrate_plan(
     cached_memory: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     mem = cached_memory or memory_context(paths, conn, config)
-    user = f"""## Memory
+    user = f"""## 记忆
 {mem}
 
-## Rhythm Diagnostics JSON
+## 节奏诊断JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
 
-## Recent Quality Feedback JSON (MUST REPAIR, DO NOT REPEAT)
+## 近期质量反馈JSON（必须修复，不得重复）
 {json.dumps(recent_quality_feedback(paths), ensure_ascii=False, indent=2)}
 
-## Candidate Plans JSON
+## 候选大纲JSON
 {json.dumps(plans, ensure_ascii=False, indent=2)}
 
-## Agent Reports JSON
+## Agent 报告JSON
 {json.dumps(reports_by_plan, ensure_ascii=False, indent=2)}
 
-Select and improve the best plan for chapter {chapter_num}."""
+为第 {chapter_num} 章选出并改进最佳大纲。"""
     raw = call_llm(
         client, paths, config, ARBITER_SYSTEM, json_prompt(user),
         max_tokens=12000, temperature=0.25, cacheable_prefix=cacheable_prefix(paths, config),
@@ -817,6 +886,44 @@ def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> f
         if int(score.get("index", -1)) == selected_index:
             return safe_score(score.get("score", 0))
     return safe_score(scores[0].get("score", 0))
+
+def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: int, paths: Paths) -> int:
+    """Adaptively reduce candidate-plan count when quality is stable + strategy
+    bandit has converged, to save tokens on the long tail of a book.
+
+    Returns the number of candidate plans to generate this chapter. Never goes
+    below 1; only kicks in after a warm-up so early chapters keep full breadth.
+    """
+    base = int(config["novel"]["candidate_plans"])
+    if not bool(config["novel"].get("adaptive_downshift_enabled", True)):
+        return base
+    warmup = int(config["novel"].get("adaptive_downshift_warmup", 60))
+    if chapter_num < warmup or base <= 1:
+        return base
+    window = int(config["novel"].get("adaptive_downshift_window", 10))
+    rows = recent_metrics(conn, window)
+    if len(rows) < window:
+        return base
+    score_floor = float(config["novel"].get("adaptive_downshift_score", 8.5))
+    scores = [safe_score(r.get("score", 0)) for r in rows if r.get("score") is not None]
+    plan_scores = [safe_score(r.get("plan_score", 0)) for r in rows if r.get("plan_score") is not None]
+    if not scores:
+        return base
+    stable = (
+        min(scores) >= score_floor
+        and (not plan_scores or min(plan_scores) >= score_floor)
+    )
+    if stable:
+        reduced = max(1, base - 1)
+        if reduced != base:
+            log(
+                paths,
+                f"Adaptive downshift Ch{chapter_num}: quality stable "
+                f"(min score={min(scores):.1f}≥{score_floor}); candidate_plans {base}->{reduced}",
+            )
+        return reduced
+    return base
+
 
 def create_plan(
     client: OpenAI,
@@ -852,7 +959,11 @@ def create_plan(
             log(paths, f"Resuming cached candidate plans Ch{chapter_num} attempt={attempt}")
         else:
             _log(paths, f"Calling generate_candidate_plans Ch{chapter_num}...")
-            plans = generate_candidate_plans(client, paths, conn, config, chapter_num, tail, cached_memory=mem)
+            n_cand = _effective_candidate_count(conn, config, chapter_num, paths)
+            plans = generate_candidate_plans(
+                client, paths, conn, config, chapter_num, tail, cached_memory=mem,
+                num_candidates_override=n_cand,
+            )
             _log(paths, f"Got {len(plans)} candidate plans, saving...")
             save_checkpoint(paths, chapter_num, plans_key, plans)
             _log(paths, f"Saved candidates checkpoint Ch{chapter_num}")
@@ -896,6 +1007,26 @@ def create_plan(
 
         score = plan_score(decision)
         log(paths, f"Arbiter selected Ch{chapter_num} plan score={score}")
+        # Scene-skeleton similarity diagnostic: warn (and nudge a retry) when the
+        # selected plan is near-identical to a recent one — the signature of the
+        # engine slicing the same micro-scene over and over.
+        if bool(config["novel"].get("scene_dedupe_enabled", True)):
+            try:
+                from quality import scene_similarity
+
+                recent_sel = _recent_selected_plans(conn, lookback=int(config["novel"].get("scene_dedupe_window", 8)))
+                sim = scene_similarity(plan, recent_sel)
+                if sim.get("max_sim", 0.0) >= float(config["novel"].get("scene_dedupe_sim_warn", 0.6)):
+                    log(
+                        paths,
+                        f"Scene-dedupe WARN Ch{chapter_num}: selected plan max_sim={sim['max_sim']} "
+                        f"vs recent — likely re-slicing the same micro-scene.",
+                    )
+                    decision.setdefault("required_constraints", []).append(
+                        "本章场景骨架与近期高度雷同，必须切换到不同的冲突场景/推进到新的局面，不得继续纠缠同一僵局。"
+                    )
+            except Exception:
+                pass
         if score > best_score:
             best_plan, best_decision, best_score = plan, decision, score
         if score >= min_score:
