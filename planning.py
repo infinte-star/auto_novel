@@ -9,7 +9,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
+from store import JsonStoryStore, db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -262,11 +262,12 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
         events = conn.recent_events(lookback)
     else:
         try:
-            rows = conn.execute(
-                "SELECT payload FROM events WHERE event_type='plan_arbitration' "
-                "ORDER BY id DESC LIMIT ?",
-                (lookback,),
-            ).fetchall()
+            with db_lock():
+                rows = conn.execute(
+                    "SELECT payload FROM events WHERE event_type='plan_arbitration' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (lookback,),
+                ).fetchall()
             events = [{"payload": json.loads(r["payload"])} for r in rows]
         except Exception:
             return {}
@@ -365,11 +366,12 @@ def _recent_selected_plans(conn: Any, lookback: int = 8) -> list[dict[str, Any]]
         events = conn.recent_events(lookback * 3)
     else:
         try:
-            rows = conn.execute(
-                "SELECT payload FROM events WHERE event_type='plan_arbitration' "
-                "ORDER BY id DESC LIMIT ?",
-                (lookback,),
-            ).fetchall()
+            with db_lock():
+                rows = conn.execute(
+                    "SELECT payload FROM events WHERE event_type='plan_arbitration' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (lookback,),
+                ).fetchall()
             events = [{"payload": json.loads(r["payload"])} for r in rows]
         except Exception:
             return []
@@ -741,18 +743,20 @@ def agent_review_plan(
         if isinstance(conn, JsonStoryStore):
             conn.add_agent_report(chapter_num, agent, report)
         else:
-            conn.execute(
-                "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    chapter_num,
-                    agent,
-                    safe_score(report.get("score", 0)),
-                    json.dumps(report, ensure_ascii=False),
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
+            with db_lock():
+                conn.execute(
+                    "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        chapter_num,
+                        agent,
+                        safe_score(report.get("score", 0)),
+                        json.dumps(report, ensure_ascii=False),
+                        datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
     if not isinstance(conn, JsonStoryStore):
-        conn.commit()
+        with db_lock():
+            conn.commit()
     return reports
 
 def review_candidate_plans(
@@ -852,18 +856,20 @@ def review_candidate_plans(
             if isinstance(conn, JsonStoryStore):
                 conn.add_agent_report(chapter_num, agent, report)
             else:
-                conn.execute(
-                    "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        chapter_num,
-                        agent,
-                        safe_score(report.get("score", 0)),
-                        json.dumps(report, ensure_ascii=False),
-                        datetime.now().isoformat(timespec="seconds"),
-                    ),
-                )
+                with db_lock():
+                    conn.execute(
+                        "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            chapter_num,
+                            agent,
+                            safe_score(report.get("score", 0)),
+                            json.dumps(report, ensure_ascii=False),
+                            datetime.now().isoformat(timespec="seconds"),
+                        ),
+                    )
     if not isinstance(conn, JsonStoryStore):
-        conn.commit()
+        with db_lock():
+            conn.commit()
 
     return reports_by_plan
 

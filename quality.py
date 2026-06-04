@@ -118,11 +118,16 @@ def style_health(text: str, config: dict[str, Any] | None = None) -> dict[str, A
             )
 
     # --- 4. Dialogue presence (collapse often drops real dialogue) --------
-    # Count both CJK quote marks and ASCII double-quote PAIRS (prose here uses
-    # straight " for dialogue, so divide the raw count by 2 for pair estimate).
-    cjk_open = body.count("“") + body.count("「")
-    ascii_q = body.count('"')
-    quote_pairs = cjk_open + ascii_q // 2
+    # Prefer paired CJK quotes (the prose convention here): count matched
+    # “…”/「…」 pairs directly. Only fall back to estimating from ASCII " pairs
+    # when no CJK quotes are present, since ASCII straight quotes are ambiguous
+    # (a chapter may use them for emphasis, not dialogue) and dividing the raw
+    # count by 2 systematically over/under-counts.
+    cjk_pairs = min(body.count("“"), body.count("”")) + min(body.count("「"), body.count("」"))
+    if cjk_pairs > 0:
+        quote_pairs = cjk_pairs
+    else:
+        quote_pairs = body.count('"') // 2
     metrics["dialogue_markers"] = quote_pairs
     # Only flag if the chapter is long enough that some dialogue is expected.
     if n > 2000 and quote_pairs < 3:

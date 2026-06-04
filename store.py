@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,27 @@ try:
     import sqlite3
 except ModuleNotFoundError:
     sqlite3 = None  # type: ignore[assignment]
+
+# sqlite3 connections/cursors are NOT thread-safe. The pipeline shares a single
+# conn across the main thread (planning/continuity reads) and BackgroundTasks
+# daemon threads (chapter_finalize writes). Without serialization this produces
+# "another row available" / "cannot start a transaction within a transaction"
+# corruption. A single process-wide reentrant lock serializes every DB op.
+# It is an RLock so a locked write that internally calls another locked helper
+# does not self-deadlock. All public read/write functions in this module and
+# the cross-module DB writers (writing.update_structured_state,
+# planning.review_*) acquire it via `with db_lock():`.
+_DB_LOCK = threading.RLock()
+
+
+def db_lock() -> "threading.RLock":
+    """Return the process-wide SQLite serialization lock.
+
+    Callers outside this module (writing.py, planning.py) wrap their raw
+    conn.execute/commit blocks in `with db_lock():` so all DB access is
+    serialized against the background finalize tasks.
+    """
+    return _DB_LOCK
 
 class JsonStoryStore:
     """Fallback event store for Python builds without sqlite3."""
@@ -246,28 +268,31 @@ def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) 
     if isinstance(conn, JsonStoryStore):
         conn.add_event(chapter, event_type, payload)
         return
-    conn.execute(
-        "INSERT INTO events(chapter, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
-        (chapter, event_type, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
+    with _DB_LOCK:
+        conn.execute(
+            "INSERT INTO events(chapter, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+            (chapter, event_type, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
 
 def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
         return conn.recent_metrics(limit)
-    rows = conn.execute(
-        "SELECT * FROM chapter_metrics ORDER BY chapter DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT * FROM chapter_metrics ORDER BY chapter DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     return [dict(row) for row in rows]
 
 def recent_events(conn: Any, limit: int = 80) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
         return conn.recent_events(limit)
-    rows = conn.execute(
-        "SELECT chapter, event_type, payload, created_at FROM events ORDER BY id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT id, chapter, event_type, payload, created_at FROM events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     out = []
     for row in rows:
         item = dict(row)
@@ -282,13 +307,14 @@ def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
         return []
     try:
-        rows = conn.execute(
-            """SELECT constraint_type, description, priority FROM stage_constraints
-               WHERE resolved_chapter IS NULL
-               AND (expires_chapter IS NULL OR expires_chapter > ?)
-               ORDER BY priority DESC""",
-            (chapter_num,),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = conn.execute(
+                """SELECT constraint_type, description, priority FROM stage_constraints
+                   WHERE resolved_chapter IS NULL
+                   AND (expires_chapter IS NULL OR expires_chapter > ?)
+                   ORDER BY priority DESC""",
+                (chapter_num,),
+            ).fetchall()
         return [dict(row) for row in rows]
     except Exception:
         return []
@@ -296,43 +322,45 @@ def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
 def store_stage_constraints(conn: Any, chapter_num: int, constraints: list[dict[str, Any]]) -> None:
     if isinstance(conn, JsonStoryStore) or not constraints:
         return
-    for c in constraints:
-        expires = None
-        if c.get("expires_in_chapters"):
-            expires = chapter_num + int(c["expires_in_chapters"])
-        conn.execute(
-            """INSERT INTO stage_constraints(source_chapter, constraint_type, description, priority, expires_chapter, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                chapter_num,
-                str(c.get("type", "require")),
-                str(c.get("description", "")),
-                int(c.get("priority", 5)),
-                expires,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-    conn.commit()
+    with _DB_LOCK:
+        for c in constraints:
+            expires = None
+            if c.get("expires_in_chapters"):
+                expires = chapter_num + int(c["expires_in_chapters"])
+            conn.execute(
+                """INSERT INTO stage_constraints(source_chapter, constraint_type, description, priority, expires_chapter, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    chapter_num,
+                    str(c.get("type", "require")),
+                    str(c.get("description", "")),
+                    int(c.get("priority", 5)),
+                    expires,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+        conn.commit()
 
 def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]]) -> None:
     if isinstance(conn, JsonStoryStore) or not links:
         return
-    for link in links:
-        conn.execute(
-            """INSERT INTO causal_links(source_event_id, target_event_id, source_chapter, target_chapter,
-               link_type, description, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                0,
-                None,
-                chapter_num,
-                link.get("target_chapter"),
-                str(link.get("link_type", "causes")),
-                str(link.get("description", "")),
-                "open",
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-    conn.commit()
+    with _DB_LOCK:
+        for link in links:
+            conn.execute(
+                """INSERT INTO causal_links(source_event_id, target_event_id, source_chapter, target_chapter,
+                   link_type, description, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    0,
+                    None,
+                    chapter_num,
+                    link.get("target_chapter"),
+                    str(link.get("link_type", "causes")),
+                    str(link.get("description", "")),
+                    "open",
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+        conn.commit()
 
 def upsert_reader_promise(conn: Any, chapter_num: int, promise: dict[str, Any]) -> None:
     promise_id = str(
@@ -343,38 +371,39 @@ def upsert_reader_promise(conn: Any, chapter_num: int, promise: dict[str, Any]) 
     if isinstance(conn, JsonStoryStore):
         conn.upsert_reader_promise(promise_id, promise, chapter_num)
         return
-    conn.execute(
-        """
-        INSERT INTO reader_promises(
-            id, description, status, opened_chapter, due_chapter, emotional_type,
-            payoff_status, risk_level, updated_chapter, payload_json, created_at
+    with _DB_LOCK:
+        conn.execute(
+            """
+            INSERT INTO reader_promises(
+                id, description, status, opened_chapter, due_chapter, emotional_type,
+                payoff_status, risk_level, updated_chapter, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                description=excluded.description,
+                status=excluded.status,
+                due_chapter=excluded.due_chapter,
+                emotional_type=excluded.emotional_type,
+                payoff_status=excluded.payoff_status,
+                risk_level=excluded.risk_level,
+                updated_chapter=excluded.updated_chapter,
+                payload_json=excluded.payload_json
+            """,
+            (
+                promise_id,
+                str(promise.get("description", "")),
+                str(promise.get("status", "open")),
+                int(promise.get("opened_chapter") or promise.get("introduced_chapter") or chapter_num),
+                promise.get("due_chapter"),
+                str(promise.get("emotional_type", promise.get("thread_type", "plot"))),
+                str(promise.get("payoff_status", "pending")),
+                int(promise.get("risk_level", 5) or 5),
+                chapter_num,
+                json.dumps(promise.get("payload", {}), ensure_ascii=False),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            description=excluded.description,
-            status=excluded.status,
-            due_chapter=excluded.due_chapter,
-            emotional_type=excluded.emotional_type,
-            payoff_status=excluded.payoff_status,
-            risk_level=excluded.risk_level,
-            updated_chapter=excluded.updated_chapter,
-            payload_json=excluded.payload_json
-        """,
-        (
-            promise_id,
-            str(promise.get("description", "")),
-            str(promise.get("status", "open")),
-            int(promise.get("opened_chapter") or promise.get("introduced_chapter") or chapter_num),
-            promise.get("due_chapter"),
-            str(promise.get("emotional_type", promise.get("thread_type", "plot"))),
-            str(promise.get("payoff_status", "pending")),
-            int(promise.get("risk_level", 5) or 5),
-            chapter_num,
-            json.dumps(promise.get("payload", {}), ensure_ascii=False),
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    conn.commit()
+        conn.commit()
 
 def get_reader_promises(conn: Any, chapter_num: int, limit: int = 12) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
@@ -388,15 +417,16 @@ def get_reader_promises(conn: Any, chapter_num: int, limit: int = 12) -> list[di
         rows.sort(key=lambda x: (-(int(x.get("risk_level", 5) or 5)), -int(x.get("overdue_by", 0) or 0)))
         return rows[:limit]
     try:
-        rows = conn.execute(
-            """SELECT id, description, status, opened_chapter, due_chapter, emotional_type,
-                      payoff_status, risk_level, updated_chapter
-               FROM reader_promises
-               WHERE status IN ('open','advanced')
-               ORDER BY risk_level DESC, COALESCE(due_chapter, 999999) ASC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = conn.execute(
+                """SELECT id, description, status, opened_chapter, due_chapter, emotional_type,
+                          payoff_status, risk_level, updated_chapter
+                   FROM reader_promises
+                   WHERE status IN ('open','advanced')
+                   ORDER BY risk_level DESC, COALESCE(due_chapter, 999999) ASC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
         out = []
         for row in rows:
             item = dict(row)
@@ -426,13 +456,14 @@ def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10,
         out.sort(key=lambda x: -x["silence_duration"])
         return out[:limit]
     try:
-        rows = conn.execute(
-            """SELECT id, description, updated_chapter FROM open_threads
-               WHERE status='open' AND updated_chapter IS NOT NULL
-               AND (? - updated_chapter) >= ?
-               ORDER BY updated_chapter ASC LIMIT ?""",
-            (chapter_num, silence_threshold, limit),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = conn.execute(
+                """SELECT id, description, updated_chapter FROM open_threads
+                   WHERE status='open' AND updated_chapter IS NOT NULL
+                   AND (? - updated_chapter) >= ?
+                   ORDER BY updated_chapter ASC LIMIT ?""",
+                (chapter_num, silence_threshold, limit),
+            ).fetchall()
         return [
             {
                 "id": row["id"],
@@ -449,11 +480,12 @@ def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
     if isinstance(conn, JsonStoryStore):
         return []
     try:
-        rows = conn.execute(
-            """SELECT link_type, description, source_chapter FROM causal_links
-               WHERE status='open' AND link_type IN ('requires', 'enables', 'blocks')
-               ORDER BY source_chapter DESC LIMIT 30""",
-        ).fetchall()
+        with _DB_LOCK:
+            rows = conn.execute(
+                """SELECT link_type, description, source_chapter FROM causal_links
+                   WHERE status='open' AND link_type IN ('requires', 'enables', 'blocks')
+                   ORDER BY source_chapter DESC LIMIT 30""",
+            ).fetchall()
         return [dict(row) for row in rows]
     except Exception:
         return []
@@ -465,10 +497,11 @@ def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | No
     if isinstance(conn, JsonStoryStore):
         return conn.get_entity_state(entity_type, name)
     try:
-        row = conn.execute(
-            "SELECT state_json FROM entities WHERE entity_type=? AND name=?",
-            (entity_type, name),
-        ).fetchone()
+        with _DB_LOCK:
+            row = conn.execute(
+                "SELECT state_json FROM entities WHERE entity_type=? AND name=?",
+                (entity_type, name),
+            ).fetchone()
         if row:
             return json.loads(row["state_json"])
     except Exception:
@@ -541,13 +574,14 @@ def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, lim
         out.sort(key=lambda x: -x["overdue_by"])
         return out[:limit]
     try:
-        rows = conn.execute(
-            """SELECT id, description, due_chapter FROM open_threads
-               WHERE status='open' AND thread_type='reader_promise'
-               AND due_chapter IS NOT NULL AND due_chapter < ?
-               ORDER BY due_chapter ASC LIMIT ?""",
-            (cutoff, limit),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = conn.execute(
+                """SELECT id, description, due_chapter FROM open_threads
+                   WHERE status='open' AND thread_type='reader_promise'
+                   AND due_chapter IS NOT NULL AND due_chapter < ?
+                   ORDER BY due_chapter ASC LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
         return [
             {
                 "id": row["id"],
@@ -569,10 +603,11 @@ def validate_plan_continuity(conn: Any, plan: dict[str, Any], chapter_num: int, 
         deep = bool(config.get("novel", {}).get("plan_validate_deep", True))
     for char in plan.get("character_focus", []):
         try:
-            row = conn.execute(
-                "SELECT state_json FROM entities WHERE entity_type='character' AND name=?",
-                (char,),
-            ).fetchone()
+            with _DB_LOCK:
+                row = conn.execute(
+                    "SELECT state_json FROM entities WHERE entity_type='character' AND name=?",
+                    (char,),
+                ).fetchone()
             if row:
                 state = json.loads(row["state_json"])
                 status = state.get("status", "").lower()
@@ -583,13 +618,24 @@ def validate_plan_continuity(conn: Any, plan: dict[str, Any], chapter_num: int, 
         except Exception:
             pass
     try:
-        overdue = conn.execute(
-            """SELECT id, description FROM open_threads
-               WHERE status='open' AND due_chapter IS NOT NULL AND due_chapter < ?""",
-            (chapter_num,),
-        ).fetchall()
+        with _DB_LOCK:
+            overdue = conn.execute(
+                """SELECT id, description FROM open_threads
+                   WHERE status='open' AND due_chapter IS NOT NULL AND due_chapter < ?
+                   ORDER BY due_chapter ASC, updated_chapter DESC
+                   LIMIT 20""",
+                (chapter_num,),
+            ).fetchall()
+        seen_desc: set[str] = set()
         for thread in overdue:
-            violations.append(f"Overdue thread '{thread['id']}': {thread['description']}")
+            desc = (thread["description"] or "").strip()
+            # 去重：同一线索被反复登记成不同 id 时，描述往往高度雷同，
+            # 取描述前 24 字做指纹，避免同一伏笔灌爆规划提示。
+            fp = desc[:24]
+            if fp and fp in seen_desc:
+                continue
+            seen_desc.add(fp)
+            violations.append(f"Overdue thread '{thread['id']}': {desc}")
     except Exception:
         pass
 
@@ -621,9 +667,10 @@ def _deep_plan_violations(conn: Any, plan: dict[str, Any], chapter_num: int) -> 
             # Only warn if the plan clearly relocates the character: another known
             # place-name entity appears in the plan blob.
             try:
-                places = conn.execute(
-                    "SELECT name FROM entities WHERE entity_type='place'",
-                ).fetchall()
+                with _DB_LOCK:
+                    places = conn.execute(
+                        "SELECT name FROM entities WHERE entity_type='place'",
+                    ).fetchall()
             except Exception:
                 places = []
             other_place_in_plan = any(

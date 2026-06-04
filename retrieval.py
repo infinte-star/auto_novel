@@ -197,11 +197,10 @@ def retrieve(
 
     scored.sort(key=lambda x: x[0], reverse=True)
     out: list[dict[str, Any]] = []
-    seen_ch: set[int] = set()
     for score, p in scored:
         ch = int(p.get("chapter", 0))
         # Cap to at most 2 passages per chapter for diversity.
-        if list(seen_ch).count(ch) if False else sum(1 for o in out if o["chapter"] == ch) >= 2:
+        if sum(1 for o in out if o["chapter"] == ch) >= 2:
             continue
         out.append({"chapter": ch, "score": round(score, 4), "text": p.get("text", "")})
         if len(out) >= top_k:
@@ -256,6 +255,69 @@ def retrieval_block(
         snippet = snippet.replace("\n", "\n    ")
         lines.append(f"- [Ch{h['chapter']}]\n    {snippet}")
     return "\n".join(lines)
+
+
+def candidate_new_entities(
+    paths: Paths,
+    chapter_text: str,
+    min_len: int = 2,
+    max_len: int = 4,
+    df_floor: int = 1,
+    limit: int = 12,
+) -> list[str]:
+    """Deterministically flag proper-noun-like tokens that appear in this chapter
+    but are essentially absent from all PRIOR indexed chapters.
+
+    This is the objective counterpart to the LLM-only "hallucinated_entities"
+    check. It does NOT prove an entity is hallucinated — a legitimately new
+    character introduced this chapter will also show up here — but it gives the
+    reviewer a concrete shortlist to verify against established facts instead of
+    relying purely on the model noticing.
+
+    Heuristic: extract CJK runs of length [min_len, max_len] that look like names
+    (followed/preceded by common name markers, or capitalized ASCII runs), then
+    keep only those whose character bigrams have near-zero document frequency in
+    the existing index (i.e. the surface form was never seen before).
+    """
+    data = _load_index(paths)
+    if not data:
+        return []
+    df: dict[str, int] = data.get("df", {})
+    if not df:
+        return []
+
+    # 1) Harvest candidate surface forms from the chapter.
+    candidates: set[str] = set()
+    # ASCII proper nouns: Capitalized word runs.
+    for m in re.findall(r"[A-Z][A-Za-z]{1,}", chapter_text):
+        candidates.add(m)
+    # CJK name-like runs: a 2-4 char CJK token immediately preceding a relational/
+    # title marker (说/道/问/答/将军/大人/陛下/公子/姑娘/先生) OR following 称号 markers.
+    cjk = r"[一-鿿]"
+    marker = r"(?:说道|说|道|问道|答道|笑道|大人|将军|陛下|公子|姑娘|先生|殿下|大王|长老|宗主|城主|师兄|师姐|师父)"
+    for m in re.findall(rf"({cjk}{{{min_len},{max_len}}}){marker}", chapter_text):
+        candidates.add(m)
+    # Quoted speaker pattern: 「X」/“X” where X is a short CJK run.
+    for m in re.findall(rf"(?:“|「)({cjk}{{{min_len},{max_len}}})(?:”|」)", chapter_text):
+        candidates.add(m)
+
+    if not candidates:
+        return []
+
+    # 2) Keep only forms whose bigrams are essentially unseen in prior chapters.
+    new_entities: list[str] = []
+    for surface in candidates:
+        grams = _tokenize(surface)
+        if not grams:
+            continue
+        # Max DF across the surface's bigrams: if even the most common bigram is
+        # at/below df_floor, the surface form is effectively new to the corpus.
+        max_df = max(df.get(g, 0) for g in grams)
+        if max_df <= df_floor:
+            new_entities.append(surface)
+        if len(new_entities) >= limit:
+            break
+    return new_entities
 
 
 def backfill_index(paths: Paths, config: dict[str, Any]) -> int:

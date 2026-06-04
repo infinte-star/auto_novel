@@ -176,7 +176,7 @@ def write_chapter_with_candidates(
 
 
 def generate_one_chapter(
-    client: OpenAI,
+    client: Any,
     paths: Paths,
     conn: Any,
     config: dict[str, Any],

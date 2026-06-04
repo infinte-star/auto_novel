@@ -162,12 +162,19 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
         # Fallback to the novel directory name (parent of state.md), else placeholder.
         title = paths.state.parent.name or "未命名"
     write_text(paths.title, title + "\n")
-    write_text(paths.state, _as_markdown(data["state"]) + "\n")
-    write_text(paths.bible, _as_markdown(data["bible"]) + "\n")
-    write_text(paths.characters, _as_markdown(data["characters"]) + "\n")
-    write_text(paths.timeline, _as_markdown(data["timeline"]) + "\n")
-    write_text(paths.threads, _as_markdown(data["threads"]) + "\n")
-    write_text(paths.volume_plan, _as_markdown(data["volume_plan"]) + "\n")
+    # The bootstrap LLM occasionally omits a key (e.g. "timeline"); never let a
+    # single missing field crash the whole bootstrap and leave a half-written
+    # state.md that blocks re-bootstrap. Degrade to a labelled placeholder so the
+    # pipeline can proceed; the per-chapter loop will populate these going forward.
+    def _section(key: str, heading: str) -> str:
+        val = _as_markdown(data.get(key))
+        return val if val else f"# {heading}\n\n（bootstrap 未生成，待连载补全）"
+    write_text(paths.state, _section("state", "当前状态") + "\n")
+    write_text(paths.bible, _section("bible", "世界观圣经") + "\n")
+    write_text(paths.characters, _section("characters", "人物") + "\n")
+    write_text(paths.timeline, _section("timeline", "时间线") + "\n")
+    write_text(paths.threads, _section("threads", "伏笔与线索") + "\n")
+    write_text(paths.volume_plan, _section("volume_plan", "卷纲") + "\n")
     # Narrative-voice charter: this is the strongest anti-style-collapse anchor and
     # must exist from chapter 1. Only write it when the model produced one; an empty
     # value falls back to the placeholder created by ensure_project().
