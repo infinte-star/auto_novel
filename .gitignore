@@ -41,6 +41,8 @@ logs/
 config.yaml
 config_template.yaml
 novels/*/config.yaml
+# Per-endpoint screenplay configs also embed live API keys (e.g. config_script_gpt55.yaml).
+config_*.yaml
 .env
 .env.*
 
@@ -74,11 +76,22 @@ novels/*/chapters/
 novels/*/chapters_refined/
 novels/*/memory/
 novels/*/logs/
+novels/*/scripts/
 novels/
+
+# Screenplay conversion outputs & checkpoints (standalone --input mode writes a
+# scripts/ dir next to the input file; checkpoints are resumable scratch state).
+scripts/
+*.md.checkpoints/
 
 # One-off scripts
 check_token_plan_keys.py
 repair_stub_chapters.py
+
+# Scratch / debugging artifacts
+*.broken
+screenplay_head.txt
+screenplay_tail.txt
 
 # OS
 .DS_Store

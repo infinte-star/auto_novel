@@ -9,6 +9,8 @@ simultaneously without sharing the engine's process-level global state
 Subcommands:
     python novel.py create <name>            scaffold novels/<name>/ from templates
     python novel.py trial <name>             generate opening trial variants without touching chapters/book
+    python novel.py script --input PATH      convert any novel text file into a 短剧 screenplay
+    python novel.py script <name> --chapters A-B   convert chapters A..B of novels/<name>/
     python novel.py run <name>               run the pipeline (background, detached)
     python novel.py run <name> --foreground  run in the current console
     python novel.py list                     list all novels + progress + running state
@@ -117,15 +119,19 @@ def _run_inprocess(name: str) -> int:
     if not config_path.exists():
         print(f"[novel] ERROR: {config_path} not found. Run `python novel.py create {name}` first.")
         return 2
+    _write_pid_file(name, os.getpid(), "foreground")
     # Pass paths relative to PROJECT_DIR (== config.ROOT) so config.ROOT joins
     # resolve correctly regardless of the launching cwd.
     os.environ["NOVEL_CONFIG"] = str(config_path.relative_to(PROJECT_DIR))
     os.environ["NOVEL_PROMPT"] = str(prompt_path.relative_to(PROJECT_DIR))
 
-    from pipeline import main  # noqa: E402  (must import after env vars are set)
+    try:
+        from pipeline import main  # noqa: E402  (must import after env vars are set)
 
-    main()
-    return 0
+        main()
+        return 0
+    finally:
+        _remove_pid_file(name, os.getpid())
 
 
 def _set_novel_env(name: str) -> tuple[Path, Path]:
@@ -186,6 +192,126 @@ def cmd_adopt_trial(name: str, trial_id: str | None) -> int:
     print(f"[novel] adopted trial route: {trial_root}")
     print(f"[novel] wrote: {adopted}")
     return 0
+
+
+def cmd_script(
+    name: str | None,
+    input_path: str | None,
+    chapters: str | None,
+    out: str | None,
+    seg_chars: int | None,
+    temperature: float | None,
+) -> int:
+    """Convert novel text into a 短剧 screenplay.
+
+    Three input modes:
+      * --input PATH                         convert any text/markdown file (standalone)
+      * <name> --chapters A-B                convert chapters A..B of novels/<name>/
+      * <name>                               convert the whole novels/<name>/book.md
+    """
+    from screenplay import convert_file, convert_text
+
+    # Standalone file mode (no novel name needed).
+    if input_path:
+        src = Path(input_path)
+        if not src.is_absolute():
+            src = (Path.cwd() / src).resolve()
+        out_path = Path(out).resolve() if out else None
+        try:
+            result = convert_file(src, out_path, seg_chars=seg_chars, temperature=temperature)
+        except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
+            print(f"[novel] script conversion failed: {exc}")
+            return 3
+        print(f"[novel] screenplay written: {result}")
+        return 0
+
+    # Per-novel mode.
+    if not name:
+        print("[novel] ERROR: provide --input PATH, or a novel <name> (optionally with --chapters A-B).")
+        return 2
+    _validate_name(name)
+    _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
+    target = novel_dir(name)
+
+    if chapters:
+        text = _gather_chapter_text(target, chapters)
+        if text is None:
+            return 2
+        default_out = target / "scripts" / f"script_ch{chapters.replace(' ', '')}.md"
+        label = f"chapters {chapters}"
+    else:
+        book = target / "book.md"
+        if not book.exists():
+            print(f"[novel] ERROR: {book} not found; specify --chapters or --input instead.")
+            return 2
+        text = book.read_text(encoding="utf-8", errors="replace")
+        default_out = target / "scripts" / "script_book.md"
+        label = "book.md"
+
+    if not text.strip():
+        print(f"[novel] ERROR: no text to convert ({label}).")
+        return 2
+
+    out_path = Path(out).resolve() if out else default_out
+    import config as _config
+
+    # _set_novel_env set NOVEL_CONFIG, but config.py captured CONFIG_FILE at import;
+    # refresh it so load_config()/get_paths() read this novel's config.
+    _config.CONFIG_FILE = _config.ROOT / os.environ.get("NOVEL_CONFIG", "config.yaml")
+    config = _config.load_config()
+    paths = _config.get_paths(config)
+    try:
+        result = convert_text(
+            text,
+            config=config,
+            paths=paths,
+            out_path=out_path,
+            seg_chars=seg_chars,
+            temperature=temperature,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[novel] script conversion failed: {exc}")
+        return 3
+    print(f"[novel] screenplay written: {result}")
+    return 0
+
+
+def _parse_chapter_range(spec: str) -> tuple[int, int] | None:
+    spec = spec.strip()
+    if "-" in spec:
+        lo_s, hi_s = spec.split("-", 1)
+    else:
+        lo_s = hi_s = spec
+    try:
+        lo, hi = int(lo_s), int(hi_s)
+    except ValueError:
+        return None
+    if lo <= 0 or hi < lo:
+        return None
+    return lo, hi
+
+
+def _gather_chapter_text(target: Path, chapters: str) -> str | None:
+    rng = _parse_chapter_range(chapters)
+    if rng is None:
+        print(f"[novel] ERROR: bad --chapters range {chapters!r}; use e.g. 1-3 or 5.")
+        return None
+    lo, hi = rng
+    chapters_dir = target / "chapters"
+    if not chapters_dir.exists():
+        print(f"[novel] ERROR: {chapters_dir} not found.")
+        return None
+    parts: list[str] = []
+    for n in range(lo, hi + 1):
+        path = chapters_dir / f"{n:04d}.md"
+        if path.exists():
+            chunk = path.read_text(encoding="utf-8", errors="replace").strip()
+            if chunk:
+                parts.append(chunk)
+    if not parts:
+        print(f"[novel] ERROR: no chapter files found in {chapters_dir} for range {lo}-{hi}.")
+        return None
+    return "\n\n".join(parts)
 
 
 def _benchmark_root() -> Path:
@@ -254,6 +380,71 @@ def _run_marker(name: str) -> str:
     return f"novel.py run {name}"
 
 
+def _pid_file(name: str) -> Path:
+    return novel_dir(name) / "logs" / "run.pid"
+
+
+def _write_pid_file(name: str, pid: int, mode: str) -> None:
+    path = _pid_file(name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pid": int(pid),
+                    "name": name,
+                    "mode": mode,
+                    "project": str(PROJECT_DIR),
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _remove_pid_file(name: str, pid: int | None = None) -> None:
+    path = _pid_file(name)
+    if not path.exists():
+        return
+    if pid is not None:
+        data = _read_pid_file(name)
+        if data and data.get("pid") != pid:
+            return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _read_pid_file(name: str) -> dict[str, object] | None:
+    path = _pid_file(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("name") != name:
+        return None
+    if str(data.get("project", "")) != str(PROJECT_DIR):
+        return None
+    try:
+        pid = int(data.get("pid", 0))
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    data["pid"] = pid
+    return data
+
+
 def cmd_run(name: str, foreground: bool) -> int:
     _validate_name(name)
     target = novel_dir(name)
@@ -274,17 +465,21 @@ def cmd_run(name: str, foreground: bool) -> int:
     if _is_windows():
         # Start-Process establishes a real detached process the OS won't reap
         # when this launcher exits (mirrors restart.py's approach).
-        ps_args = [
-            "powershell", "-NoProfile", "-Command",
-            "Start-Process",
-            "-FilePath", f"'{python}'",
-            "-ArgumentList", f"'-u','{entry}','run','{name}','--foreground'",
-            "-WorkingDirectory", f"'{PROJECT_DIR}'",
-            "-RedirectStandardOutput", f"'{run_log}'",
-            "-RedirectStandardError", f"'{log_dir / 'runner_stderr.log'}'",
-            "-WindowStyle", "Hidden",
-            "-PassThru",
-        ]
+        # Emit ONLY the child's PID (the .Id property) so we never mis-scrape it
+        # from the Get-Process-style table that `-PassThru` prints by default.
+        # The old table parser grabbed the first all-digit column (Handles),
+        # writing a bogus small PID into run.pid; `stop` then trusted that PID,
+        # killed the wrong/nonexistent process, and left the real worker alive.
+        ps_command = (
+            "(Start-Process "
+            f"-FilePath '{python}' "
+            f"-ArgumentList '-u','{entry}','run','{name}','--foreground' "
+            f"-WorkingDirectory '{PROJECT_DIR}' "
+            f"-RedirectStandardOutput '{run_log}' "
+            f"-RedirectStandardError '{log_dir / 'runner_stderr.log'}' "
+            "-WindowStyle Hidden -PassThru).Id"
+        )
+        ps_args = ["powershell", "-NoProfile", "-Command", ps_command]
         try:
             out = subprocess.check_output(ps_args, text=True, encoding="utf-8", errors="replace")
         except subprocess.CalledProcessError as exc:
@@ -293,11 +488,8 @@ def cmd_run(name: str, foreground: bool) -> int:
         pid_val = "unknown"
         for line in out.splitlines():
             line = line.strip()
-            if line.lower().startswith("id ") and ":" in line:
-                pid_val = line.split(":", 1)[1].strip()
-                break
-            if line.split() and line.split()[0].isdigit():
-                pid_val = line.split()[0]
+            if line.isdigit():
+                pid_val = line
                 break
         try:
             with open(run_log, "ab", buffering=0) as fp:
@@ -306,6 +498,10 @@ def cmd_run(name: str, foreground: bool) -> int:
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} (PID {pid_val}) ==========\n".encode()
                 )
         except Exception:
+            pass
+        try:
+            _write_pid_file(name, int(pid_val), "background")
+        except (TypeError, ValueError):
             pass
         print(f"[novel] '{name}' started PID={pid_val}")
         print(f"[novel] tailing log: {run_log}")
@@ -323,6 +519,7 @@ def cmd_run(name: str, foreground: bool) -> int:
             stdin=subprocess.DEVNULL, stdout=log_fp, stderr=subprocess.STDOUT,
             start_new_session=True, close_fds=True,
         )
+        _write_pid_file(name, proc.pid, "background")
         print(f"[novel] '{name}' started PID={proc.pid}")
         print(f"[novel] tailing log: {run_log}")
     finally:
@@ -412,12 +609,46 @@ def _all_python_pids_with_cmdline() -> list[tuple[int, str]]:
     return results
 
 
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if _is_windows():
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, OSError):
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def find_novel_pids(name: str) -> list[int]:
     """PIDs whose command line runs `novel.py run <name>` for THIS project."""
-    marker = _run_marker(name).lower().replace("\\", "/")
     project_root = str(PROJECT_DIR).lower().replace("\\", "/")
     self_pid = os.getpid()
     pids: list[int] = []
+    pid_data = _read_pid_file(name)
+    if pid_data:
+        pid = int(pid_data["pid"])
+        if pid != self_pid and _pid_exists(pid):
+            pids.append(pid)
+        elif not _pid_exists(pid):
+            _remove_pid_file(name, pid)
     for pid, cmd in _all_python_pids_with_cmdline():
         if pid == self_pid:
             continue
@@ -429,7 +660,7 @@ def find_novel_pids(name: str) -> list[int]:
             continue
         # Confine to this project: either the path appears, or it's a bare launch
         # (cwd was the project dir).
-        if project_root in cmd_norm or _looks_like_local_launch(cmd_norm):
+        if (project_root in cmd_norm or _looks_like_local_launch(cmd_norm)) and pid not in pids:
             pids.append(pid)
     return pids
 
@@ -456,8 +687,24 @@ def kill_pids(pids: list[int]) -> None:
         print(f"[novel] killing PID {pid} ...")
         try:
             if _is_windows():
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-Command",
+                            f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
             else:
                 os.kill(pid, 15)
         except ProcessLookupError:
@@ -482,8 +729,22 @@ def cmd_stop(name: str) -> int:
     pids = find_novel_pids(name)
     if not pids:
         print(f"[novel] no running process found for '{name}'.")
+        _remove_pid_file(name)
         return 0
     kill_pids(pids)
+    # Verify the kill landed. taskkill /T may miss grandchildren if the worker
+    # already re-parented, and a wrong pid file could have hidden survivors; do a
+    # fresh scan and re-kill anything still matching so `stop` never leaves a
+    # worker running while reporting success.
+    survivors = find_novel_pids(name)
+    if survivors:
+        print(f"[novel] {len(survivors)} process(es) survived first kill; retrying ...")
+        kill_pids(survivors)
+        survivors = find_novel_pids(name)
+    _remove_pid_file(name)
+    if survivors:
+        print(f"[novel] WARNING: could not kill PID(s) {survivors} for '{name}'.")
+        return 1
     return 0
 
 
@@ -492,6 +753,7 @@ def cmd_restart(name: str, foreground: bool, wait: float) -> int:
     pids = find_novel_pids(name)
     if pids:
         kill_pids(pids)
+        _remove_pid_file(name)
         if wait > 0:
             print(f"[novel] waiting {wait}s for '{name}' to drain ...")
             time.sleep(wait)
@@ -593,6 +855,14 @@ def main() -> int:
     p_bench_add.add_argument("source")
     p_bench_add.add_argument("--title", default=None)
 
+    p_script = sub.add_parser("script", help="convert novel text into a 短剧 screenplay")
+    p_script.add_argument("name", nargs="?", default=None, help="novel name (omit when using --input)")
+    p_script.add_argument("--input", default=None, help="path to any text/markdown file to convert (standalone)")
+    p_script.add_argument("--chapters", default=None, help="chapter range from novels/<name>/chapters, e.g. 1-3 or 5")
+    p_script.add_argument("--out", default=None, help="output screenplay path")
+    p_script.add_argument("--seg-chars", type=int, default=None, help="max novel chars per LLM call (default 6000)")
+    p_script.add_argument("--temperature", type=float, default=None, help="LLM temperature override")
+
     p_run = sub.add_parser("run", help="run the pipeline for a novel")
     p_run.add_argument("name")
     p_run.add_argument("--foreground", action="store_true", help="run in the current console instead of detaching")
@@ -622,6 +892,15 @@ def main() -> int:
             return cmd_benchmark_add(args.platform, args.style, args.source, title=args.title)
     if args.command == "run":
         return cmd_run(args.name, foreground=args.foreground)
+    if args.command == "script":
+        return cmd_script(
+            args.name,
+            input_path=args.input,
+            chapters=args.chapters,
+            out=args.out,
+            seg_chars=args.seg_chars,
+            temperature=args.temperature,
+        )
     if args.command == "list":
         return cmd_list()
     if args.command == "stop":

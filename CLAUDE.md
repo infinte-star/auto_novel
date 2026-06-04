@@ -30,6 +30,8 @@ python novel.py run <name> --foreground  # run in the current console
 python novel.py list                     # list every novel: chapters / chars / running? / last log line
 python novel.py stop <name>              # kill ONLY this novel's process (token-exact `run <name>` match)
 python novel.py restart <name>           # stop + relaunch (resumes from checkpoint)
+python novel.py script --input PATH      # convert ANY novel text file -> 短剧 screenplay (standalone)
+python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/<name>/
 ```
 
 How it works (no engine changes — pure scaffolding around the existing pipeline):
@@ -214,6 +216,23 @@ When the JSON contract matters, prompts are wrapped in `json_prompt(user)` which
 
 ### Refine pass (`refine.py`)
 Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond 3× original.
+
+### Screenplay conversion (`screenplay.py`)
+Standalone novel-text → 短剧 (vertical-drama) script converter, decoupled from the
+generation pipeline. `convert_file(input, out)` / `convert_text(...)` split input on
+`第N章` markers (or char-budgeted paragraph packing when there are no markers), then
+run **one LLM call per segment** with continuity carry-over (running 第N集 episode
+number, last segment's tail) so episode/scene numbering stays monotonic across calls.
+Output follows the reference duanju format: `第N集` → `N-N 地点 时段 内/外` → `人物：` →
+`△`动作行 → `角色：台词` → `（字幕：…）` / `角色（OS）：旁白` / `（镜头：…）`. Per-segment
+checkpoints under `<out>.checkpoints/seg_NNNN.json` make the pass resumable. Default
+output goes to a `scripts/` dir: `novels/<name>/scripts/` for per-novel mode, or a
+`scripts/` subdir next to the input file in standalone `--input` mode (override with
+`--out`). It reuses
+the engine's config-driven LLM client only for API keys; with no `--config`/`NOVEL_CONFIG`
+it falls back to `config_template.yaml` (the shared keys). Tuned by `script_seg_chars`,
+`script_max_tokens`, `script_temperature`. CLI: `python novel.py script --input PATH`
+(any file) or `python novel.py script <name> --chapters A-B` / bare `<name>` (book.md).
 
 ## Things to be careful with
 
