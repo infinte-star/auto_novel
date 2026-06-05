@@ -4,9 +4,16 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from checkpoint import CHAPTER_CURRENT_CHECKPOINT, load_checkpoint, save_checkpoint, should_resume_existing_chapter
+from checkpoint import (
+    CHAPTER_CURRENT_CHECKPOINT,
+    bump_finalize_attempts,
+    load_checkpoint,
+    save_checkpoint,
+    should_resume_existing_chapter,
+)
 from config import (
     Paths,
+    book_reached_target,
     chapter_path,
     configured_api_endpoints,
     count_chars,
@@ -53,6 +60,11 @@ class BackgroundTasks:
                 errors.append(exc)
                 log(self.paths, f"Background task {label} failed: {exc}")
 
+        with self.lock:
+            for existing_label, existing_thread, _ in self.tasks:
+                if existing_label == label and existing_thread.is_alive():
+                    log(self.paths, f"Skipping resubmit of {label}; already running")
+                    return
         thread = threading.Thread(target=runner, name=f"bg-{label}", daemon=True)
         thread.start()
         with self.lock:
@@ -175,6 +187,38 @@ def write_chapter_with_candidates(
     return best_text, best_review
 
 
+def _fallback_extraction(plan: dict[str, Any], review: dict[str, Any], chapter_num: int, error: str) -> dict[str, Any]:
+    """Minimal extraction payload written when extract_events cannot run.
+
+    Used both when the LLM extraction raises and when finalize is force-completed
+    after exhausting retries, so the resume markers always get written and the
+    main loop can advance instead of re-entering the same chapter forever.
+    """
+    return {
+        "title": plan.get("title", f"Ch{chapter_num}"),
+        "events": [
+            {
+                "type": "plot",
+                "summary": f"Ch{chapter_num} saved; LLM extraction failed, fallback event recorded.",
+                "effects": [],
+            }
+        ],
+        "entities": [],
+        "threads": [],
+        "causal_links": [],
+        "metrics": {
+            "payoff_type": plan.get("payoff_type"),
+            "conflict_type": plan.get("conflict_type"),
+            "tension": None,
+            "novelty": None,
+            "hook_strength": review.get("hook_strength"),
+            "emotional_tone": "",
+        },
+        "memory_updates": {"bible": [], "characters": [], "timeline": [], "threads": []},
+        "fallback_error": str(error),
+    }
+
+
 def generate_one_chapter(
     client: Any,
     paths: Paths,
@@ -182,6 +226,7 @@ def generate_one_chapter(
     config: dict[str, Any],
     chapter_num: int,
     background: BackgroundTasks | None = None,
+    resume: bool = False,
 ) -> None:
     if background is not None and chapter_num > 1:
         # Block until the previous chapter's extract + structured-state writes
@@ -478,29 +523,7 @@ def generate_one_chapter(
                 )
             except Exception as exc:
                 log(paths, f"Extraction failed Ch{chapter_num}; using local fallback extraction: {exc}")
-                extraction_local = {
-                    "title": plan.get("title", f"Ch{chapter_num}"),
-                    "events": [
-                        {
-                            "type": "plot",
-                            "summary": f"Ch{chapter_num} saved; LLM extraction failed, fallback event recorded.",
-                            "effects": [],
-                        }
-                    ],
-                    "entities": [],
-                    "threads": [],
-                    "causal_links": [],
-                    "metrics": {
-                        "payoff_type": plan.get("payoff_type"),
-                        "conflict_type": plan.get("conflict_type"),
-                        "tension": None,
-                        "novelty": None,
-                        "hook_strength": review.get("hook_strength"),
-                        "emotional_tone": "",
-                    },
-                    "memory_updates": {"bible": [], "characters": [], "timeline": [], "threads": []},
-                    "fallback_error": str(exc),
-                }
+                extraction_local = _fallback_extraction(plan, review, chapter_num, str(exc))
             save_checkpoint(paths, chapter_num, "extraction.json", extraction_local)
         else:
             extraction_local = load_checkpoint(paths, chapter_num, "extraction.json") or {}
@@ -517,7 +540,8 @@ def generate_one_chapter(
     state_file_label = f"state_file_ch{chapter_num}"
 
     needs_finalize = not (extraction_done and structured_done and completed_done)
-    if extract_in_bg and background is not None and needs_finalize:
+    use_bg_finalize = extract_in_bg and background is not None and needs_finalize and not resume
+    if use_bg_finalize:
         # CRITICAL: write chapter_completed.json synchronously BEFORE submitting
         # background work. The main loop uses this marker to decide whether to
         # re-enter `Resuming partially indexed Ch{n}`; if we left it for the bg
@@ -536,15 +560,43 @@ def generate_one_chapter(
                 _run_state_file(extraction_local)
         background.submit(finalize_label, _bg_finalize_and_state)
     else:
-        extraction_local = _run_finalize()
-        if not state_file_done:
-            if state_in_bg and background is not None:
-                background.submit(state_file_label, _run_state_file, extraction_local)
-            else:
-                _run_state_file(extraction_local)
-        if not load_checkpoint(paths, chapter_num, "chapter_completed.json"):
-            db_event(conn, chapter_num, "chapter_completed", {"review": review, "plan": plan, "decision": decision})
-            save_checkpoint(paths, chapter_num, "chapter_completed.json", {"done": True})
+        # Synchronous finalize. This is the path taken on a RESUME (resume=True):
+        # the first-pass background finalize never wrote its markers (e.g. the bg
+        # extract LLM call failed against dead keys), so the loop re-entered this
+        # chapter. Running finalize synchronously here — bounded by
+        # max_finalize_attempts — guarantees extraction.json/structured_state_done
+        # become durable so should_resume_existing_chapter stops re-triggering and
+        # the loop advances instead of resubmitting forever.
+        max_attempts = int(config["novel"].get("max_finalize_attempts", 3) or 3)
+        attempts = bump_finalize_attempts(paths, chapter_num) if resume and needs_finalize else 0
+        if resume and needs_finalize and attempts > max_attempts:
+            log(
+                paths,
+                f"Finalize for Ch{chapter_num} exhausted {attempts - 1} attempts "
+                f"(max={max_attempts}); force-completing with fallback markers to break resume loop",
+            )
+            if not extraction_done:
+                save_checkpoint(
+                    paths, chapter_num, "extraction.json",
+                    _fallback_extraction(plan, review, chapter_num, "finalize attempts exhausted"),
+                )
+            if not structured_done:
+                save_checkpoint(paths, chapter_num, "structured_state_done.json", {"done": True, "forced": True})
+            if not state_file_done:
+                save_checkpoint(paths, chapter_num, "state_file_done.json", {"done": True, "forced": True})
+            if not load_checkpoint(paths, chapter_num, "chapter_completed.json"):
+                db_event(conn, chapter_num, "chapter_completed", {"review": review, "plan": plan, "decision": decision})
+                save_checkpoint(paths, chapter_num, "chapter_completed.json", {"done": True, "forced": True})
+        else:
+            extraction_local = _run_finalize()
+            if not state_file_done:
+                if state_in_bg and background is not None and not resume:
+                    background.submit(state_file_label, _run_state_file, extraction_local)
+                else:
+                    _run_state_file(extraction_local)
+            if not load_checkpoint(paths, chapter_num, "chapter_completed.json"):
+                db_event(conn, chapter_num, "chapter_completed", {"review": review, "plan": plan, "decision": decision})
+                save_checkpoint(paths, chapter_num, "chapter_completed.json", {"done": True})
     log(paths, f"Saved and indexed Ch{chapter_num}")
 
     # Log prompt-cache effectiveness per chapter for monitoring.
@@ -653,7 +705,7 @@ def generate_one_chapter(
             max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
             next_num = chapter_num + 1
             should_prefetch = True
-            if target_chars and count_chars(paths.book) >= target_chars:
+            if target_chars and book_reached_target(paths.book, target_chars):
                 should_prefetch = False
                 log(paths, f"Prefetch skipped after Ch{chapter_num}: target_chars reached")
             if max_chapters and next_num > max_chapters:
@@ -772,17 +824,18 @@ def main() -> None:
     log(paths, f"Start target_chars={target} current_chars={count_chars(paths.book)} max_chapters={max_chapters or 'none'}")
     background = BackgroundTasks(paths)
     try:
-        while count_chars(paths.book) < target:
+        while not book_reached_target(paths.book, target):
             last_chapter = find_last_chapter(paths)
             if max_chapters and last_chapter >= max_chapters:
                 log(paths, f"Reached max_chapters={max_chapters}; stopping chapter loop")
                 break
-            if should_resume_existing_chapter(paths, last_chapter):
+            is_resume = should_resume_existing_chapter(paths, last_chapter)
+            if is_resume:
                 chapter_num = last_chapter
                 log(paths, f"Resuming partially indexed Ch{chapter_num}")
             else:
                 chapter_num = last_chapter + 1
-            generate_one_chapter(client, paths, conn, config, chapter_num, background=background)
+            generate_one_chapter(client, paths, conn, config, chapter_num, background=background, resume=is_resume)
             total = count_chars(paths.book)
             log(paths, f"Progress chars={total}/{target} pct={total / target * 100:.2f}%")
     finally:

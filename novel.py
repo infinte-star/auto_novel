@@ -812,6 +812,77 @@ def cmd_list() -> int:
     return 0
 
 
+def cmd_stats(name: str) -> int:
+    """Aggregate logs/llm_calls.jsonl for a novel into a per-stage summary."""
+    nd = NOVELS_DIR / name
+    metrics_path = nd / "logs" / "llm_calls.jsonl"
+    if not metrics_path.exists():
+        print(f"[novel] no metrics yet for {name!r} ({metrics_path} missing). "
+              f"They accumulate once the novel runs with api.metrics_enabled (default on).")
+        return 0
+    by_tag: dict[str, dict[str, float]] = {}
+    totals = {"calls": 0.0, "elapsed": 0.0, "prompt": 0.0, "output": 0.0,
+              "attempts": 0.0, "salvaged": 0.0, "failed": 0.0}
+    try:
+        lines = metrics_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        print(f"[novel] could not read {metrics_path}: {exc}")
+        return 1
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        tag = str(row.get("tag") or "(untagged)")
+        agg = by_tag.setdefault(tag, {"calls": 0.0, "elapsed": 0.0, "prompt": 0.0,
+                                      "output": 0.0, "attempts": 0.0,
+                                      "salvaged": 0.0, "failed": 0.0})
+        elapsed = float(row.get("elapsed") or 0.0)
+        prompt = float(row.get("prompt_chars") or 0.0)
+        output = float(row.get("output_chars") or 0.0)
+        attempts = float(row.get("attempts") or 1.0)
+        salvaged = 1.0 if row.get("salvaged") else 0.0
+        failed = 0.0 if row.get("ok", True) else 1.0
+        for bucket in (agg, totals):
+            bucket["calls"] += 1
+            bucket["elapsed"] += elapsed
+            bucket["prompt"] += prompt
+            bucket["output"] += output
+            bucket["attempts"] += attempts
+            bucket["salvaged"] += salvaged
+            bucket["failed"] += failed
+
+    if totals["calls"] == 0:
+        print(f"[novel] {metrics_path} has no parseable records yet.")
+        return 0
+
+    print(f"[novel] LLM call stats for {name!r}  (source: {metrics_path})")
+    header = (f"{'STAGE/TAG':<28} {'CALLS':>7} {'AVG_s':>7} {'TOT_s':>9} "
+              f"{'AVG_OUT':>8} {'RETRY%':>7} {'SALV%':>6} {'FAIL%':>6}")
+    print(header)
+    print("-" * len(header))
+
+    def _emit(label: str, agg: dict[str, float]) -> None:
+        calls = agg["calls"] or 1.0
+        avg_s = agg["elapsed"] / calls
+        avg_out = agg["output"] / calls
+        # attempts includes the first try; retry% = extra attempts per call.
+        retry_pct = max(0.0, (agg["attempts"] / calls - 1.0)) * 100.0
+        salv_pct = agg["salvaged"] / calls * 100.0
+        fail_pct = agg["failed"] / calls * 100.0
+        print(f"{label:<28} {int(agg['calls']):>7} {avg_s:>7.1f} {agg['elapsed']:>9.0f} "
+              f"{int(avg_out):>8} {retry_pct:>6.0f}% {salv_pct:>5.0f}% {fail_pct:>5.0f}%")
+
+    for tag in sorted(by_tag, key=lambda t: by_tag[t]["elapsed"], reverse=True):
+        _emit(tag, by_tag[tag])
+    print("-" * len(header))
+    _emit("TOTAL", totals)
+    return 0
+
+
 def _tail_line(path: Path, max_len: int = 60) -> str:
     if not path.exists():
         return ""
@@ -869,6 +940,9 @@ def main() -> int:
 
     sub.add_parser("list", help="list all novels and their progress")
 
+    p_stats = sub.add_parser("stats", help="aggregate per-stage LLM call metrics for a novel")
+    p_stats.add_argument("name")
+
     p_stop = sub.add_parser("stop", help="kill the running process for a novel")
     p_stop.add_argument("name")
 
@@ -903,6 +977,8 @@ def main() -> int:
         )
     if args.command == "list":
         return cmd_list()
+    if args.command == "stats":
+        return cmd_stats(args.name)
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

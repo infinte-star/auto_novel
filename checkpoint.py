@@ -70,3 +70,23 @@ def should_resume_existing_chapter(paths: Paths, chapter_num: int) -> bool:
     if completed and extraction_done and structured_done:
         return False
     return True
+
+def bump_finalize_attempts(paths: Paths, chapter_num: int) -> int:
+    """Increment and return the per-chapter finalize-attempt counter.
+
+    Persisted to `finalize_attempts.json` in the chapter's checkpoint dir. Used by
+    the synchronous (resume) finalize path to force-complete a chapter after a
+    bounded number of failed attempts, so a permanently-failing extract/state
+    update can never trap the main loop in `Resuming partially indexed Ch{n}`.
+    Returns the new (post-increment) attempt count.
+    """
+    data = load_checkpoint(paths, chapter_num, "finalize_attempts.json")
+    count = 0
+    if isinstance(data, dict):
+        try:
+            count = int(data.get("attempts", 0))
+        except (TypeError, ValueError):
+            count = 0
+    count += 1
+    save_checkpoint(paths, chapter_num, "finalize_attempts.json", {"attempts": count})
+    return count

@@ -112,7 +112,7 @@ def creative_boost(client: OpenAI, paths: Paths, conn: Any, config: dict[str, An
     try:
         raw = call_llm(
             client, paths, config, CREATIVE_BOOST_SYSTEM,
-            json_prompt(read_text(PROMPT_FILE)), temperature=0.9,
+            json_prompt(read_text(PROMPT_FILE)), temperature=0.9, tag="creative_boost",
         )
         boost = load_json_with_repair(client, paths, config, raw, fallback={})
         if not isinstance(boost, dict) or not boost:
@@ -155,7 +155,7 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     brief = read_text(PROMPT_FILE)
     if boost_block:
         brief = brief + "\n\n" + boost_block
-    raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7)
+    raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7, tag="bootstrap")
     data = load_json_with_repair(client, paths, config, raw)
     title = str(data.get("title") or "").strip()
     if not title:
@@ -504,7 +504,7 @@ def compress_memory_file(
     mem_max_kb = int(config["novel"].get("memory_max_kb", 15))
     max_chars = max(3000, mem_max_kb * 1024 // 3)
     system = MEMORY_COMPRESS_SYSTEM.format(max_chars=max_chars)
-    compressed = call_llm(client, paths, config, system, old_text, max_tokens=12000, temperature=0.2)
+    compressed = call_llm(client, paths, config, system, old_text, max_tokens=12000, temperature=0.2, tag="memory_compress")
     compressed = normalize_text(compressed)
     new_content = header.rstrip() + "\n\n## Consolidated\n" + compressed + "\n\n" + "".join(recent_sections)
     write_text(file_path, new_content)

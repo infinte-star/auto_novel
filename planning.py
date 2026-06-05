@@ -547,6 +547,7 @@ def generate_candidate_plans(
                     max_tokens=16000,
                     temperature=0.65 + idx * 0.05,
                     cacheable_prefix=cacheable_prefix(paths, config),
+                    tag="plan_candidate",
                 )
                 plan = load_json_with_repair(client, paths, config, raw)
                 plan["candidate_index"] = idx
@@ -596,6 +597,7 @@ def screen_candidates(
     raw = call_llm(
         client, paths, config, SCREEN_SYSTEM, json_prompt(user),
         max_tokens=12000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
+        tag="plan_screen",
     )
     result = load_json_with_repair(
         client, paths, config, raw, fallback={"ranking": [{"index": i} for i in range(len(plans))]}
@@ -672,6 +674,7 @@ def _fused_review_one_plan(
                 max_tokens=12000,
                 temperature=0.2,
                 cacheable_prefix=cacheable_prefix(paths, config),
+                tag="plan_review_fused",
             )
             fused = load_json_with_repair(client, paths, config, raw, fallback=fallback)
             if not isinstance(fused.get("axes"), dict):
@@ -715,6 +718,7 @@ def agent_review_plan(
                         client, paths, config, system, json_prompt(user),
                         max_tokens=12000, temperature=0.2,
                         cacheable_prefix=cacheable_prefix(paths, config),
+                        tag="plan_review_axis",
                     )
                     report = load_json_with_repair(
                         client,
@@ -820,6 +824,7 @@ def review_candidate_plans(
                         client, paths, config, system, json_prompt(user),
                         max_tokens=12000, temperature=0.2,
                         cacheable_prefix=cacheable_prefix(paths, config),
+                        tag="plan_review_axis",
                     )
                     report = load_json_with_repair(
                         client,
@@ -903,6 +908,7 @@ def arbitrate_plan(
     raw = call_llm(
         client, paths, config, ARBITER_SYSTEM, json_prompt(user),
         max_tokens=12000, temperature=0.25, cacheable_prefix=cacheable_prefix(paths, config),
+        tag="plan_arbitrate",
     )
     decision = load_json_with_repair(client, paths, config, raw)
     plan = decision.get("merged_plan") or plans[int(decision.get("selected_index", 0))]

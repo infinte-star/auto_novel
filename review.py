@@ -429,6 +429,7 @@ def review_chapter(
     raw = call_llm(
         client, paths, config, REVIEW_SYSTEM, json_prompt(user),
         max_tokens=32000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
+        tag="review",
     )
     report = load_json_with_repair(
         client,
@@ -602,7 +603,7 @@ def stage_review(
 {chr(10).join(recent)}
 
 审校截至第 {chapter_num} 章的长周期质量。"""
-    raw = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, json_prompt(user), max_tokens=12000, temperature=0.3)
+    raw = call_llm(client, paths, config, STAGE_REVIEW_SYSTEM, json_prompt(user), max_tokens=12000, temperature=0.3, tag="stage_review")
     data = load_json_with_repair(
         client,
         paths,
@@ -710,7 +711,7 @@ def pack_review(
 ## 待评审章节 Ch{start}-{chapter_num}
 {chr(10).join(recent)}
 """
-    raw = call_llm(client, paths, config, PACK_REVIEW_SYSTEM, json_prompt(user), max_tokens=16000, temperature=0.25)
+    raw = call_llm(client, paths, config, PACK_REVIEW_SYSTEM, json_prompt(user), max_tokens=16000, temperature=0.25, tag="pack_review")
     data = load_json_with_repair(client, paths, config, raw, fallback={})
     append_text(
         paths.logs_dir / "pack_reviews.md",
@@ -796,7 +797,7 @@ def refresh_voice_anchors(
 {recent_text[:18000]}
 
 为第 {chapter_num} 章刷新 voice.md。"""
-    new_voice = call_llm(client, paths, config, VOICE_ANCHOR_SYSTEM, voice_user, max_tokens=8000, temperature=0.3)
+    new_voice = call_llm(client, paths, config, VOICE_ANCHOR_SYSTEM, voice_user, max_tokens=8000, temperature=0.3, tag="voice_anchor")
     new_voice = normalize_text(new_voice).strip()
     if new_voice:
         write_text(paths.voice, new_voice + "\n")
@@ -810,7 +811,7 @@ def refresh_voice_anchors(
 {recent_text[:18000]}
 
 为第 {chapter_num} 章刷新 voices.md。"""
-    new_voices = call_llm(client, paths, config, VOICES_TABLE_SYSTEM, voices_user, max_tokens=8000, temperature=0.3)
+    new_voices = call_llm(client, paths, config, VOICES_TABLE_SYSTEM, voices_user, max_tokens=8000, temperature=0.3, tag="voices_table")
     new_voices = normalize_text(new_voices).strip()
     if new_voices:
         write_text(paths.voices, new_voices + "\n")
@@ -853,6 +854,7 @@ def cold_reader_review(
     raw = call_llm(
         client, paths, config, COLD_READER_SYSTEM, json_prompt(user),
         max_tokens=2000, temperature=0.3,  # NOTE: deliberately no cacheable_prefix
+        tag="cold_reader",
     )
     data = load_json_with_repair(
         client, paths, config, raw,
@@ -908,7 +910,7 @@ def macro_progress_check(
 当前已写到第 {chapter_num} 章。判断主线是否在推进，还是原地打转。"""
     raw = call_llm(
         client, paths, config, MACRO_PROGRESS_SYSTEM, json_prompt(user),
-        max_tokens=2500, temperature=0.3,
+        max_tokens=2500, temperature=0.3, tag="macro_progress",
     )
     data = load_json_with_repair(
         client, paths, config, raw,
@@ -989,6 +991,6 @@ def adaptive_replan(
 {json.dumps(get_active_constraints(conn, chapter_num), ensure_ascii=False, indent=2)}
 
 当前章节：{chapter_num}。从 Ch{chapter_num} 起重规划接下来的 40-60 章，保持分卷的结构化格式。不要改写过去。"""
-    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=16000, temperature=0.5)
+    new_plan = call_llm(client, paths, config, REPLAN_SYSTEM, user, max_tokens=16000, temperature=0.5, tag="replan")
     write_text(paths.volume_plan, normalize_text(new_plan) + "\n")
     db_event(conn, chapter_num, "adaptive_replan", {"reason": "metrics_degradation"})

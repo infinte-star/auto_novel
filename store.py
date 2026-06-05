@@ -153,6 +153,17 @@ def init_db(paths: Paths) -> Any:
         conn.executescript(
             """
             PRAGMA journal_mode=WAL;
+            -- With max_parallel_workers>1 several daemon threads hammer the DB.
+            -- _DB_LOCK serializes Python-side access within this process, but
+            -- WAL also lets a separate reader (e.g. `novel.py stats`/`list` on
+            -- another process) touch the file. busy_timeout makes any such
+            -- contender wait up to 5s for a lock instead of instantly raising
+            -- "database is locked". synchronous=NORMAL is the standard, safe
+            -- pairing with WAL (durable across app crashes; only a power loss
+            -- mid-write can lose the last transaction) and noticeably cuts
+            -- per-commit fsync latency on the hot finalize path.
+            PRAGMA busy_timeout=5000;
+            PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chapter INTEGER NOT NULL,
@@ -697,10 +708,29 @@ def _deep_plan_violations(conn: Any, plan: dict[str, Any], chapter_num: int) -> 
             )
     return out
 
+_QUALITY_FEEDBACK_CACHE: dict[tuple[str, int, int], tuple[tuple[float, int], list[dict[str, Any]]]] = {}
+_QUALITY_FEEDBACK_CACHE_LOCK = threading.Lock()
+
 def recent_quality_feedback(paths: Paths, limit: int = 5, max_items: int = 18) -> list[dict[str, Any]]:
     path = paths.logs_dir / "reviews.jsonl"
     if not path.exists():
         return []
+    # reviews.jsonl grows linearly with chapter count but this helper only ever
+    # returns the tail; it is called 4+ times per chapter (writer/reviewer/plan/
+    # arbitration prompts). Cache the parsed result keyed by (path, limit,
+    # max_items) and invalidated by the file's (mtime, size) so a fresh review
+    # append busts the cache while repeated reads within a chapter hit it.
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime, stat.st_size)
+    except OSError:
+        signature = None
+    cache_key = (str(path), limit, max_items)
+    if signature is not None:
+        with _QUALITY_FEEDBACK_CACHE_LOCK:
+            cached = _QUALITY_FEEDBACK_CACHE.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                return [dict(row) for row in cached[1]]
     rows: list[dict[str, Any]] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -740,4 +770,7 @@ def recent_quality_feedback(paths: Paths, limit: int = 5, max_items: int = 18) -
         risks = row["continuity_risks"][:remaining]
         item_count += len(problems) + len(risks)
         trimmed.append({**row, "problems": problems, "continuity_risks": risks})
+    if signature is not None:
+        with _QUALITY_FEEDBACK_CACHE_LOCK:
+            _QUALITY_FEEDBACK_CACHE[cache_key] = (signature, [dict(row) for row in trimmed])
     return trimmed

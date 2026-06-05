@@ -102,7 +102,65 @@ def load_config() -> dict[str, Any]:
         for key in keys:
             if key not in config[section_name]:
                 raise KeyError(f"Missing config value: {section_name}.{key}")
+    _validate_config(config)
     return config
+
+# (section, key) -> validation spec. Caught at load time so a typo (e.g.
+# `temperature: 0,8` parsed as the string "0,8") fails loudly here instead of
+# crashing N chapters later with an opaque TypeError far from the root cause.
+# `int_like`/`float_like` mean the value must coerce; `min`/`max` bound it.
+_NUMERIC_SPECS: dict[tuple[str, str], dict[str, Any]] = {
+    ("api", "max_tokens"): {"kind": "int", "min": 1},
+    ("api", "temperature"): {"kind": "float", "min": 0.0, "max": 2.0},
+    ("novel", "chapter_words"): {"kind": "int", "min": 1},
+    ("novel", "target_words"): {"kind": "int", "min": 1},
+    ("novel", "quality_threshold"): {"kind": "float", "min": 0.0, "max": 10.0},
+    ("novel", "max_revision_rounds"): {"kind": "int", "min": 0},
+    ("novel", "candidate_plans"): {"kind": "int", "min": 1},
+    ("novel", "min_plan_score"): {"kind": "float", "min": 0.0, "max": 10.0},
+}
+
+def _validate_config(config: dict[str, Any]) -> None:
+    for (section_name, key), spec in _NUMERIC_SPECS.items():
+        if section_name not in config or key not in config[section_name]:
+            continue
+        raw = config[section_name][key]
+        kind = spec["kind"]
+        try:
+            value = int(raw) if kind == "int" else float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Config value {section_name}.{key} must be {kind}, got {raw!r}. "
+                f"(config.yaml is a YAML subset — check for stray quotes/commas.)"
+            ) from None
+        low = spec.get("min")
+        high = spec.get("max")
+        if low is not None and value < low:
+            raise ValueError(f"Config value {section_name}.{key}={value} is below minimum {low}")
+        if high is not None and value > high:
+            raise ValueError(f"Config value {section_name}.{key}={value} is above maximum {high}")
+        config[section_name][key] = value
+
+    # Optional integer knobs: validate only if present and non-empty.
+    for section_name, key, minimum in [
+        ("novel", "max_chapters", 0),
+        ("novel", "max_parallel_workers", 1),
+        ("novel", "candidate_chapters", 1),
+        ("api", "max_attempts", 1),
+    ]:
+        if section_name in config and key in config[section_name]:
+            raw = config[section_name][key]
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Config value {section_name}.{key} must be an integer, got {raw!r}."
+                ) from None
+            if value < minimum:
+                raise ValueError(f"Config value {section_name}.{key}={value} is below minimum {minimum}")
+            config[section_name][key] = value
 
 def configured_api_keys(config: dict[str, Any]) -> list[str]:
     api = config["api"]
@@ -203,6 +261,23 @@ def normalize_text(text: str) -> str:
 
 def normalize_chapter(text: str) -> str:
     text = normalize_text(text)
+    # The writer prompt instructs the model to keep its pre-writing self-review
+    # in reasoning_content, but providers sometimes return it inline in content
+    # as an <analysis>…</analysis> (or ```analysis``` / "## Pre-writing…") block
+    # before the real prose. Strip any such leading meta block so it never gets
+    # saved as chapter text. We only remove a leading block (before the first
+    # "第N章" title line) to avoid touching legitimate prose.
+    text = re.sub(r"^\s*<analysis\b[^>]*>.*?</analysis>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\s*<thinking\b[^>]*>.*?</thinking>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\s*<details\b[^>]*>.*?</details>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\s*<reasoning\b[^>]*>.*?</reasoning>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    # Heading-style leaked review: drop everything up to the first 第N章 title
+    # line when a self-review heading precedes it.
+    m = re.search(r"(?m)^\s*(#{0,6}\s*)?(第\s*[0-9零一二三四五六七八九十百千]+\s*章)", text)
+    if m and m.start() > 0:
+        head = text[: m.start()]
+        if re.search(r"(写前自我审查|Pre-writing|Self-Review|highest risk|reasoning|分析[:：])", head, re.IGNORECASE):
+            text = text[m.start():]
     # LLM sometimes emits markdown heading for the title line
     # ("# 第N章 …" instead of "第N章 …"). Strip it so the title format
     # stays consistent across chapters.
@@ -211,6 +286,29 @@ def normalize_chapter(text: str) -> str:
 
 def count_chars(path: Path) -> int:
     return len(read_text(path))
+
+def book_reached_target(path: Path, target_chars: int) -> bool:
+    """Return True when `path` holds at least `target_chars` characters.
+
+    Hot path: this is polled on every main-loop iteration (and per prefetch)
+    against book.md, which grows to multiple MB for a long novel. A full
+    `count_chars` would re-read and UTF-8-decode the whole file each time.
+    Instead we first look at the on-disk byte size: a UTF-8 file can never
+    contain more characters than it has bytes, so when `getsize < target` the
+    book definitively has fewer than `target` chars and we skip the read. Only
+    once the byte size could plausibly meet the target do we pay for one exact
+    `count_chars`. For CJK text (~3 bytes/char) the byte size stays well above
+    the char count for almost the entire run, so the expensive read happens
+    only in the final stretch.
+    """
+    if target_chars <= 0:
+        return True
+    try:
+        if path.stat().st_size < target_chars:
+            return False
+    except OSError:
+        return False
+    return count_chars(path) >= target_chars
 
 def is_final_chapter(config: dict[str, Any], chapter_num: int) -> bool:
     """True when chapter_num is the deterministic final chapter of the book.

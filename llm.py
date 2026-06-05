@@ -19,6 +19,61 @@ _STREAM_END = object()
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_STARTED_AT = 0.0
 
+# Lightweight observability sink. call_llm appends one JSON line per finished
+# call to logs/llm_calls.jsonl. We use a plain file (not the SQLite store) so
+# the recorder is reachable from every call site without threading a `conn`
+# through, and so background worker threads never contend store._DB_LOCK just
+# to log a metric. `novel.py stats` aggregates this file. Disable via
+# api.metrics_enabled: false. The lock only serializes the local append.
+_METRICS_LOCK = threading.Lock()
+
+
+def _record_llm_call(
+    paths: Paths,
+    api: dict[str, Any],
+    *,
+    tag: str,
+    model: str,
+    stream: bool,
+    json_mode: bool,
+    attempt: int,
+    prompt_chars: int,
+    output_chars: int,
+    elapsed: float,
+    salvaged: bool,
+    ok: bool,
+    error: str = "",
+) -> None:
+    if not bool(api.get("metrics_enabled", True)):
+        return
+    record = {
+        "ts": time.time(),
+        "tag": tag,
+        "model": model,
+        "stream": stream,
+        "json_mode": json_mode,
+        # attempt is 0-based internally; persist 1-based attempt count.
+        "attempts": attempt + 1,
+        "prompt_chars": prompt_chars,
+        "output_chars": output_chars,
+        "elapsed": round(elapsed, 3),
+        "salvaged": salvaged,
+        "ok": ok,
+    }
+    if error:
+        record["error"] = error[:200]
+    try:
+        path = paths.logs_dir / "llm_calls.jsonl"
+        line = json.dumps(record, ensure_ascii=False)
+        with _METRICS_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        # Observability must never break generation.
+        pass
+
+
 
 def _configured_min_request_interval(api: dict[str, Any]) -> float:
     explicit = api.get("min_request_interval_secs")
@@ -383,6 +438,7 @@ def call_llm(
     temperature: float | None = None,
     json_mode: bool | None = None,
     cacheable_prefix: str | None = None,
+    tag: str = "",
 ) -> str:
     api = config["api"]
     context_window = int(api.get("context_window", 1000000))
@@ -400,6 +456,7 @@ def call_llm(
     wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
     use_response_format = wants_json and bool(api.get("json_response_format", True))
     max_attempts = int(api.get("max_attempts", 6))
+    salvaged_any = False
     for attempt in range(max_attempts):
         started = time.perf_counter()
         try:
@@ -522,6 +579,7 @@ def call_llm(
                         f"content_chars={len(content)} elapsed={elapsed:.1f}s reason={stream_timeout_reason}",
                     )
                     stream_timeout_reason = None
+                    salvaged_any = True
                 if stream_timeout_reason:
                     raise TimeoutError(stream_timeout_reason)
                 if not content.strip() and reasoning_parts:
@@ -561,6 +619,12 @@ def call_llm(
                 )
                 time.sleep(wait)
                 continue
+            _record_llm_call(
+                paths, api,
+                tag=tag, model=request["model"], stream=stream, json_mode=wants_json,
+                attempt=attempt, prompt_chars=total_chars, output_chars=len(content),
+                elapsed=elapsed, salvaged=salvaged_any, ok=True,
+            )
             return content
         except Exception as exc:
             if use_response_format and _looks_like_response_format_error(exc):
@@ -570,11 +634,25 @@ def call_llm(
             if _looks_like_nonretryable_block(exc):
                 elapsed = time.perf_counter() - started
                 log(paths, f"LLM call blocked by provider; not retrying elapsed={elapsed:.1f}s error={exc}")
+                _record_llm_call(
+                    paths, api,
+                    tag=tag, model=api["model"], stream=bool(api.get("stream", False)),
+                    json_mode=wants_json, attempt=attempt, prompt_chars=total_chars,
+                    output_chars=0, elapsed=elapsed, salvaged=salvaged_any, ok=False,
+                    error=str(exc),
+                )
                 raise RuntimeError(f"LLM provider blocked the request: {exc}") from exc
             wait = _backoff_wait(attempt, exc)
             elapsed = time.perf_counter() - started
             log(paths, f"LLM call failed attempt={attempt + 1}/{max_attempts} wait={wait:.1f}s elapsed={elapsed:.1f}s error={exc}")
             time.sleep(wait)
+    _record_llm_call(
+        paths, api,
+        tag=tag, model=api["model"], stream=bool(api.get("stream", False)),
+        json_mode=wants_json, attempt=max_attempts - 1, prompt_chars=total_chars,
+        output_chars=0, elapsed=0.0, salvaged=salvaged_any, ok=False,
+        error=f"failed after {max_attempts} attempts",
+    )
     raise RuntimeError(f"LLM call failed after {max_attempts} attempts")
 
 def _looks_like_response_format_error(exc: Exception) -> bool:
@@ -630,6 +708,7 @@ def load_json_with_repair(
             json_prompt(repair_prompt),
             max_tokens=8000,
             temperature=0,
+            tag="json_repair",
         )
         return safe_json_loads(repaired)
     except Exception as exc:

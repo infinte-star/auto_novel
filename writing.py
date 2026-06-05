@@ -745,7 +745,7 @@ def write_chapter(
     prefix = cacheable_prefix(paths, config)
     from config import log
     log(paths, f"write_chapter Ch{chapter_num} calling LLM with temp={temp:.2f} user_len={len(user)} system_len={len(system)}")
-    raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix)
+    raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix, tag="write")
     log(paths, f"write_chapter Ch{chapter_num} LLM returned {len(raw)} chars")
     return normalize_chapter(raw)
 
@@ -859,7 +859,7 @@ def revise_chapter(
 修订整章。"""
     raw = call_llm(
         client, paths, config, REVISE_SYSTEM, user,
-        temperature=0.45, cacheable_prefix=cacheable_prefix(paths, config),
+        temperature=0.45, cacheable_prefix=cacheable_prefix(paths, config), tag="revise",
     )
     return normalize_chapter(raw)
 
@@ -903,7 +903,7 @@ def extract_events(
 {chapter[:8000]}
 
 抽取持久的状态变化。"""
-    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=12000, user=json_prompt(user), temperature=0.2)
+    raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=12000, user=json_prompt(user), temperature=0.2, tag="extract")
     return load_json_with_repair(client, paths, config, raw)
 
 def update_structured_state(
@@ -1173,7 +1173,7 @@ def update_state_file(
 {chapter[:5000]}
 
 在第 {chapter_num} 章之后更新 state.md。"""
-        new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=12000, temperature=0.25)
+        new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=12000, temperature=0.25, tag="state_update")
         write_text(paths.state, normalize_text(new_state) + "\n")
         return
 
@@ -1196,7 +1196,7 @@ def update_state_file(
         raw = call_llm(
             client, paths, config, STATE_DYNAMIC_SECTIONS_SYSTEM, json_prompt(user),
             max_tokens=4000, temperature=0.25,
-            cacheable_prefix=cacheable_prefix(paths, config),
+            cacheable_prefix=cacheable_prefix(paths, config), tag="state_sections",
         )
         data = load_json_with_repair(
             client, paths, config, raw,
