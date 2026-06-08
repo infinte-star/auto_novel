@@ -99,6 +99,8 @@ def cmd_create(name: str) -> int:
     print(f"[novel] created {target}")
     print(f"[novel]   config:  {target / 'config.yaml'}")
     print(f"[novel]   prompt:  {target / 'prompt.md'}  <-- fill this in before running")
+    for warn in _config_health_check(target / "config.yaml"):
+        print(f"[novel] CONFIG WARNING: {warn}")
     print(f"[novel] next: edit prompt.md, then `python novel.py run {name}`")
     return 0
 
@@ -375,7 +377,90 @@ def cmd_benchmark_add(platform: str, style: str, source: str, title: str | None)
     return 0
 
 
-def _run_marker(name: str) -> str:
+def _parse_config_novel_section(config_path: Path) -> dict[str, str]:
+    """Lightweight reader for the `novel:` section of a config.yaml.
+
+    config.yaml is NOT real YAML (see config.py:load_config) — only `section:`
+    headers and indented `key: value` pairs. We avoid importing config.py here so
+    `create` stays import-light and never triggers the NOVEL_CONFIG/openai import
+    chain. Returns the raw string values under `novel:`.
+    """
+    values: dict[str, str] = {}
+    section = ""
+    try:
+        lines = config_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return values
+    for raw in lines:
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t")) and line.rstrip().endswith(":"):
+            section = line.strip()[:-1]
+            continue
+        if section == "novel" and ":" in line:
+            key, _, val = line.strip().partition(":")
+            values[key.strip()] = val.strip().strip('"').strip("'")
+    return values
+
+
+def _config_health_check(config_path: Path) -> list[str]:
+    """Return human-readable warnings about internally inconsistent stop-conditions.
+
+    Short novels are driven by max_chapters; the engine stops at whichever of
+    target_words / max_chapters is hit first. If target_words implies a wildly
+    different chapter count than max_chapters, the run will under- or over-shoot
+    (e.g. suspense_5ch hit target_words at Ch4 and never wrote Ch5). We flag a
+    >20% deviation so the author can reconcile the two before running.
+    """
+    nv = _parse_config_novel_section(config_path)
+
+    def _num(key: str) -> float | None:
+        v = nv.get(key, "").strip()
+        if not v:
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    warnings: list[str] = []
+    chapter_words = _num("chapter_words")
+    target_words = _num("target_words")
+    max_chapters = _num("max_chapters")
+
+    if max_chapters and max_chapters > 0 and chapter_words and chapter_words > 0:
+        implied_target = chapter_words * max_chapters
+        if target_words and target_words > 0:
+            dev = abs(target_words - implied_target) / implied_target
+            if dev > 0.20:
+                warnings.append(
+                    f"target_words={int(target_words)} but max_chapters({int(max_chapters)}) × "
+                    f"chapter_words({int(chapter_words)}) ≈ {int(implied_target)} "
+                    f"(deviation {dev*100:.0f}% > 20%). In short-novel mode max_chapters is "
+                    f"authoritative and the run stops at whichever limit is hit first, so "
+                    f"target_words too low will cut the book short (e.g. finish at Ch"
+                    f"{max(1, int(target_words // chapter_words))} instead of {int(max_chapters)}); "
+                    f"too high wastes budget. Suggest target_words ≈ {int(implied_target * 1.3)} "
+                    f"(give ~30% headroom so all {int(max_chapters)} chapters write)."
+                )
+            elif target_words <= implied_target:
+                # Even at 0% deviation, the char-count stop fires before the last
+                # chapter writes: generated chapters routinely overshoot
+                # chapter_words, so cumulative chars reach target_words a chapter
+                # or two early. Leave headroom so max_chapters is the real limit.
+                warnings.append(
+                    f"target_words={int(target_words)} is ≤ max_chapters({int(max_chapters)}) × "
+                    f"chapter_words({int(chapter_words)}) = {int(implied_target)}. The run stops at "
+                    f"whichever limit is hit first, and chapters usually overshoot chapter_words, so "
+                    f"the char-count target can trip a chapter or two early and you may not reach Ch"
+                    f"{int(max_chapters)}. Suggest target_words ≈ {int(implied_target * 1.3)} "
+                    f"(~30% headroom) so max_chapters stays authoritative."
+                )
+    return warnings
+
+
+
     """The command-line substring used to find/kill this novel's process."""
     return f"novel.py run {name}"
 
@@ -451,6 +536,9 @@ def cmd_run(name: str, foreground: bool) -> int:
     if not (target / "config.yaml").exists():
         print(f"[novel] ERROR: {target / 'config.yaml'} not found. Run `python novel.py create {name}` first.")
         return 2
+
+    for warn in _config_health_check(target / "config.yaml"):
+        print(f"[novel] CONFIG WARNING: {warn}")
 
     if foreground:
         return _run_inprocess(name)

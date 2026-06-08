@@ -189,6 +189,8 @@ def init_db(paths: Paths) -> Any:
                 hook_strength INTEGER,
                 emotional_tone TEXT,
                 accepted INTEGER,
+                em_dash_per_kchar REAL,
+                style_penalty REAL,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS entities (
@@ -265,6 +267,8 @@ def init_db(paths: Paths) -> Any:
             "novelty_score REAL",
             "prose_score REAL",
             "continuity_score REAL",
+            "em_dash_per_kchar REAL",
+            "style_penalty REAL",
         ):
             try:
                 conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")

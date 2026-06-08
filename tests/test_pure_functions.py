@@ -16,8 +16,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
-from quality import scene_similarity, style_health  # noqa: E402
-from llm import _repair_truncated_json, safe_json_loads  # noqa: E402
+from quality import plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
+from pipeline import _apply_force_accept_patches  # noqa: E402
+from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, safe_json_loads  # noqa: E402
 
 
 class NormalizeChapterTests(unittest.TestCase):
@@ -129,6 +130,86 @@ class SceneSimilarityTests(unittest.TestCase):
         self.assertIsNone(res["most_similar_to"])
 
 
+class VisualPayoffTests(unittest.TestCase):
+    def test_abstract_shadow_payoff_is_blocked(self):
+        plan = {
+            "payoff_type": "reveal",
+            "payoff": "沈澜发现阴影方向与光源角度不一致，反推出现场存在第二反射路径。",
+            "beats": ["她根据光源方向和几何关系推理出凶手动过镜子。"],
+        }
+        res = plan_visual_payoff_check(plan, {"novel": {"visual_payoff_min_score": 7.0}})
+        self.assertTrue(res["blocked"])
+        self.assertIn("abstract_visual_payoff", res["flags"])
+
+    def test_concrete_visual_contradiction_passes(self):
+        plan = {
+            "payoff_type": "reveal",
+            "payoff": "临终画面里林知夏左手戴着方形金属手表，但现实尸体左手垂落且手腕没有手表，压痕也消失。",
+            "beats": [
+                "沈澜描摹手腕压痕，确认死前画面有表。",
+                "罗鹤检查尸体左手，现实中没有手表也没有表带链节。",
+                "她用镜中左手与尸体现实左手的有无矛盾推翻高屹作案结论。",
+            ],
+        }
+        res = plan_visual_payoff_check(plan, {"novel": {"visual_payoff_min_score": 7.0}})
+        self.assertFalse(res["blocked"])
+        self.assertGreaterEqual(res["score"], 7.0)
+        self.assertIn("presence_absence", res["template_hits"])
+
+
+class QualityDebtPatchTests(unittest.TestCase):
+    def test_force_accept_patches_land_without_llm(self):
+        import shutil
+        from pathlib import Path
+        from config import Paths
+
+        root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "manual_tmp_test" / "quality_debt_patch"
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            ckpt = root / "logs" / "checkpoints"
+            paths = Paths(
+                book=root / "book.md",
+                state=root / "state.md",
+                title=root / "title.txt",
+                bible=root / "memory" / "bible.md",
+                characters=root / "memory" / "characters.md",
+                timeline=root / "memory" / "timeline.md",
+                threads=root / "memory" / "threads.md",
+                volume_plan=root / "memory" / "volume_plan.md",
+                voices=root / "memory" / "voices.md",
+                voice=root / "memory" / "voice.md",
+                contract=root / "memory" / "contract.md",
+                chapters_dir=root / "chapters",
+                logs_dir=root / "logs",
+                database=root / "story_state.db",
+            )
+            ckpt.mkdir(parents=True, exist_ok=True)
+            chapter = "第一章 断绝\n\n周窈看清了。\n"
+            review = {
+                "score": 7.8,
+                "patches": [{
+                    "op": "replace",
+                    "locator": "周窈看清了",
+                    "before": "周窈看清了",
+                    "after": "周窈知道那条手腕上应该有什么",
+                }],
+            }
+            patched, new_review = _apply_force_accept_patches(
+                paths,
+                {"novel": {"quality_debt_apply_patches": True}},
+                1,
+                chapter,
+                review,
+            )
+            self.assertIn("周窈知道那条手腕上应该有什么", patched)
+            self.assertEqual(new_review["quality_debt_patches_applied"], 1)
+            self.assertTrue((root / "logs" / "checkpoints" / "ch0001" / "quality_debt_patched.md").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 class JsonSalvageTests(unittest.TestCase):
     def test_clean_json(self):
         self.assertEqual(safe_json_loads('{"a": 1}'), {"a": 1})
@@ -158,6 +239,34 @@ class JsonSalvageTests(unittest.TestCase):
         import json
         with self.assertRaises(json.JSONDecodeError):
             safe_json_loads("这里完全没有 JSON 对象")
+
+class PromptEnhancementTests(unittest.TestCase):
+    def test_default_enhancement_injects_global_and_tag_blocks(self):
+        system = _enhance_system_prompt(
+            "base system",
+            {"api": {}, "novel": {}},
+            tag="plan_candidate",
+            wants_json=True,
+        )
+        self.assertIn("全局提示词纪律", system)
+        self.assertIn("JSON 任务额外纪律", system)
+        self.assertIn("规划/仲裁任务额外纪律", system)
+
+    def test_enhancement_can_be_disabled(self):
+        system = _enhance_system_prompt(
+            "base system",
+            {"api": {"prompt_enhancement_enabled": False}, "novel": {}},
+            tag="write",
+            wants_json=False,
+        )
+        self.assertEqual(system, "base system")
+
+    def test_json_prompt_marker_matches_enhancement_detection(self):
+        user = json_prompt("please return data")
+        wants_json = "强制 JSON 输出格式" in user
+        system = _enhance_system_prompt("base system", {"api": {}, "novel": {}}, tag="", wants_json=wants_json)
+        self.assertTrue(wants_json)
+        self.assertIn("JSON 任务额外纪律", system)
 
 
 if __name__ == "__main__":

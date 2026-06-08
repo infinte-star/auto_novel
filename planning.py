@@ -27,6 +27,8 @@ schema：
   "pressure": "在兑现之前用什么来压制主角/读者",
   "beats": ["5-9 个具体节拍；每个节拍必须是一句完整的主谓宾句，含一个可见的动作，禁止用破折号堆叠状态短语"],
   "character_focus": ["在本章获得能动性或情感推进的人物"],
+  "location": "本章主要发生的物理场地/空间（简短名词，如'灯塔二层走廊''渔民小屋'）",
+  "info_source": "本章推进真相/剧情所依赖的主要信息来源（如'死者临终画面''匿名信''某人证词'）",
   "world_state_changes": ["若本章发生，会带来哪些状态变化"],
   "thread_actions": ["开启/推进/找回的伏线"],
   "hook": "章末抛给读者的问题",
@@ -61,6 +63,7 @@ ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
     "title": "...", "goal": "...", "conflict": "...", "conflict_type": "...",
     "payoff": "...", "payoff_type": "...", "pressure": "...",
     "beats": ["..."], "character_focus": ["..."], "world_state_changes": ["..."],
+    "location": "...", "info_source": "...",
     "thread_actions": ["..."], "hook": "...", "risk": "..."
   },
   "required_constraints": ["作者必须遵守的硬性约束"],
@@ -355,29 +358,53 @@ def _select_strategies_bandit(
     return picked
 
 
-def _recent_selected_plans(conn: Any, lookback: int = 8) -> list[dict[str, Any]]:
+def _recent_selected_plans(
+    conn: Any, lookback: int = 8, exclude_chapter: int | None = None
+) -> list[dict[str, Any]]:
     """Return the most recent arbiter-selected (merged) plans, newest first.
 
     Used for scene-skeleton dedupe: the candidate generator is told to avoid
     re-running the same conflict/payoff/beats that recent chapters already used,
     which is the engine's main defense against "infinitely slicing one scene".
+
+    ``exclude_chapter`` MUST be passed with the chapter currently being planned.
+    Otherwise this returns the chapter's OWN just-written ``plan_arbitration``
+    event (arbitrate_plan persists it before the dedupe check reads it back),
+    so scene_similarity compares the plan against itself and ``max_sim`` is
+    pinned at 1.0 on every chapter — silently turning the dedupe BLOCK into a
+    guaranteed false positive that wastes a full extra plan-generation round.
     """
+    # Over-fetch so that excluding the current chapter's own (possibly multiple)
+    # arbitration rows still leaves up to ``lookback`` genuine prior chapters.
+    fetch = lookback + 6
     if isinstance(conn, JsonStoryStore):
-        events = conn.recent_events(lookback * 3)
+        events = conn.recent_events(fetch * 3)
     else:
         try:
             with db_lock():
-                rows = conn.execute(
-                    "SELECT payload FROM events WHERE event_type='plan_arbitration' "
-                    "ORDER BY id DESC LIMIT ?",
-                    (lookback,),
-                ).fetchall()
-            events = [{"payload": json.loads(r["payload"])} for r in rows]
+                if exclude_chapter is not None:
+                    rows = conn.execute(
+                        "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                        "AND chapter != ? ORDER BY id DESC LIMIT ?",
+                        (int(exclude_chapter), fetch),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                        "ORDER BY id DESC LIMIT ?",
+                        (fetch,),
+                    ).fetchall()
+            events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
         except Exception:
             return []
     plans: list[dict[str, Any]] = []
     for ev in events:
-        payload = ev.get("payload") if isinstance(ev, dict) else None
+        if not isinstance(ev, dict):
+            continue
+        if exclude_chapter is not None and ev.get("chapter") == int(exclude_chapter):
+            # JsonStoryStore path has no SQL filter; drop self-events here.
+            continue
+        payload = ev.get("payload")
         if not isinstance(payload, dict):
             continue
         decision = payload.get("decision") or {}
@@ -403,6 +430,7 @@ def generate_candidate_plans(
     tail: str,
     cached_memory: str | None = None,
     num_candidates_override: int | None = None,
+    replan_feedback: str | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics = rhythm_diagnostics(conn, config)
     structural = structural_repetition_analysis(conn, config)
@@ -430,18 +458,58 @@ def generate_candidate_plans(
     if bool(config["novel"].get("scene_dedupe_enabled", True)):
         try:
             window = int(config["novel"].get("scene_dedupe_window", 8))
-            recent_sel = _recent_selected_plans(conn, lookback=window)
+            recent_sel = _recent_selected_plans(conn, lookback=window, exclude_chapter=chapter_num)
             skeletons = []
             for rp in recent_sel:
+                beats = rp.get("beats")
+                beats_list = [str(b)[:60] for b in beats[:5]] if isinstance(beats, list) else []
+                # Fields here MUST match _plan_skeleton_tokens() in quality.py
+                # (conflict/payoff/pressure/goal/beats); otherwise the generator
+                # is told to avoid one set of dimensions while the detector judges
+                # duplication on another, so a reworded conflict still trips BLOCK.
                 skeletons.append({
+                    "goal": str(rp.get("goal", ""))[:120],
                     "conflict": str(rp.get("conflict", ""))[:120],
+                    "pressure": str(rp.get("pressure", ""))[:120],
                     "payoff": str(rp.get("payoff", ""))[:120],
                     "payoff_type": rp.get("payoff_type", ""),
+                    "beats": beats_list,
                 })
             if skeletons:
                 dedupe_block = json.dumps(skeletons, ensure_ascii=False, indent=2)
         except Exception:
             dedupe_block = "None"
+    # Used-location/setting blacklist: collect the physical settings & information
+    # sources recent chapters already leaned on so the generator is forced to open
+    # a NEW space or info source rather than re-staging the same room. This is the
+    # positive-pressure counterpart to the after-the-fact scene_similarity WARN —
+    # the WARN only fires once a near-dup is already chosen; this steers generation
+    # away up front. (Diagnosis of suspense_v3: Ch2 max_sim=0.807, the whole book
+    # circled the航海镜/渔民小屋穿衣镜.)
+    used_locations_block = "None"
+    if bool(config["novel"].get("scene_dedupe_enabled", True)):
+        try:
+            window = int(config["novel"].get("scene_dedupe_window", 8))
+            recent_sel = _recent_selected_plans(conn, lookback=window, exclude_chapter=chapter_num)
+            locs: list[str] = []
+            for rp in recent_sel:
+                for key in ("location", "setting", "scene", "place", "info_source"):
+                    v = rp.get(key)
+                    if isinstance(v, str) and v.strip() and v.strip() not in locs:
+                        locs.append(v.strip()[:40])
+                # Mine beats/conflict free-text for repeated concrete nouns is noisy;
+                # rely on structured fields the planner emits + the skeleton beats.
+                beats = rp.get("beats")
+                if isinstance(beats, list) and beats:
+                    head = str(beats[0])[:40]
+                    if head and head not in locs:
+                        locs.append(head)
+            if locs:
+                used_locations_block = json.dumps(locs[:12], ensure_ascii=False)
+        except Exception:
+            used_locations_block = "None"
+    quality_threshold = float(config["novel"].get("quality_threshold", 8.0))
+    dimension_floor = float(config["novel"].get("prewrite_dimension_floor", max(7.2, quality_threshold - 0.3)))
     base_user = f"""## 记忆
 {mem}
 
@@ -458,6 +526,17 @@ def generate_candidate_plans(
 
 ## 近期质量反馈JSON（必须修复，不得重复）
 {json.dumps(quality_feedback, ensure_ascii=False, indent=2) if quality_feedback else "None"}
+
+## 首稿质量前置门槛（必须落实到本章大纲，而不是留给正文重写）
+- 目标：后续首稿总分达到 {quality_threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。
+- goal/conflict/payoff/hook 必须分别回答：本章推进什么、谁阻碍、读者得到什么、为什么要看下一章。
+- beats 不能只是意图清单；每个 beat 必须有可见行动、对话交锋、信息变化或资源代价。
+- 至少一个 beat 必须正面修复近期质量反馈里的具体问题；若反馈为空，也必须避免重复近期场景骨架。
+- 若本章没有挣来的兑现，payoff_type 不得伪装成 reveal/reversal；必须在 pressure 和 beats 中补足代价与铺垫。
+- 悬疑/推理章节的核心 payoff 禁止只停留在“光源方向不对、阴影角度矛盾、逻辑上可推出”这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、反/正、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。
+- 如果使用镜子、照片、倒影、阴影，beats 必须同时给出“画面里看到什么”和“现实中对照什么”，否则视为爽点未落地。
+- 若本章使用主角的核心能力（如临终视像读取），该次使用的流程/条件/代价/解读路径必须与最近各章的能力使用方式有可见区别，禁止原样复用同一套“读取→看画面→报结论”的流程；info_source 即便相同，beats 里的能力使用方式也必须翻新。
+- 锁定关键嫌疑/真凶时，beats 不得让单一物证一步定罪；必须把画面物证与此前已在前文铺垫的行为模式/逻辑缺口结合成推理闭环。
 
 ## 当前生效的阶段约束（必须遵守）
 {json.dumps(constraints, ensure_ascii=False, indent=2) if constraints else "None"}
@@ -477,6 +556,9 @@ def generate_candidate_plans(
 ## 近期已用过的场景骨架（硬性：本章的 conflict / payoff 不得与下列任何一条实质重复，必须推进到新的局面，禁止把同一个僵局/同一份公文/同一场对峙再切一刀）
 {dedupe_block}
 
+## 近期已反复使用的场地 / 信息来源（硬性：本章至少更换其一——开辟一个新的物理空间，或引入一个新的信息来源/对手，不得继续在下列地点原地打转）
+{used_locations_block}
+
 ## 上章结尾
 {tail[-2000:]}
 
@@ -494,9 +576,22 @@ def generate_candidate_plans(
 - goal/payoff 必须正面解决全书主线矛盾，把已开启的关键伏线在本章收束。
 - "hook" 字段不再是抛给读者的新悬念，而是一句收束/余韵/主题升华；严禁以全新未解决危机作结。
 - beats 的最后 1-2 拍必须落在"结局兑现 + 情绪落点"，而非开启新冲突。"""
+    # When this is a quality-replan (the previous version of THIS chapter scored
+    # below threshold), inject exactly WHY it failed — the reviewer's concrete
+    # problems + the deterministic style metrics — so the regenerated plan
+    # attacks the real defect instead of being a blind retry. Without this the
+    # replan reuses the same lite memory and produces a near-identical candidate
+    # set (suspense_v3: replans震荡在 5.5~7.8, 净收益≈0).
+    if replan_feedback:
+        base_user += f"""
+
+## 上一版本章未达标的具体原因（最高优先级：本次大纲必须正面消除下列每一条，不得回避）
+{replan_feedback}
+- 不要只换措辞或换场景名；要针对上面的每条缺陷，在 goal/conflict/payoff/beats 里给出可见的修复动作。
+- 若上一版因文体碎片化/破折号堆砌失分，本章 beats 必须明确要求用完整主谓宾长句叙事、控制破折号。
+- 若上一版因能力越界/视角越界失分，本章必须在 risk 字段写明如何严守能力模态与限制视角。"""
     num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
-
     # Explicit differentiation strategies — each candidate is told to attack the
     # chapter from a distinct angle so the arbiter sees a real choice, not 5
     # near-identical variants.
@@ -878,6 +973,124 @@ def review_candidate_plans(
 
     return reports_by_plan
 
+def plan_calibration_hint(conn: Any, config: dict[str, Any], lookback: int = 12) -> str:
+    """Build a calibration directive from the historical plan→realized gap.
+
+    The arbiter chronically rates merged plans ~8.5 (a ceiling), while the
+    chapters they produce realize ~7.5 — an open loop: the arbiter never sees
+    that its 8.5s become 7.5s, so it keeps minting 8.5s. This reads the last
+    `lookback` chapters' (plan_score, realized score) pairs from chapter_metrics
+    and, when a systematic positive gap exists, tells the arbiter to deflate its
+    score by the observed mean gap and to score the *executability* of beats
+    rather than the ambition of intent. Returns "" when there isn't enough data.
+    """
+    rows = recent_metrics(conn, lookback)
+    pairs: list[tuple[float, float]] = []
+    for r in rows:
+        ps = r.get("plan_score")
+        sc = r.get("score")
+        if ps is None or sc is None:
+            continue
+        ps_f = safe_score(ps)
+        sc_f = safe_score(sc)
+        # Only count chapters where both scores are real (>0); a plan_score of 0
+        # means the field was never populated (legacy rows / JSON fallback).
+        if ps_f <= 0 or sc_f <= 0:
+            continue
+        pairs.append((ps_f, sc_f))
+    if len(pairs) < 3:
+        return ""
+    gaps = [ps - sc for ps, sc in pairs]
+    mean_gap = sum(gaps) / len(gaps)
+    mean_plan = sum(ps for ps, _ in pairs) / len(pairs)
+    mean_real = sum(sc for _, sc in pairs) / len(pairs)
+    # Only fire when the arbiter is systematically over-scoring (gap is the
+    # bias we want to correct; a near-zero or negative gap means it's calibrated
+    # and we should not nag it).
+    min_gap = float(config["novel"].get("plan_calibration_min_gap", 0.6))
+    if mean_gap < min_gap:
+        return ""
+    return (
+        f"## 仲裁分校准（必须读，基于最近 {len(pairs)} 章的实测回归）\n"
+        f"历史上你给大纲的平均仲裁分 {mean_plan:.1f}，但这些大纲成稿后的实测综合分平均只有 "
+        f"{mean_real:.1f}（系统性高估 {mean_gap:.1f} 分）。这说明你在为「意图的雄心」打分，"
+        f"而成稿是按「节拍的可执行性」被评判的。本次评分务必：\n"
+        f"1) 先按你的直觉给分，再减去 {mean_gap:.1f} 分作为校准基线，"
+        f"只有当某候选的 beats 是具体到可直接落地成场景的动作（谁、在哪、做了什么、读者看到什么反转/兑现）时，才把分数加回去；\n"
+        f"2) 对停留在抽象意图、把兑现推到页面之外、或 beats 只是状态描述而非可见动作的候选，"
+        f"分数必须显著低于 {mean_plan:.1f}；\n"
+        f"3) 不要因为「看起来雄心勃勃」而给 8.5+ —— 8.5+ 只应留给那些你确信成稿能实测到 8.5+ 的、"
+        f"每个 beat 都自带画面与冲突落点的大纲。"
+    )
+
+
+STRUCTURAL_DIAGNOSE_SYSTEM = """你是长篇小说引擎中的"重写前诊断官"。
+一章刚刚被判定为结构性失败（场景设计层面的问题，光改措辞无效，必须重做场景）。
+在引擎重新生成大纲之前，你要先精确定位：到底是哪一个 beat / 哪一个维度塌了，
+这样重写才有靶子，而不是又生成一份"看起来不一样、实则同样落不了地"的大纲。
+
+你会收到：本章原计划（含 beats）、失败评审（含各维度分、问题、beats_audit）、本章正文节选。
+只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
+{
+  "root_cause": "一句话点出结构性失败的根因（哪个维度/哪个 beat 没落地，为什么）",
+  "failed_beats": ["原计划里没有真正在正文兑现的 beat 原文（逐条）"],
+  "weakest_dimension": "novelty|payoff|readthrough|hook|continuity|prose",
+  "scene_fix": "重写时场景设计必须做出的具体改变（换信息来源/换冲突落点/把抽象兑现落到一个可见动作上等），要具体到可直接执行",
+  "must_dramatize": ["重写稿必须在正文里真正演出来（而非梗概/暗示）的 2-4 个具体画面/动作"]
+}
+只诊断、不重写。判定从严：beats_audit 里 status 为 absent/partial 的，几乎都属于 failed_beats。"""
+
+
+def diagnose_structural_failure(
+    client: OpenAI,
+    paths: Paths,
+    config: dict[str, Any],
+    chapter_num: int,
+    plan: dict[str, Any],
+    review: dict[str, Any],
+    chapter_text: str,
+) -> dict[str, Any]:
+    """Locate the failed beat/dimension before a structural replan.
+
+    A structural replan regenerates the whole plan from scratch; historically it
+    often came back "did not improve" because the new plan repeated the SAME
+    open-loop mistake (abstract intent, off-page payoff) with different surface
+    wording. This is a cheap, targeted diagnose pass that pins down *what* failed
+    — which beats never landed, which dimension is weakest, what the scene must
+    change — so the regenerated plan's required_constraints carry a concrete
+    target rather than a vague "do better". Returns {} on failure (caller treats
+    a missing diagnosis as "no extra constraints").
+    """
+    beats = plan.get("beats") or []
+    audit = review.get("beats_audit") or []
+    user = f"""## 本章原计划（节选）
+title: {plan.get('title','')}
+goal: {plan.get('goal','')}
+payoff: {plan.get('payoff','')}
+beats:
+{json.dumps(beats, ensure_ascii=False, indent=2)}
+
+## 失败评审摘要
+score: {review.get('score')}
+novelty/payoff/readthrough/hook/continuity/prose: {review.get('novelty_score')}/{review.get('payoff_score')}/{review.get('readthrough_score')}/{review.get('hook_score', review.get('hook_strength'))}/{review.get('continuity_score')}/{review.get('prose_score', review.get('aesthetic_score'))}
+problems: {json.dumps((review.get('problems') or [])[:6], ensure_ascii=False)}
+beats_audit: {json.dumps(audit[:12], ensure_ascii=False)}
+
+## 本章正文节选
+{(chapter_text or '')[:6000]}
+
+诊断本章结构性失败的根因，定位没落地的 beat 与最弱维度。"""
+    try:
+        raw = call_llm(
+            client, paths, config, STRUCTURAL_DIAGNOSE_SYSTEM, json_prompt(user),
+            max_tokens=2000, temperature=0.2, tag="structural_diagnose",
+        )
+        data = load_json_with_repair(client, paths, config, raw, fallback={})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def arbitrate_plan(
     client: OpenAI,
     paths: Paths,
@@ -889,8 +1102,11 @@ def arbitrate_plan(
     cached_memory: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     mem = cached_memory or memory_context(paths, conn, config)
+    calib = plan_calibration_hint(conn, config)
+    calib_block = f"\n{calib}\n" if calib else ""
     user = f"""## 记忆
 {mem}
+{calib_block}
 
 ## 节奏诊断JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
@@ -973,6 +1189,7 @@ def create_plan(
     tail: str,
     checkpoint_label: str = "initial",
     cached_memory: str | None = None,
+    replan_feedback: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     cached = load_checkpoint(paths, chapter_num, f"plan_{checkpoint_label}_selected.json")
     if isinstance(cached, dict) and cached.get("plan") and cached.get("decision"):
@@ -1001,7 +1218,7 @@ def create_plan(
             n_cand = _effective_candidate_count(conn, config, chapter_num, paths)
             plans = generate_candidate_plans(
                 client, paths, conn, config, chapter_num, tail, cached_memory=mem,
-                num_candidates_override=n_cand,
+                num_candidates_override=n_cand, replan_feedback=replan_feedback,
             )
             _log(paths, f"Got {len(plans)} candidate plans, saving...")
             save_checkpoint(paths, chapter_num, plans_key, plans)
@@ -1054,9 +1271,34 @@ def create_plan(
             try:
                 from quality import scene_similarity
 
-                recent_sel = _recent_selected_plans(conn, lookback=int(config["novel"].get("scene_dedupe_window", 8)))
+                # exclude_chapter is load-bearing: arbitrate_plan persists this
+                # chapter's plan_arbitration BEFORE we get here, so without the
+                # filter scene_similarity compares the plan against itself and
+                # max_sim is pinned at 1.0, forcing a guaranteed false BLOCK.
+                recent_sel = _recent_selected_plans(
+                    conn,
+                    lookback=int(config["novel"].get("scene_dedupe_window", 8)),
+                    exclude_chapter=chapter_num,
+                )
                 sim = scene_similarity(plan, recent_sel)
-                if sim.get("max_sim", 0.0) >= float(config["novel"].get("scene_dedupe_sim_warn", 0.6)):
+                warn_threshold = float(config["novel"].get("scene_dedupe_sim_warn", 0.6))
+                block_threshold = float(config["novel"].get("scene_dedupe_sim_block", 0.82))
+                force_retry = bool(config["novel"].get("scene_dedupe_force_retry", True))
+                # Short / chapter-capped novels (暴风雪山庄、密室、单一场景悬疑) reuse
+                # the same physical space and cast by design, so a high skeleton
+                # overlap is expected, not a bug. Relax the BLOCK there to avoid
+                # burning a whole extra plan round chasing differentiation that
+                # the premise can't supply; the WARN nudge still fires.
+                max_ch = config["novel"].get("max_chapters")
+                if max_ch and int(max_ch) <= int(
+                    config["novel"].get("scene_dedupe_short_novel_chapters", 8)
+                ):
+                    block_threshold = max(
+                        block_threshold,
+                        float(config["novel"].get("scene_dedupe_short_novel_block", 0.92)),
+                    )
+                    force_retry = False
+                if sim.get("max_sim", 0.0) >= warn_threshold:
                     log(
                         paths,
                         f"Scene-dedupe WARN Ch{chapter_num}: selected plan max_sim={sim['max_sim']} "
@@ -1065,11 +1307,7 @@ def create_plan(
                     decision.setdefault("required_constraints", []).append(
                         "本章场景骨架与近期高度雷同，必须切换到不同的冲突场景/推进到新的局面，不得继续纠缠同一僵局。"
                     )
-                block_threshold = float(config["novel"].get("scene_dedupe_sim_block", 0.82))
-                if (
-                    bool(config["novel"].get("scene_dedupe_force_retry", True))
-                    and sim.get("max_sim", 0.0) >= block_threshold
-                ):
+                if force_retry and sim.get("max_sim", 0.0) >= block_threshold:
                     duplicate_blocked = True
                     decision.setdefault("required_constraints", []).append(
                         "硬性重规划：上一版大纲与近期场景骨架重复度过高。本章必须更换信息来源、物理场地、冲突参与者或兑现类型中的至少两项。"
@@ -1086,6 +1324,41 @@ def create_plan(
             log(
                 paths,
                 f"Scene-dedupe BLOCK Ch{chapter_num}: retrying plan attempt {attempt + 1}/{max_attempts - 1}",
+            )
+            continue
+        visual_blocked = False
+        if bool(config["novel"].get("visual_payoff_check_enabled", True)):
+            try:
+                from quality import plan_visual_payoff_check
+
+                visual = plan_visual_payoff_check(plan, config)
+                decision["visual_payoff_check"] = visual
+                if visual.get("flags"):
+                    log(
+                        paths,
+                        f"Visual-payoff check Ch{chapter_num}: score={visual.get('score')} "
+                        f"flags={visual.get('flags')} templates={visual.get('template_hits')}",
+                    )
+                    for directive in visual.get("directives", []):
+                        if directive not in decision.setdefault("required_constraints", []):
+                            decision["required_constraints"].append(directive)
+                if visual.get("blocked"):
+                    visual_blocked = True
+                    decision.setdefault("required_constraints", []).append(
+                        "硬性重规划：本章核心推理爽点过抽象，必须改成具体视觉矛盾模板（画面A vs 现实B），并在 beats 中写出读者可见的物证对照。"
+                    )
+                    db_event(
+                        conn,
+                        chapter_num,
+                        "visual_payoff_retry",
+                        {"score": score, "visual": visual, "decision": decision, "plan": plan},
+                    )
+            except Exception as exc:
+                log(paths, f"Visual-payoff check failed (non-fatal) Ch{chapter_num}: {exc}")
+        if visual_blocked and attempt < max_attempts - 1:
+            log(
+                paths,
+                f"Visual-payoff BLOCK Ch{chapter_num}: retrying plan attempt {attempt + 1}/{max_attempts - 1}",
             )
             continue
         if score > best_score:

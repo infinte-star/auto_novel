@@ -16,6 +16,7 @@ from config import (
     book_reached_target,
     chapter_path,
     configured_api_endpoints,
+    configured_review_endpoints,
     count_chars,
     ensure_project,
     find_last_chapter,
@@ -32,9 +33,10 @@ from config import (
 from llm import LLMClientPool
 from memory import bootstrap, cacheable_prefix, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
 from planning import create_plan
-from review import adaptive_replan, cold_reader_review, macro_progress_check, pack_review, review_chapter, should_replan, stage_review
+from review import adaptive_replan, anchor_completion_gate, cold_reader_review, macro_progress_check, pack_review, review_chapter, should_replan, stage_review
 from store import db_event, init_db, validate_plan_continuity
 from writing import extract_events, revise_chapter, save_chapter, update_state_file, update_structured_state, write_chapter
+from writing import apply_review_patches
 
 
 class BackgroundTasks:
@@ -121,18 +123,31 @@ def write_chapter_with_candidates(
     decision: dict[str, Any],
     tail: str,
     cached_memory: str | None = None,
+    num_candidates_override: int | None = None,
+    base_temp_override: float | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate N candidate chapter drafts in parallel, review each, keep the best.
 
     Returns (best_chapter_text, best_review_or_None). When N <= 1 falls back to single
     write_chapter with no review (review_round0 will be produced by the normal loop).
+
+    `num_candidates_override` / `base_temp_override` let the structural-replan path
+    force multi-candidate + lower-temperature sampling to dampen writer variance (a
+    single replan draft once turned an 8.5 plan into a 5.5 chapter); averaging over
+    several lower-temp drafts and keeping the best review is the cheap hedge.
     """
-    n = int(config["novel"].get("candidate_chapters", 1))
+    n = int(num_candidates_override if num_candidates_override is not None
+            else config["novel"].get("candidate_chapters", 1))
+    base_temp = float(base_temp_override if base_temp_override is not None
+                      else config["api"]["temperature"])
     if n <= 1:
-        text = write_chapter(client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=cached_memory)
+        text = write_chapter(
+            client, paths, conn, config, chapter_num, plan, decision, tail,
+            cached_memory=cached_memory,
+            temperature=base_temp if base_temp_override is not None else None,
+        )
         return text, None
 
-    base_temp = float(config["api"]["temperature"])
     max_workers = int(config["novel"].get("max_parallel_workers", 8))
 
     def write_one(idx: int) -> str:
@@ -217,6 +232,172 @@ def _fallback_extraction(plan: dict[str, Any], review: dict[str, Any], chapter_n
         "memory_updates": {"bible": [], "characters": [], "timeline": [], "threads": []},
         "fallback_error": str(error),
     }
+
+
+class _LocalFixDone(Exception):
+    """Internal control-flow sentinel: the local-fix route handled a below-threshold
+    chapter, so the full-replan body should be skipped (caught immediately)."""
+
+
+def _build_replan_feedback(review: dict[str, Any]) -> str:
+    """Distil the failing review of THIS chapter's previous version into a compact,
+    concrete feedback block for the quality-replan's plan generator.
+
+    Pulls the reviewer's free-text problems, structured contract violations, the
+    deterministic style metrics (so the replan knows the prose collapsed even when
+    the reviewer's own self-report was unreliable), and the audit mismatch. This is
+    what turns the replan from a blind retry into a targeted fix.
+    """
+    lines: list[str] = []
+    score = review.get("score")
+    if score is not None:
+        lines.append(f"- 上一版总分：{score}/10（未达阈值）")
+    for p in (review.get("problems") or [])[:6]:
+        t = str(p).strip()
+        if t:
+            lines.append(f"- 评审问题：{t[:160]}")
+    for cv in (review.get("contract_violations") or [])[:4]:
+        if isinstance(cv, dict):
+            rule = str(cv.get("rule") or cv.get("type") or "?")[:80]
+            prose = str(cv.get("prose") or "")[:60]
+            lines.append(f"- 契约违约({cv.get('severity','?')})：{rule}｜原文「{prose}」")
+    sh = review.get("style_health") or {}
+    metrics = sh.get("metrics") or {}
+    if metrics:
+        em = metrics.get("em_dash_per_kchar")
+        frag = metrics.get("fragment_line_ratio")
+        avg = metrics.get("avg_sentence_chars")
+        if em is not None or frag is not None:
+            lines.append(
+                f"- 文体实测：破折号/千字={em}，碎句行占比={frag}，平均句长={avg}（实测值，"
+                f"不要相信上一版自评的文体分；本章必须显著降低破折号与碎句）"
+            )
+    mismatch = review.get("style_audit_mismatch")
+    if mismatch:
+        lines.append("- 注意：上一版评审低报了文体问题，实际碎片化远比它自报严重，务必正面修复。")
+    return "\n".join(lines) if lines else ""
+
+
+def _apply_force_accept_patches(
+    paths: Paths,
+    config: dict[str, Any],
+    chapter_num: int,
+    chapter: str,
+    review: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Before force-accepting quality debt, land review patches if possible.
+
+    The normal revise loop skips patches for structural failures and tries a full
+    replan instead. If that still leaves a chapter below threshold (e.g. 7.8) and
+    we must accept to keep the pipeline moving, the review's concrete patches are
+    still useful for low-risk local fixes: clarify a clue, align a direction,
+    add a missing reaction. Apply them once, save the patched text, and carry the
+    patch results in final_review / quality_debt so the refine pass knows what
+    was already handled.
+    """
+    if not bool(config["novel"].get("quality_debt_apply_patches", True)):
+        return chapter, review
+    patches = review.get("patches") if isinstance(review, dict) else None
+    if not isinstance(patches, list) or not patches:
+        return chapter, review
+    patched, results = apply_review_patches(chapter, patches)
+    applied = sum(1 for r in results if r.get("applied"))
+    total = len(results)
+    if applied <= 0:
+        log(paths, f"Quality-debt patch landing Ch{chapter_num}: no patches applied ({applied}/{total})")
+        new_review = dict(review)
+        new_review["quality_debt_patch_results"] = results
+        return chapter, new_review
+    patched = normalize_chapter(patched)
+    save_checkpoint(paths, chapter_num, f"quality_debt_patched.md", patched)
+    new_review = dict(review)
+    new_review["quality_debt_patches_applied"] = applied
+    new_review["quality_debt_patch_total"] = total
+    new_review["quality_debt_patch_results"] = results
+    new_review.setdefault("problems", []).append(
+        f"QUALITY_DEBT_PATCHED: 强制接受前已自动应用 {applied}/{total} 条评审补丁；剩余问题交给精修优先处理。"
+    )
+    log(paths, f"Quality-debt patch landing Ch{chapter_num}: applied={applied}/{total}")
+    return patched, new_review
+
+
+def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> tuple[str, str]:
+    """Decide whether a below-threshold chapter needs a full structural replan or
+    just a targeted local fix.
+
+    A *full chapter replan* (regenerate plan → rewrite → review) is expensive and
+    high-variance — three of our historical replans came back "did not improve".
+    It is only worth it for STRUCTURAL failures: the scene itself is wrong
+    (multiple low dimensions, scene雷同 with recent chapters, missing payoff).
+
+    A *local* failure — a single dimension dipped, a contract violation that has a
+    locatable patch, or pure prose collapse — is better served by extra surgical
+    revise rounds (apply_review_patches) which keep the working scene and surgically
+    fix the flaw, rather than rolling the dice on a whole new scene.
+
+    Returns (kind, reason) where kind is "local" or "structural".
+    """
+    cfg = config["novel"]
+    # Per-dimension scores; count how many fell materially below threshold.
+    threshold = float(cfg.get("quality_threshold", 8.0))
+    dims = {
+        "readthrough": safe_score(review.get("readthrough_score", 0)),
+        "hook": safe_score(review.get("hook_score", review.get("hook_strength", 0))),
+        "payoff": safe_score(review.get("payoff_score", 0)),
+        "novelty": safe_score(review.get("novelty_score", 0)),
+        "prose": safe_score(review.get("prose_score", review.get("aesthetic_score", 0))),
+        "continuity": safe_score(review.get("continuity_score", 0)),
+    }
+    weak = {k: v for k, v in dims.items() if v and v < threshold - 0.5}
+
+    # KEY-DIM structural shortfall: a low novelty/payoff is a SCENE-DESIGN flaw,
+    # not a prose flaw — revise patches (which edit wording in place) cannot make
+    # a scene more novel or make a payoff actually land. So even a single key-dim
+    # dip below its floor is structural (matches review.py's key_dimension_floor
+    # cap, which routes such chapters here). Gated by the same floor toggle.
+    if bool(cfg.get("key_dimension_floor_enabled", True)):
+        nov_floor = float(cfg.get("novelty_floor", 7.0))
+        pay_floor = float(cfg.get("payoff_floor", 7.0))
+        if (dims["novelty"] and dims["novelty"] < nov_floor) or (
+            dims["payoff"] and dims["payoff"] < pay_floor
+        ):
+            bad = []
+            if dims["novelty"] and dims["novelty"] < nov_floor:
+                bad.append(f"novelty={dims['novelty']:.1f}")
+            if dims["payoff"] and dims["payoff"] < pay_floor:
+                bad.append(f"payoff={dims['payoff']:.1f}")
+            return "structural", f"关键维度低于硬地板（{', '.join(bad)}）—场景设计问题，revise 无效"
+
+    # Scene雷同 / payoff缺失 are inherently structural — the scene design is wrong.
+    blob = " ".join(str(p) for p in (review.get("problems") or []))
+    rr = " ".join(str(p) for p in (review.get("rhythm_risks") or []))
+    structural_markers = ("雷同", "重复", "原地打转", "审美疲劳", "payoff", "兑现", "没有推进", "停滞", "scene_dedupe")
+    if any(m in (blob + rr) for m in structural_markers):
+        return "structural", f"命中结构性问题标记（{[m for m in structural_markers if m in (blob+rr)][:3]}）"
+
+    has_patches = bool(review.get("patches"))
+
+    # `prose` dips are surgically fixable (the revise patch path targets exactly
+    # the collapsed paragraphs), so a low prose score is NOT itself structural.
+    # Only count NON-prose weak dimensions toward the "broadly underperforming"
+    # structural test — otherwise a pure em-dash/碎句 collapse (the canonical
+    # local case) gets misrouted to a high-variance full replan.
+    weak_nonprose = {k: v for k, v in weak.items() if k != "prose"}
+    if len(weak_nonprose) >= 2:
+        return "structural", f"{len(weak_nonprose)} 个非文体维度显著偏低（{ {k: round(v,1) for k,v in weak_nonprose.items()} }）"
+
+    # A contract violation that carries no usable patch locator needs the scene
+    # rethought (ability/modality drift baked into the scene premise).
+    cvs = review.get("contract_violations") or []
+    if cvs and not has_patches:
+        return "structural", "存在契约违约且无可定位补丁"
+
+    # Otherwise: single weak dimension and/or style collapse with patches available.
+    if has_patches:
+        return "local", "单一维度短板/文体问题且评审给出了可应用补丁"
+    # Fall back to structural when we have nothing surgical to apply.
+    return "structural", "无可应用补丁，回退到整章重做"
+
 
 
 def generate_one_chapter(
@@ -304,13 +485,28 @@ def generate_one_chapter(
     threshold = float(config["novel"]["quality_threshold"])
     max_rounds = int(config["novel"]["max_revision_rounds"])
     final_review = load_checkpoint(paths, chapter_num, "final_review.json")
-    if (
+    # A final_review is authoritative on resume in two cases:
+    #   1. it met the threshold and was accepted; or
+    #   2. it was force-accepted below threshold (the loop already exhausted all
+    #      revise + local-fix + replan rounds and picked the best draft). Replaying
+    #      the loop from scratch on resume would waste a full chapter of LLM calls
+    #      AND can regress the accepted text to a worse-scoring earlier round
+    #      (observed: a force-accepted 7.8 replayed back down to 7.5). Honour the
+    #      stored best instead.
+    final_is_authoritative = (
         isinstance(final_review, dict)
-        and safe_score(final_review.get("score", 0)) >= threshold
-        and final_review.get("accepted", True)
-    ):
+        and (
+            (safe_score(final_review.get("score", 0)) >= threshold and final_review.get("accepted", True))
+            or bool(final_review.get("force_accepted"))
+        )
+    )
+    if final_is_authoritative:
         review = final_review
-        log(paths, f"Resuming final review Ch{chapter_num} score={review.get('score')}/10")
+        log(
+            paths,
+            f"Resuming final review Ch{chapter_num} score={review.get('score')}/10"
+            f"{' (force-accepted)' if final_review.get('force_accepted') else ''}",
+        )
     else:
         if isinstance(final_review, dict):
             log(
@@ -322,8 +518,27 @@ def generate_one_chapter(
         best_review = review
         no_improvement_rounds = 0
         max_no_improvement_rounds = int(config["novel"].get("max_no_improvement_revision_rounds", 1))
+        # When the round-0 failure is a STRUCTURAL macro-dimension shortfall
+        # (novelty/payoff/hook too low), revise patches have ~0 net effect —
+        # empirically 0/7 such revises moved the score across threshold, and one
+        # even regressed it. Skip the revise rounds entirely and let the
+        # structural-replan path below rebuild the scene. revise rounds stay
+        # reserved for prose/continuity-style local flaws that patches CAN fix.
+        skip_revise_macro = bool(config["novel"].get("skip_revise_on_macro_fail", True))
         for round_num in range(max_rounds + 1):
             if round_num > 0:
+                # Decide whether revising is worth it: only for non-structural
+                # (local) failures. A structural macro-dimension shortfall goes
+                # straight to replan.
+                if skip_revise_macro:
+                    fk, fr = _classify_replan_failure(review, config)
+                    if fk == "structural":
+                        log(
+                            paths,
+                            f"Skipping revise rounds Ch{chapter_num}: structural failure ({fr}); "
+                            f"revise patches are ~0-gain here — deferring to structural replan.",
+                        )
+                        break
                 revised_key = f"chapter_revised_round{round_num}.md"
                 revised = load_checkpoint(paths, chapter_num, revised_key)
                 if revised:
@@ -372,12 +587,115 @@ def generate_one_chapter(
             and not load_checkpoint(paths, chapter_num, "quality_replan_done.json")
         ):
             try:
+                # Route: local failures (single weak dimension / locatable contract
+                # violation / prose collapse with patches) get extra TARGETED revise
+                # rounds — keep the working scene, surgically fix the flaw — instead
+                # of a high-variance full-scene replan. Only structural failures
+                # (multi-dimension low / scene雷同 / payoff缺失) trigger a full replan.
+                fail_kind, fail_reason = _classify_replan_failure(review, config)
+                log(paths, f"Quality replan routing Ch{chapter_num}: kind={fail_kind} ({fail_reason})")
+
+                if fail_kind == "local" and bool(config["novel"].get("local_fix_before_replan", True)):
+                    local_rounds = int(config["novel"].get("local_fix_max_rounds", 2))
+                    local_chapter = chapter
+                    local_review = review
+                    improved = False
+                    for lr in range(1, local_rounds + 1):
+                        lkey = f"local_fix_round{lr}.md"
+                        cached_local = load_checkpoint(paths, chapter_num, lkey)
+                        if cached_local:
+                            local_chapter = normalize_chapter(str(cached_local))
+                        else:
+                            local_chapter = revise_chapter(
+                                client, paths, conn, config, local_chapter, local_review,
+                                plan, tail, cached_memory=writing_memory,
+                            )
+                            save_checkpoint(paths, chapter_num, lkey, local_chapter)
+                        local_review = review_chapter(
+                            client, paths, conn, config, chapter_num, plan,
+                            local_chapter, tail, cached_memory=writing_memory,
+                        )
+                        log(
+                            paths,
+                            f"Local fix Ch{chapter_num} round={lr} score={local_review.get('score')}/10",
+                        )
+                        if safe_score(local_review.get("score", 0)) > safe_score(best_review.get("score", 0)):
+                            chapter = normalize_chapter(local_chapter)
+                            review = local_review
+                            best_chapter = chapter
+                            best_review = dict(review)
+                            save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
+                            save_checkpoint(paths, chapter_num, "final_review.json", review)
+                            improved = True
+                        if (
+                            safe_score(local_review.get("score", 0)) >= threshold
+                            and local_review.get("accepted", True)
+                        ):
+                            review["accepted"] = True
+                            break
+                    save_checkpoint(
+                        paths, chapter_num, "quality_replan_done.json",
+                        {"route": "local", "reason": fail_reason, "improved": improved,
+                         "score_after": review.get("score")},
+                    )
+                    # If local fixes still left it below threshold, fall through to
+                    # the force-accept/debt block below (no full replan for local).
+                    raise _LocalFixDone()
+
                 log(
                     paths,
                     f"Quality replan Ch{chapter_num}: best score={review.get('score')}/10 below threshold={threshold}",
                 )
                 replan_tail = tail_text(paths.book, int(config["novel"]["recent_tail_chars"]))
                 replan_memory = memory_context(paths, conn, config)
+                replan_fb = _build_replan_feedback(review)
+                # V3-#3: diagnose BEFORE regenerating the plan. A structural replan
+                # regenerates the whole plan, and historically often came back "did
+                # not improve" because the fresh plan repeated the same open-loop
+                # mistake (abstract intent / off-page payoff) in new wording. Pin
+                # down which beats never landed + the weakest dimension so the new
+                # plan's constraints carry a concrete target, not a vague "do better".
+                diagnose_constraints: list[str] = []
+                if bool(config["novel"].get("structural_diagnose_enabled", True)):
+                    try:
+                        from planning import diagnose_structural_failure as _diagnose
+                        diag = _diagnose(
+                            client, paths, config, chapter_num, plan, review, chapter,
+                        )
+                        if isinstance(diag, dict) and diag:
+                            save_checkpoint(paths, chapter_num, "structural_diagnose.json", diag)
+                            rc = str(diag.get("root_cause", "")).strip()
+                            sf = str(diag.get("scene_fix", "")).strip()
+                            fb = [str(b).strip() for b in (diag.get("failed_beats") or []) if str(b).strip()]
+                            md = [str(b).strip() for b in (diag.get("must_dramatize") or []) if str(b).strip()]
+                            wd = str(diag.get("weakest_dimension", "")).strip()
+                            if rc:
+                                diagnose_constraints.append(f"上一版结构性失败根因：{rc}")
+                            if fb:
+                                diagnose_constraints.append(
+                                    "以下原计划 beat 在上一版根本没落地，重写必须真正演出来："
+                                    + "；".join(fb[:4])
+                                )
+                            if wd:
+                                diagnose_constraints.append(f"最弱维度是 {wd}，本次必须把它作为首要修复目标。")
+                            if sf:
+                                diagnose_constraints.append(f"场景设计必须改变：{sf}")
+                            if md:
+                                diagnose_constraints.append(
+                                    "下列画面/动作必须在正文真正发生（不得用梗概/暗示带过）："
+                                    + "；".join(md[:4])
+                                )
+                            # Surface the diagnosis to the plan generator too.
+                            if diagnose_constraints:
+                                replan_fb = (replan_fb + "\n" if replan_fb else "") + \
+                                    "## 重写前诊断（必须据此重做场景）\n- " + "\n- ".join(diagnose_constraints)
+                            log(
+                                paths,
+                                f"Structural diagnose Ch{chapter_num}: root_cause={rc[:60]!r} "
+                                f"weakest={wd} failed_beats={len(fb)}",
+                            )
+                    except Exception as exc:
+                        log(paths, f"Structural diagnose failed (non-fatal) Ch{chapter_num}: {exc}")
                 replan_plan, replan_decision = create_plan(
                     client,
                     paths,
@@ -387,11 +705,20 @@ def generate_one_chapter(
                     replan_tail,
                     checkpoint_label="quality_replan",
                     cached_memory=replan_memory,
+                    replan_feedback=replan_fb,
                 )
                 replan_decision.setdefault("required_constraints", []).append(
                     "上一版章节低于质量阈值。本次必须重做场景设计，而不是只修补措辞；优先提升追读、兑现与新鲜度。"
                 )
-                replan_chapter, _ = write_chapter_with_candidates(
+                for dc in diagnose_constraints:
+                    if dc not in replan_decision["required_constraints"]:
+                        replan_decision["required_constraints"].append(dc)
+                # Variance hedge: a single replan draft once turned an 8.5 plan
+                # into a 5.5 chapter. Sample several lower-temperature drafts and
+                # keep the best-reviewed one instead of betting on one roll.
+                sr_candidates = int(config["novel"].get("structural_replan_candidates", 3))
+                sr_temp = float(config["novel"].get("structural_replan_temperature", 0.65))
+                replan_chapter, replan_review = write_chapter_with_candidates(
                     client,
                     paths,
                     conn,
@@ -401,18 +728,22 @@ def generate_one_chapter(
                     replan_decision,
                     replan_tail,
                     cached_memory=writing_memory,
+                    num_candidates_override=max(1, sr_candidates),
+                    base_temp_override=sr_temp,
                 )
-                replan_review = review_chapter(
-                    client,
-                    paths,
-                    conn,
-                    config,
-                    chapter_num,
-                    replan_plan,
-                    replan_chapter,
-                    replan_tail,
-                    cached_memory=writing_memory,
-                )
+                if replan_review is None:
+                    # n<=1 path returned no review (or only 1 valid draft); review now.
+                    replan_review = review_chapter(
+                        client,
+                        paths,
+                        conn,
+                        config,
+                        chapter_num,
+                        replan_plan,
+                        replan_chapter,
+                        replan_tail,
+                        cached_memory=writing_memory,
+                    )
                 save_checkpoint(
                     paths,
                     chapter_num,
@@ -440,6 +771,8 @@ def generate_one_chapter(
                         f"Quality replan Ch{chapter_num} did not improve "
                         f"(new score={replan_review.get('score')}/10); keeping previous best.",
                     )
+            except _LocalFixDone:
+                pass
             except Exception as exc:
                 save_checkpoint(paths, chapter_num, "quality_replan_done.json", {"error": str(exc)})
                 log(paths, f"Quality replan failed (non-fatal) Ch{chapter_num}: {exc}")
@@ -447,12 +780,44 @@ def generate_one_chapter(
         if safe_score(review.get("score", 0)) < threshold or not review.get("accepted", True):
             chapter = best_chapter
             review = best_review
+            chapter, review = _apply_force_accept_patches(paths, config, chapter_num, chapter, review)
             log(
                 paths,
                 f"Ch{chapter_num} did not meet threshold {threshold} after {max_rounds + 1} rounds "
                 f"(best score={review.get('score')}/10). Accepting anyway to avoid pipeline halt.",
             )
             review["accepted"] = True
+            # Mark this as a force-accept and persist the chosen best as the
+            # authoritative final_review + current chapter text. On resume, the
+            # final_is_authoritative check honours force_accepted reviews, so the
+            # loop does NOT replay review/revise/local-fix from scratch (which both
+            # wastes LLM calls and can regress to a worse earlier round).
+            review["force_accepted"] = True
+            save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
+            save_checkpoint(paths, chapter_num, "final_review.json", review)
+            # Register a "quality debt": this chapter was force-accepted below the
+            # threshold, so the post-completion refine pass should prioritise it
+            # (higher intensity) instead of treating it like a healthy chapter. We
+            # persist a small marker the refine pass reads back. Style-collapse and
+            # contract issues bias toward heavier intensity.
+            try:
+                sh_metrics = (review.get("style_health") or {}).get("metrics") or {}
+                debt = {
+                    "chapter": chapter_num,
+                    "score": review.get("score"),
+                    "style_penalty": (review.get("style_health") or {}).get("penalty", 0.0),
+                    "em_dash_per_kchar": sh_metrics.get("em_dash_per_kchar"),
+                    "fragment_line_ratio": sh_metrics.get("fragment_line_ratio"),
+                    "had_contract_violation": bool(review.get("contract_violations")),
+                    "patches_applied": review.get("quality_debt_patches_applied", 0),
+                    "patch_total": review.get("quality_debt_patch_total", 0),
+                    "problems": [str(p)[:160] for p in (review.get("problems") or [])[:5]],
+                }
+                save_checkpoint(paths, chapter_num, "quality_debt.json", debt)
+                db_event(conn, chapter_num, "quality_debt", debt)
+                log(paths, f"Quality-debt registered Ch{chapter_num} (score={review.get('score')}/10) for refine priority")
+            except Exception as exc:
+                log(paths, f"Quality-debt registration failed (non-fatal) Ch{chapter_num}: {exc}")
 
         # Hook-only mini revise: if the chapter ends weakly, rewrite only the
         # last ~400 chars rather than running another full revise round. This
@@ -811,8 +1176,70 @@ def main() -> None:
     )
     log(paths, f"LLM client pool initialized keys={len(clients)} primary={primary_endpoint_count}")
 
+    # Reviewer routing: when api.review_base_url is configured, build a separate
+    # client pool for the reviewer model (e.g. GPT) and attach it to the primary
+    # client. call_llm picks it up via getattr for tags in llm.REVIEW_TAGS, so
+    # scoring/review calls go to the reviewer while writing/planning/memory stay
+    # on the primary model. No review_* config => nothing attached => unchanged.
+    review_endpoints = configured_review_endpoints(config)
+    if review_endpoints:
+        review_clients = [
+            OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout, default_headers=default_headers or None)
+            for base_url, api_key in review_endpoints
+        ]
+        review_pool: Any = (
+            LLMClientPool(review_clients, endpoints=review_endpoints, log_fn=lambda msg: log(paths, msg))
+            if len(review_clients) > 1
+            else review_clients[0]
+        )
+        setattr(client, "review_pool", review_pool)
+        setattr(client, "review_api", config["api"])
+        log(
+            paths,
+            f"Reviewer pool initialized model={config['api'].get('review_model')} "
+            f"endpoints={len(review_clients)}",
+        )
+
     if not paths.state.exists() or not read_text(paths.state).strip():
-        bootstrap(client, paths, conn, config)
+        try:
+            bootstrap(client, paths, conn, config)
+        except Exception as exc:
+            # Bootstrap is the single hard dependency for the whole run: every
+            # chapter needs state.md/bible/characters/etc. If the core bootstrap
+            # LLM call dies (observed: all API keys 401'd + 429 "quota exhausted"
+            # at startup), the old behaviour left a half-written / empty state.md
+            # and crashed with an opaque traceback. Detect the quota/auth case and
+            # exit with an actionable message instead, and make sure we did NOT
+            # persist a partial state that would block a clean re-bootstrap later.
+            msg = str(exc)
+            is_quota = any(
+                k in msg.lower()
+                for k in ("quota exhausted", "429", "401", "all api keys", "marked invalid")
+            )
+            try:
+                st = read_text(paths.state).strip()
+                # A bootstrap that died mid-write may have left a stub state.md.
+                # Remove it so the next launch re-bootstraps from scratch rather
+                # than treating the stub as a valid (but empty) project.
+                if st and ("待连载补全" in st or len(st) < 200) and paths.state.exists():
+                    paths.state.unlink()
+                    log(paths, "Removed partial state.md so a later run can re-bootstrap cleanly")
+            except Exception:
+                pass
+            if is_quota:
+                log(
+                    paths,
+                    "Bootstrap aborted: API quota/auth exhausted at startup "
+                    "(keys 401/429). No chapters were written. Rotate or add fresh "
+                    "keys in this novel's config.yaml (api.api_key / api_keys / "
+                    "api_key_groups), or wait for the shared quota window to reset, "
+                    "then re-run `novel.py run <name>` — it resumes cleanly.",
+                )
+                raise SystemExit(
+                    "Bootstrap aborted: API quota/auth exhausted (keys 401/429). "
+                    "Rotate keys or wait for quota reset, then re-run."
+                ) from exc
+            raise
 
     if not paths.book.exists() and find_last_chapter(paths) > 0:
         rebuild_book(paths)
@@ -822,14 +1249,91 @@ def main() -> None:
     # so the long novel (which never sets this) keeps its char-target-only loop.
     max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
     log(paths, f"Start target_chars={target} current_chars={count_chars(paths.book)} max_chapters={max_chapters or 'none'}")
+    # V3-#2: anchor-completion gate. In short-novel mode the loop terminates on
+    # char/chapter cap alone, which can stop with the climactic volume_plan
+    # anchors (truth reveal / confrontation / cost payoff) never dramatized.
+    # When we're about to stop, audit those anchors; if any are unrealized, allow
+    # a bounded number of extra chapters (each carrying an explicit "land this
+    # anchor" directive) so the finale is actually written rather than summarized
+    # away. Bounded by anchor_gate_max_extra to avoid an unbounded tail.
+    anchor_gate_enabled = bool(config["novel"].get("anchor_gate_enabled", True))
+    anchor_gate_max_extra = int(config["novel"].get("anchor_gate_max_extra", 3))
+    anchor_extra_used = 0
     background = BackgroundTasks(paths)
     try:
-        while not book_reached_target(paths.book, target):
+        while True:
+            if book_reached_target(paths.book, target):
+                last_chapter = find_last_chapter(paths)
+                stop_for_chapters = bool(max_chapters and last_chapter >= max_chapters)
+                # Only the anchor gate can keep us going past the quantitative
+                # cap, and only in short-novel mode with budget left.
+                if (
+                    anchor_gate_enabled
+                    and max_chapters
+                    and (stop_for_chapters or book_reached_target(paths.book, target))
+                    and anchor_extra_used < anchor_gate_max_extra
+                ):
+                    background.wait_label(f"chapter_finalize_ch{last_chapter}")
+                    try:
+                        gate = anchor_completion_gate(client, paths, conn, config, last_chapter)
+                    except Exception as exc:
+                        log(paths, f"Anchor gate failed (non-fatal) Ch{last_chapter}: {exc}")
+                        gate = {"all_anchors_realized": True, "directives": []}
+                    if not gate.get("all_anchors_realized", True):
+                        anchor_extra_used += 1
+                        directives = gate.get("directives") or []
+                        log(
+                            paths,
+                            f"Anchor gate: {len(gate.get('unrealized_anchors') or [])} unrealized "
+                            f"anchor(s) at Ch{last_chapter}; extending +1 chapter "
+                            f"({anchor_extra_used}/{anchor_gate_max_extra}) to dramatize them.",
+                        )
+                        # Persist directives onto the latest review so the next
+                        # writer reads them, and raise the chapter cap by one.
+                        try:
+                            existing = load_checkpoint(paths, last_chapter, "final_review.json")
+                            if isinstance(existing, dict):
+                                wd = list(existing.get("writer_directives_for_next_chapter") or [])
+                                for d in directives:
+                                    if d and d not in wd:
+                                        wd.append(d)
+                                existing["writer_directives_for_next_chapter"] = wd[:12]
+                                save_checkpoint(paths, last_chapter, "final_review.json", existing)
+                        except Exception as exc:
+                            log(paths, f"Failed to persist anchor directives Ch{last_chapter}: {exc}")
+                        if max_chapters:
+                            max_chapters = last_chapter + 1
+                        # Fall through to generate the extra chapter.
+                    else:
+                        log(paths, "Anchor gate: all must-hit anchors realized; stopping.")
+                        break
+                else:
+                    break
             last_chapter = find_last_chapter(paths)
             if max_chapters and last_chapter >= max_chapters:
                 log(paths, f"Reached max_chapters={max_chapters}; stopping chapter loop")
                 break
             is_resume = should_resume_existing_chapter(paths, last_chapter)
+            if is_resume:
+                # A chapter file + checkpoint dir exist but the finalize markers
+                # (extraction.json / structured_state_done.json / chapter_completed)
+                # aren't all present yet. This is almost always because the PREVIOUS
+                # iteration just submitted `chapter_finalize_ch{n}` to the background
+                # pool and the loop raced ahead before those markers were written —
+                # NOT a genuine crash-resume. Joining the finalize barrier here lets
+                # the background extract/structured writes become durable, so the
+                # re-check below can see the chapter as finished and advance, instead
+                # of needlessly replaying its whole review/revise/local-fix loop
+                # (which both wastes ~1 extra chapter's worth of LLM calls and can
+                # regress the accepted text to a lower-scoring earlier round).
+                background.wait_label(f"chapter_finalize_ch{last_chapter}")
+                if not should_resume_existing_chapter(paths, last_chapter):
+                    log(
+                        paths,
+                        f"Ch{last_chapter} finalize completed after barrier wait; "
+                        f"advancing instead of resuming.",
+                    )
+                    is_resume = False
             if is_resume:
                 chapter_num = last_chapter
                 log(paths, f"Resuming partially indexed Ch{chapter_num}")

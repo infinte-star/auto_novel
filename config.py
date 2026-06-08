@@ -27,6 +27,7 @@ class Paths:
     volume_plan: Path
     voices: Path
     voice: Path
+    contract: Path
     chapters_dir: Path
     logs_dir: Path
     database: Path
@@ -74,14 +75,10 @@ def load_config() -> dict[str, Any]:
             "max_revision_rounds",
             "candidate_plans",
             "min_plan_score",
-            "outline_buffer",
-            "summary_keep",
             "recent_tail_chars",
-            "long_memory_every",
             "stage_review_every",
             "repeat_window",
             "fatigue_window",
-            "key_event_interval",
         ],
         "paths": [
             "book",
@@ -162,6 +159,18 @@ def _validate_config(config: dict[str, Any]) -> None:
                 raise ValueError(f"Config value {section_name}.{key}={value} is below minimum {minimum}")
             config[section_name][key] = value
 
+    # Optional reviewer routing (main writer = primary model, reviewer = a
+    # separate model+endpoint). All review_* keys are optional; if review_base_url
+    # is set, review_model becomes mandatory so a half-configured reviewer fails
+    # loudly here instead of sending an empty model name to the provider.
+    api = config.get("api", {})
+    review_base_url = str(api.get("review_base_url", "")).strip()
+    if review_base_url and not str(api.get("review_model", "")).strip():
+        raise ValueError(
+            "api.review_base_url is set but api.review_model is missing. "
+            "Either set api.review_model or remove api.review_base_url."
+        )
+
 def configured_api_keys(config: dict[str, Any]) -> list[str]:
     api = config["api"]
     keys: list[str] = []
@@ -214,6 +223,35 @@ def configured_api_endpoints(config: dict[str, Any]) -> tuple[list[tuple[str, st
 
     return endpoints, primary_count
 
+def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Endpoints for the separate reviewer model (main writer = primary model).
+
+    Returns [(base_url, key), ...] built from api.review_base_url plus
+    api.review_api_key and api.review_keys (comma/semicolon/space separated).
+    Returns [] when review_base_url is not configured, so the engine keeps
+    routing every call through the primary model (backward compatible).
+    """
+    api = config["api"]
+    base_url = str(api.get("review_base_url", "")).strip()
+    if not base_url:
+        return []
+    keys: list[str] = []
+    primary = str(api.get("review_api_key", "")).strip()
+    if primary:
+        keys.append(primary)
+    extra = str(api.get("review_keys", "")).strip()
+    if extra:
+        keys.extend(k for k in re.split(r"[,;\s]+", extra) if k)
+
+    endpoints: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key in keys:
+        endpoint = (base_url, key)
+        if endpoint not in seen:
+            seen.add(endpoint)
+            endpoints.append(endpoint)
+    return endpoints
+
 def get_paths(config: dict[str, Any]) -> Paths:
     raw = config["paths"]
     return Paths(
@@ -227,6 +265,7 @@ def get_paths(config: dict[str, Any]) -> Paths:
         volume_plan=ROOT / str(raw["volume_plan"]),
         voices=ROOT / str(raw.get("voices", "memory/voices.md")),
         voice=ROOT / str(raw.get("voice", "memory/voice.md")),
+        contract=ROOT / str(raw.get("contract", str(Path(str(raw.get("voice", "memory/voice.md"))).parent / "contract.md"))),
         chapters_dir=ROOT / str(raw["chapters_dir"]),
         logs_dir=ROOT / str(raw["logs_dir"]),
         database=ROOT / str(raw["database"]),

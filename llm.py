@@ -19,6 +19,21 @@ _STREAM_END = object()
 _REQUEST_THROTTLE_LOCK = threading.Lock()
 _LAST_REQUEST_STARTED_AT = 0.0
 
+# Tags whose LLM calls should be routed to the separate reviewer model
+# (main writer = primary model, reviewer = GPT) when a reviewer pool is
+# configured and attached to the client. Every other tag stays on the primary
+# model. See call_llm's reviewer-routing block and pipeline.py's reviewer pool
+# construction. When no reviewer pool is attached, this set is inert.
+REVIEW_TAGS = frozenset({
+    "review",
+    "cold_reader",
+    "stage_review",
+    "pack_review",
+    "macro_progress",
+    "plan_review_fused",
+    "plan_review_axis",
+})
+
 # Lightweight observability sink. call_llm appends one JSON line per finished
 # call to logs/llm_calls.jsonl. We use a plain file (not the SQLite store) so
 # the recorder is reachable from every call site without threading a `conn`
@@ -151,7 +166,13 @@ def _backoff_wait(attempt: int, exc: Exception | None = None) -> float:
     """
     status_code = getattr(exc, "status_code", None) if exc is not None else None
     is_rate_limit = status_code is not None and int(status_code) == 429
-    if exc is not None:
+    # Cloudflare 504/502/520-524 gateway errors set Retry-After: 120, but those
+    # are origin-overload/timeout (transient), not a real rate-limit quota — the
+    # next attempt usually succeeds within a few seconds. Honoring the 120s hint
+    # there just burns 2 minutes per retry (observed: 3×120s on a single
+    # bootstrap). Cap gateway-error backoff to a short jittered window instead.
+    is_gateway_error = status_code is not None and int(status_code) in {502, 503, 504, 520, 521, 522, 523, 524}
+    if exc is not None and not is_gateway_error:
         hinted = _retry_after_secs(exc)
         if hinted is not None:
             # Respect the server hint but add small jitter and a sane ceiling.
@@ -159,6 +180,9 @@ def _backoff_wait(attempt: int, exc: Exception | None = None) -> float:
     if is_rate_limit:
         # Base grows 4,8,16,... capped at 90s for 429 so we actually back off.
         cap = min(90.0, 4.0 * (2 ** attempt))
+    elif is_gateway_error:
+        # Short backoff for transient gateway timeouts: 4,8,16,32 capped at 32s.
+        cap = min(32.0, 4.0 * (2 ** attempt))
     else:
         cap = min(60.0, 2.0 * (2 ** attempt))
     # Full jitter: random point in [cap/2, cap] keeps a floor while decorrelating.
@@ -361,6 +385,69 @@ def _repair_truncated_json(text: str) -> str | None:
             continue
     return None
 
+def _escape_inner_string_quotes_unchecked(text: str) -> str:
+    """Core of the inner-quote escaper, WITHOUT the final parse gate.
+
+    Walks the text tracking string state; a `"` inside a string is a genuine
+    closing delimiter only when the next non-whitespace char is JSON structure
+    (`,` `:` `}` `]`) or end-of-text, otherwise it is content and is escaped to
+    `\\"`. Used both directly (last-resort, combined with truncation repair) and
+    by `_escape_inner_string_quotes`, which adds a parse check.
+    """
+    out: list[str] = []
+    n = len(text)
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if esc:
+            out.append(c)
+            esc = False
+            continue
+        if c == "\\":
+            out.append(c)
+            esc = True
+            continue
+        if c == '"':
+            if not in_str:
+                in_str = True
+                out.append(c)
+                continue
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            nxt = text[j] if j < n else ""
+            if nxt in ",:}]" or nxt == "":
+                in_str = False
+                out.append(c)
+            else:
+                out.append('\\"')
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+def _escape_inner_string_quotes(text: str) -> str | None:
+    """Repair JSON whose string VALUES contain unescaped double quotes.
+
+    The model frequently emits values like `"state": "...以"团建素描顾问"名义..."`
+    — raw double quotes (often the CJK-content kind, sometimes ASCII) sitting
+    inside a string value. Standard json.loads aborts at the first such quote,
+    and neither the `\\{.*\\}` slice nor `_repair_truncated_json` can recover it
+    because both assume well-formed string boundaries.
+
+    Returns the repaired string if it then parses, else None. This is a
+    last-resort fixer, tried after the cheaper paths in safe_json_loads.
+    """
+    if '"' not in text:
+        return None
+    repaired = _escape_inner_string_quotes_unchecked(text)
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        return None
+
+
 def safe_json_loads(text: str) -> dict[str, Any]:
     cleaned = normalize_text(text)
     try:
@@ -373,9 +460,24 @@ def safe_json_loads(text: str) -> dict[str, Any]:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
+    # Unescaped quotes inside string values (model emits 以"x"名义 verbatim).
+    # Try this before the truncation repair, since a body full of inner quotes
+    # makes _repair_truncated_json's brace-balancing read structure wrong.
+    quote_fixed = _escape_inner_string_quotes(cleaned)
+    if quote_fixed is not None:
+        return json.loads(quote_fixed)
     repaired = _repair_truncated_json(cleaned)
     if repaired:
         return json.loads(repaired)
+    # Last resort: a stream that is BOTH truncated AND carries inner quotes.
+    # Escape the inner quotes first (without the parse gate), then balance braces.
+    half_fixed = _escape_inner_string_quotes_unchecked(cleaned)
+    repaired2 = _repair_truncated_json(half_fixed)
+    if repaired2:
+        try:
+            return json.loads(repaired2)
+        except json.JSONDecodeError:
+            pass
     raise json.JSONDecodeError(f"Could not recover JSON. Preview: {cleaned[:300]!r}", cleaned, 0)
 
 JSON_REPAIR_SYSTEM = """你负责修复 LLM 返回的格式错误的 JSON。
@@ -391,8 +493,72 @@ JSON_OUTPUT_CONTRACT = """输出约定：
 - 严格保留所要求的 schema 键名，键名一律用英文原样输出，不得翻译。
 - 若不确定，仍要返回所要求的 schema，取保守值，字符串用简短中文。"""
 
+GLOBAL_PROMPT_HYGIENE = """## 全局提示词纪律（适用于本次调用）
+- 严格服从本任务要求的输出格式；除非任务明确要求，不要输出思考过程、解释、道歉、前言或元评论。
+- 优先使用上文给出的事实、约束、schema、章节状态；遇到冲突时，以更具体、更近期、更硬性的约束为准。
+- 输出必须具体可执行：用人物行动、场景变化、因果桥梁、资源代价、证据或字段值回答问题，避免空泛口号。
+- 不把缺陷留给下游修订；在本次输出内先完成自检，再给最终结果。"""
+
+JSON_PROMPT_HYGIENE = """## JSON 任务额外纪律
+- 只生成一个 JSON 对象，不要在 JSON 前后添加任何文本。
+- 保留 schema 中要求的键名和层级；缺失信息时填保守、简短、可解析的值，不要删键。
+- 数字字段输出数字，布尔字段输出 true/false，数组字段输出数组；不要输出 NaN、Infinity、注释或尾随逗号。"""
+
+PLAN_PROMPT_HYGIENE = """## 规划/仲裁任务额外纪律
+- 大纲必须能直接驱动首稿写作：每个 beat 都要有可见行动、阻力、信息增量或资源代价。
+- 不接受“加强冲突”“提升节奏”这类抽象修正；必须给出具体场景任务、人物选择和章末问题。
+- 选择或合并方案时，优先解决近期低分原因、重复场景骨架、沉默伏线和兑现拖欠。"""
+
+WRITE_PROMPT_HYGIENE = """## 写作/修订任务额外纪律
+- 首稿就按终审标准执行：剧情推进、主角能动性、压力、兑现、新鲜度、文笔和连续性都必须同时过线。
+- 所有大纲节拍必须落到页面上的动作、对话、后果或细节；不要用总结性旁白替代戏剧化呈现。
+- 修订时优先修结构、因果、节奏和钩子，再润色措辞；不得引入新的事实矛盾。"""
+
+REVIEW_PROMPT_HYGIENE = """## 审校/评分任务额外纪律
+- 分维度独立判断，不让单一优点掩盖追读、兑现、新鲜度、文笔或连续性的短板。
+- 所有扣分、风险和修改建议都要可执行；指出页面上缺什么、应补在哪里、下一次如何避免。
+- 不要分数通胀；若关键节拍缺失、兑现空洞、重复或连续性风险明显，总分必须受限。"""
+
+MEMORY_PROMPT_HYGIENE = """## 记忆/抽取/压缩任务额外纪律
+- 保留稳定事实、人物目标、资源状态、因果链接、伏线状态和不可违背约束；删掉套话和风格性复述。
+- 新增事实必须来自输入文本或明确任务，不要编造未出现的人物、地点、物品或因果。
+- 输出要便于后续生成直接引用：短句、具体、去重、按状态变化组织。"""
+
+
 def json_prompt(user: str) -> str:
     return user.rstrip() + "\n\n## 强制 JSON 输出格式\n" + JSON_OUTPUT_CONTRACT
+
+
+def _enhance_system_prompt(system: str, config: dict[str, Any], *, tag: str, wants_json: bool) -> str:
+    api = config.get("api", {})
+    novel = config.get("novel", {})
+    if not bool(api.get("prompt_enhancement_enabled", novel.get("prompt_enhancement_enabled", True))):
+        return system
+    if "## 全局提示词纪律（适用于本次调用）" in system:
+        return system
+
+    tag_l = (tag or "").lower()
+    blocks = [GLOBAL_PROMPT_HYGIENE]
+    if wants_json:
+        blocks.append(JSON_PROMPT_HYGIENE)
+    if tag_l.startswith("plan_") or tag_l in {"replan", "macro_progress"}:
+        blocks.append(PLAN_PROMPT_HYGIENE)
+    if tag_l in {"write", "revise"} or "write" in tag_l or "revise" in tag_l:
+        blocks.append(WRITE_PROMPT_HYGIENE)
+    if "review" in tag_l or tag_l in {"cold_reader", "stage_review", "pack_review"}:
+        blocks.append(REVIEW_PROMPT_HYGIENE)
+    if tag_l in {
+        "bootstrap",
+        "creative_boost",
+        "memory_compress",
+        "extract",
+        "state_update",
+        "state_sections",
+        "voice_anchor",
+        "voices_table",
+    }:
+        blocks.append(MEMORY_PROMPT_HYGIENE)
+    return system.rstrip() + "\n\n" + "\n\n".join(blocks)
 
 def emergency_truncate(user_text: str, max_chars: int) -> str:
     if len(user_text) <= max_chars:
@@ -441,6 +607,16 @@ def call_llm(
     tag: str = "",
 ) -> str:
     api = config["api"]
+    # Reviewer routing: when a reviewer pool is attached to the client (see
+    # pipeline.py) and this call's tag is a scoring/review tag, send it to the
+    # separate reviewer model+endpoint instead of the primary model. Attribute
+    # probing keeps call_llm's signature unchanged across its ~25 call sites.
+    # `review_api` is the same config["api"] dict, read for the review_* keys.
+    review_pool = getattr(client, "review_pool", None)
+    review_api = getattr(client, "review_api", None)
+    use_reviewer = bool(review_pool) and bool(review_api) and tag in REVIEW_TAGS
+    call_client = review_pool if use_reviewer else client
+    model_name = str(review_api["review_model"]) if use_reviewer else api["model"]
     context_window = int(api.get("context_window", 1000000))
     max_input_chars = int(context_window * 1.8)
     # Prepend cacheable_prefix verbatim at the very top of user message so that
@@ -450,10 +626,11 @@ def call_llm(
     # characters, voice anchors).
     if cacheable_prefix:
         user = cacheable_prefix.rstrip() + "\n\n" + user
+    wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
+    system = _enhance_system_prompt(system, config, tag=tag, wants_json=wants_json)
     total_chars = len(system) + len(user)
     if total_chars > max_input_chars:
         user = emergency_truncate(user, max_input_chars - len(system) - 1000)
-    wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
     use_response_format = wants_json and bool(api.get("json_response_format", True))
     max_attempts = int(api.get("max_attempts", 6))
     salvaged_any = False
@@ -461,7 +638,7 @@ def call_llm(
         started = time.perf_counter()
         try:
             request = {
-                "model": api["model"],
+                "model": model_name,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -469,9 +646,32 @@ def call_llm(
                 "max_tokens": _effective_max_tokens(api, max_tokens),
                 "temperature": float(api["temperature"]) if temperature is None else temperature,
             }
+            if use_reviewer and str(review_api.get("review_temperature", "")).strip() != "":
+                try:
+                    request["temperature"] = float(review_api["review_temperature"])
+                except (TypeError, ValueError):
+                    pass
             extra_body: dict[str, Any] = {}
-            if api.get("group"):
+            if not use_reviewer and api.get("group"):
                 extra_body["group"] = str(api.get("group"))
+            # Some providers (e.g. mimo-v2.5-pro) default to an unbounded
+            # "thinking" / reasoning phase. On large write prompts this can emit
+            # tens of thousands of reasoning_content chars and NEVER produce
+            # `content`, so the stream runs until stream_timeout (1800s) and the
+            # whole pipeline stalls retrying forever. Disabling thinking makes
+            # content stream within seconds. `api.thinking_disabled` (default
+            # true) sends the documented `extra_body={"thinking": {"type":
+            # "disabled"}}`; set false to restore provider-default reasoning.
+            # Reviewer (GPT) path reads review_thinking_disabled (default False),
+            # since GPT reasoning models reject the Anthropic-style thinking flag.
+            if use_reviewer:
+                thinking_disabled = review_api.get("review_thinking_disabled", False)
+            else:
+                thinking_disabled = api.get("thinking_disabled", True)
+            if isinstance(thinking_disabled, str):
+                thinking_disabled = thinking_disabled.strip().lower() not in {"false", "0", "no", "off", ""}
+            if thinking_disabled:
+                extra_body["thinking"] = {"type": "disabled"}
             if api.get("top_p") is not None:
                 request["top_p"] = float(api.get("top_p"))
             if api.get("frequency_penalty") is not None:
@@ -486,10 +686,10 @@ def call_llm(
             if stream:
                 request["stream"] = True
             _throttle_request_start(paths, api)
-            if hasattr(client, "create_completion"):
-                resp = client.create_completion(**request)
+            if hasattr(call_client, "create_completion"):
+                resp = call_client.create_completion(**request)
             else:
-                resp = client.chat.completions.create(**request)
+                resp = call_client.chat.completions.create(**request)
             if stream:
                 parts: list[str] = []
                 reasoning_parts: list[str] = []
@@ -636,7 +836,7 @@ def call_llm(
                 log(paths, f"LLM call blocked by provider; not retrying elapsed={elapsed:.1f}s error={exc}")
                 _record_llm_call(
                     paths, api,
-                    tag=tag, model=api["model"], stream=bool(api.get("stream", False)),
+                    tag=tag, model=model_name, stream=bool(api.get("stream", False)),
                     json_mode=wants_json, attempt=attempt, prompt_chars=total_chars,
                     output_chars=0, elapsed=elapsed, salvaged=salvaged_any, ok=False,
                     error=str(exc),
@@ -648,7 +848,7 @@ def call_llm(
             time.sleep(wait)
     _record_llm_call(
         paths, api,
-        tag=tag, model=api["model"], stream=bool(api.get("stream", False)),
+        tag=tag, model=model_name, stream=bool(api.get("stream", False)),
         json_mode=wants_json, attempt=max_attempts - 1, prompt_chars=total_chars,
         output_chars=0, elapsed=0.0, salvaged=salvaged_any, ok=False,
         error=f"failed after {max_attempts} attempts",
