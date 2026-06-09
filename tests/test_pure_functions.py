@@ -19,6 +19,7 @@ from config import normalize_chapter  # noqa: E402
 from quality import plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, safe_json_loads  # noqa: E402
+from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 
 
 class NormalizeChapterTests(unittest.TestCase):
@@ -155,6 +156,33 @@ class VisualPayoffTests(unittest.TestCase):
         self.assertFalse(res["blocked"])
         self.assertGreaterEqual(res["score"], 7.0)
         self.assertIn("presence_absence", res["template_hits"])
+
+
+class FirstDraftExecutionLedgerTests(unittest.TestCase):
+    def test_ledger_maps_beats_to_page_execution(self):
+        plan = {
+            "beats": [
+                "沈澜把验尸单压在桌沿，对照两处伤口位置逼罗鹤改口。",
+                "她推导出镜子被人动过。",
+            ]
+        }
+        out = _first_draft_execution_ledger({"novel": {"chapter_words": 4000}}, plan)
+        self.assertIn("首稿页面执行账本", out)
+        self.assertIn("beat1", out)
+        self.assertIn("谁在什么场地", out)
+        self.assertIn("风险：该 beat 含抽象实现词", out)
+
+    def test_ledger_can_be_disabled(self):
+        plan = {"beats": ["她发现证词矛盾。"]}
+        out = _first_draft_execution_ledger(
+            {"novel": {"first_draft_execution_ledger": False}},
+            plan,
+        )
+        self.assertEqual(out, "")
+
+    def test_concretization_heuristic_ignores_action_anchored_beats(self):
+        self.assertFalse(_beat_needs_concretization("她把证词摊在桌上，证明罗鹤说谎。"))
+        self.assertTrue(_beat_needs_concretization("她意识到证词存在矛盾。"))
 
 
 class QualityDebtPatchTests(unittest.TestCase):

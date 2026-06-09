@@ -39,7 +39,19 @@ schema：
 - 把至少一个遗留的审校问题转化为一个具体的、落在页面上的场景。
 - 当旅行时间、消息送达、资金流动、监视等要素重要时，给出对应的因果桥梁。
 - 给出可见的动作、感官锚点与对话张力，而非只有分析或概括。
-- 避免复用最近章节的章末手法、分析姿态或情感节拍。"""
+- 避免复用最近章节的章末手法、分析姿态或情感节拍。
+
+## 可落地性（最高优先级——本大纲会被一个"按可落地性而非野心打分"的仲裁层评审）
+你的大纲不是用来"听起来雄心勃勃"的，而是要让一个写手能照着 beats 在 3500 字内写出读者一眼可见的画面与物证。历史数据反复证明：抽象意图型大纲被首稿写崩（仲裁 8 分→成稿 5-6 分）。请在生成时就规避：
+- payoff 与高潮 beat 必须写成"某角色用具体动作操作具体物体、产生读者一眼可见的结果"的可拍句子（例：'沈澜把两张验尸单并排压在桌沿，用铅笔尖在两处伤口位置各画一道弧线对齐'）。严禁停留在只有结论没有画面的抽象意图——凡核心 payoff/高潮 beat 的动词是"推导出/意识到/想通/完成/还原/引导/心算/反应过来"而无具体动作+具体物体+可见结果，即视为写崩，必须改写成可拍动作。
+- 高潮场景禁止被压缩成一句概括，或用纸条/口头转述（如"断电前用纸条告知方法"）：必须原子化为多个连续的可见动作 beat，让读者跟着角色一步步看到过程。
+- payoff_type 不得伪装：没有挣来的兑现就不要标 reveal/reversal，必须在 pressure 与 beats 里补足代价与铺垫。
+- 若采用反转，须按 setup→misdirect→overturn 组织：先建立并强化一个被相信的事实/信任源，再推翻它；禁止凭空冒出真相的突兀反转。
+- 悬疑/推理的核心 payoff 禁止只停留在"逻辑上可推出"这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、正/反、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。
+
+## 文体（生成端就要锁死，别留给正文重写）
+- 每个 beat 都必须是完整的主谓宾长句叙事；严禁用破折号把状态短语堆叠成"句子——状态——状态"的碎片节奏。
+- beat 不能只是意图清单（"她决定查清真相"），必须含可见行动、对话交锋、信息变化或资源代价之一。"""
 
 SCREEN_SYSTEM = """你是长篇小说引擎中快速初筛的一层。
 你会收到多份候选章节大纲。请按整体质量排序，考量以下方面：
@@ -55,6 +67,16 @@ SCREEN_SYSTEM = """你是长篇小说引擎中快速初筛的一层。
 
 ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
 请结合全局状态、近期指标、重复风险、因果价值、人物一致性、兑现新鲜度与读者期待，评估各份候选大纲。
+
+## 评分理念（最高优先级：按"可落地性"打分，不要按"意图的雄心"打分）
+你给每份候选的 score（1-10）衡量的是：**一个写手在 3500 字内、能否照这份 beats 真正写出读者一眼可见的画面与物证**，而不是这份大纲"听起来多有野心/题材多独特"。
+历史数据反复证明：意图雄心的大纲被你打 8.0，成稿却跌到 5-6，因为高潮/兑现停留在"推导出真相/意识到矛盾/完成闭合"这类没有可拍动作的抽象意图。请直接对这种计划降分。
+- 默认从 7.0 起步，逐项核验后只有确实可落地的候选才上浮到 8+。
+- 硬上限：若某候选的核心 payoff/高潮 beat 停留在抽象意图（动词是"推导出/意识到/想通/完成/还原/引导"而无具体动作+具体物体+可见结果），或高潮被压缩成一句概括/纸条/口头转述，该候选 score 不得高于 7.0，并在 cons 中点名是哪一条 beat。
+- 只有当 payoff/高潮 beat 已写成"角色用具体动作操作具体物体、产生读者可见结果"的可拍句子时，才允许给 8+。
+- 选出的 merged_plan 也必须满足上述可落地标准；若候选都不达标，你必须在改写 merged_plan 时把抽象 beat 改写成可拍动作，并据此打分。
+
+请结合全局状态、近期指标、重复风险、因果价值、人物一致性、兑现新鲜度与读者期待综合评估。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
 {
   "selected_index": 0,
@@ -72,7 +94,8 @@ ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
 merged_plan 必须包含上述全部键，不得缺字段。改写 beats 时，每个 beat 仍须是完整主谓宾句子，禁止破折号状态短语堆叠。
 对以下大纲予以否决或降分：把已知审校问题停留在抽象层面、依赖在页面之外解决、重复相同的物理调度、或留有未解决的时间线/物流漏洞。
 若候选采用 "reversal"（反转）策略，当其反转没有铺垫（事先建立并强化过一个事实/信任源，再将其推翻）时降分——
-没有铺垫的反转只是突兀的转折，而非兑现。请改进 merged_plan，让作者拿到的是具体的场景任务，而非含糊的意图。"""
+没有铺垫的反转只是突兀的转折，而非兑现。请改进 merged_plan，让作者拿到的是具体的场景任务，而非含糊的意图。
+最后再次确认：你的 score 是"可落地性分"——payoff/高潮 beat 若仍是抽象意图（无具体动作+物体+可见结果），score 必须 ≤7.0。"""
 
 FUSED_PLAN_REVIEW_SYSTEM = """你是一部中国历史/玄幻网文的多维度大纲审校者。
 请沿 6 个相互独立的维度评估候选大纲。不要让某个强项拉高弱项——每个维度都单独评分。
@@ -528,14 +551,13 @@ def generate_candidate_plans(
 {json.dumps(quality_feedback, ensure_ascii=False, indent=2) if quality_feedback else "None"}
 
 ## 首稿质量前置门槛（必须落实到本章大纲，而不是留给正文重写）
-- 目标：后续首稿总分达到 {quality_threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。
+- 目标：后续首稿总分达到 {quality_threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。把它们逐一落到字段上：readthrough→hook 要让读者非看下一章不可；payoff→必须是挣来的、可拍的兑现；novelty→location/info_source/payoff_type 相对近期要换新；prose→beats 用完整长句、控破折号；continuity→risk 字段写明本章如何不踩时间线/物流/能力越界。
 - goal/conflict/payoff/hook 必须分别回答：本章推进什么、谁阻碍、读者得到什么、为什么要看下一章。
-- beats 不能只是意图清单；每个 beat 必须有可见行动、对话交锋、信息变化或资源代价。
-- 至少一个 beat 必须正面修复近期质量反馈里的具体问题；若反馈为空，也必须避免重复近期场景骨架。
-- 若本章没有挣来的兑现，payoff_type 不得伪装成 reveal/reversal；必须在 pressure 和 beats 中补足代价与铺垫。
-- 悬疑/推理章节的核心 payoff 禁止只停留在“光源方向不对、阴影角度矛盾、逻辑上可推出”这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、反/正、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。
-- 如果使用镜子、照片、倒影、阴影，beats 必须同时给出“画面里看到什么”和“现实中对照什么”，否则视为爽点未落地。
-- 若本章使用主角的核心能力（如临终视像读取），该次使用的流程/条件/代价/解读路径必须与最近各章的能力使用方式有可见区别，禁止原样复用同一套“读取→看画面→报结论”的流程；info_source 即便相同，beats 里的能力使用方式也必须翻新。
+- 至少一个 beat 必须正面修复"近期质量反馈JSON"里的具体问题；若反馈为空，也必须避免重复近期场景骨架。
+- （system 已说明可落地性与文体硬约束；下面是本书题材的专项落地要求）
+- 悬疑/推理章节的核心 payoff 禁止只停留在"光源方向不对、阴影角度矛盾、逻辑上可推出"这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、反/正、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。
+- 如果使用镜子、照片、倒影、阴影，beats 必须同时给出"画面里看到什么"和"现实中对照什么"，否则视为爽点未落地。
+- 若本章使用主角的核心能力（如临终视像读取），该次使用的流程/条件/代价/解读路径必须与最近各章的能力使用方式有可见区别，禁止原样复用同一套"读取→看画面→报结论"的流程；info_source 即便相同，beats 里的能力使用方式也必须翻新。
 - 锁定关键嫌疑/真凶时，beats 不得让单一物证一步定罪；必须把画面物证与此前已在前文铺垫的行为模式/逻辑缺口结合成推理闭环。
 
 ## 当前生效的阶段约束（必须遵守）
@@ -576,6 +598,23 @@ def generate_candidate_plans(
 - goal/payoff 必须正面解决全书主线矛盾，把已开启的关键伏线在本章收束。
 - "hook" 字段不再是抛给读者的新悬念，而是一句收束/余韵/主题升华；严禁以全新未解决危机作结。
 - beats 的最后 1-2 拍必须落在"结局兑现 + 情绪落点"，而非开启新冲突。"""
+    # Cold-start block: in the first few chapters the strategy bandit, scene
+    # dedupe, used-locations blacklist and quality-feedback loops are all empty
+    # (no history yet), so the generator gets almost no steering and tends to
+    # spend the opening on world-info dump + slow setup. These early chapters
+    # decide whether a reader keeps going, so inject opening-specific craft
+    # constraints when we're early AND there's genuinely little to dedupe against.
+    cold_start_n = int(config["novel"].get("cold_start_chapters", 3))
+    history_thin = (dedupe_block == "None" and used_locations_block == "None")
+    if chapter_num <= cold_start_n and history_thin and not is_final_chapter(config, chapter_num):
+        base_user += f"""
+
+## 开篇章节要求（硬性：这是第 {chapter_num} 章，处于决定读者去留的开篇区，历史去重数据尚空，必须靠本章自身立住）
+- 卖点前置：本章必须在前 1/3 就让读者看到本书的核心钩子/金手指/独特设定的一次具体运作，而不是铺垫几千字背景后才出现；第一个 beat 就要有动作或冲突，禁止以大段世界观/履历介绍开场。
+- 信息克制：禁止信息倾倒（一次性抛设定、地名、人物关系表）；世界观只在角色行动中按需带出。risk 字段须自查是否存在开篇信息过载。
+- 钩子强度：hook 必须是一个读者会主动追问的具体悬念或诱惑（谁、为什么、接下来怎么办），而非"故事就此展开"这类空泛收束。
+- 主角立人设：第一章须让主角通过一次可见的选择/反应展示其性格与处境，让读者迅速产生代入或好奇。
+- 即便没有历史去重数据，仍要为后续留出空间：location 与 info_source 选择具体、有延展性的，不要把最大的爽点在开篇一次性烧光。"""
     # When this is a quality-replan (the previous version of THIS chapter scored
     # below threshold), inject exactly WHY it failed — the reviewer's concrete
     # problems + the deterministic style metrics — so the regenerated plan
@@ -592,6 +631,13 @@ def generate_candidate_plans(
 - 若上一版因能力越界/视角越界失分，本章必须在 risk 字段写明如何严守能力模态与限制视角。"""
     num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
+    # Temperature spread across candidates. A wider spread is the cheapest lever
+    # against candidate convergence: the low-temp candidates anchor a safe plan
+    # while high-temp ones explore. Default base/step give 0.6,0.72,0.84,... so
+    # even candidate 0 and 1 are meaningfully apart (the old 0.65+0.05*idx put
+    # the first two at 0.65/0.70 — near-identical drafts). Clamped to <=1.1.
+    temp_base = float(config["novel"].get("plan_candidate_temp_base", 0.6))
+    temp_step = float(config["novel"].get("plan_candidate_temp_step", 0.12))
     # Explicit differentiation strategies — each candidate is told to attack the
     # chapter from a distinct angle so the arbiter sees a real choice, not 5
     # near-identical variants.
@@ -628,8 +674,12 @@ def generate_candidate_plans(
             f"候选编号：{idx}\n"
             f"策略：{strategy_name}\n"
             f"定义：{strategy_desc}\n"
-            f"你必须围绕这一策略来设计本候选大纲。"
-            f"其它候选采用不同策略——不要趋同。"
+            f"你必须围绕这一策略来设计本候选大纲，让本策略的特征在 goal/conflict/beats 里清晰可辨。\n"
+            f"## 反趋同（硬性）\n"
+            f"其它候选会采用不同策略来攻同一章——你必须真正岔开，不要产出只是换措辞的安全答案：\n"
+            f"- 选一个与上方'近期已反复使用的场地/信息来源'不同、且最贴合本策略的 location 与 info_source；\n"
+            f"- 你的 payoff_type 要服务于本策略的兑现方式，不要默认套用最稳妥的那一种；\n"
+            f"- 宁可让本候选带有鲜明的策略棱角（可被仲裁层挑出独特的 pros），也不要为了'四平八稳'把棱角磨平。"
         )
         for retry in range(2):
             try:
@@ -640,7 +690,7 @@ def generate_candidate_plans(
                     CANDIDATE_PLAN_SYSTEM,
                     json_prompt(base_user + strategy_block),
                     max_tokens=16000,
-                    temperature=0.65 + idx * 0.05,
+                    temperature=min(1.1, temp_base + idx * temp_step),
                     cacheable_prefix=cacheable_prefix(paths, config),
                     tag="plan_candidate",
                 )

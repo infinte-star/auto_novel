@@ -159,6 +159,28 @@ def _validate_config(config: dict[str, Any]) -> None:
                 raise ValueError(f"Config value {section_name}.{key}={value} is below minimum {minimum}")
             config[section_name][key] = value
 
+    # Optional float knobs: validate only if present and non-empty.
+    for section_name, key, lo, hi in [
+        ("novel", "plan_candidate_temp_base", 0.0, 2.0),
+        ("novel", "plan_candidate_temp_step", 0.0, 1.0),
+        ("novel", "prewrite_dimension_floor", 0.0, 10.0),
+    ]:
+        if section_name in config and key in config[section_name]:
+            raw = config[section_name][key]
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Config value {section_name}.{key} must be a float, got {raw!r}."
+                ) from None
+            if value < lo or value > hi:
+                raise ValueError(
+                    f"Config value {section_name}.{key}={value} is out of range [{lo}, {hi}]"
+                )
+            config[section_name][key] = value
+
     # Optional reviewer routing (main writer = primary model, reviewer = a
     # separate model+endpoint). All review_* keys are optional; if review_base_url
     # is set, review_model becomes mandatory so a half-configured reviewer fails

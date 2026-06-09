@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -653,6 +654,127 @@ def writer_directives_for_chapter(paths: Paths, chapter_num: int, limit: int = 6
     return directives
 
 
+ABSTRACT_BEAT_MARKERS = (
+    "推导出",
+    "意识到",
+    "想通",
+    "完成",
+    "还原",
+    "引导",
+    "心算",
+    "反应过来",
+    "发现",
+    "确认",
+    "证明",
+    "判断",
+    "说服",
+    "揭示",
+)
+
+CONCRETE_BEAT_MARKERS = (
+    "把",
+    "按",
+    "压",
+    "递",
+    "翻",
+    "拿",
+    "写",
+    "锁",
+    "摁",
+    "贴",
+    "拆",
+    "划",
+    "量",
+    "照",
+    "指",
+    "举",
+    "撕",
+    "收",
+    "扣",
+    "放",
+    "打开",
+    "合上",
+    "签",
+    "盖",
+    "查",
+    "对照",
+    "并排",
+)
+
+
+def _beat_needs_concretization(beat: str) -> bool:
+    """Heuristic: abstract realization verbs need an object/action anchor."""
+    text = str(beat or "").strip()
+    if not text:
+        return False
+    has_abstract = any(marker in text for marker in ABSTRACT_BEAT_MARKERS)
+    has_concrete = any(marker in text for marker in CONCRETE_BEAT_MARKERS)
+    return has_abstract and not has_concrete
+
+
+def _beat_concrete_details(beat: str) -> list[str]:
+    """Extract the concrete verifiable details a beat promises, so the writer
+    prompt can require each one be acted out on the page (not summarised away).
+
+    v8 failure mode: the plan said '她另一只手在药箱搭扣上摸了一下' but the prose
+    wrote only '搭扣发出一声轻响' — the concrete action was replaced by its sound/
+    result, costing a partial-beat penalty. We surface short noun/action phrases
+    so the execution ledger can name them as non-negotiable acceptance items.
+    """
+    text = str(beat or "").strip()
+    if not text:
+        return []
+    details: list[str] = []
+    # Split on common Chinese clause separators and keep clauses that carry a
+    # concrete body action or named object (i.e. NOT pure abstract-realization).
+    parts = re.split(r"[，。；、,;]", text)
+    for part in parts:
+        part = part.strip()
+        if not part or len(part) < 4:
+            continue
+        has_concrete = any(m in part for m in CONCRETE_BEAT_MARKERS)
+        has_abstract_only = any(m in part for m in ABSTRACT_BEAT_MARKERS) and not has_concrete
+        if has_concrete and not has_abstract_only:
+            details.append(part[:40])
+    return details
+
+
+def _first_draft_execution_ledger(config: dict[str, Any], plan: dict[str, Any]) -> str:
+    """Return a compact beat-to-page execution checklist for the writer prompt."""
+    novel_cfg = config.get("novel", {}) if isinstance(config, dict) else {}
+    if not bool(novel_cfg.get("first_draft_execution_ledger", True)):
+        return ""
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    if not isinstance(beats, list):
+        return ""
+    beat_list = [str(b).strip() for b in beats if str(b).strip()]
+    if not beat_list:
+        return ""
+
+    chapter_words = int(novel_cfg.get("chapter_words", 4000) or 4000)
+    per_beat = max(260, int(chapter_words / max(1, len(beat_list)) * 0.75))
+    lines = [
+        "### 首稿页面执行账本（内部执行，不要输出账本）",
+        "- 写作前先把每个 beat 映射成：上一拍后果 -> 角色当下目标 -> 阻力/对手动作 -> 可见动作或有攻防的对话 -> 新信息/代价/局势变化。",
+        "- 每个 beat 至少占一个有场面功能的自然段或对话回合；禁止把两个以上关键 beat 压缩成一句总结。",
+        f"- 节奏预算：本章 {len(beat_list)} 个 beat，平均每个关键 beat 约 {per_beat}-{per_beat + 220} 字；第一个 beat 必须在前 1/3 之前进入冲突或行动。",
+        "- 转场只写因果，不写流水账时间标签；下一场必须由上一场的后果推出来。",
+        "- 【细节保真·最高优先级】beat 里写明的每一个具体动作（谁的手做了什么）、具体物件、具体数字、具体动机，都是本章验收项，必须在正文里把该动作/物件本身实演出来；"
+        "严禁用它的“结果”或“声音”替代动作本身（例如 beat 写“她另一只手在药箱搭扣上摸了一下”，正文只写“搭扣发出一声轻响”即判不合格——必须写出“摸”这个动作和沈澜看到的手），"
+        "严禁用“一笔带过/读了也读不出/总结一句”抹掉 beat 里要求的内心挣扎或动机铺垫。删一个具体细节就少一分。",
+    ]
+    for i, beat in enumerate(beat_list[:9], 1):
+        risk = "；风险：该 beat 含抽象实现词，正文必须补出具体物件、身体动作、对手反应和可见结果" if _beat_needs_concretization(beat) else ""
+        fidelity = ""
+        details = _beat_concrete_details(beat)
+        if details:
+            fidelity = "；必须逐项实演不得删减或用结果替代：" + "、".join(details[:6])
+        lines.append(
+            f"- beat{i}: {beat[:150]} -> 正文落点必须回答“谁在什么场地，为了什么目标，顶着什么阻力，做/说了什么，页面上留下什么后果”{risk}{fidelity}。"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _prewrite_quality_contract(
     paths: Paths,
     config: dict[str, Any],
@@ -709,6 +831,9 @@ def _prewrite_quality_contract(
 
     lines = [
         "## 写前质量合同（首稿必须达标，不要留给低分后重写）",
+        "- 【细节保真·最高优先级】大纲每个 beat 里写明的具体动作、具体物件、具体数字、具体动机，都是本章硬验收项——必须在正文里把该动作/物件/动机本身实演出来，"
+        "缺一项即判该 beat 为 partial 并扣分。严禁用结果或声音替代动作本身（如 beat 写“手摸搭扣”，正文写成“搭扣响了”不合格），"
+        "严禁用“一笔带过/读了也读不出/他决定放弃”等总结句抹掉 beat 要求的挣扎、动机或铺垫，也严禁让正文与大纲的具体描述自相矛盾（如大纲“无人影”正文却写“有灯光人在”）。",
         f"- 目标：首稿总分必须达到 {threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。",
         f"- 当前大纲仲裁分：{selected_plan_score:.1f}/10。若大纲分偏低，正文必须用更具体的场景执行弥补，不得照抄抽象意图。",
         "- 每个大纲 beat 都必须在页面上变成可见行动、对话交锋、信息变化或资源代价；不得用总结句带过。",
@@ -739,6 +864,9 @@ def _prewrite_quality_contract(
         lines.append("\n### 本章 beat 戏剧化清单（写完前内部确认每条都是 realized，而非 partial/absent）")
         for i, b in enumerate(beat_list[:9], 1):
             lines.append(f"- beat{i}: {b[:160]} —— 它在正文里对应哪个可见动作/对话/后果？")
+        ledger = _first_draft_execution_ledger(config, plan)
+        if ledger:
+            lines.append("\n" + ledger.rstrip())
     elif beat_count:
         lines.append(f"- 本章大纲共有 {beat_count} 个 beat；正文完成前内部确认没有 partial/absent beat。")
     if constraint_lines:
