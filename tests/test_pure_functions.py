@@ -55,6 +55,31 @@ class NormalizeChapterTests(unittest.TestCase):
         self.assertNotIn("写前自我审查", out)
         self.assertTrue(out.lstrip().startswith("第四章"))
 
+    def test_strips_english_self_review_before_title(self):
+        text = (
+            "## Pre-writing Self-Review (in reasoning, not in output)\n\n"
+            "### Three Highest Risks:\n"
+            "1. Repetition risk.\n\n"
+            "第4章 捡漏\n\n真正的正文。"
+        )
+        out = normalize_chapter(text)
+        self.assertNotIn("Pre-writing Self-Review", out)
+        self.assertNotIn("Three Highest Risks", out)
+        self.assertTrue(out.lstrip().startswith("第4章"))
+
+    def test_strips_fenced_analysis_block(self):
+        text = (
+            "```analysis\n"
+            "## Pre-writing Self-Review\n"
+            "risk notes\n"
+            "```\n\n"
+            "第5章 地下\n\n真正的正文。"
+        )
+        out = normalize_chapter(text)
+        self.assertNotIn("risk notes", out)
+        self.assertNotIn("```", out)
+        self.assertTrue(out.lstrip().startswith("第5章"))
+
     def test_does_not_eat_legitimate_prose_before_title(self):
         # No self-review keywords -> a leading paragraph must NOT be deleted.
         text = "这是一段合法的引子文字。\n第五章 标题\n\n正文。"

@@ -206,6 +206,122 @@ def style_health(
 
 
 # ---------------------------------------------------------------------------
+# Raw-text similarity: catch adjacent-chapter duplicate generation.
+# ---------------------------------------------------------------------------
+
+def _text_bigrams(text: str) -> set[str]:
+    """Character-bigram set over the substantive (CJK/alnum) content of a text."""
+    cleaned = re.sub(r"[^一-鿿A-Za-z0-9]", "", text or "")
+    if len(cleaned) < 2:
+        return set()
+    return {cleaned[i : i + 2] for i in range(len(cleaned) - 1)}
+
+
+def text_similarity(a: str, b: str) -> float:
+    """Jaccard similarity of two prose blocks over their character bigrams.
+
+    Used to catch the "adjacent chapters are near-verbatim duplicates" failure
+    mode (observed in refine output: Ch5≈Ch6, Ch7≈Ch8) where the same scene is
+    emitted twice. ~0.0 = unrelated, ~1.0 = (near-)identical.
+    """
+    return _jaccard(_text_bigrams(a), _text_bigrams(b))
+
+
+# ---------------------------------------------------------------------------
+# Cross-chapter repetition: catch sentence/metaphor "fossils" reused verbatim.
+# ---------------------------------------------------------------------------
+
+# A reused signature phrase ("像一颗心脏在缓慢地跳动", "不是暂时的，是永久的")
+# becomes a tic when it recurs across chapters. Self-review never flags it
+# because the drifted voice treats it as motif. This deterministic check counts
+# how often this chapter's distinctive clauses already appeared in prior prose.
+
+def _clause_segments(text: str, min_len: int = 6, max_len: int = 40) -> list[str]:
+    """Split prose into clause-sized segments suitable for repeat detection."""
+    body = _strip_title_line(text)
+    # Strip quotes/markup so a recurring narration clause is comparable.
+    raw = re.split(r"[，。！？…；\n“”\"「」]", body)
+    out: list[str] = []
+    for s in raw:
+        s = re.sub(r"\s+", "", s.strip())
+        if min_len <= len(s) <= max_len:
+            out.append(s)
+    return out
+
+
+def _normalize_clause(s: str) -> str:
+    """Collapse digits so 'every 3 seconds' / 'every 7 seconds' match as one tic."""
+    return re.sub(r"[0-9一二三四五六七八九十两零]+", "#", s)
+
+
+def cross_chapter_repetition(
+    text: str,
+    prior_texts: list[str] | None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect signature clauses in `text` that recur in earlier chapters.
+
+    Returns {"metrics", "penalty", "flags", "directives", "repeats"}. `repeats`
+    lists the offending clauses (with prior occurrence counts) for logging and
+    for folding into the writer's avoid-list directive.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    enabled = bool(cfg.get("style_cross_repeat_enabled", True))
+    result: dict[str, Any] = {
+        "metrics": {}, "penalty": 0.0, "flags": [], "directives": [], "repeats": [],
+    }
+    if not enabled or not prior_texts:
+        return result
+
+    # Build a frequency map of normalized clauses across prior chapters.
+    prior_counts: dict[str, int] = {}
+    for pt in prior_texts:
+        seen_in_chap: set[str] = set()
+        for c in _clause_segments(pt):
+            seen_in_chap.add(_normalize_clause(c))
+        for c in seen_in_chap:
+            prior_counts[c] = prior_counts.get(c, 0) + 1
+
+    cur_clauses = _clause_segments(text)
+    cur_norm_seen: set[str] = set()
+    repeats: list[tuple[str, int]] = []
+    for c in cur_clauses:
+        nc = _normalize_clause(c)
+        if nc in cur_norm_seen:
+            continue
+        cur_norm_seen.add(nc)
+        prior = prior_counts.get(nc, 0)
+        if prior >= 1 and len(c) >= int(cfg.get("style_cross_repeat_min_len", 7)):
+            repeats.append((c, prior))
+
+    # Penalize by how many earlier chapters already used the clause.
+    fossil_threshold = int(cfg.get("style_cross_repeat_chapters", 2))
+    fossils = [(c, p) for c, p in repeats if p >= fossil_threshold]
+    repeats.sort(key=lambda x: -x[1])
+    result["repeats"] = [{"clause": c, "prior_chapters": p} for c, p in repeats[:12]]
+    result["metrics"]["cross_repeat_count"] = len(repeats)
+    result["metrics"]["cross_repeat_fossils"] = len(fossils)
+
+    if fossils:
+        # Each entrenched fossil adds penalty, capped.
+        pen = min(2.0, 0.5 * len(fossils))
+        result["penalty"] = round(pen, 2)
+        result["flags"].append(f"cross_chapter_fossils({len(fossils)})")
+        examples = "、".join(f"“{c}”(已出现{p}章)" for c, p in fossils[:4])
+        result["directives"].append(
+            "文体复读预警：以下标志性句子/比喻在前面多章反复出现，已成为口癖，"
+            f"本章必须改写或避免：{examples}。同一意象请换新的具体写法。"
+        )
+    elif len(repeats) >= int(cfg.get("style_cross_repeat_warn_count", 4)):
+        result["penalty"] = 0.5
+        result["flags"].append(f"cross_chapter_repeats({len(repeats)})")
+        result["directives"].append(
+            "本章有多处句子与前文几乎雷同，存在复读倾向，请用不同措辞重写这些重复表达。"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Scene-skeleton dedupe: stop the engine from infinitely slicing one scene.
 # ---------------------------------------------------------------------------
 

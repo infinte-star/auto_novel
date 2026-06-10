@@ -643,6 +643,42 @@ def review_chapter(
         except Exception as exc:
             log(paths, f"style_health check failed (non-fatal) Ch{chapter_num}: {exc}")
 
+    # Cross-chapter repetition: signature clauses/metaphors reused verbatim across
+    # chapters ("像一颗心脏在缓慢地跳动", "不是暂时的，是永久的", "锁扣声每N秒一次")
+    # become tics that self-review treats as motif. Deterministically penalize the
+    # chapter and feed an avoid-list directive to the next writer prompt.
+    if bool(config["novel"].get("style_cross_repeat_enabled", True)):
+        try:
+            from quality import cross_chapter_repetition
+
+            lookback = int(config["novel"].get("style_cross_repeat_lookback", 6))
+            prior_texts: list[str] = []
+            for num in range(max(1, chapter_num - lookback), chapter_num):
+                p = chapter_path(paths, num)
+                if p.exists():
+                    prior_texts.append(read_text(p))
+            cr = cross_chapter_repetition(chapter, prior_texts, config)
+            report["cross_chapter_repetition"] = cr
+            cr_penalty = float(cr.get("penalty", 0.0))
+            if cr_penalty > 0:
+                penalties += cr_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in cr.get("flags", []):
+                    tag = f"repeat:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in cr.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(
+                    paths,
+                    f"Cross-repeat Ch{chapter_num} penalty={cr_penalty} "
+                    f"flags={cr.get('flags')} fossils={cr.get('metrics', {}).get('cross_repeat_fossils')}",
+                )
+        except Exception as exc:
+            log(paths, f"cross_chapter_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+
     # Creative-contract violations: author-declared hard rules (ability whitelist/
     # modality, blacklist, banned tropes, must-hold). This is the layer that
     # catches "self-consistent but off-contract" drift (e.g. a text-only memory

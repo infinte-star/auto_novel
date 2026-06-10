@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
-from memory import cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
+from memory import beat_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
 from store import JsonStoryStore, db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
@@ -466,6 +466,29 @@ def generate_candidate_plans(
     active_promises = get_reader_promises(conn, chapter_num, limit=12)
     carried_over_risks = _carried_over_risks_from_prev(paths, chapter_num)
     mem = cached_memory or memory_context(paths, conn, config)
+    # Whole-book beat scheduler: locate this chapter against the volume_plan
+    # milestones so the planner is told which payoff/高潮 should land around now.
+    # Pure parse+inject, no LLM call; degrades to "" on any parse failure.
+    beat_block = ""
+    try:
+        from config import read_text as _read_text
+
+        max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
+        if max_chapters:
+            est_total = max_chapters
+        else:
+            cw = int(config["novel"].get("chapter_words", 3000) or 3000)
+            est_total = int(config["novel"].get("target_words", 0) or 0) // max(cw, 1)
+        beat_block, _eff_gap = beat_directive(
+            _read_text(paths.volume_plan),
+            chapter_num,
+            est_total,
+            diagnostics.get("chapters_since_payoff"),
+            int(diagnostics.get("payoff_max_gap", config["novel"].get("payoff_max_gap", 99))),
+            config,
+        )
+    except Exception:
+        beat_block = ""
     platform_block = ""
     benchmark_block = ""
     try:
@@ -581,6 +604,8 @@ def generate_candidate_plans(
 ## 近期已反复使用的场地 / 信息来源（硬性：本章至少更换其一——开辟一个新的物理空间，或引入一个新的信息来源/对手，不得继续在下列地点原地打转）
 {used_locations_block}
 
+{beat_block}
+
 ## 上章结尾
 {tail[-2000:]}
 
@@ -596,8 +621,28 @@ def generate_candidate_plans(
 ## 终章要求（硬性：这是全书最后一章，必须规划成结局而非过渡章）
 - 本章 payoff_type 必须是一个真正的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），严禁 strategic_setup。
 - goal/payoff 必须正面解决全书主线矛盾，把已开启的关键伏线在本章收束。
+- 悬疑/推理类必须在本章给出确定的谜底（凶手/真相/核心谜题答案），不得含糊或留作开放。
+- 必须收束所有尚未了结的关键悬念线（open threads 逐一收束或明确交代去向）。
+- 严禁引入任何新人物、新势力、新案件、新悬念、新危机、新反转钩子；终章只收束已有元素。
 - "hook" 字段不再是抛给读者的新悬念，而是一句收束/余韵/主题升华；严禁以全新未解决危机作结。
 - beats 的最后 1-2 拍必须落在"结局兑现 + 情绪落点"，而非开启新冲突。"""
+    else:
+        from config import narrative_mode
+        mode = narrative_mode(config)
+        if mode == "reasoning":
+            base_user += """
+
+## 叙事模式：单密室·精密推理（规划硬性约束）
+- 场景收敛：本章核心场景应收束在一个封闭/半封闭空间，减少场景跳转，让推理在受限空间逐步逼出。
+- payoff 必须绑定 2 个以上可触摸/可观察的具体物件或身体状态（压痕、链节、血迹方向、齿痕、反光），核心爽点尽量是读者一眼能懂的视觉矛盾，而非抽象"角度/逻辑不对"。
+- 公平线索：关键揭示必须可在前文找到伏笔；本章至少推进或收束1条已有疑点，少开新悬念。"""
+        elif mode == "serial":
+            base_user += """
+
+## 叙事模式：强钩子·情绪外放·可连载（规划硬性约束）
+- 强钩子前置：beats 的第1拍即抛出强冲突/强悬念/强反差，开篇禁止铺垫与设定倾倒。
+- 情绪兑现：本章须有明确的情绪兑现或小高潮（揭晓/打脸/反转/关系推进），payoff_type 优先 reveal/reversal/emotional，避免纯 strategic_setup。
+- 章末强钩：hook 字段必须是一个让读者必须追读的强悬念/反转/危机/承诺。"""
     # Cold-start block: in the first few chapters the strategy bandit, scene
     # dedupe, used-locations blacklist and quality-feedback loops are all empty
     # (no history yet), so the generator gets almost no steering and tends to
@@ -615,6 +660,18 @@ def generate_candidate_plans(
 - 钩子强度：hook 必须是一个读者会主动追问的具体悬念或诱惑（谁、为什么、接下来怎么办），而非"故事就此展开"这类空泛收束。
 - 主角立人设：第一章须让主角通过一次可见的选择/反应展示其性格与处境，让读者迅速产生代入或好奇。
 - 即便没有历史去重数据，仍要为后续留出空间：location 与 info_source 选择具体、有延展性的，不要把最大的爽点在开篇一次性烧光。"""
+    # Platform-tuned opening rules: fire for ALL opening chapters (not gated on
+    # history_thin), since the golden-3-chapters bar differs sharply by platform
+    # and these chapters决定 sign-off/retention. Additive to the craft block above.
+    opening_chapters = int(config["novel"].get("opening_chapters", 3))
+    if chapter_num <= opening_chapters and not is_final_chapter(config, chapter_num):
+        try:
+            from benchmark import platform_opening
+            po = platform_opening(config)
+            if po:
+                base_user += "\n\n" + po
+        except Exception:
+            pass
     # When this is a quality-replan (the previous version of THIS chapter scored
     # below threshold), inject exactly WHY it failed — the reviewer's concrete
     # problems + the deterministic style metrics — so the regenerated plan
@@ -1377,7 +1434,18 @@ def create_plan(
             )
             continue
         visual_blocked = False
-        if bool(config["novel"].get("visual_payoff_check_enabled", True)):
+        # The visual-payoff gate enforces concrete物证/视觉矛盾 reveals — exactly
+        # the spine of "单密室·精密推理" mode. In "serial" (strong-hook/emotional)
+        # mode the payoff is often a relational/emotional beat, not a visual
+        # contradiction, so forcing the template would mis-steer; allow opting it
+        # down to non-blocking advisory there unless explicitly overridden.
+        from config import narrative_mode as _nm
+        _mode = _nm(config)
+        _visual_enabled = bool(config["novel"].get("visual_payoff_check_enabled", True))
+        _visual_blocks = bool(config["novel"].get("visual_payoff_blocks_plan", True))
+        if _mode == "serial" and "visual_payoff_blocks_plan" not in config["novel"]:
+            _visual_blocks = False
+        if _visual_enabled:
             try:
                 from quality import plan_visual_payoff_check
 
@@ -1392,7 +1460,7 @@ def create_plan(
                     for directive in visual.get("directives", []):
                         if directive not in decision.setdefault("required_constraints", []):
                             decision["required_constraints"].append(directive)
-                if visual.get("blocked"):
+                if visual.get("blocked") and _visual_blocks:
                     visual_blocked = True
                     decision.setdefault("required_constraints", []).append(
                         "硬性重规划：本章核心推理爽点过抽象，必须改成具体视觉矛盾模板（画面A vs 现实B），并在 beats 中写出读者可见的物证对照。"

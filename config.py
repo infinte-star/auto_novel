@@ -332,6 +332,7 @@ def normalize_chapter(text: str) -> str:
     text = re.sub(r"^\s*<thinking\b[^>]*>.*?</thinking>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"^\s*<details\b[^>]*>.*?</details>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"^\s*<reasoning\b[^>]*>.*?</reasoning>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^\s*```(?:analysis|thinking|reasoning)\s*.*?```\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
     # Heading-style leaked review: drop everything up to the first 第N章 title
     # line when a self-review heading precedes it.
     m = re.search(r"(?m)^\s*(#{0,6}\s*)?(第\s*[0-9零一二三四五六七八九十百千]+\s*章)", text)
@@ -383,6 +384,22 @@ def is_final_chapter(config: dict[str, Any], chapter_num: int) -> bool:
         return False
     max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
     return max_chapters > 0 and chapter_num == max_chapters
+
+# Valid narrative-mode identifiers. `reasoning` = single-room / precise物证 mode
+# (strengthens closure, fair clues, concrete physical anchors); `serial` =
+# strong-hook / emotional / serializable mode (relaxes per-chapter closure,
+# strengthens hooks & emotional outburst). `balanced` keeps prior behaviour.
+NARRATIVE_MODES = ("balanced", "reasoning", "serial")
+
+def narrative_mode(config: dict[str, Any]) -> str:
+    """Return the configured narrative mode, defaulting to 'balanced'.
+
+    Driven by `novel.narrative_mode`. Unknown/empty values fall back to
+    'balanced' so an unset config behaves exactly as before this feature.
+    """
+    raw = str(config.get("novel", {}).get("narrative_mode", "") or "").strip().lower()
+    return raw if raw in NARRATIVE_MODES else "balanced"
+
 
 def tail_text(path: Path, n_chars: int) -> str:
     text = read_text(path)

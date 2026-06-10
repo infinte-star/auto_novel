@@ -40,6 +40,7 @@ from config import (
     write_text,
 )
 from llm import call_llm, json_prompt, load_json_with_repair
+from quality import text_similarity
 
 
 REFINED_DIR_NAME = "chapters_refined"
@@ -667,6 +668,7 @@ def refine_one_chapter(
     extra_anchors: list[tuple[int, str]],
     diagnosis: dict[str, Any],
     is_finale: bool = False,
+    anti_dup_note: str = "",
 ) -> str:
     """Ask the LLM to refine a single chapter at the chosen intensity."""
     original = ""
@@ -701,7 +703,34 @@ def refine_one_chapter(
     if is_finale:
         ending_block = """
 ## 终章收束要求（硬性）
-本章是全书最后一章。精调时若结尾是抛给读者的新悬念/新危机（如新急报、新敌人、未解决的反转），必须改写为收束式结局：正面兑现主线、给情绪落点与主题呼应；可保留一句远景余韵，但不得制造"必须看下一章"的新问题。
+本章是全书最后一章，必须作为真正的结局收束，逐条满足：
+1. 正面兑现并解答主线核心悬念（凶手/真相/谜底必须明确给出，不得含糊或留作开放）。
+2. 清算尚未了结的关键悬念线（threads 中标为 open 的伏笔逐一收束或明确交代去向）。
+3. 不得引入任何新人物、新势力、新案件、新悬念、新危机、新反转钩子。
+4. 给情绪落点与主题呼应；可保留一句克制的远景余韵，但不得制造"必须看下一章"的新问题。
+若原文结尾是开放式悬念/新急报/新敌人，必须改写为上述收束式结局。
+"""
+
+    anti_dup_block = ""
+    if anti_dup_note:
+        anti_dup_block = f"""
+## 去重要求（硬性）
+{anti_dup_note}
+本章正文必须与相邻章节内容明显不同：不得复述上一章已写过的同一场景、同一段对话或同一组动作。请聚焦本章自身的情节推进与独有信息，与上下文形成区分。
+"""
+
+    mode_block = ""
+    from config import narrative_mode
+    _mode = narrative_mode(config)
+    if not is_finale and _mode == "reasoning":
+        mode_block = """
+## 叙事模式：单密室·精密推理（精调硬性）
+精调时强化：场景向封闭/半封闭空间收敛；怀疑与揭示挂在可触摸的具体物证/身体状态上；关键揭示在前文有公平铺垫；核心爽点尽量改写为读者一眼能懂的视觉矛盾，而非抽象推断。
+"""
+    elif not is_finale and _mode == "serial":
+        mode_block = """
+## 叙事模式：强钩子·情绪外放·可连载（精调硬性）
+精调时强化：开场钩更前置更强；人物情绪敢于外显并落到具体动作与对白；节奏更紧凑、每场景有推进或翻转；章末保留强追读钩子。不要把情绪压得过度内敛。
 """
 
     user = f"""## 精调任务
@@ -709,6 +738,8 @@ def refine_one_chapter(
 
 {intensity_instr}
 {ending_block}
+{anti_dup_block}
+{mode_block}
 ## 本章焦点
 {focus or "（按编辑判断处理）"}
 
@@ -780,6 +811,29 @@ def _refined_text_acceptable(
     if len(refined) > len(original) * max_grow:
         return False, f"grew beyond {max_grow:g}x of original ({len(refined)}/{len(original)})"
     return True, ""
+
+
+def _adjacent_duplicate(
+    refined: str,
+    prev_refined: str,
+    prev_original: str,
+    config: dict[str, Any],
+) -> tuple[bool, float]:
+    """Detect that a refined chapter is a near-duplicate of its predecessor.
+
+    Compares against BOTH the previously-refined neighbour and that neighbour's
+    original text (the duplication may have existed in the source and survived
+    refine). Returns (is_duplicate, max_similarity).
+    """
+    if not bool(config["novel"].get("refine_adjacent_dedupe_enabled", True)):
+        return False, 0.0
+    threshold = float(config["novel"].get("refine_adjacent_sim_max", 0.7))
+    sim = 0.0
+    if prev_refined.strip():
+        sim = max(sim, text_similarity(refined, prev_refined))
+    if prev_original.strip():
+        sim = max(sim, text_similarity(refined, prev_original))
+    return (sim >= threshold), round(sim, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -897,10 +951,28 @@ def refine_book(
 
         already_refined = set((ckpt or {}).get("refined_chapters", []) or [])
 
+        # Track the immediately-preceding chapter's text (refined if available,
+        # else original) to detect adjacent-chapter duplicate generation. Seed
+        # from the previous group's last chapter so the gate also catches
+        # duplicates that straddle a group boundary (e.g. Ch5≈Ch6).
+        prev_refined_text = ""
+        prev_original_text = ""
+        if start > 1:
+            prev_orig_p = chapter_path(paths, start - 1)
+            if prev_orig_p.exists():
+                prev_original_text = read_text(prev_orig_p)
+            prev_ref_p = refined_chapter_path(paths, start - 1)
+            if prev_ref_p.exists():
+                prev_refined_text = read_text(prev_ref_p)
+
         for item in diagnosis.get("per_chapter", []):
             ch = int(item.get("chapter"))
+            original = next((t for n, t in group_chapters if n == ch), "")
             if ch in already_refined and refined_chapter_path(paths, ch).exists():
                 log(paths, f"Refine Ch{ch}: already done, skipping")
+                # Keep the rolling-neighbour window correct on resume.
+                prev_refined_text = read_text(refined_chapter_path(paths, ch))
+                prev_original_text = original
                 continue
             intensity = item.get("intensity", "polish")
             focus = item.get("focus", "")
@@ -923,25 +995,62 @@ def refine_book(
                 if debt_problems:
                     focus = (focus + " ｜ 欠债项(必须修复): " + debt_problems)[:300]
             log(paths, f"Refine Ch{ch} intensity={intensity} focus={focus[:60]!r}")
-            original = next((t for n, t in group_chapters if n == ch), "")
             if not original:
                 log(paths, f"Refine Ch{ch}: original missing, skip")
                 continue
-            try:
-                refined = refine_one_chapter(
-                    client, paths, config, ch, intensity, focus,
-                    group_chapters, extra_anchors, diagnosis,
-                    is_finale=(bool(config["novel"].get("ending_aware", True)) and ch == last_chapter),
+            max_dup_retries = int(config["novel"].get("refine_adjacent_dedupe_retries", 1))
+            anti_dup_note = ""
+            refined = ""
+            accepted = False
+            for attempt in range(max_dup_retries + 1):
+                try:
+                    refined = refine_one_chapter(
+                        client, paths, config, ch, intensity, focus,
+                        group_chapters, extra_anchors, diagnosis,
+                        is_finale=(bool(config["novel"].get("ending_aware", True)) and ch == last_chapter),
+                        anti_dup_note=anti_dup_note,
+                    )
+                except Exception as exc:
+                    log(paths, f"Refine Ch{ch} failed: {exc}; keeping original")
+                    break
+                ok, reason = _refined_text_acceptable(original, refined, config, intensity)
+                if not ok:
+                    log(paths, f"Refine Ch{ch} rejected ({reason}); keeping original")
+                    break
+                is_dup, sim = _adjacent_duplicate(
+                    refined, prev_refined_text, prev_original_text, config
                 )
-            except Exception as exc:
-                log(paths, f"Refine Ch{ch} failed: {exc}; keeping original")
-                continue
-            ok, reason = _refined_text_acceptable(original, refined, config, intensity)
-            if not ok:
-                log(paths, f"Refine Ch{ch} rejected ({reason}); keeping original")
+                if is_dup:
+                    if attempt < max_dup_retries:
+                        log(
+                            paths,
+                            f"Refine Ch{ch}: adjacent duplicate (sim={sim}); "
+                            f"regenerating with anti-dup directive (attempt {attempt + 1})",
+                        )
+                        anti_dup_note = (
+                            f"检测到本章与上一章相似度过高(sim={sim})，疑似重复生成同一场景。"
+                        )
+                        intensity = "rewrite"  # force a structural rework, not a re-polish
+                        continue
+                    # Out of retries: keep original rather than persist a duplicate.
+                    log(
+                        paths,
+                        f"Refine Ch{ch}: still duplicate after retries (sim={sim}); "
+                        "keeping original to avoid emitting a duplicate chapter",
+                    )
+                    break
+                accepted = True
+                break
+            if not accepted:
+                # Roll the neighbour window forward using the ORIGINAL text so the
+                # next chapter is still compared against real adjacent content.
+                prev_refined_text = original
+                prev_original_text = original
                 continue
             write_text(refined_chapter_path(paths, ch), refined)
             already_refined.add(ch)
+            prev_refined_text = refined
+            prev_original_text = original
             save_group_checkpoint(paths, start, {
                 "diagnosis": diagnosis,
                 "completed": False,

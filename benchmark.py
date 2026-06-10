@@ -36,6 +36,55 @@ def platform_guidance(config: dict[str, Any]) -> str:
     return PLATFORM_GUIDANCE.get(preset, PLATFORM_GUIDANCE["general"])
 
 
+# Platform-specific GOLDEN-FIRST-CHAPTERS rules. The generic OPENING_RULES_BLOCK
+# (writing.py) covers craft fundamentals; this layer encodes how each platform's
+# audience decides whether to keep reading, which differs sharply (免费流要前几行
+# 见冲突；起点男频容忍中线铺垫但要亮体系卖点). Injected into both the opening
+# plan prompt and the opening writer prompt for chapter_num <= opening_chapters.
+PLATFORM_OPENING = {
+    "qidian_male": (
+        "## 平台开篇专项（起点男频·黄金三章）\n"
+        "- 卖点亮相：前 1/3 必须让读者看清本书的体系/金手指/主角核心反差，可保留中长线谜团但不能让首章只铺设定。\n"
+        "- 主角立住：首章用一次可见的选择或冲突展示主角性格与处境，给出明确的长期目标方向。\n"
+        "- 钩子：章末留一个能支撑追读的具体悬念或升级预期，而非泛泛的'命运改变'。\n"
+        "- 信息克制：世界观边演边给，禁止整段名词/设定倾倒。"
+    ),
+    "fanqie_free": (
+        "## 平台开篇专项（番茄免费·强留存）\n"
+        "- 极速入戏：正文前 300 字内必须出现强冲突或强情绪事件，禁止任何回忆/铺垫/设定/天气开场。\n"
+        "- 低门槛卖点：本书爽点方向要一句话能懂，主角的处境与诉求直给，不绕弯。\n"
+        "- 高密度钩子：首章至少 2 个让人想往下翻的悬念或反转点，章末问题必须直观强烈。\n"
+        "- 情绪优先：让读者第一时间产生爽/愤/好奇/揪心中的一种强情绪。"
+    ),
+    "qimao_free": (
+        "## 平台开篇专项（七猫免费·泛用户）\n"
+        "- 直给冲突：开篇即抛出低门槛、可秒懂的冲突与利害关系，少用复杂专名。\n"
+        "- 即时收益：首章就给读者一个明显的情绪收益或悬念推进，不慢热。\n"
+        "- 主角动机清晰：让读者立刻明白主角要什么、被什么逼着走。\n"
+        "- 章末强钩：用一个直观的危机或反转收尾。"
+    ),
+    "jinjiang_female": (
+        "## 平台开篇专项（晋江女频·关系驱动）\n"
+        "- 关系张力前置：首章即建立男女主（或核心关系）的化学反应或张力锚点，哪怕只是一次有潜台词的交锋。\n"
+        "- 人设化学反应：通过具体互动展现人物魅力与反差，而非旁白介绍。\n"
+        "- 情绪锚：给读者一个明确的情绪投射点（心动/意难平/好奇/护短欲）。\n"
+        "- 能动性：女主在首章要有自己的选择与诉求，不做纯被动工具。"
+    ),
+    "general": (
+        "## 平台开篇专项（通用·黄金三章）\n"
+        "- 卖点清晰：首章让读者明白本书核心吸引力与主角处境。\n"
+        "- 冲突前置：尽早抛出核心冲突或悬念，避免长铺垫。\n"
+        "- 章末留钩：用具体悬念/反转/危机收尾，制造追读冲动。"
+    ),
+}
+
+
+def platform_opening(config: dict[str, Any]) -> str:
+    """Return the platform-specific golden-first-chapters opening rules."""
+    preset = str(config.get("novel", {}).get("platform_preset", "general")).strip() or "general"
+    return PLATFORM_OPENING.get(preset, PLATFORM_OPENING["general"])
+
+
 def _tokenize(text: str) -> set[str]:
     cleaned = re.sub(r"[^一-鿿A-Za-z0-9]", "", text)
     if len(cleaned) < 2:
