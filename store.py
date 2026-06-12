@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from datetime import datetime
@@ -8,282 +9,214 @@ from typing import Any
 
 from config import Paths, read_text, safe_score, write_text
 
-try:
-    import sqlite3
-except ModuleNotFoundError:
-    sqlite3 = None  # type: ignore[assignment]
+import sqlite3
 
-# sqlite3 connections/cursors are NOT thread-safe. The pipeline shares a single
-# conn across the main thread (planning/continuity reads) and BackgroundTasks
-# daemon threads (chapter_finalize writes). Without serialization this produces
-# "another row available" / "cannot start a transaction within a transaction"
-# corruption. A single process-wide reentrant lock serializes every DB op.
-# It is an RLock so a locked write that internally calls another locked helper
-# does not self-deadlock. All public read/write functions in this module and
-# the cross-module DB writers (writing.update_structured_state,
-# planning.review_*) acquire it via `with db_lock():`.
-_DB_LOCK = threading.RLock()
+# Historically a single sqlite3 connection was shared across the main thread and
+# the BackgroundTasks daemon threads, guarded by one process-wide RLock that
+# serialized EVERY DB op (sqlite3 connections/cursors are not thread-safe). That
+# made WAL's reader/writer concurrency useless: finalize writes and planning
+# reads could never overlap.
+#
+# We now give each thread its OWN connection via `ThreadLocalConn` (below). WAL
+# already allows concurrent readers plus a single writer across connections, and
+# busy_timeout makes a contending writer wait instead of erroring. So the global
+# lock is no longer needed: `db_lock()` is kept as a NO-OP context manager purely
+# so the ~20 internal `with db_lock():` sites and the external callers
+# (writing.update_structured_state, planning.review_*, review.py) keep working
+# unchanged.
+_DB_LOCK = threading.RLock()  # retained for back-compat; no longer the serialization point
 
 
-def db_lock() -> "threading.RLock":
-    """Return the process-wide SQLite serialization lock.
+def db_lock() -> Any:
+    """Return a NO-OP context manager.
 
-    Callers outside this module (writing.py, planning.py) wrap their raw
-    conn.execute/commit blocks in `with db_lock():` so all DB access is
-    serialized against the background finalize tasks.
+    Per-thread connections (ThreadLocalConn) + WAL provide the concurrency that
+    the old single shared connection lacked, so there is no longer a global
+    serialization point. Call sites keep `with db_lock(): ...` for zero churn;
+    it simply does nothing now.
     """
-    return _DB_LOCK
+    return contextlib.nullcontext()
 
-class JsonStoryStore:
-    """Fallback event store for Python builds without sqlite3."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self._write(
-                {
-                    "events": [],
-                    "chapter_metrics": {},
-                    "entities": {},
-                    "open_threads": {},
-                    "reader_promises": {},
-                    "agent_reports": [],
-                }
-            )
+class ThreadLocalConn:
+    """A sqlite3 facade that hands each thread its own connection.
 
-    def _read(self) -> dict[str, Any]:
-        return json.loads(read_text(self.path) or "{}")
+    Exposes the subset of the sqlite3.Connection API the codebase uses
+    (`execute`, `executescript`, `commit`, plus `row_factory`) so the ~25
+    `conn.execute(...)` call sites and `init_db()`'s return value keep working
+    with no changes.
 
-    def _write(self, data: dict[str, Any]) -> None:
-        write_text(self.path, json.dumps(data, ensure_ascii=False, indent=2))
+    WAL permits one writer at a time; a concurrent writer gets SQLITE_BUSY which
+    busy_timeout waits out. `execute` additionally retries once on a transient
+    "database is locked" to be robust under the background finalize fan-out.
+    """
 
-    def add_event(self, chapter: int, event_type: str, payload: dict[str, Any]) -> None:
-        data = self._read()
-        data.setdefault("events", []).append(
-            {
-                "id": len(data.get("events", [])) + 1,
-                "chapter": chapter,
-                "event_type": event_type,
-                "payload": payload,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        self._write(data)
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        self._local = threading.local()
 
-    def recent_metrics(self, limit: int) -> list[dict[str, Any]]:
-        metrics = list(self._read().get("chapter_metrics", {}).values())
-        metrics.sort(key=lambda x: int(x.get("chapter", 0)), reverse=True)
-        return metrics[:limit]
+    def _conn(self) -> "sqlite3.Connection":
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5.0)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA busy_timeout=5000")
+            c.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = c
+        return c
 
-    def recent_events(self, limit: int) -> list[dict[str, Any]]:
-        events = self._read().get("events", [])
-        return list(reversed(events))[:limit]
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._conn().execute(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - timing dependent
+            if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
+                return self._conn().execute(*args, **kwargs)
+            raise
 
-    def add_agent_report(self, chapter: int, agent: str, report: dict[str, Any]) -> None:
-        data = self._read()
-        data.setdefault("agent_reports", []).append(
-            {
-                "chapter": chapter,
-                "agent": agent,
-                "score": safe_score(report.get("score", 0)),
-                "report": report,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        self._write(data)
+    def executescript(self, *args: Any, **kwargs: Any) -> Any:
+        return self._conn().executescript(*args, **kwargs)
 
-    def get_entity_state(self, entity_type: str, name: str) -> dict[str, Any]:
-        key = f"{entity_type}:{name}"
-        return self._read().get("entities", {}).get(key, {}).get("state", {})
+    def commit(self) -> None:
+        self._conn().commit()
 
-    def upsert_entity(self, entity_type: str, name: str, state: dict[str, Any], chapter: int) -> None:
-        data = self._read()
-        key = f"{entity_type}:{name}"
-        data.setdefault("entities", {})[key] = {
-            "entity_type": entity_type,
-            "name": name,
-            "state": state,
-            "updated_chapter": chapter,
-        }
-        self._write(data)
+    def close_current(self) -> None:
+        """Close THIS thread's connection (call from a worker's finally)."""
+        c = getattr(self._local, "conn", None)
+        if c is not None:
+            try:
+                c.close()
+            finally:
+                self._local.conn = None
 
-    def upsert_thread(self, thread_id: str, thread: dict[str, Any], chapter: int) -> None:
-        data = self._read()
-        data.setdefault("open_threads", {})[thread_id] = {
-            "id": thread_id,
-            "description": str(thread.get("description", "")),
-            "status": str(thread.get("status", "open")),
-            "thread_type": str(thread.get("thread_type", "plot")),
-            "introduced_chapter": thread.get("introduced_chapter"),
-            "due_chapter": thread.get("due_chapter"),
-            "updated_chapter": chapter,
-            "payload": thread.get("payload", {}),
-        }
-        self._write(data)
-
-    def upsert_reader_promise(self, promise_id: str, promise: dict[str, Any], chapter: int) -> None:
-        data = self._read()
-        data.setdefault("reader_promises", {})[promise_id] = {
-            "id": promise_id,
-            "description": str(promise.get("description", "")),
-            "status": str(promise.get("status", "open")),
-            "opened_chapter": int(promise.get("opened_chapter") or promise.get("introduced_chapter") or chapter),
-            "due_chapter": promise.get("due_chapter"),
-            "emotional_type": str(promise.get("emotional_type", promise.get("thread_type", "plot"))),
-            "payoff_status": str(promise.get("payoff_status", "pending")),
-            "risk_level": int(promise.get("risk_level", 5) or 5),
-            "updated_chapter": chapter,
-            "payload": promise.get("payload", {}),
-        }
-        self._write(data)
-
-    def upsert_metrics(self, chapter: int, metrics: dict[str, Any]) -> None:
-        data = self._read()
-        data.setdefault("chapter_metrics", {})[str(chapter)] = metrics
-        self._write(data)
 
 def init_db(paths: Paths) -> Any:
     paths.database.parent.mkdir(parents=True, exist_ok=True)
-    if sqlite3 is None:
-        return JsonStoryStore(paths.logs_dir / "story_state.json")
+    conn = ThreadLocalConn(paths.database)
+    # Run schema creation + idempotent migrations on the MAIN thread's
+    # connection (the first _conn() call below opens it). WAL is a persistent
+    # database setting, so setting it once here covers every later per-thread
+    # connection. CREATE TABLE IF NOT EXISTS / ALTER are idempotent, so even
+    # if two threads raced this it would be safe.
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        PRAGMA busy_timeout=5000;
+        PRAGMA synchronous=NORMAL;
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chapter_metrics (
+            chapter INTEGER PRIMARY KEY,
+            title TEXT,
+            score REAL,
+            readthrough_score REAL,
+            hook_score REAL,
+            payoff_score REAL,
+            novelty_score REAL,
+            prose_score REAL,
+            continuity_score REAL,
+            plan_score REAL,
+            payoff_type TEXT,
+            conflict_type TEXT,
+            tension INTEGER,
+            novelty INTEGER,
+            hook_strength INTEGER,
+            emotional_tone TEXT,
+            accepted INTEGER,
+            em_dash_per_kchar REAL,
+            style_penalty REAL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS entities (
+            entity_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_chapter INTEGER NOT NULL,
+            PRIMARY KEY (entity_type, name)
+        );
+        CREATE TABLE IF NOT EXISTS open_threads (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            introduced_chapter INTEGER,
+            due_chapter INTEGER,
+            updated_chapter INTEGER,
+            payload_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reader_promises (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            opened_chapter INTEGER NOT NULL,
+            due_chapter INTEGER,
+            emotional_type TEXT,
+            payoff_status TEXT,
+            risk_level INTEGER DEFAULT 5,
+            updated_chapter INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter INTEGER NOT NULL,
+            agent TEXT NOT NULL,
+            score REAL,
+            report_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS stage_constraints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_chapter INTEGER NOT NULL,
+            constraint_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            priority INTEGER DEFAULT 5,
+            expires_chapter INTEGER,
+            resolved_chapter INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS causal_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_event_id INTEGER NOT NULL,
+            target_event_id INTEGER,
+            source_chapter INTEGER NOT NULL,
+            target_chapter INTEGER,
+            link_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status TEXT DEFAULT 'open',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    # Idempotent migration: classify threads by type (plot/reader_promise/...).
+    # Older DBs predate this column; ALTER is wrapped so re-runs are no-ops.
     try:
-        conn = sqlite3.connect(paths.database, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.executescript(
-            """
-            PRAGMA journal_mode=WAL;
-            -- With max_parallel_workers>1 several daemon threads hammer the DB.
-            -- _DB_LOCK serializes Python-side access within this process, but
-            -- WAL also lets a separate reader (e.g. `novel.py stats`/`list` on
-            -- another process) touch the file. busy_timeout makes any such
-            -- contender wait up to 5s for a lock instead of instantly raising
-            -- "database is locked". synchronous=NORMAL is the standard, safe
-            -- pairing with WAL (durable across app crashes; only a power loss
-            -- mid-write can lose the last transaction) and noticeably cuts
-            -- per-commit fsync latency on the hot finalize path.
-            PRAGMA busy_timeout=5000;
-            PRAGMA synchronous=NORMAL;
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chapter INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chapter_metrics (
-                chapter INTEGER PRIMARY KEY,
-                title TEXT,
-                score REAL,
-                readthrough_score REAL,
-                hook_score REAL,
-                payoff_score REAL,
-                novelty_score REAL,
-                prose_score REAL,
-                continuity_score REAL,
-                plan_score REAL,
-                payoff_type TEXT,
-                conflict_type TEXT,
-                tension INTEGER,
-                novelty INTEGER,
-                hook_strength INTEGER,
-                emotional_tone TEXT,
-                accepted INTEGER,
-                em_dash_per_kchar REAL,
-                style_penalty REAL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS entities (
-                entity_type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                state_json TEXT NOT NULL,
-                updated_chapter INTEGER NOT NULL,
-                PRIMARY KEY (entity_type, name)
-            );
-            CREATE TABLE IF NOT EXISTS open_threads (
-                id TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                status TEXT NOT NULL,
-                introduced_chapter INTEGER,
-                due_chapter INTEGER,
-                updated_chapter INTEGER,
-                payload_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS reader_promises (
-                id TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                status TEXT NOT NULL,
-                opened_chapter INTEGER NOT NULL,
-                due_chapter INTEGER,
-                emotional_type TEXT,
-                payoff_status TEXT,
-                risk_level INTEGER DEFAULT 5,
-                updated_chapter INTEGER NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS agent_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chapter INTEGER NOT NULL,
-                agent TEXT NOT NULL,
-                score REAL,
-                report_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS stage_constraints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_chapter INTEGER NOT NULL,
-                constraint_type TEXT NOT NULL,
-                description TEXT NOT NULL,
-                priority INTEGER DEFAULT 5,
-                expires_chapter INTEGER,
-                resolved_chapter INTEGER,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS causal_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_event_id INTEGER NOT NULL,
-                target_event_id INTEGER,
-                source_chapter INTEGER NOT NULL,
-                target_chapter INTEGER,
-                link_type TEXT NOT NULL,
-                description TEXT NOT NULL,
-                status TEXT DEFAULT 'open',
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        # Idempotent migration: classify threads by type (plot/reader_promise/...).
-        # Older DBs predate this column; ALTER is wrapped so re-runs are no-ops.
+        conn.execute("ALTER TABLE open_threads ADD COLUMN thread_type TEXT DEFAULT 'plot'")
+        conn.commit()
+    except Exception:
+        pass
+    for column in (
+        "readthrough_score REAL",
+        "hook_score REAL",
+        "payoff_score REAL",
+        "novelty_score REAL",
+        "prose_score REAL",
+        "continuity_score REAL",
+        "em_dash_per_kchar REAL",
+        "style_penalty REAL",
+    ):
         try:
-            conn.execute("ALTER TABLE open_threads ADD COLUMN thread_type TEXT DEFAULT 'plot'")
+            conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
             conn.commit()
         except Exception:
             pass
-        for column in (
-            "readthrough_score REAL",
-            "hook_score REAL",
-            "payoff_score REAL",
-            "novelty_score REAL",
-            "prose_score REAL",
-            "continuity_score REAL",
-            "em_dash_per_kchar REAL",
-            "style_penalty REAL",
-        ):
-            try:
-                conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
-                conn.commit()
-            except Exception:
-                pass
-        return conn
-    except Exception:
-        return JsonStoryStore(paths.logs_dir / "story_state.json")
+    return conn
 
 def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) -> None:
-    if isinstance(conn, JsonStoryStore):
-        conn.add_event(chapter, event_type, payload)
-        return
-    with _DB_LOCK:
+    with db_lock():
         conn.execute(
             "INSERT INTO events(chapter, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
             (chapter, event_type, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")),
@@ -291,9 +224,7 @@ def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) 
         conn.commit()
 
 def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        return conn.recent_metrics(limit)
-    with _DB_LOCK:
+    with db_lock():
         rows = conn.execute(
             "SELECT * FROM chapter_metrics ORDER BY chapter DESC LIMIT ?",
             (limit,),
@@ -301,9 +232,7 @@ def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 def recent_events(conn: Any, limit: int = 80) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        return conn.recent_events(limit)
-    with _DB_LOCK:
+    with db_lock():
         rows = conn.execute(
             "SELECT id, chapter, event_type, payload, created_at FROM events ORDER BY id DESC LIMIT ?",
             (limit,),
@@ -319,10 +248,8 @@ def recent_events(conn: Any, limit: int = 80) -> list[dict[str, Any]]:
     return out
 
 def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        return []
     try:
-        with _DB_LOCK:
+        with db_lock():
             rows = conn.execute(
                 """SELECT constraint_type, description, priority FROM stage_constraints
                    WHERE resolved_chapter IS NULL
@@ -335,9 +262,9 @@ def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
         return []
 
 def store_stage_constraints(conn: Any, chapter_num: int, constraints: list[dict[str, Any]]) -> None:
-    if isinstance(conn, JsonStoryStore) or not constraints:
+    if not constraints:
         return
-    with _DB_LOCK:
+    with db_lock():
         for c in constraints:
             expires = None
             if c.get("expires_in_chapters"):
@@ -357,9 +284,9 @@ def store_stage_constraints(conn: Any, chapter_num: int, constraints: list[dict[
         conn.commit()
 
 def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]]) -> None:
-    if isinstance(conn, JsonStoryStore) or not links:
+    if not links:
         return
-    with _DB_LOCK:
+    with db_lock():
         for link in links:
             conn.execute(
                 """INSERT INTO causal_links(source_event_id, target_event_id, source_chapter, target_chapter,
@@ -383,10 +310,7 @@ def upsert_reader_promise(conn: Any, chapter_num: int, promise: dict[str, Any]) 
         or promise.get("thread_id")
         or f"promise-ch{chapter_num}-{abs(hash(json.dumps(promise, ensure_ascii=False))) % 100000}"
     )
-    if isinstance(conn, JsonStoryStore):
-        conn.upsert_reader_promise(promise_id, promise, chapter_num)
-        return
-    with _DB_LOCK:
+    with db_lock():
         conn.execute(
             """
             INSERT INTO reader_promises(
@@ -421,18 +345,8 @@ def upsert_reader_promise(conn: Any, chapter_num: int, promise: dict[str, Any]) 
         conn.commit()
 
 def get_reader_promises(conn: Any, chapter_num: int, limit: int = 12) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        rows = []
-        for p in conn._read().get("reader_promises", {}).values():
-            if str(p.get("status", "open")) not in {"open", "advanced"}:
-                continue
-            due = p.get("due_chapter")
-            overdue_by = chapter_num - int(due) if due is not None and int(due) < chapter_num else 0
-            rows.append({**p, "overdue_by": overdue_by})
-        rows.sort(key=lambda x: (-(int(x.get("risk_level", 5) or 5)), -int(x.get("overdue_by", 0) or 0)))
-        return rows[:limit]
     try:
-        with _DB_LOCK:
+        with db_lock():
             rows = conn.execute(
                 """SELECT id, description, status, opened_chapter, due_chapter, emotional_type,
                           payoff_status, risk_level, updated_chapter
@@ -453,25 +367,8 @@ def get_reader_promises(conn: Any, chapter_num: int, limit: int = 12) -> list[di
         return []
 
 def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10, limit: int = 8) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        threads = conn._read().get("open_threads", {}).values()
-        out = []
-        for t in threads:
-            if t.get("status") != "open":
-                continue
-            updated = int(t.get("updated_chapter") or 0)
-            silence = chapter_num - updated
-            if silence >= silence_threshold:
-                out.append({
-                    "id": t.get("id"),
-                    "description": t.get("description", ""),
-                    "updated_chapter": updated,
-                    "silence_duration": silence,
-                })
-        out.sort(key=lambda x: -x["silence_duration"])
-        return out[:limit]
     try:
-        with _DB_LOCK:
+        with db_lock():
             rows = conn.execute(
                 """SELECT id, description, updated_chapter FROM open_threads
                    WHERE status='open' AND updated_chapter IS NOT NULL
@@ -492,10 +389,8 @@ def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10,
         return []
 
 def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
-    if isinstance(conn, JsonStoryStore):
-        return []
     try:
-        with _DB_LOCK:
+        with db_lock():
             rows = conn.execute(
                 """SELECT link_type, description, source_chapter FROM causal_links
                    WHERE status='open' AND link_type IN ('requires', 'enables', 'blocks')
@@ -509,10 +404,8 @@ def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | No
     """Return an entity's stored state. The entities table only keeps the latest
     state (no temporal history yet), so `chapter` is accepted for API forward-
     compatibility but currently ignored; latest state is returned."""
-    if isinstance(conn, JsonStoryStore):
-        return conn.get_entity_state(entity_type, name)
     try:
-        with _DB_LOCK:
+        with db_lock():
             row = conn.execute(
                 "SELECT state_json FROM entities WHERE entity_type=? AND name=?",
                 (entity_type, name),
@@ -570,26 +463,8 @@ def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, lim
             }
             for p in ledger[:limit]
         ]
-    if isinstance(conn, JsonStoryStore):
-        out = []
-        for t in conn._read().get("open_threads", {}).values():
-            if t.get("status") != "open":
-                continue
-            if str(t.get("thread_type", "plot")) != "reader_promise":
-                continue
-            due = t.get("due_chapter")
-            if due is None or int(due) >= cutoff:
-                continue
-            out.append({
-                "id": t.get("id"),
-                "description": t.get("description", ""),
-                "due_chapter": int(due),
-                "overdue_by": chapter_num - int(due),
-            })
-        out.sort(key=lambda x: -x["overdue_by"])
-        return out[:limit]
     try:
-        with _DB_LOCK:
+        with db_lock():
             rows = conn.execute(
                 """SELECT id, description, due_chapter FROM open_threads
                    WHERE status='open' AND thread_type='reader_promise'
@@ -611,14 +486,12 @@ def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, lim
 
 def validate_plan_continuity(conn: Any, plan: dict[str, Any], chapter_num: int, config: dict[str, Any] | None = None) -> list[str]:
     violations = []
-    if isinstance(conn, JsonStoryStore):
-        return violations
     deep = True
     if config is not None:
         deep = bool(config.get("novel", {}).get("plan_validate_deep", True))
     for char in plan.get("character_focus", []):
         try:
-            with _DB_LOCK:
+            with db_lock():
                 row = conn.execute(
                     "SELECT state_json FROM entities WHERE entity_type='character' AND name=?",
                     (char,),
@@ -633,7 +506,7 @@ def validate_plan_continuity(conn: Any, plan: dict[str, Any], chapter_num: int, 
         except Exception:
             pass
     try:
-        with _DB_LOCK:
+        with db_lock():
             overdue = conn.execute(
                 """SELECT id, description FROM open_threads
                    WHERE status='open' AND due_chapter IS NOT NULL AND due_chapter < ?
@@ -682,7 +555,7 @@ def _deep_plan_violations(conn: Any, plan: dict[str, Any], chapter_num: int) -> 
             # Only warn if the plan clearly relocates the character: another known
             # place-name entity appears in the plan blob.
             try:
-                with _DB_LOCK:
+                with db_lock():
                     places = conn.execute(
                         "SELECT name FROM entities WHERE entity_type='place'",
                     ).fetchall()

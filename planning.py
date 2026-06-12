@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -9,7 +12,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import beat_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import JsonStoryStore, db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
+from store import db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -74,6 +77,7 @@ ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
 - 默认从 7.0 起步，逐项核验后只有确实可落地的候选才上浮到 8+。
 - 硬上限：若某候选的核心 payoff/高潮 beat 停留在抽象意图（动词是"推导出/意识到/想通/完成/还原/引导"而无具体动作+具体物体+可见结果），或高潮被压缩成一句概括/纸条/口头转述，该候选 score 不得高于 7.0，并在 cons 中点名是哪一条 beat。
 - 只有当 payoff/高潮 beat 已写成"角色用具体动作操作具体物体、产生读者可见结果"的可拍句子时，才允许给 8+。
+- 后期重复坍缩（最高优先级降分项）：若某候选的核心能力使用方式或核心物证与"近期已用金手指用法/物证"参照表雷同——即让主角用同一套动作作用同一物体、或继续围绕同一件物证演示同一结论而无新信息增量——该候选 score 不得高于 7.0，并在 cons 中点名是哪个物证/哪套用法在重复。这是为防止短篇后期把上一章近乎逐字翻写。
 - 选出的 merged_plan 也必须满足上述可落地标准；若候选都不达标，你必须在改写 merged_plan 时把抽象 beat 改写成可拍动作，并据此打分。
 
 请结合全局状态、近期指标、重复风险、因果价值、人物一致性、兑现新鲜度与读者期待综合评估。
@@ -155,105 +159,6 @@ FUSED_PLAN_REVIEW_SYSTEM = """你是一部中国历史/玄幻网文的多维度�
 - overall_score 由引擎根据 6 个维度分数自动计算，你可以填 0 或省略，无需自己做算术。
 - 要果断——含糊的风险只会浪费下游 token。每个维度的 risks/required_fixes 都必须具体、可执行。"""
 
-AGENT_REVIEW_SYSTEMS = {
-    "world": """你是一部中国历史/玄幻网文的「世界 Agent」。
-请对照既定世界规则审查章节大纲。具体核查：
-1. 地理与旅行：距离、路线、旅行时间是否一致（京城到江南需数日，而非瞬移）
-2. 力量体系：修炼/战斗/政治权力规则是否符合既定设定
-3. 机构：官职、官僚程序、等级是否符合时代
-4. 资源：金钱、物资、兵力是否守恒（无无故补充）
-5. 历法与季节：日期是否与既定时间线对齐，季节细节是否一致
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 违反地理/旅行时间 -1.5
-- 与既定规则矛盾的力量体系 -2.0
-- 机构程序时代错置或不可能 -2.5
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
-
-    "character": """你是一部中国历史/玄幻网文的「人物 Agent」。
-请审查章节大纲的人物一致性与成长。具体核查：
-1. 目标与动机：每个人物都依据既定目标行动，而非剧情便利
-2. 能动性：人物做出有可见代价的主动选择，而非被动旁观
-3. 关系：互动反映既定的人物关系（盟友、敌人、人情债）
-4. 秘密与知识：人物只依据其确实拥有的信息行动
-5. 成长弧线：主角呈现渐进式变化，而非突然的性格突变
-6. 对话口吻：每个人物的说话方式契合其出身与身份
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 人物依据其不应拥有的信息行动 -2.0
-- 主角在本章没有有意义的选择或代价 -1.0
-- 人物无理由地脱离人设 -1.5
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
-
-    "rhythm": """你是一部中国历史/玄幻网文的「节奏 Agent」。
-请对照近期章节审查节奏与结构变化。具体核查：
-1. 场景结构：本章的开场/收场手法是否不同于最近 3 章？
-2. 压缩/释放：是否既有张力积累又有释放时刻？
-3. 场景数量与变化：至少 2 个设定或动态不同的场景
-4. 章末手法：不与前 2 章相同类型（悬念/揭示/平静收尾）
-5. 信息密度：动作、对话与反思之间是否平衡（无 1000 字以上的独白）
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 章末与上一章重复同一手法 -1.0
-- 整章是单一拉长场景、毫无切换 -1.5
-- 节奏单调（全程高张力或全程低张力） -1.0
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
-
-    "payoff": """你是一部中国历史/玄幻网文的「兑现 Agent」。
-请审查情感兑现质量与压迫-兑现的平衡。具体核查：
-1. 压迫积累：兑现之前是否有有意义的阻力/障碍？
-2. 兑现新鲜度：payoff_type 是否不同于最近 3 章？
-3. 代价可见：兑现是否伴随可见的代价或取舍？
-4. 挣来的解决：解决是否由因果挣来（而非巧合或天降救星）？
-5. 情感质地：本章是否唤起一种有区分度的情感，而非泛泛的紧张？
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 兑现依赖巧合或无解释的运气 -2.0
-- payoff_type 与前 2 章相同 -1.0
-- 主角没有可见的代价或取舍 -1.0
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
-
-    "foreshadowing": """你是一部中国历史/玄幻网文的「伏线 Agent」。
-请审查伏线管理与长线承诺的兑现。具体核查：
-1. 逾期伏线：标记任何 >20 章前引入、却未在此推进的已开启伏线
-2. 伏线推进：本章是否至少推进一条已有伏线？
-3. 新伏线引入：若开启新伏线，其 due_chapter 是否现实？
-4. 找回机会：是否有被丢弃、可在此自然找回的伏线？
-5. 承诺密度：已开启伏线不要过多（>8 条活跃 = 读者混乱风险）
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 存在可处理却未处理的逾期伏线（>20 章） -1.0
-- 没有推进或找回任何已有伏线 -1.5
-- 在不闭合旧伏线的情况下开启第 9 条及以上并发伏线 -1.0
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[]}""",
-
-    "reader": """你是一部中国历史/玄幻网文的「读者模拟 Agent」。
-请模拟一名连载读者读完本章大纲。具体评估：
-1. 追读欲：读完本章后，哪 3 个问题会让读者点击"下一章"？
-2. 满足感：本章是否提供至少一个满足时刻（而非全是铺垫）？
-3. 混乱风险：跳读了 2 章的读者是否仍能跟上主线？
-4. 疲劳信号：读者是否被要求同时追踪过多伏线？
-5. 情感钩子：是否有一个能引发共情或投入的人物时刻？
-
-使用完整的 1-10 区间；默认从 6.5 起步，9+ 仅保留给几乎无缺陷的维度，不可滥发。施加软性惩罚（扣分，不钳制）：
-- 没有清晰的"下一章"问题 -1.0
-- 本章是纯铺垫、零兑现时刻 -1.5
-- 读者需要记住 >5 个先前情节点才能看懂本章 -1.0
-
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-schema：{"score":1-10,"risks":[],"required_fixes":[],"state_patch":[],"follow_next_reason":"..."}""",
-}
-
 def _carried_over_risks_from_prev(paths: Paths, chapter_num: int) -> list[str]:
     """Extract continuity/rhythm/fatigue risks from the previous chapter's final review.
 
@@ -284,19 +189,16 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
     "wins" counts how often a candidate with that strategy was the
     arbiter-selected one.
     """
-    if isinstance(conn, JsonStoryStore):
-        events = conn.recent_events(lookback)
-    else:
-        try:
-            with db_lock():
-                rows = conn.execute(
-                    "SELECT payload FROM events WHERE event_type='plan_arbitration' "
-                    "ORDER BY id DESC LIMIT ?",
-                    (lookback,),
-                ).fetchall()
-            events = [{"payload": json.loads(r["payload"])} for r in rows]
-        except Exception:
-            return {}
+    try:
+        with db_lock():
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE event_type='plan_arbitration' "
+                "ORDER BY id DESC LIMIT ?",
+                (lookback,),
+            ).fetchall()
+        events = [{"payload": json.loads(r["payload"])} for r in rows]
+    except Exception:
+        return {}
     stats: dict[str, dict[str, float]] = {}
     for ev in events:
         payload = ev.get("payload") if isinstance(ev, dict) else None
@@ -331,12 +233,20 @@ def _select_strategies_bandit(
     n: int,
     paths: Paths,
 ) -> list[tuple[str, str]]:
-    """Epsilon-greedy selection of n strategies from the candidate pool.
+    """Strategy selection for candidate plans using Thompson sampling.
 
-    Score per strategy = mean(score) + 0.5 * win_rate. Strategies with
-    fewer than 3 trials are treated as "exploration" and always included
-    in the pool. Picks top-n by composite score with ε probability of a
-    random swap to keep exploring.
+    Beta-posterior Thompson sampling over arbiter win-rates. Each strategy's
+    selection count is a Bernoulli success; we sample win_rate ~ Beta(wins+1,
+    losses+1) per strategy and keep the top-n samples. This naturally concentrates
+    draws on winners while preserving principled exploration: an under-observed
+    strategy has a wide posterior and still wins some draws. A small floor of
+    forced exploration (`strategy_bandit_explore_frac`, default 0.1) guards
+    against posterior lock-in over a long book.
+
+    Cross-book prior (gated by `cross_book_prior_enabled`): global telemetry
+    wins/trials are blended in as pseudo-counts, so a brand-new book starts
+    from the library's accumulated win-rates. Any telemetry failure silently
+    degrades to local-only.
     """
     import random as _random
 
@@ -345,37 +255,49 @@ def _select_strategies_bandit(
         return [strategies[i % len(strategies)] for i in range(n)]
 
     lookback = int(config["novel"].get("strategy_bandit_lookback", 60))
-    epsilon = float(config["novel"].get("strategy_bandit_epsilon", 0.2))
     stats = _strategy_history(conn, lookback=lookback)
 
-    scored: list[tuple[float, int, tuple[str, str]]] = []
+    global_stats: dict[str, dict[str, float]] = {}
+    if bool(config["novel"].get("cross_book_prior_enabled", False)):
+        try:
+            import telemetry as _telemetry
+            genre = str(config["novel"].get("genre", "_default") or "_default")
+            novel_name = paths.logs_dir.parent.name
+            global_stats = _telemetry.global_strategy_history(genre, exclude_novel=novel_name)
+        except Exception:
+            global_stats = {}
+    prior_weight = float(config["novel"].get("cross_book_prior_weight", 0.3))
+
+    used_prior = False
+    sampled: list[tuple[float, int, tuple[str, str]]] = []
     for idx, strat in enumerate(strategies):
         name = strat[0]
         s = stats.get(name)
-        if not s or s["trials"] < 3:
-            # Boost under-explored strategies so they get picked sometimes.
-            composite = 9.0 + _random.random() * 0.5
-        else:
-            mean_score = s["score_sum"] / s["trials"]
-            win_rate = s["wins"] / s["trials"]
-            composite = mean_score + 0.5 * win_rate
-        scored.append((composite, idx, strat))
-
-    # Sort by composite desc, stable on original idx.
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    picked = [item[2] for item in scored[:n]]
-
-    # With probability epsilon, swap one of the picked with a random un-picked.
-    if epsilon > 0 and len(strategies) > n and _random.random() < epsilon:
+        g = global_stats.get(name)
+        wins = float(s["wins"]) if s else 0.0
+        trials = float(s["trials"]) if s else 0.0
+        # Global prior enters as capped pseudo-counts; local evidence dominates as it accumulates.
+        if g and float(g.get("trials", 0)) >= 3 and prior_weight > 0:
+            k = prior_weight * min(float(g["trials"]), 20.0)
+            g_win_rate = float(g["wins"]) / float(g["trials"])
+            wins += k * g_win_rate
+            trials += k
+            used_prior = True
+        losses = max(0.0, trials - wins)
+        sampled.append((_random.betavariate(wins + 1.0, losses + 1.0), idx, strat))
+    sampled.sort(key=lambda x: (-x[0], x[1]))
+    picked = [item[2] for item in sampled[:n]]
+    # Exploration floor: with small probability force one slot to a strategy
+    # outside the top draws, so a temporarily-unlucky arm keeps getting data.
+    explore_frac = float(config["novel"].get("strategy_bandit_explore_frac", 0.1))
+    if explore_frac > 0 and len(strategies) > n and _random.random() < explore_frac:
         picked_names = {p[0] for p in picked}
         leftovers = [s for s in strategies if s[0] not in picked_names]
         if leftovers:
-            swap_in = _random.choice(leftovers)
-            swap_out_idx = _random.randrange(len(picked))
-            picked[swap_out_idx] = swap_in
-
+            picked[_random.randrange(len(picked))] = _random.choice(leftovers)
     try:
-        log(paths, f"Strategy bandit picked: {[p[0] for p in picked]}")
+        suffix = " (thompson, with cross-book prior)" if used_prior else " (thompson)"
+        log(paths, f"Strategy bandit picked: {[p[0] for p in picked]}{suffix}")
     except Exception:
         pass
     return picked
@@ -400,32 +322,28 @@ def _recent_selected_plans(
     # Over-fetch so that excluding the current chapter's own (possibly multiple)
     # arbitration rows still leaves up to ``lookback`` genuine prior chapters.
     fetch = lookback + 6
-    if isinstance(conn, JsonStoryStore):
-        events = conn.recent_events(fetch * 3)
-    else:
-        try:
-            with db_lock():
-                if exclude_chapter is not None:
-                    rows = conn.execute(
-                        "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
-                        "AND chapter != ? ORDER BY id DESC LIMIT ?",
-                        (int(exclude_chapter), fetch),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
-                        "ORDER BY id DESC LIMIT ?",
-                        (fetch,),
-                    ).fetchall()
-            events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
-        except Exception:
-            return []
+    try:
+        with db_lock():
+            if exclude_chapter is not None:
+                rows = conn.execute(
+                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                    "AND chapter != ? ORDER BY id DESC LIMIT ?",
+                    (int(exclude_chapter), fetch),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (fetch,),
+                ).fetchall()
+        events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
+    except Exception:
+        return []
     plans: list[dict[str, Any]] = []
     for ev in events:
         if not isinstance(ev, dict):
             continue
         if exclude_chapter is not None and ev.get("chapter") == int(exclude_chapter):
-            # JsonStoryStore path has no SQL filter; drop self-events here.
             continue
         payload = ev.get("payload")
         if not isinstance(payload, dict):
@@ -442,6 +360,93 @@ def _recent_selected_plans(
         if len(plans) >= lookback:
             break
     return plans
+
+
+# ---------------------------------------------------------------------------
+# Used-element ledger: the single data source that prevents late-chapter
+# "repetition collapse" — the dominant quality+cost sink across suspense_v5..v11.
+#
+# Root cause (confirmed in logs): the candidate generator, arbiter, and writer
+# could not SEE which concrete devices/evidence/payoffs prior chapters already
+# used (long context dilutes them, and scene_similarity only matches字面 Jaccard
+# of conflict/payoff/beats). So once a 6-章 mystery exhausts its fresh scenes,
+# Ch7 re-narrates Ch6 near-verbatim (cross_repeat fossils=12), novelty drops
+# below floor, the score is capped, structural replan fires and burns ~60% of
+# wall-time re-rolling plans that re-commit the SAME repetition.
+#
+# This函数 mines the recent selected plans for three classes of already-used
+# concrete elements and feeds them, as an explicit avoid-list, to ALL THREE of
+# generation / arbitration / writing — moving differentiation from after-the-fact
+# penalty to up-front prevention. Pure regex + frequency counting; NO LLM call,
+# NO cacheable_prefix impact (it lands in the variable user-message segment).
+# ---------------------------------------------------------------------------
+
+# Golden-finger / ability verbs. Kept generic so it works cross-genre (触痕/辨隙/
+# 临终视像/声纹...). The neighbouring concrete object is captured to form
+# "深读门把手"-style usage signatures the writer/planner must vary.
+_DEVICE_VERBS = (
+    "深读", "凝神", "残力", "残影", "触痕", "按指腹", "指腹", "摸", "触",
+    "辨隙", "深听", "聆听", "听出", "回放", "视像", "读取", "读出", "读到",
+)
+
+# High-signal evidence nouns recur as fossils ("门把手"/"硬币"/"提手"...). Generic
+# household/crime物件 so the same regex serves any closed-room mystery without a
+# per-novel list. Falls back gracefully when nothing matches.
+_EVIDENCE_NOUNS = (
+    "门把手", "把手", "栏杆", "提手", "硬币", "箱扣", "钥匙环", "钥匙", "铝牌",
+    "淤伤", "凹痕", "金属粉末", "粉末", "磁带", "录音机", "纽扣", "袖口",
+    "鞋印", "压痕", "伤口", "表带", "链节", "镜子", "倒影", "照片", "锁",
+    "绳", "血迹", "指甲", "螺丝", "扳手", "刀", "玻璃", "窗", "门",
+)
+
+
+def used_element_ledger(
+    conn: Any, config: dict[str, Any], chapter_num: int, lookback: int = 6
+) -> dict[str, list[str]]:
+    """Mine recently-used concrete devices / evidence / payoff_types so the
+    planner, arbiter and writer can be forced to vary them this chapter.
+
+    Returns {"device_usage": [...], "evidence": [...], "payoff_types": [...]}.
+    Each list is the top-N most-frequently-reused items across the last
+    ``lookback`` selected plans (newest first). No LLM call; safe to disable by
+    ignoring the result. Never raises — returns empty lists on any failure.
+    """
+    try:
+        recent = _recent_selected_plans(conn, lookback=lookback, exclude_chapter=chapter_num)
+    except Exception:
+        return {"device_usage": [], "evidence": [], "payoff_types": []}
+    device: list[str] = []
+    evidence: list[str] = []
+    ptypes: list[str] = []
+    verb_alt = "|".join(re.escape(v) for v in _DEVICE_VERBS)
+    noun_alt = "|".join(re.escape(n) for n in _EVIDENCE_NOUNS)
+    # device usage = ability verb followed (within ~6 chars) by a concrete object
+    usage_re = re.compile(rf"(?:{verb_alt})[^，。；、\s]{{0,6}}?({noun_alt})")
+    noun_re = re.compile(noun_alt)
+    for rp in recent:
+        if not isinstance(rp, dict):
+            continue
+        pt = rp.get("payoff_type")
+        if pt:
+            ptypes.append(str(pt)[:30])
+        blob_parts = [str(rp.get(k, "")) for k in ("payoff", "conflict", "info_source", "goal", "pressure")]
+        beats = rp.get("beats")
+        if isinstance(beats, list):
+            blob_parts.extend(str(b) for b in beats[:8])
+        blob = " ".join(blob_parts)
+        for m in usage_re.finditer(blob):
+            device.append(m.group(0)[:20])
+        for m in noun_re.finditer(blob):
+            evidence.append(m.group(0))
+
+    def _topn(xs: list[str], n: int = 8) -> list[str]:
+        return [w for w, _ in Counter(x for x in xs if x).most_common(n)]
+
+    return {
+        "device_usage": _topn(device),
+        "evidence": _topn(evidence),
+        "payoff_types": _topn(ptypes),
+    }
 
 
 def generate_candidate_plans(
@@ -554,6 +559,17 @@ def generate_candidate_plans(
                 used_locations_block = json.dumps(locs[:12], ensure_ascii=False)
         except Exception:
             used_locations_block = "None"
+    # Used-element ledger (P0 anti-collapse): explicit list of devices/evidence/
+    # payoff_types prior chapters已用, so the generator must vary them up front
+    # rather than letting cross_repeat penalise the fossil after the fact.
+    used_element_block = "None"
+    if bool(config["novel"].get("used_element_ledger_enabled", True)):
+        led = used_element_ledger(
+            conn, config, chapter_num,
+            lookback=int(config["novel"].get("scene_dedupe_window", 8)),
+        )
+        if led.get("device_usage") or led.get("evidence"):
+            used_element_block = json.dumps(led, ensure_ascii=False)
     quality_threshold = float(config["novel"].get("quality_threshold", 8.0))
     dimension_floor = float(config["novel"].get("prewrite_dimension_floor", max(7.2, quality_threshold - 0.3)))
     base_user = f"""## 记忆
@@ -603,6 +619,9 @@ def generate_candidate_plans(
 
 ## 近期已反复使用的场地 / 信息来源（硬性：本章至少更换其一——开辟一个新的物理空间，或引入一个新的信息来源/对手，不得继续在下列地点原地打转）
 {used_locations_block}
+
+## 近期已反复使用的金手指用法 / 物证 / 兑现类型（硬性·防后期重复坍缩：device_usage=已用过的能力使用方式，evidence=已反复出现的物证，payoff_types=已用兑现类型。本章若再次使用核心能力，其"动作+作用物体+解读路径"必须与 device_usage 列表里的写法有可见区别；核心物证不得继续锁定在 evidence 列表的同一件上反复演示同一结论；payoff_type 不得与列表近项重复。除非剧情确有必要追踪同一物件，否则换新的具体物证/新的能力用法）
+{used_element_block}
 
 {beat_block}
 
@@ -705,8 +724,6 @@ def generate_candidate_plans(
          "以主角或核心配角的内心两难为核心：本章的胜负来自角色的关键选择与可见代价；选择必须在 beats 里明示。"),
         ("thread-driven",
          "以推进 2 条以上 open thread 为核心：必须在 thread_actions 显式列出推进的具体 thread id 与下一步具体动作。"),
-        ("institutional",
-         "以制度/程序/官僚摩擦为核心：本章必须呈现一次具体的衙门程序（如送文、批红、查证、回禀），用程序细节制造张力。"),
         ("reversal",
          "以认知反转为核心，必须按 setup→misdirect→overturn 三段结构组织，并在 beats 中显式标注每一段："
          "①setup：先建立一个被广泛相信的'事实/信任源/判断'；②misdirect：通过证据或他人之口强化它，让读者也信以为真；"
@@ -911,58 +928,24 @@ def agent_review_plan(
     if fused_enabled:
         reports = _fused_review_one_plan(client, paths, config, user)
     else:
-        max_workers = int(config["novel"].get("max_parallel_workers", 5))
-
-        def review_one(agent: str, system: str) -> dict[str, Any]:
-            for retry in range(2):
-                try:
-                    raw = call_llm(
-                        client, paths, config, system, json_prompt(user),
-                        max_tokens=12000, temperature=0.2,
-                        cacheable_prefix=cacheable_prefix(paths, config),
-                        tag="plan_review_axis",
-                    )
-                    report = load_json_with_repair(
-                        client,
-                        paths,
-                        config,
-                        raw,
-                        fallback={"score": 5, "risks": [], "required_fixes": [], "state_patch": []},
-                    )
-                    report["agent"] = agent
-                    return report
-                except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                    log(paths, f"Agent {agent} review parse failed retry={retry}: {exc}")
-            return {"agent": agent, "score": 5, "risks": [], "required_fixes": [], "state_patch": []}
-
-        reports: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(review_one, agent, system): agent
-                for agent, system in AGENT_REVIEW_SYSTEMS.items()
-            }
-            for future in as_completed(futures):
-                reports.append(future.result())
+        reports = _fused_review_one_plan(client, paths, config, user)
+        log(paths, "Note: fused_plan_review=false ignored; always using fused review")
 
     for report in reports:
         agent = report["agent"]
-        if isinstance(conn, JsonStoryStore):
-            conn.add_agent_report(chapter_num, agent, report)
-        else:
-            with db_lock():
-                conn.execute(
-                    "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        chapter_num,
-                        agent,
-                        safe_score(report.get("score", 0)),
-                        json.dumps(report, ensure_ascii=False),
-                        datetime.now().isoformat(timespec="seconds"),
-                    ),
-                )
-    if not isinstance(conn, JsonStoryStore):
         with db_lock():
-            conn.commit()
+            conn.execute(
+                "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    chapter_num,
+                    agent,
+                    safe_score(report.get("score", 0)),
+                    json.dumps(report, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+    with db_lock():
+        conn.commit()
     return reports
 
 def review_candidate_plans(
@@ -993,90 +976,46 @@ def review_candidate_plans(
 
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
     reports_by_plan: list[list[dict[str, Any]]] = [[] for _ in plans]
-    fused_enabled = bool(config["novel"].get("fused_plan_review", True))
+    # Always use fused review (one LLM call per plan, expands to 6 axis reports).
+    # The legacy unfused 6-parallel-calls path has been removed.
 
-    if fused_enabled:
-        # One fused LLM call per candidate plan; expands to 6 axis reports each.
-        def fused_one(plan_index: int) -> tuple[int, list[dict[str, Any]]]:
-            return plan_index, _fused_review_one_plan(
-                client, paths, config, plan_users[plan_index], plan_index_for_log=plan_index
-            )
+    def fused_one(plan_index: int) -> tuple[int, list[dict[str, Any]]]:
+        return plan_index, _fused_review_one_plan(
+            client, paths, config, plan_users[plan_index], plan_index_for_log=plan_index
+        )
 
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(plans))) as executor:
-            futures = {executor.submit(fused_one, i): i for i in range(len(plans))}
-            for future in as_completed(futures):
-                plan_index = futures[future]
-                try:
-                    _, reports = future.result()
-                    reports_by_plan[plan_index] = reports
-                except Exception as exc:
-                    log(paths, f"Fused review thread failed plan={plan_index}: {exc}")
-                    reports_by_plan[plan_index] = _explode_fused_axes(
-                        {"axes": {
-                            name: {"score": 5, "risks": [], "required_fixes": [], "state_patch": [], "score_caps_triggered": []}
-                            for name in ("world", "character", "rhythm", "payoff", "foreshadowing", "reader")
-                        }}
-                    )
-    else:
-        def review_one(plan_index: int, agent: str, system: str) -> dict[str, Any]:
-            user = plan_users[plan_index]
-            for retry in range(2):
-                try:
-                    raw = call_llm(
-                        client, paths, config, system, json_prompt(user),
-                        max_tokens=12000, temperature=0.2,
-                        cacheable_prefix=cacheable_prefix(paths, config),
-                        tag="plan_review_axis",
-                    )
-                    report = load_json_with_repair(
-                        client,
-                        paths,
-                        config,
-                        raw,
-                        fallback={"score": 5, "risks": [], "required_fixes": [], "state_patch": []},
-                    )
-                    report["agent"] = agent
-                    return report
-                except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                    log(paths, f"Agent {agent} review parse failed plan={plan_index} retry={retry}: {exc}")
-            return {"agent": agent, "score": 5, "risks": [], "required_fixes": [], "state_patch": []}
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(review_one, plan_index, agent, system): (plan_index, agent)
-                for plan_index in range(len(plans))
-                for agent, system in AGENT_REVIEW_SYSTEMS.items()
-            }
-            for future in as_completed(futures):
-                plan_index, agent = futures[future]
-                try:
-                    reports_by_plan[plan_index].append(future.result())
-                except Exception as exc:
-                    log(paths, f"Agent {agent} review thread failed plan={plan_index}: {exc}")
-                    reports_by_plan[plan_index].append(
-                        {"agent": agent, "score": 5, "risks": [], "required_fixes": [], "state_patch": []}
-                    )
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(plans))) as executor:
+        futures = {executor.submit(fused_one, i): i for i in range(len(plans))}
+        for future in as_completed(futures):
+            plan_index = futures[future]
+            try:
+                _, reports = future.result()
+                reports_by_plan[plan_index] = reports
+            except Exception as exc:
+                log(paths, f"Fused review thread failed plan={plan_index}: {exc}")
+                reports_by_plan[plan_index] = _explode_fused_axes(
+                    {"axes": {
+                        name: {"score": 5, "risks": [], "required_fixes": [], "state_patch": [], "score_caps_triggered": []}
+                        for name in ("world", "character", "rhythm", "payoff", "foreshadowing", "reader")
+                    }}
+                )
 
     for reports in reports_by_plan:
         for report in reports:
             agent = report["agent"]
-            if isinstance(conn, JsonStoryStore):
-                conn.add_agent_report(chapter_num, agent, report)
-            else:
-                with db_lock():
-                    conn.execute(
-                        "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (
-                            chapter_num,
-                            agent,
-                            safe_score(report.get("score", 0)),
-                            json.dumps(report, ensure_ascii=False),
-                            datetime.now().isoformat(timespec="seconds"),
-                        ),
-                    )
-    if not isinstance(conn, JsonStoryStore):
-        with db_lock():
-            conn.commit()
+            with db_lock():
+                conn.execute(
+                    "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        chapter_num,
+                        agent,
+                        safe_score(report.get("score", 0)),
+                        json.dumps(report, ensure_ascii=False),
+                        datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+    with db_lock():
+        conn.commit()
 
     return reports_by_plan
 
@@ -1211,9 +1150,27 @@ def arbitrate_plan(
     mem = cached_memory or memory_context(paths, conn, config)
     calib = plan_calibration_hint(conn, config)
     calib_block = f"\n{calib}\n" if calib else ""
+    # Used-element ledger so the arbiter can PENALISE a candidate whose ability
+    # usage / core evidence just re-runs the last few chapters' (P0 anti-collapse;
+    # the writer otherwise produces a near-verbatim repeat that only cross_repeat
+    # catches after the fact).
+    ledger_block = ""
+    if bool(config["novel"].get("used_element_ledger_enabled", True)):
+        led = used_element_ledger(
+            conn, config, chapter_num,
+            lookback=int(config["novel"].get("scene_dedupe_window", 8)),
+        )
+        if led.get("device_usage") or led.get("evidence"):
+            ledger_block = (
+                "\n## 近期已用金手指用法/物证/兑现类型（评分参照）\n"
+                + json.dumps(led, ensure_ascii=False)
+                + "\n规则：若某候选的核心能力使用方式或核心物证与上表雷同（同一动作作用同一物体、"
+                "或继续围绕同一物证演示同一结论），判定为后期重复风险，该候选 score 不得高于 7.0，"
+                "并在 cons 中点名。仲裁改写 merged_plan 时也必须避开上表已用项。\n"
+            )
     user = f"""## 记忆
 {mem}
-{calib_block}
+{calib_block}{ledger_block}
 
 ## 节奏诊断JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
@@ -1236,6 +1193,19 @@ def arbitrate_plan(
     decision = load_json_with_repair(client, paths, config, raw)
     plan = decision.get("merged_plan") or plans[int(decision.get("selected_index", 0))]
     db_event(conn, chapter_num, "plan_arbitration", {"decision": decision, "plans": plans})
+    # Cross-book telemetry double-write (observer; silently degrades). Done at
+    # the source because this is the only point where the full candidate list
+    # plus the arbiter decision coexist.
+    if bool(config["novel"].get("telemetry_enabled", True)):
+        try:
+            import telemetry as _telemetry
+            _telemetry.record_arbitration(
+                paths.logs_dir.parent.name,
+                str(config["novel"].get("genre", "_default") or "_default"),
+                chapter_num, decision, plans,
+            )
+        except Exception:
+            pass
     return plan, decision
 
 def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> float:
@@ -1250,20 +1220,57 @@ def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> f
     return safe_score(scores[0].get("score", 0))
 
 def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: int, paths: Paths) -> int:
-    """Adaptively reduce candidate-plan count when quality is stable + strategy
-    bandit has converged, to save tokens on the long tail of a book.
+    """Risk-adaptive candidate-plan count.
 
-    Returns the number of candidate plans to generate this chapter. Never goes
-    below 1; only kicks in after a warm-up so early chapters keep full breadth.
+    Two forces, applied in order:
+      1. RISK UPSHIFT — recent chapters show trouble (style/repeat penalties,
+         gate rejects, falling scores, force-accepts): restore full breadth even
+         if a downshift would otherwise apply. Recovering from a collapse is
+         exactly when plan diversity pays for itself.
+      2. STABLE DOWNSHIFT — quality stably high after a warm-up: drop one
+         candidate to save the (plan_candidate + fused_review + arbitrate)
+         overhead, which measures ~55% of total LLM seconds per chapter.
+
+    Never returns below 1; chapter 1-2 always keep full breadth.
     """
     base = int(config["novel"]["candidate_plans"])
     if not bool(config["novel"].get("adaptive_downshift_enabled", True)):
         return base
-    warmup = int(config["novel"].get("adaptive_downshift_warmup", 60))
-    if chapter_num < warmup or base <= 1:
+    if base <= 1 or chapter_num <= 2:
         return base
+
     window = int(config["novel"].get("adaptive_downshift_window", 10))
     rows = recent_metrics(conn, window)
+
+    # --- 1. Risk upshift (acts from Ch3, no warmup: collapse won't wait) ---
+    risk_window = int(config["novel"].get("risk_upshift_window", 3))
+    recent = rows[:risk_window]  # newest-first
+    risky = False
+    reasons: list[str] = []
+    if recent:
+        scores_recent = [safe_score(r.get("score", 0)) for r in recent if r.get("score") is not None]
+        risk_floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
+        if scores_recent and min(scores_recent) < risk_floor:
+            risky = True
+            reasons.append(f"min_recent_score={min(scores_recent):.1f}<{risk_floor}")
+        pen_cut = float(config["novel"].get("risk_upshift_style_penalty", 1.0))
+        pens = [float(r.get("style_penalty") or 0.0) for r in recent]
+        if pens and max(pens) >= pen_cut:
+            risky = True
+            reasons.append(f"max_style_penalty={max(pens):.1f}>={pen_cut}")
+    if risky:
+        if base < int(config["novel"]["candidate_plans"]):
+            base = int(config["novel"]["candidate_plans"])
+        log(
+            paths,
+            f"Risk upshift Ch{chapter_num}: keeping full candidate breadth ({base}) — {', '.join(reasons)}",
+        )
+        return base
+
+    # --- 2. Stable downshift (original behaviour, warmup-gated) ---
+    warmup = int(config["novel"].get("adaptive_downshift_warmup", 60))
+    if chapter_num < warmup:
+        return base
     if len(rows) < window:
         return base
     score_floor = float(config["novel"].get("adaptive_downshift_score", 8.5))
@@ -1328,12 +1335,52 @@ def create_plan(
                 num_candidates_override=n_cand, replan_feedback=replan_feedback,
             )
             _log(paths, f"Got {len(plans)} candidate plans, saving...")
+            # Candidate-level scene-dedupe pre-filter: a candidate whose scene
+            # skeleton is near-identical to a recently SELECTED plan is dead on
+            # arrival — reviewing/arbitrating it wastes LLM calls, and worse, the
+            # arbiter regularly picks it (it reads as "consistent with the book").
+            # Drop such candidates here unless that would leave none.
+            if bool(config["novel"].get("scene_dedupe_enabled", True)) and len(plans) > 1:
+                try:
+                    from quality import scene_similarity as _scene_sim
+                    _recent = _recent_selected_plans(
+                        conn,
+                        lookback=int(config["novel"].get("scene_dedupe_window", 8)),
+                        exclude_chapter=chapter_num,
+                    )
+                    if _recent:
+                        _cut = float(config["novel"].get("scene_dedupe_candidate_block", 0.85))
+                        kept, dropped = [], []
+                        for p in plans:
+                            s = _scene_sim(p, _recent)
+                            if float(s.get("max_sim", 0.0) or 0.0) >= _cut:
+                                dropped.append((str(p.get("strategy") or "?"), s.get("max_sim")))
+                            else:
+                                kept.append(p)
+                        if dropped and kept:
+                            plans = kept
+                            log(
+                                paths,
+                                f"Scene-dedupe candidate filter Ch{chapter_num}: dropped "
+                                f"{len(dropped)} near-duplicate candidate(s) {dropped} "
+                                f"(sim>={_cut}); {len(plans)} remain.",
+                            )
+                        elif dropped and not kept:
+                            log(
+                                paths,
+                                f"Scene-dedupe candidate filter Ch{chapter_num}: ALL candidates "
+                                f"near-duplicate {dropped}; keeping them (arbitration-stage block will judge).",
+                            )
+                except Exception as exc:
+                    log(paths, f"Scene-dedupe candidate filter failed (non-fatal) Ch{chapter_num}: {exc}")
             save_checkpoint(paths, chapter_num, plans_key, plans)
             _log(paths, f"Saved candidates checkpoint Ch{chapter_num}")
 
         screen_key = f"plan_{checkpoint_label}_attempt{attempt}_screen.json"
         cached_screen = load_checkpoint(paths, chapter_num, screen_key)
-        skip_screen = bool(config["novel"].get("plan_skip_screen", False))
+        _n_plans = len(plans)
+        _skip_default = _n_plans <= 3
+        skip_screen = bool(config["novel"].get("plan_skip_screen", _skip_default))
         if isinstance(cached_screen, list) and cached_screen:
             top_indices = cached_screen
             log(paths, f"Resuming cached screening Ch{chapter_num} attempt={attempt} top={top_indices}")
@@ -1347,6 +1394,19 @@ def create_plan(
             log(paths, f"Screened Ch{chapter_num} candidates: top={top_indices} from {len(plans)}")
 
         screened_plans = [plans[i] for i in top_indices if i < len(plans)]
+
+        # Two-stage planning: when screening was actually run (not skipped) and
+        # produced a ranked order for 4+ candidates, pre-eliminate the bottom
+        # candidates before the expensive full review to save LLM calls.
+        # Keep ceil(67%) of candidates, minimum 2.
+        if not skip_screen and len(screened_plans) >= 4:
+            keep_n = max(2, math.ceil(len(screened_plans) * 0.67))
+            if keep_n < len(screened_plans):
+                screened_plans = screened_plans[:keep_n]
+                log(
+                    paths,
+                    f"Two-stage plan knockout Ch{chapter_num}: reduced {len(top_indices)} screened → {keep_n} for full review",
+                )
 
         reports = load_checkpoint(paths, chapter_num, reports_key)
         if isinstance(reports, list) and reports:
@@ -1404,7 +1464,17 @@ def create_plan(
                         block_threshold,
                         float(config["novel"].get("scene_dedupe_short_novel_block", 0.92)),
                     )
-                    force_retry = False
+                    # NOTE: force_retry used to be disabled entirely here, which is
+                    # how suspense_v11 Ch8 sailed through with max_sim=1.0 (a plan
+                    # literally identical to a recent one). Short-novel mode keeps
+                    # the RELAXED threshold (0.92) but retains the hard retry: a
+                    # premise can justify reusing the venue/cast, never an
+                    # identical conflict/payoff/beats skeleton.
+                # Absolute ceiling: a near-identical skeleton is a planning bug in
+                # ANY mode and must never be written. Overrides force_retry=false.
+                identical_threshold = float(
+                    config["novel"].get("scene_dedupe_sim_identical", 0.97)
+                )
                 if sim.get("max_sim", 0.0) >= warn_threshold:
                     log(
                         paths,
@@ -1414,7 +1484,10 @@ def create_plan(
                     decision.setdefault("required_constraints", []).append(
                         "本章场景骨架与近期高度雷同，必须切换到不同的冲突场景/推进到新的局面，不得继续纠缠同一僵局。"
                     )
-                if force_retry and sim.get("max_sim", 0.0) >= block_threshold:
+                max_sim_val = float(sim.get("max_sim", 0.0) or 0.0)
+                if (force_retry and max_sim_val >= block_threshold) or (
+                    max_sim_val >= identical_threshold
+                ):
                     duplicate_blocked = True
                     decision.setdefault("required_constraints", []).append(
                         "硬性重规划：上一版大纲与近期场景骨架重复度过高。本章必须更换信息来源、物理场地、冲突参与者或兑现类型中的至少两项。"

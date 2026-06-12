@@ -338,6 +338,9 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
             + f"- max_chapters={max_chapters}：全书总章数上限为 {max_chapters} 章，必须在第 {max_chapters} 章或之前完结收束。\n"
             + f"- volume_plan 必须严格按 {max_chapters} 章规划：章节区间与所有大事件锚点的章号都不得超过 {max_chapters}；"
             + f"最后一个高潮/真相/代价锚点必须落在第 {max_chapters} 章或之前。禁止套用 60-80 章/多卷长篇模板。"
+            + f"\n- 卷纲必须保证每一章对核心能力/金手指的使用在「机制 / 代价 / 约束 / 解读路径」上彼此可区分；"
+            + f"若该 premise 无法支撑 {max_chapters} 次实质不同的能力使用，请主动把卷纲压缩到更少章数并相应下调高潮锚点章号，"
+            + f"宁可短而完整，不要靠重复同一套用法凑章数。"
         )
     raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7, tag="bootstrap")
     data = load_json_with_repair(client, paths, config, raw)

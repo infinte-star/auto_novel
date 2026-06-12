@@ -27,15 +27,31 @@ from typing import Any
 from config import Paths, log, read_text
 
 _INDEX_NAME = "retrieval_index.json"
+_INDEX_DIR_NAME = "retrieval_index"
+_DF_NAME = "_df.json"
 _PASSAGE_CHARS = 600
 _NGRAM = 2  # character bigrams — robust for Chinese without segmentation
 
-# Per-process cache: (mtime, parsed_index)
-_INDEX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# Per-process cache: (signature, parsed_index). The signature is a cheap proxy
+# for "has anything changed": for the legacy monolithic file it is the file
+# mtime; for the sharded layout it is (shard-dir mtime, _df.json mtime).
+_INDEX_CACHE: dict[str, tuple[Any, dict[str, Any]]] = {}
 
 
 def _index_path(paths: Paths) -> Path:
     return paths.logs_dir / _INDEX_NAME
+
+
+def _shard_dir(paths: Paths) -> Path:
+    return paths.logs_dir / _INDEX_DIR_NAME
+
+
+def _shard_path(paths: Paths, chapter_num: int) -> Path:
+    return _shard_dir(paths) / f"ch{chapter_num:04d}.json"
+
+
+def _df_path(paths: Paths) -> Path:
+    return _shard_dir(paths) / _DF_NAME
 
 
 def _tokenize(text: str) -> list[str]:
@@ -75,22 +91,15 @@ def _split_passages(text: str, size: int = _PASSAGE_CHARS) -> list[str]:
     return passages
 
 
-def index_chapter(paths: Paths, chapter_num: int, chapter_text: str) -> None:
-    """Append one chapter's passages to the on-disk index. Idempotent per chapter."""
-    if not bool_enabled(paths):
-        # cheap guard not needed; indexing is always safe & small. keep building.
-        pass
-    path = _index_path(paths)
-    try:
-        data = json.loads(read_text(path) or "{}") if path.exists() else {}
-    except Exception:
-        data = {}
-    passages: list[dict[str, Any]] = data.get("passages", [])
-    df: dict[str, int] = data.get("df", {})
-    indexed_chapters = set(data.get("chapters", []))
-    if chapter_num in indexed_chapters:
-        return
+def _passages_for_chapter(chapter_num: int, chapter_text: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build this chapter's passage records and its per-chapter df contribution.
 
+    The df contribution counts each term ONCE per passage (document frequency),
+    matching the original monolithic index build (retrieval.py legacy: df[t]+=1
+    per passage). Returned df is the increment to fold into the aggregate.
+    """
+    passages: list[dict[str, Any]] = []
+    df_inc: dict[str, int] = {}
     for idx, ptext in enumerate(_split_passages(chapter_text)):
         toks = _tokenize(ptext)
         if not toks:
@@ -99,19 +108,108 @@ def index_chapter(paths: Paths, chapter_num: int, chapter_text: str) -> None:
         for t in toks:
             tf[t] = tf.get(t, 0) + 1
         for t in tf:
-            df[t] = df.get(t, 0) + 1
+            df_inc[t] = df_inc.get(t, 0) + 1
         passages.append(
             {"chapter": chapter_num, "i": idx, "text": ptext, "tf": tf, "len": len(toks)}
         )
+    return passages, df_inc
 
+
+def index_chapter(paths: Paths, chapter_num: int, chapter_text: str) -> None:
+    """Append one chapter's passages to the on-disk index. Idempotent per chapter.
+
+    Sharded layout (avoids the legacy O(n^2) whole-file rewrite): each chapter is
+    written to logs/retrieval_index/ch{NNNN}.json (its own small file), and an
+    aggregate logs/retrieval_index/_df.json holds {df, n_docs, chapters}. Writing
+    a chapter is O(1) for the shard plus an O(vocab) rewrite of the small df file
+    — no re-serialization of the entire growing passage corpus.
+    """
+    shard_dir = _shard_dir(paths)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    # One-time migration: if a legacy monolithic index exists but no shards yet,
+    # explode it into per-chapter shards + df so old books keep their index.
+    df_path = _df_path(paths)
+    legacy = _index_path(paths)
+    if not df_path.exists() and legacy.exists():
+        try:
+            _migrate_monolithic_to_shards(paths)
+        except Exception:
+            pass
+
+    # Idempotency: a shard for this chapter already means it's indexed.
+    if _shard_path(paths, chapter_num).exists():
+        return
+
+    # Load aggregate df (small).
+    try:
+        agg = json.loads(read_text(df_path) or "{}") if df_path.exists() else {}
+    except Exception:
+        agg = {}
+    df: dict[str, int] = agg.get("df", {})
+    indexed_chapters = set(agg.get("chapters", []))
+    n_docs = int(agg.get("n_docs", 0))
+    if chapter_num in indexed_chapters:
+        return
+
+    passages, df_inc = _passages_for_chapter(chapter_num, chapter_text)
+    # Write the per-chapter shard first (so a crash leaves df un-double-counted;
+    # df is only advanced after the shard is durable).
+    shard_payload = {"chapter": chapter_num, "passages": passages}
+    _shard_path(paths, chapter_num).write_text(
+        json.dumps(shard_payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    for t, c in df_inc.items():
+        df[t] = df.get(t, 0) + c
     indexed_chapters.add(chapter_num)
-    data["passages"] = passages
-    data["df"] = df
-    data["chapters"] = sorted(indexed_chapters)
-    data["n_docs"] = len(passages)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    _INDEX_CACHE.pop(str(path), None)
+    n_docs += len(passages)
+    df_path.write_text(
+        json.dumps(
+            {"df": df, "n_docs": n_docs, "chapters": sorted(indexed_chapters)},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _INDEX_CACHE.pop(str(shard_dir), None)
+
+
+def _migrate_monolithic_to_shards(paths: Paths) -> None:
+    """Explode a legacy logs/retrieval_index.json into the sharded layout."""
+    legacy = _index_path(paths)
+    try:
+        data = json.loads(read_text(legacy) or "{}")
+    except Exception:
+        return
+    passages: list[dict[str, Any]] = data.get("passages", [])
+    if not passages:
+        return
+    shard_dir = _shard_dir(paths)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    by_chapter: dict[int, list[dict[str, Any]]] = {}
+    for p in passages:
+        ch = int(p.get("chapter", 0))
+        by_chapter.setdefault(ch, []).append(p)
+    for ch, plist in by_chapter.items():
+        sp = _shard_path(paths, ch)
+        if not sp.exists():
+            sp.write_text(
+                json.dumps({"chapter": ch, "passages": plist}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+    df_path = _df_path(paths)
+    if not df_path.exists():
+        df_path.write_text(
+            json.dumps(
+                {
+                    "df": data.get("df", {}),
+                    "n_docs": int(data.get("n_docs", len(passages))),
+                    "chapters": sorted({int(c) for c in by_chapter}),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
 
 def bool_enabled(paths: Paths) -> bool:  # noqa: D401 - tiny helper
@@ -119,6 +217,47 @@ def bool_enabled(paths: Paths) -> bool:  # noqa: D401 - tiny helper
 
 
 def _load_index(paths: Paths) -> dict[str, Any] | None:
+    """Return the merged index dict {passages, df, chapters, n_docs} or None.
+
+    Prefers the sharded layout (logs/retrieval_index/ch*.json + _df.json), merging
+    all shards into the SAME structure the legacy monolithic file produced so that
+    `retrieve`, `candidate_new_entities`, and `backfill_index` are unchanged.
+    Falls back to the legacy monolithic logs/retrieval_index.json when no shards
+    exist. Cached per-process keyed by a cheap change-signature.
+    """
+    shard_dir = _shard_dir(paths)
+    df_path = _df_path(paths)
+    if shard_dir.exists() and df_path.exists():
+        try:
+            sig: Any = (shard_dir.stat().st_mtime, df_path.stat().st_mtime)
+        except OSError:
+            sig = None
+        cache_key = str(shard_dir)
+        cached = _INDEX_CACHE.get(cache_key)
+        if cached and sig is not None and cached[0] == sig:
+            return cached[1]
+        try:
+            agg = json.loads(df_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            agg = {}
+        passages: list[dict[str, Any]] = []
+        for sp in sorted(shard_dir.glob("ch*.json")):
+            try:
+                shard = json.loads(sp.read_text(encoding="utf-8") or "{}")
+            except Exception:
+                continue
+            passages.extend(shard.get("passages", []))
+        data = {
+            "passages": passages,
+            "df": agg.get("df", {}),
+            "chapters": agg.get("chapters", []),
+            "n_docs": int(agg.get("n_docs", len(passages))),
+        }
+        if sig is not None:
+            _INDEX_CACHE[cache_key] = (sig, data)
+        return data
+
+    # Legacy monolithic fallback.
     path = _index_path(paths)
     if not path.exists():
         return None

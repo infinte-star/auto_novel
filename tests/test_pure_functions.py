@@ -22,6 +22,28 @@ from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, saf
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 
 
+def _make_paths(root):
+    """Build a Paths rooted at a temp dir (mirrors QualityDebtPatchTests)."""
+    from config import Paths
+
+    return Paths(
+        book=root / "book.md",
+        state=root / "state.md",
+        title=root / "title.txt",
+        bible=root / "memory" / "bible.md",
+        characters=root / "memory" / "characters.md",
+        timeline=root / "memory" / "timeline.md",
+        threads=root / "memory" / "threads.md",
+        volume_plan=root / "memory" / "volume_plan.md",
+        voices=root / "memory" / "voices.md",
+        voice=root / "memory" / "voice.md",
+        contract=root / "memory" / "contract.md",
+        chapters_dir=root / "chapters",
+        logs_dir=root / "logs",
+        database=root / "story_state.db",
+    )
+
+
 class NormalizeChapterTests(unittest.TestCase):
     def test_plain_prose_is_preserved(self):
         text = "第一章 开端\n\n他走进屋子，看见桌上的信。"
@@ -320,6 +342,219 @@ class PromptEnhancementTests(unittest.TestCase):
         system = _enhance_system_prompt("base system", {"api": {}, "novel": {}}, tag="", wants_json=wants_json)
         self.assertTrue(wants_json)
         self.assertIn("JSON 任务额外纪律", system)
+
+
+class BookConsistencyTests(unittest.TestCase):
+    """config.book_is_consistent decides whether the resume path can skip the
+    O(n) rebuild_book. It must be conservative: consistent only when book.md
+    demonstrably contains the latest chapter."""
+
+    def _setup(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from config import write_text
+
+        root = Path(tempfile.mkdtemp(prefix="book_consist_"))
+        paths = _make_paths(root)
+        paths.chapters_dir.mkdir(parents=True, exist_ok=True)
+        return root, paths, write_text, shutil
+
+    def test_consistent_book_skips_rebuild(self):
+        from config import book_is_consistent
+        root, paths, write_text, shutil = self._setup()
+        try:
+            ch1 = "第一章\n\n内容甲。\n"
+            ch2 = "第二章\n\n内容乙，结尾在这里。\n"
+            write_text(paths.chapters_dir / "0001.md", ch1)
+            write_text(paths.chapters_dir / "0002.md", ch2)
+            write_text(paths.book, ch1.strip() + "\n\n" + ch2.strip() + "\n")
+            self.assertTrue(book_is_consistent(paths))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_missing_latest_chapter_triggers_rebuild(self):
+        from config import book_is_consistent
+        root, paths, write_text, shutil = self._setup()
+        try:
+            ch1 = "第一章\n\n内容甲。\n"
+            ch2 = "第二章\n\n内容乙，结尾在这里。\n"
+            write_text(paths.chapters_dir / "0001.md", ch1)
+            write_text(paths.chapters_dir / "0002.md", ch2)
+            # book.md is stale: it only has chapter 1 (the latest append was lost).
+            write_text(paths.book, ch1.strip() + "\n")
+            self.assertFalse(book_is_consistent(paths))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_missing_book_file_triggers_rebuild(self):
+        from config import book_is_consistent
+        root, paths, write_text, shutil = self._setup()
+        try:
+            write_text(paths.chapters_dir / "0001.md", "第一章\n\n内容。\n")
+            self.assertFalse(book_is_consistent(paths))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_no_chapters_is_consistent(self):
+        from config import book_is_consistent
+        root, paths, write_text, shutil = self._setup()
+        try:
+            write_text(paths.book, "something\n")
+            self.assertTrue(book_is_consistent(paths))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class RetrievalShardTests(unittest.TestCase):
+    """retrieval.py sharded index must produce the same merged structure the old
+    monolithic file did, stay idempotent per chapter, and load a legacy file."""
+
+    def _setup(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        root = Path(tempfile.mkdtemp(prefix="retr_shard_"))
+        paths = _make_paths(root)
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        return root, paths, shutil
+
+    def test_index_and_merge(self):
+        import retrieval
+        root, paths, shutil = self._setup()
+        try:
+            retrieval._INDEX_CACHE.clear()
+            retrieval.index_chapter(paths, 1, "周窈走进密室，发现一枚铜钥匙。\n\n墙上有血迹。")
+            retrieval.index_chapter(paths, 2, "罗鹤在码头等待那艘货船，铜钥匙在他口袋里。")
+            data = retrieval._load_index(paths)
+            self.assertIsNotNone(data)
+            self.assertEqual(sorted(data["chapters"]), [1, 2])
+            self.assertGreater(len(data["passages"]), 0)
+            self.assertEqual(data["n_docs"], len(data["passages"]))
+            self.assertIn("df", data)
+            # Shard files exist; no monolithic file written.
+            self.assertTrue((paths.logs_dir / "retrieval_index" / "ch0001.json").exists())
+            self.assertTrue((paths.logs_dir / "retrieval_index" / "_df.json").exists())
+            self.assertFalse((paths.logs_dir / "retrieval_index.json").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_index_idempotent(self):
+        import retrieval
+        root, paths, shutil = self._setup()
+        try:
+            retrieval._INDEX_CACHE.clear()
+            retrieval.index_chapter(paths, 1, "周窈走进密室，发现一枚铜钥匙。")
+            before = retrieval._load_index(paths)
+            n_before = before["n_docs"]
+            retrieval.index_chapter(paths, 1, "完全不同的文本不应被重新索引。")
+            after = retrieval._load_index(paths)
+            self.assertEqual(after["n_docs"], n_before)
+            self.assertEqual(sorted(after["chapters"]), [1])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_retrieve_returns_old_chapter(self):
+        import retrieval
+        root, paths, shutil = self._setup()
+        try:
+            retrieval._INDEX_CACHE.clear()
+            retrieval.index_chapter(paths, 1, "铜钥匙藏在密室墙后的暗格里。")
+            for n in range(2, 9):
+                retrieval.index_chapter(paths, n, f"第{n}章无关内容，讲述别的事。")
+            hits = retrieval.retrieve(paths, "铜钥匙 密室 暗格", top_k=3, exclude_recent_chapters=3, current_chapter=8)
+            self.assertTrue(any(h["chapter"] == 1 for h in hits))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_legacy_monolithic_fallback_and_migration(self):
+        import json
+        import retrieval
+        root, paths, shutil = self._setup()
+        try:
+            retrieval._INDEX_CACHE.clear()
+            # Hand-write a legacy monolithic index (pre-shard format).
+            passages, df_inc = retrieval._passages_for_chapter(1, "旧版单体索引中的第一章文本。")
+            legacy = {
+                "passages": passages,
+                "df": df_inc,
+                "chapters": [1],
+                "n_docs": len(passages),
+            }
+            (paths.logs_dir / "retrieval_index.json").write_text(
+                json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+            )
+            # Reading with no shards present must fall back to the monolithic file.
+            data = retrieval._load_index(paths)
+            self.assertEqual(sorted(data["chapters"]), [1])
+            # Indexing a new chapter triggers migration to shards.
+            retrieval.index_chapter(paths, 2, "新版分片中的第二章。")
+            retrieval._INDEX_CACHE.clear()
+            merged = retrieval._load_index(paths)
+            self.assertEqual(sorted(merged["chapters"]), [1, 2])
+            self.assertTrue((paths.logs_dir / "retrieval_index" / "ch0001.json").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class ThreadLocalConnTests(unittest.TestCase):
+    """store.ThreadLocalConn gives each thread its own sqlite connection; db_lock
+    is now a no-op context manager."""
+
+    def test_db_lock_is_noop_contextmanager(self):
+        import store
+        with store.db_lock():
+            pass  # must enter/exit cleanly without serializing
+
+    def test_init_db_returns_threadlocal_conn(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        import store
+        if store.sqlite3 is None:
+            self.skipTest("sqlite3 unavailable")
+        root = Path(tempfile.mkdtemp(prefix="tlc_"))
+        paths = _make_paths(root)
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            conn = store.init_db(paths)
+            self.assertIsInstance(conn, store.ThreadLocalConn)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_concurrent_writes_from_threads(self):
+        import shutil
+        import tempfile
+        import threading
+        from pathlib import Path
+        import store
+        if store.sqlite3 is None:
+            self.skipTest("sqlite3 unavailable")
+        root = Path(tempfile.mkdtemp(prefix="tlc_cc_"))
+        paths = _make_paths(root)
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            conn = store.init_db(paths)
+            errors = []
+
+            def worker(base):
+                try:
+                    for i in range(10):
+                        store.db_event(conn, base + i, "story_event", {"i": i})
+                    conn.close_current()
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(b,)) for b in (0, 100, 200)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            events = store.recent_events(conn, 100)
+            self.assertEqual(len(events), 30)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

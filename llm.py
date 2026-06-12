@@ -16,8 +16,22 @@ if TYPE_CHECKING:
 
 
 _STREAM_END = object()
-_REQUEST_THROTTLE_LOCK = threading.Lock()
-_LAST_REQUEST_STARTED_AT = 0.0
+
+# Per-base_url throttle state. Each endpoint has its own lock + timestamp so
+# parallel calls to different endpoints (or even to the same endpoint with
+# different keys) don't serialize each other unnecessarily.
+_ENDPOINT_THROTTLE_LOCKS: dict[str, threading.Lock] = {}
+_ENDPOINT_LAST_STARTED_AT: dict[str, float] = {}
+_ENDPOINT_THROTTLE_META_LOCK = threading.Lock()  # guards the two dicts above
+
+
+def _get_endpoint_throttle_state(base_url: str) -> tuple[threading.Lock, str]:
+    """Return (lock, key) for the given base_url, creating if needed."""
+    with _ENDPOINT_THROTTLE_META_LOCK:
+        if base_url not in _ENDPOINT_THROTTLE_LOCKS:
+            _ENDPOINT_THROTTLE_LOCKS[base_url] = threading.Lock()
+            _ENDPOINT_LAST_STARTED_AT[base_url] = 0.0
+        return _ENDPOINT_THROTTLE_LOCKS[base_url], base_url
 
 # Tags whose LLM calls should be routed to the separate reviewer model
 # (main writer = primary model, reviewer = GPT) when a reviewer pool is
@@ -82,6 +96,15 @@ def _record_llm_call(
         line = json.dumps(record, ensure_ascii=False)
         with _METRICS_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
+            # Rotate log when it exceeds 50 MB so it doesn't grow unboundedly.
+            try:
+                if path.exists() and path.stat().st_size > 50 * 1024 * 1024:
+                    rotated = path.with_suffix(".jsonl.1")
+                    if rotated.exists():
+                        rotated.unlink()
+                    path.rename(rotated)
+            except OSError:
+                pass
             with path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except Exception:
@@ -113,14 +136,15 @@ def _throttle_request_start(paths: Paths, api: dict[str, Any]) -> None:
     interval = _configured_min_request_interval(api)
     if interval <= 0:
         return
-    global _LAST_REQUEST_STARTED_AT
-    with _REQUEST_THROTTLE_LOCK:
+    base_url = str(api.get("base_url", "default"))
+    lock, key = _get_endpoint_throttle_state(base_url)
+    with lock:
         now = time.perf_counter()
-        wait = (_LAST_REQUEST_STARTED_AT + interval) - now
+        wait = (_ENDPOINT_LAST_STARTED_AT[key] + interval) - now
         if wait > 0:
-            log(paths, f"LLM throttle sleeping {wait:.1f}s min_interval={interval:.1f}s")
+            log(paths, f"LLM throttle sleeping {wait:.1f}s min_interval={interval:.1f}s endpoint={base_url[:40]}")
             time.sleep(wait)
-        _LAST_REQUEST_STARTED_AT = time.perf_counter()
+        _ENDPOINT_LAST_STARTED_AT[key] = time.perf_counter()
 
 
 def _effective_max_tokens(api: dict[str, Any], requested: int | None) -> int:
@@ -630,7 +654,9 @@ def call_llm(
     system = _enhance_system_prompt(system, config, tag=tag, wants_json=wants_json)
     total_chars = len(system) + len(user)
     if total_chars > max_input_chars:
-        user = emergency_truncate(user, max_input_chars - len(system) - 1000)
+        truncated_to = max_input_chars - len(system) - 1000
+        log(paths, f"[WARN] emergency_truncate fired: prompt {total_chars} chars > max {max_input_chars}; truncating user to {truncated_to} chars (tag={tag})")
+        user = emergency_truncate(user, truncated_to)
     use_response_format = wants_json and bool(api.get("json_response_format", True))
     max_attempts = int(api.get("max_attempts", 6))
     salvaged_any = False

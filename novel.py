@@ -16,6 +16,7 @@ Subcommands:
     python novel.py list                     list all novels + progress + running state
     python novel.py stop <name>              kill the running process for one novel
     python novel.py restart <name>           stop + relaunch (resumes from checkpoint)
+    python novel.py stats <name>             rich quality + cost report (per-chapter heatmap)
 
 A `run <name>` process is identified by the literal marker "novel.py run <name>"
 on its command line, so stop/restart target exactly one novel and never touch
@@ -879,6 +880,47 @@ def _read_title(nd: Path, max_len: int = 20) -> str:
     return ""
 
 
+def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
+    """Read novels/<name>/logs/llm_calls.jsonl and return (ok_calls, prompt_chars, output_chars, cost).
+
+    Returns None if the file does not exist.
+    Cost formula: (prompt_chars/4)*$0.000003 + (output_chars/4)*$0.000015
+    """
+    metrics_path = nd / "logs" / "llm_calls.jsonl"
+    if not metrics_path.exists():
+        return None
+    ok_calls = 0
+    total_prompt = 0
+    total_output = 0
+    try:
+        with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("ok") is True:
+                    ok_calls += 1
+                total_prompt += int(row.get("prompt_chars") or 0)
+                total_output += int(row.get("output_chars") or 0)
+    except OSError:
+        return None
+    cost = (total_prompt / 4) * 0.000003 + (total_output / 4) * 0.000015
+    return ok_calls, total_prompt, total_output, cost
+
+
+def _fmt_chars(n: int) -> str:
+    """Format a large char count as e.g. '2.4M' or '847K'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
 def cmd_list() -> int:
     if not NOVELS_DIR.exists():
         print("[novel] no novels/ directory yet. Use `python novel.py create <name>`.")
@@ -897,77 +939,279 @@ def cmd_list() -> int:
         running = "yes" if find_novel_pids(name) else "no"
         last_log = _tail_line(nd / "logs" / "run.log")
         print(f"{name:<24} {title:<22} {chapters:>8} {chars:>10}  {running:<8} {last_log}")
+        llm_stats = _llm_call_stats(nd)
+        if llm_stats is not None:
+            ok_calls, prompt_chars, output_chars, cost = llm_stats
+            total_chars = prompt_chars + output_chars
+            cost_str = f"~${cost:.2f}"
+            print(f"  llm: {ok_calls} calls | ~{_fmt_chars(total_chars)} chars | {cost_str}")
     return 0
 
 
-def cmd_stats(name: str) -> int:
-    """Aggregate logs/llm_calls.jsonl for a novel into a per-stage summary."""
-    nd = NOVELS_DIR / name
+def _load_checkpoint_json(path: Path) -> dict | None:
+    """Load a checkpoint JSON file written by checkpoint.py:save_checkpoint.
+
+    Handles the versioned wrapper ``{"_checkpoint_version": N, "payload": {...}}``
+    as well as bare dicts (legacy or unversioned).  Returns None on any error.
+    Does NOT import from checkpoint.py to stay import-light (no openai/config chain).
+    """
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    # Versioned wrapper written by save_checkpoint
+    if "_checkpoint_version" in raw and "payload" in raw:
+        payload = raw["payload"]
+        return payload if isinstance(payload, dict) else None
+    return raw
+
+
+def _collect_chapter_quality(nd: Path) -> list[dict]:
+    """Scan logs/checkpoints/ch*/  and return a list of per-chapter quality dicts.
+
+    Each entry contains:
+      chapter      int   – chapter number (from directory name)
+      score        float | None
+      penalty      float         – style penalty (0.0 if not recorded)
+      force_accept bool          – True when quality_debt.json exists
+      gate_rejects list[str]     – gate names from quality_debt.json
+    Sorted ascending by chapter number.
+    """
+    ckpt_root = nd / "logs" / "checkpoints"
+    if not ckpt_root.exists():
+        return []
+
+    entries: list[dict] = []
+    for ch_dir in ckpt_root.iterdir():
+        if not ch_dir.is_dir():
+            continue
+        dirname = ch_dir.name  # e.g. "ch0042"
+        if not dirname.startswith("ch") or not dirname[2:].isdigit():
+            continue
+        ch_num = int(dirname[2:])
+
+        # --- quality_debt.json (force-accepted chapters) ---
+        debt = _load_checkpoint_json(ch_dir / "quality_debt.json")
+
+        # --- final_review.json (all chapters) ---
+        review = _load_checkpoint_json(ch_dir / "final_review.json")
+
+        # Extract score: prefer final_review, fall back to debt
+        score: float | None = None
+        if isinstance(review, dict):
+            try:
+                score = float(review["score"])
+            except (KeyError, TypeError, ValueError):
+                pass
+        if score is None and isinstance(debt, dict):
+            try:
+                score = float(debt["score"])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        # Extract style penalty
+        penalty = 0.0
+        if isinstance(review, dict):
+            sh = review.get("style_health")
+            if isinstance(sh, dict):
+                try:
+                    penalty = float(sh.get("penalty") or 0.0)
+                except (TypeError, ValueError):
+                    penalty = 0.0
+        if penalty == 0.0 and isinstance(debt, dict):
+            try:
+                penalty = float(debt.get("style_penalty") or 0.0)
+            except (TypeError, ValueError):
+                penalty = 0.0
+
+        # Force-accept: quality_debt.json present means the chapter was force-accepted
+        force_accept = debt is not None
+
+        # Gate rejects
+        gate_rejects: list[str] = []
+        if isinstance(debt, dict):
+            gr = debt.get("gate_rejects")
+            if isinstance(gr, list):
+                gate_rejects = [str(g) for g in gr]
+
+        entries.append({
+            "chapter": ch_num,
+            "score": score,
+            "penalty": penalty,
+            "force_accept": force_accept,
+            "gate_rejects": gate_rejects,
+        })
+
+    entries.sort(key=lambda e: e["chapter"])
+    return entries
+
+
+def _llm_tag_breakdown(nd: Path) -> list[tuple[str, int]] | None:
+    """Return [(tag, count), ...] sorted descending by count from llm_calls.jsonl.
+
+    Returns None if the file doesn't exist.
+    """
     metrics_path = nd / "logs" / "llm_calls.jsonl"
     if not metrics_path.exists():
-        print(f"[novel] no metrics yet for {name!r} ({metrics_path} missing). "
-              f"They accumulate once the novel runs with api.metrics_enabled (default on).")
-        return 0
-    by_tag: dict[str, dict[str, float]] = {}
-    totals = {"calls": 0.0, "elapsed": 0.0, "prompt": 0.0, "output": 0.0,
-              "attempts": 0.0, "salvaged": 0.0, "failed": 0.0}
+        return None
+    tag_counts: dict[str, int] = {}
     try:
-        lines = metrics_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        print(f"[novel] could not read {metrics_path}: {exc}")
+        for raw in metrics_path.open(encoding="utf-8", errors="replace"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            tag = str(row.get("tag") or "(untagged)")
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    except OSError:
+        return None
+    return sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+
+
+def cmd_stats(name: str) -> int:
+    """Rich quality + cost report for a specific novel."""
+    nd = NOVELS_DIR / name
+    if not nd.exists():
+        print(f"[novel] ERROR: novel '{name}' not found (expected {nd}).")
+        return 2
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    total_chars = _count_chars(nd / "book.md")
+    chapters_dir = nd / "chapters"
+    chapter_count = _last_chapter(chapters_dir) if chapters_dir.exists() else 0
+
+    print(f"Novel: {name}   Chapters: {chapter_count}   Total chars: {_fmt_chars(total_chars)}")
+    print("─" * 51)
+
+    # ── Per-chapter quality table ────────────────────────────────────────────
+    quality_data = _collect_chapter_quality(nd)
+
+    if not quality_data:
+        print("(no checkpoint data found — novel may not have run yet)")
+    else:
+        header_row = f" {'Ch':>4}  {'Score':>5}  {'Penalty':>7}  {'Status':<12}"
+        print(header_row)
+        print("─" * 36)
+        force_accepted_total = 0
+        scores_valid: list[float] = []
+        penalties_all: list[float] = []
+        for entry in quality_data:
+            ch = entry["chapter"]
+            score = entry["score"]
+            penalty = entry["penalty"]
+            fa = entry["force_accept"]
+            gr = entry["gate_rejects"]
+
+            score_str = f"{score:.1f}" if score is not None else "  —  "
+            penalty_str = f"{penalty:.1f}"
+
+            if gr:
+                status = f"GATE:{','.join(gr[:2])}"
+            elif fa:
+                status = "DEBT"
+            else:
+                status = "ok"
+
+            print(f" {ch:>4}  {score_str:>5}  {penalty_str:>7}  {status}")
+
+            if fa:
+                force_accepted_total += 1
+            if score is not None:
+                scores_valid.append(score)
+            penalties_all.append(penalty)
+
+        print("─" * 51)
+        avg_score = sum(scores_valid) / len(scores_valid) if scores_valid else 0.0
+        avg_penalty = sum(penalties_all) / len(penalties_all) if penalties_all else 0.0
+        total_ckpts = len(quality_data)
+        print(
+            f"Avg score: {avg_score:.1f}   "
+            f"Avg penalty: {avg_penalty:.2f}   "
+            f"Force-accepted: {force_accepted_total}/{total_ckpts}"
+        )
+
+    # ── LLM cost summary ─────────────────────────────────────────────────────
+    llm_stats = _llm_call_stats(nd)
+    if llm_stats is not None:
+        ok_calls, prompt_chars, output_chars, cost = llm_stats
+        total_llm_chars = prompt_chars + output_chars
+        print()
+        print(
+            f"LLM calls: {ok_calls:,}   "
+            f"Total chars: {_fmt_chars(total_llm_chars)}   "
+            f"Est. cost: ~${cost:.2f}"
+        )
+
+    # ── Per-tag breakdown ────────────────────────────────────────────────────
+    tag_breakdown = _llm_tag_breakdown(nd)
+    if tag_breakdown:
+        total_tag_calls = sum(c for _, c in tag_breakdown)
+        print()
+        print("Top call tags:")
+        for tag, count in tag_breakdown[:15]:
+            pct = count / total_tag_calls * 100 if total_tag_calls else 0.0
+            print(f"  {tag:<24} {count:>5}  ({pct:>5.1f}%)")
+        if len(tag_breakdown) > 15:
+            others = sum(c for _, c in tag_breakdown[15:])
+            other_pct = others / total_tag_calls * 100 if total_tag_calls else 0.0
+            print(f"  {'(other)':<24} {others:>5}  ({other_pct:>5.1f}%)")
+
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# telemetry (global cross-novel repository)
+# ----------------------------------------------------------------------------
+def cmd_telemetry_backfill() -> int:
+    """Import every novel's historical metrics/arbitrations/revise pairs into
+    telemetry/global.db. Idempotent: INSERT OR REPLACE on composite keys, so
+    re-running never duplicates rows."""
+    try:
+        import telemetry
+    except Exception as exc:
+        print(f"[novel] telemetry module unavailable: {exc}")
         return 1
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        tag = str(row.get("tag") or "(untagged)")
-        agg = by_tag.setdefault(tag, {"calls": 0.0, "elapsed": 0.0, "prompt": 0.0,
-                                      "output": 0.0, "attempts": 0.0,
-                                      "salvaged": 0.0, "failed": 0.0})
-        elapsed = float(row.get("elapsed") or 0.0)
-        prompt = float(row.get("prompt_chars") or 0.0)
-        output = float(row.get("output_chars") or 0.0)
-        attempts = float(row.get("attempts") or 1.0)
-        salvaged = 1.0 if row.get("salvaged") else 0.0
-        failed = 0.0 if row.get("ok", True) else 1.0
-        for bucket in (agg, totals):
-            bucket["calls"] += 1
-            bucket["elapsed"] += elapsed
-            bucket["prompt"] += prompt
-            bucket["output"] += output
-            bucket["attempts"] += attempts
-            bucket["salvaged"] += salvaged
-            bucket["failed"] += failed
-
-    if totals["calls"] == 0:
-        print(f"[novel] {metrics_path} has no parseable records yet.")
+    if not NOVELS_DIR.exists():
+        print("[novel] no novels/ directory yet; nothing to backfill.")
         return 0
+    novels = sorted(p for p in NOVELS_DIR.iterdir() if p.is_dir() and (p / "config.yaml").exists())
+    if not novels:
+        print("[novel] no novels found under novels/.")
+        return 0
+    grand = {"chapter_metrics": 0, "events": 0, "strategy_outcomes": 0, "revise_pairs": 0}
+    print(f"{'NAME':<24} {'METRICS':>8} {'EVENTS':>8} {'STRATEGY':>9} {'REVISE':>7}")
+    print("-" * 60)
+    for nd in novels:
+        try:
+            counts = telemetry.backfill_novel(nd)
+        except Exception as exc:
+            print(f"{nd.name:<24} backfill failed: {exc}")
+            continue
+        print(f"{nd.name:<24} {counts['chapter_metrics']:>8} {counts['events']:>8}"
+              f" {counts['strategy_outcomes']:>9} {counts['revise_pairs']:>7}")
+        for k in grand:
+            grand[k] += counts.get(k, 0)
+    print("-" * 60)
+    print(f"{'TOTAL':<24} {grand['chapter_metrics']:>8} {grand['events']:>8}"
+          f" {grand['strategy_outcomes']:>9} {grand['revise_pairs']:>7}")
+    print(f"[novel] global DB: {telemetry.TELEMETRY_DB}")
+    return 0
 
-    print(f"[novel] LLM call stats for {name!r}  (source: {metrics_path})")
-    header = (f"{'STAGE/TAG':<28} {'CALLS':>7} {'AVG_s':>7} {'TOT_s':>9} "
-              f"{'AVG_OUT':>8} {'RETRY%':>7} {'SALV%':>6} {'FAIL%':>6}")
-    print(header)
-    print("-" * len(header))
 
-    def _emit(label: str, agg: dict[str, float]) -> None:
-        calls = agg["calls"] or 1.0
-        avg_s = agg["elapsed"] / calls
-        avg_out = agg["output"] / calls
-        # attempts includes the first try; retry% = extra attempts per call.
-        retry_pct = max(0.0, (agg["attempts"] / calls - 1.0)) * 100.0
-        salv_pct = agg["salvaged"] / calls * 100.0
-        fail_pct = agg["failed"] / calls * 100.0
-        print(f"{label:<28} {int(agg['calls']):>7} {avg_s:>7.1f} {agg['elapsed']:>9.0f} "
-              f"{int(avg_out):>8} {retry_pct:>6.0f}% {salv_pct:>5.0f}% {fail_pct:>5.0f}%")
-
-    for tag in sorted(by_tag, key=lambda t: by_tag[t]["elapsed"], reverse=True):
-        _emit(tag, by_tag[tag])
-    print("-" * len(header))
-    _emit("TOTAL", totals)
+def cmd_telemetry_stats(genre: str | None) -> int:
+    try:
+        import telemetry
+    except Exception as exc:
+        print(f"[novel] telemetry module unavailable: {exc}")
+        return 1
+    print(telemetry.stats(genre=genre))
     return 0
 
 
@@ -1028,8 +1272,24 @@ def main() -> int:
 
     sub.add_parser("list", help="list all novels and their progress")
 
-    p_stats = sub.add_parser("stats", help="aggregate per-stage LLM call metrics for a novel")
+    p_stats = sub.add_parser("stats", help="rich quality + cost report for a novel (per-chapter scores, penalties, LLM cost)")
     p_stats.add_argument("name")
+
+    p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
+    p_compare.add_argument("name_a")
+    p_compare.add_argument("name_b")
+
+    p_ablate = sub.add_parser("ablate", help="scaffold a chapter-capped copy of a novel with ONE config key flipped")
+    p_ablate.add_argument("name")
+    p_ablate.add_argument("--flip", required=True, help="config key to flip, e.g. style_cross_repeat_enabled")
+    p_ablate.add_argument("--set", dest="set_value", default=None, help="explicit new value (required for non-boolean keys)")
+    p_ablate.add_argument("--chapters", type=int, default=8, help="max_chapters cap for the ablation run (default 8)")
+
+    p_telemetry = sub.add_parser("telemetry", help="global cross-novel telemetry repository")
+    telemetry_sub = p_telemetry.add_subparsers(dest="telemetry_command", required=True)
+    telemetry_sub.add_parser("backfill", help="import all novels' historical data into telemetry/global.db (idempotent)")
+    p_tel_stats = telemetry_sub.add_parser("stats", help="show cross-book strategy win-rates and totals")
+    p_tel_stats.add_argument("--genre", default=None, help="filter by genre bucket")
 
     p_stop = sub.add_parser("stop", help="kill the running process for a novel")
     p_stop.add_argument("name")
@@ -1067,6 +1327,17 @@ def main() -> int:
         return cmd_list()
     if args.command == "stats":
         return cmd_stats(args.name)
+    if args.command == "compare":
+        from compare import cmd_compare
+        return cmd_compare(args.name_a, args.name_b)
+    if args.command == "ablate":
+        from compare import cmd_ablate
+        return cmd_ablate(args.name, flip_key=args.flip, set_value=args.set_value, chapters=args.chapters)
+    if args.command == "telemetry":
+        if args.telemetry_command == "backfill":
+            return cmd_telemetry_backfill()
+        if args.telemetry_command == "stats":
+            return cmd_telemetry_stats(genre=args.genre)
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

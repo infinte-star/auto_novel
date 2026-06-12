@@ -32,6 +32,8 @@ python novel.py stop <name>              # kill ONLY this novel's process (token
 python novel.py restart <name>           # stop + relaunch (resumes from checkpoint)
 python novel.py script --input PATH      # convert ANY novel text file -> 短剧 screenplay (standalone)
 python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/<name>/
+python novel.py compare <a> <b>          # deterministic side-by-side report (scores/penalties/fossils/cost/config diff) -> experiments/
+python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped
 ```
 
 How it works (no engine changes — pure scaffolding around the existing pipeline):
@@ -64,7 +66,7 @@ python novel.py list                   # progress + running state for all novels
 python novel.py stop|restart <name>    # per-novel process control
 ```
 
-There is no test suite, lint config, or build step.
+There is no lint config or build step. Tests: `python -m unittest discover tests` (pure-function tests only, no LLM).
 
 ## Configuration
 
@@ -110,7 +112,7 @@ create_plan → validate_plan_continuity → write_chapter_with_candidates
 Critical invariant in `pipeline.py:413-422`: `chapter_completed.json` must be written **synchronously** before submitting the finalize background task. If left for the bg task, the main loop's resume check would re-enter `Resuming partially indexed Ch{n}` and resubmit on every iteration, leaking threads and memory.
 
 ### Planning (`planning.py:create_plan`)
-1. `generate_candidate_plans` — N parallel candidates, each forced into a different strategy (`scene-driven`, `character-driven`, `thread-driven`, `institutional`, `reversal`, `pressure-payoff`) selected by an epsilon-greedy bandit over historical `plan_arbitration` events
+1. `generate_candidate_plans` — N parallel candidates, each forced into a different strategy (`scene-driven`, `character-driven`, `thread-driven`, `institutional`, `reversal`, `pressure-payoff`) selected by a bandit over historical `plan_arbitration` events. Default `strategy_bandit_mode: thompson` (Beta-posterior sampling on arbiter win-rates, with `strategy_bandit_explore_frac` forced exploration); `epsilon` keeps the legacy epsilon-greedy for ablation. Candidates whose scene skeleton is ≥ `scene_dedupe_candidate_block` (0.85) similar to a recently selected plan are dropped pre-review (unless all would be dropped)
 2. Optional `screen_candidates` (skipped when `plan_skip_screen: true`)
 3. `review_candidate_plans` — fused 6-axis review (world/character/rhythm/payoff/foreshadowing/reader) per candidate, one LLM call expanded into 6 legacy reports via `_explode_fused_axes`. Toggle with `fused_plan_review` (true) — the legacy 6-parallel-calls path is still in the codebase
 4. `arbitrate_plan` — picks `selected_index` and emits a `merged_plan` plus `required_constraints`
@@ -138,9 +140,23 @@ to catch its own degeneration.
   into the next chapter's writer prompt. Gated by `style_health_enabled`.
 - **`quality.py:scene_similarity(plan, recent_plans)`** — Jaccard similarity of a
   plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent selected
-  plans. `planning.py:create_plan` warns and appends `required_constraints` when
-  similarity exceeds `scene_dedupe_sim_warn`, stopping the engine from endlessly
-  slicing one micro-scene. Gated by `scene_dedupe_enabled`.
+  plans. Three escalation levels in `planning.py:create_plan`: WARN appends
+  `required_constraints` at `scene_dedupe_sim_warn`; BLOCK forces a plan retry at
+  `scene_dedupe_sim_block` (relaxed to `scene_dedupe_short_novel_block` in
+  chapter-capped mode, but no longer disabled there); `scene_dedupe_sim_identical`
+  (0.97) is an absolute ceiling that forces retry in EVERY mode (v11 Ch8 shipped a
+  max_sim=1.0 plan when short-novel mode disabled the retry). Candidates are also
+  pre-filtered at generation time (`scene_dedupe_candidate_block`).
+  Gated by `scene_dedupe_enabled`.
+- **`quality.py:cross_chapter_repetition`** — detects signature clauses reused
+  verbatim across chapters. Returns a `level`: `advise` (penalty + avoid-list
+  directive) or `reject` when fossils ≥ `style_cross_repeat_reject_count` (8).
+  A `reject` makes `review_chapter` mark the report `accepted=False` with a
+  structured `gate_rejects` entry; `pipeline._classify_replan_failure` routes any
+  `gate_rejects` straight to STRUCTURAL replan (never wording patches), and
+  `_build_replan_feedback` injects the concrete fossil clauses as hard avoid
+  evidence into the new plan. Rationale: v11 carried fossils 9–25 for 6 straight
+  chapters on advisory directives alone and never recovered.
 - **`retrieval.py`** — dependency-free TF-IDF char-bigram RAG (no embeddings — the
   only dependency is `openai`). `index_chapter` is called idempotently from
   `save_chapter` and writes `logs/retrieval_index.json`; `retrieval_block` builds
@@ -162,10 +178,26 @@ to catch its own degeneration.
   degraded prose became "the book's voice."
 
 ### Adaptive cost control (`planning.py`)
-- `_effective_candidate_count` downshifts the number of candidate plans (overriding
-  `candidate_plans`) once quality is stably high — min score ≥ `adaptive_downshift_score`
-  over an `adaptive_downshift_window`-chapter window, after `adaptive_downshift_warmup`
-  chapters. Gated by `adaptive_downshift_enabled`.
+- `_effective_candidate_count` is bidirectional: RISK UPSHIFT (checked first, from
+  Ch3, no warmup) restores full candidate breadth when the last
+  `risk_upshift_window` chapters show a score below `risk_upshift_score_floor` or a
+  style penalty ≥ `risk_upshift_style_penalty` — collapse recovery is when plan
+  diversity pays. STABLE DOWNSHIFT then drops one candidate once quality is stably
+  ≥ `adaptive_downshift_score` over `adaptive_downshift_window` chapters after
+  `adaptive_downshift_warmup`. Gated by `adaptive_downshift_enabled`.
+
+### Experiment harness (`compare.py`)
+- `novel.py compare <a> <b>` — deterministic, zero-LLM side-by-side report
+  (per-chapter scores/style penalties, force-accepts, quality-debt/gate-reject
+  events, fossil warnings, scene-dedupe hits, LLM cost + planning share, non-secret
+  config diff, heuristic verdict). Saved to `experiments/<a>_vs_<b>.md`. Calibrated
+  against known ground truth: it must judge v10 over v11.
+- `novel.py ablate <name> --flip <key> [--set V] [--chapters N]` — scaffolds
+  `novels/<name>__ablate_<key>/` with the same prompt, ONE config key flipped, and
+  `max_chapters` capped (default 8). Run it like any novel, then `compare` it
+  against the source. Metadata saved under `experiments/ablate_*.json`. Every
+  engine change should carry an ablation report instead of a hand-compared full
+  rerun.
 
 ### Memory layers (`memory.py`)
 Two distinct context builders feed different LLM calls:

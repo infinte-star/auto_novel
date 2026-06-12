@@ -21,7 +21,7 @@ from config import (
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, contract_block, contract_capsule, memory_context, writing_memory_context
 from planning import plan_score
-from store import JsonStoryStore, db_event, db_lock, recent_quality_feedback, store_causal_links, upsert_reader_promise
+from store import db_event, db_lock, recent_quality_feedback, store_causal_links, upsert_reader_promise
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -1036,6 +1036,30 @@ def write_chapter(
             f"当与通用准则冲突时，以这些指令为准。\n"
             f"{json.dumps(directives, ensure_ascii=False, indent=2)}\n"
         )
+    # Used-element avoid-list (P0 anti-collapse): the writer otherwise re-invents
+    # the same concrete action/evidence every chapter ("祝寒的右手在口袋里握了握"
+    # surfaced as a fossil in 5 chapters of suspense_v11). Surface what prior
+    # chapters already leaned on so the writer varies the wording/object rather
+    # than producing a near-verbatim repeat that only cross_repeat catches later.
+    if bool(config["novel"].get("used_element_ledger_enabled", True)):
+        try:
+            from planning import used_element_ledger
+
+            led = used_element_ledger(
+                conn, config, chapter_num,
+                lookback=int(config["novel"].get("scene_dedupe_window", 8)),
+            )
+            if led.get("device_usage") or led.get("evidence"):
+                carryover_block += (
+                    "\n## 前文已反复使用的金手指用法 / 物证（避免复读化石句）\n"
+                    "以下能力使用方式与物证在前几章已反复出现。本章除非剧情确需追踪同一物件，"
+                    "否则不要再用相同的措辞重演同一个动作或围绕同一物证重复同一结论——"
+                    "换一个具体物证、换一种能力使用的写法、或推进到新的信息增量。\n"
+                    f"{json.dumps(led, ensure_ascii=False)}\n"
+                )
+        except Exception as exc:
+            from config import log as _log
+            _log(paths, f"used_element_ledger (writer) failed (non-fatal) Ch{chapter_num}: {exc}")
     # Retrieval-augmented context: surface specific older facts the layered
     # memory summaries have compressed away, so long-range names/numbers/places
     # stay consistent.
@@ -1259,15 +1283,12 @@ def extract_events(
     # 否则同一条伏笔会被反复登记成几十个不同 id，灌爆规划提示（伏笔台账爆炸）。
     open_threads_block = ""
     try:
-        if isinstance(conn, JsonStoryStore):
-            rows = []
-        else:
-            with db_lock():
-                rows = conn.execute(
-                    """SELECT id, description, status, thread_type FROM open_threads
-                       WHERE status='open'
-                       ORDER BY updated_chapter DESC LIMIT 40""",
-                ).fetchall()
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, status, thread_type FROM open_threads
+                   WHERE status='open'
+                   ORDER BY updated_chapter DESC LIMIT 40""",
+            ).fetchall()
         if rows:
             lines = [
                 f"- id={r['id']} | {r['thread_type']} | {(r['description'] or '')[:60]}"
@@ -1304,33 +1325,27 @@ def update_structured_state(
     for entity in extraction.get("entities", []):
         entity_type = str(entity.get("entity_type", "unknown"))
         name = str(entity.get("name", "unknown"))
-        if isinstance(conn, JsonStoryStore):
-            state = conn.get_entity_state(entity_type, name)
-        else:
-            with db_lock():
-                old = conn.execute(
-                    "SELECT state_json FROM entities WHERE entity_type=? AND name=?",
-                    (entity_type, name),
-                ).fetchone()
-            state = json.loads(old["state_json"]) if old else {}
+        with db_lock():
+            old = conn.execute(
+                "SELECT state_json FROM entities WHERE entity_type=? AND name=?",
+                (entity_type, name),
+            ).fetchone()
+        state = json.loads(old["state_json"]) if old else {}
         patch = entity.get("state_patch") or {}
         if isinstance(patch, dict):
             state.update(patch)
         else:
             state["note"] = str(patch)
-        if isinstance(conn, JsonStoryStore):
-            conn.upsert_entity(entity_type, name, state, chapter_num)
-        else:
-            with db_lock():
-                conn.execute(
-                    """
-                    INSERT INTO entities(entity_type, name, state_json, updated_chapter)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(entity_type, name)
-                    DO UPDATE SET state_json=excluded.state_json, updated_chapter=excluded.updated_chapter
-                    """,
-                    (entity_type, name, json.dumps(state, ensure_ascii=False), chapter_num),
-                )
+        with db_lock():
+            conn.execute(
+                """
+                INSERT INTO entities(entity_type, name, state_json, updated_chapter)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(entity_type, name)
+                DO UPDATE SET state_json=excluded.state_json, updated_chapter=excluded.updated_chapter
+                """,
+                (entity_type, name, json.dumps(state, ensure_ascii=False), chapter_num),
+            )
 
     for thread in extraction.get("threads", []):
         thread_id = str(thread.get("id") or f"ch{chapter_num}-{abs(hash(json.dumps(thread, ensure_ascii=False))) % 100000}")
@@ -1339,11 +1354,8 @@ def update_structured_state(
             promise["id"] = thread_id
             promise.setdefault("opened_chapter", thread.get("introduced_chapter", chapter_num))
             upsert_reader_promise(conn, chapter_num, promise)
-        if isinstance(conn, JsonStoryStore):
-            conn.upsert_thread(thread_id, thread, chapter_num)
-        else:
-            with db_lock():
-                conn.execute(
+        with db_lock():
+            conn.execute(
                     """
                     INSERT INTO open_threads(id, description, status, thread_type, introduced_chapter, due_chapter, updated_chapter, payload_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1390,53 +1402,50 @@ def update_structured_state(
         "style_penalty": _sh.get("penalty"),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
-    if isinstance(conn, JsonStoryStore):
-        conn.upsert_metrics(chapter_num, metrics_row)
-    else:
-        with db_lock():
-            conn.execute(
-                """
-                INSERT INTO chapter_metrics(
-                    chapter, title, score, readthrough_score, hook_score, payoff_score,
-                    novelty_score, prose_score, continuity_score, plan_score, payoff_type, conflict_type, tension,
-                    novelty, hook_strength, emotional_tone, accepted, em_dash_per_kchar, style_penalty, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chapter) DO UPDATE SET
-                    title=excluded.title, score=excluded.score,
-                    readthrough_score=excluded.readthrough_score, hook_score=excluded.hook_score,
-                    payoff_score=excluded.payoff_score, novelty_score=excluded.novelty_score,
-                    prose_score=excluded.prose_score, continuity_score=excluded.continuity_score,
-                    plan_score=excluded.plan_score,
-                    payoff_type=excluded.payoff_type, conflict_type=excluded.conflict_type,
-                    tension=excluded.tension, novelty=excluded.novelty, hook_strength=excluded.hook_strength,
-                    emotional_tone=excluded.emotional_tone, accepted=excluded.accepted,
-                    em_dash_per_kchar=excluded.em_dash_per_kchar, style_penalty=excluded.style_penalty
-                """,
-                (
-                    metrics_row["chapter"],
-                    metrics_row["title"],
-                    metrics_row["score"],
-                    metrics_row["readthrough_score"],
-                    metrics_row["hook_score"],
-                    metrics_row["payoff_score"],
-                    metrics_row["novelty_score"],
-                    metrics_row["prose_score"],
-                    metrics_row["continuity_score"],
-                    metrics_row["plan_score"],
-                    metrics_row["payoff_type"],
-                    metrics_row["conflict_type"],
-                    metrics_row["tension"],
-                    metrics_row["novelty"],
-                    metrics_row["hook_strength"],
-                    metrics_row["emotional_tone"],
-                    metrics_row["accepted"],
-                    metrics_row["em_dash_per_kchar"],
-                    metrics_row["style_penalty"],
-                    metrics_row["created_at"],
-                ),
+    with db_lock():
+        conn.execute(
+            """
+            INSERT INTO chapter_metrics(
+                chapter, title, score, readthrough_score, hook_score, payoff_score,
+                novelty_score, prose_score, continuity_score, plan_score, payoff_type, conflict_type, tension,
+                novelty, hook_strength, emotional_tone, accepted, em_dash_per_kchar, style_penalty, created_at
             )
-            conn.commit()
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chapter) DO UPDATE SET
+                title=excluded.title, score=excluded.score,
+                readthrough_score=excluded.readthrough_score, hook_score=excluded.hook_score,
+                payoff_score=excluded.payoff_score, novelty_score=excluded.novelty_score,
+                prose_score=excluded.prose_score, continuity_score=excluded.continuity_score,
+                plan_score=excluded.plan_score,
+                payoff_type=excluded.payoff_type, conflict_type=excluded.conflict_type,
+                tension=excluded.tension, novelty=excluded.novelty, hook_strength=excluded.hook_strength,
+                emotional_tone=excluded.emotional_tone, accepted=excluded.accepted,
+                em_dash_per_kchar=excluded.em_dash_per_kchar, style_penalty=excluded.style_penalty
+            """,
+            (
+                metrics_row["chapter"],
+                metrics_row["title"],
+                metrics_row["score"],
+                metrics_row["readthrough_score"],
+                metrics_row["hook_score"],
+                metrics_row["payoff_score"],
+                metrics_row["novelty_score"],
+                metrics_row["prose_score"],
+                metrics_row["continuity_score"],
+                metrics_row["plan_score"],
+                metrics_row["payoff_type"],
+                metrics_row["conflict_type"],
+                metrics_row["tension"],
+                metrics_row["novelty"],
+                metrics_row["hook_strength"],
+                metrics_row["emotional_tone"],
+                metrics_row["accepted"],
+                metrics_row["em_dash_per_kchar"],
+                metrics_row["style_penalty"],
+                metrics_row["created_at"],
+            ),
+        )
+        conn.commit()
 
     updates = extraction.get("memory_updates") or {}
     append_memory(paths.bible, chapter_num, updates.get("bible") or [])

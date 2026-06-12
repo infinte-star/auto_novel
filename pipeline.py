@@ -20,6 +20,7 @@ from config import (
     count_chars,
     ensure_project,
     find_last_chapter,
+    book_is_consistent,
     get_paths,
     is_final_chapter,
     load_config,
@@ -33,10 +34,11 @@ from config import (
 from llm import LLMClientPool
 from memory import bootstrap, cacheable_prefix, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
 from planning import create_plan
-from review import adaptive_replan, anchor_completion_gate, cold_reader_review, macro_progress_check, pack_review, review_chapter, should_replan, stage_review
+from review import adaptive_replan, anchor_completion_gate, horizon_review, review_chapter, should_replan, stage_review
 from store import db_event, init_db, validate_plan_continuity
 from writing import extract_events, revise_chapter, save_chapter, update_state_file, update_structured_state, write_chapter
 from writing import apply_review_patches
+import telemetry
 
 
 class BackgroundTasks:
@@ -47,8 +49,9 @@ class BackgroundTasks:
     them. Exceptions are logged but do not crash the main loop.
     """
 
-    def __init__(self, paths: Paths) -> None:
+    def __init__(self, paths: Paths, conn: Any = None) -> None:
         self.paths = paths
+        self.conn = conn
         self.lock = threading.Lock()
         self.tasks: list[tuple[str, threading.Thread, list[Exception]]] = []
 
@@ -61,6 +64,16 @@ class BackgroundTasks:
             except Exception as exc:
                 errors.append(exc)
                 log(self.paths, f"Background task {label} failed: {exc}")
+            finally:
+                # Each worker thread opened its own sqlite3 connection (via
+                # ThreadLocalConn) on first DB access; close it on thread exit so
+                # the many short-lived finalize threads don't leak connections.
+                conn = self.conn
+                if conn is not None and hasattr(conn, "close_current"):
+                    try:
+                        conn.close_current()
+                    except Exception:
+                        pass
 
         with self.lock:
             for existing_label, existing_thread, _ in self.tasks:
@@ -110,7 +123,12 @@ class BackgroundTasks:
 
     def prune_done(self) -> None:
         with self.lock:
-            self.tasks = [(l, t, e) for (l, t, e) in self.tasks if t.is_alive()]
+            alive = [(l, t, e) for (l, t, e) in self.tasks if t.is_alive()]
+            done = [(l, t, e) for (l, t, e) in self.tasks if not t.is_alive()]
+            # Keep only the most-recent 60 completed tasks so wait_label can still
+            # find barriers from the immediately prior chapter, but the list doesn't
+            # grow to thousands of entries over a long novel.
+            self.tasks = alive + done[-60:]
 
 
 def write_chapter_with_candidates(
@@ -125,6 +143,7 @@ def write_chapter_with_candidates(
     cached_memory: str | None = None,
     num_candidates_override: int | None = None,
     base_temp_override: float | None = None,
+    chapter_aux_cache: dict | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate N candidate chapter drafts in parallel, review each, keep the best.
 
@@ -180,10 +199,21 @@ def write_chapter_with_candidates(
         log(paths, f"Only 1/{n} valid draft for Ch{chapter_num} idx={idx}; skipping comparative review")
         return text, None
 
+    # Pre-build review auxiliary context once; all candidate reviews share it.
+    # Reuse caller-provided aux cache if available; build one only if not.
+    if chapter_aux_cache is not None:
+        _aux = chapter_aux_cache
+    else:
+        try:
+            from review import build_chapter_aux_cache
+            _aux = build_chapter_aux_cache(paths, conn, config, chapter_num)
+        except Exception:
+            _aux = None
+
     def review_one(item: tuple[int, str]) -> tuple[int, str, dict[str, Any]]:
         idx, text = item
         try:
-            report = review_chapter(client, paths, conn, config, chapter_num, plan, text, tail, cached_memory=cached_memory)
+            report = review_chapter(client, paths, conn, config, chapter_num, plan, text, tail, cached_memory=cached_memory, chapter_aux_cache=_aux)
         except Exception as exc:
             log(paths, f"Candidate draft review idx={idx} failed: {exc}")
             report = {"score": 0, "accepted": False}
@@ -275,6 +305,29 @@ def _build_replan_feedback(review: dict[str, Any]) -> str:
     mismatch = review.get("style_audit_mismatch")
     if mismatch:
         lines.append("- 注意：上一版评审低报了文体问题，实际碎片化远比它自报严重，务必正面修复。")
+    # Deterministic gate-reject evidence: concrete fossil clauses / overlap
+    # metrics measured against the actual prior chapters. This is the strongest
+    # signal available — it tells the new plan exactly which sentences and
+    # scene shapes are forbidden, instead of a vague "be less repetitive".
+    for g in (review.get("gate_rejects") or [])[:3]:
+        if not isinstance(g, dict):
+            continue
+        gate = str(g.get("gate", "?"))
+        ev = g.get("evidence") or {}
+        if gate == "cross_chapter_repetition":
+            examples = "；".join(str(e) for e in (ev.get("examples") or [])[:5])
+            lines.append(
+                f"- 质量门作废（文体化石复读，{ev.get('fossils')} 处）：以下句子/比喻已在多章重复，"
+                f"新稿绝对禁止出现近似表达：{examples}"
+            )
+        elif gate == "adjacent_repetition":
+            m = ev.get("metrics") or {}
+            lines.append(
+                f"- 质量门作废（逐字复述上一章，clause_overlap={m.get('clause_overlap')}）："
+                "新稿必须从上一章结尾之后的【新】事件写起，上一章场景至多一句带过。"
+            )
+        for d in (g.get("directives") or [])[:2]:
+            lines.append(f"- 质量门指令：{str(d)[:160]}")
     return "\n".join(lines) if lines else ""
 
 
@@ -338,6 +391,14 @@ def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> 
     Returns (kind, reason) where kind is "local" or "structural".
     """
     cfg = config["novel"]
+    # Deterministic gate rejects (cross-chapter fossil collapse, adjacent
+    # re-narration) are ALWAYS structural: the draft itself is a write-off and
+    # wording-level patches measurably cannot fix it. Checked first so no other
+    # heuristic can downgrade it to "local".
+    grs = review.get("gate_rejects") or []
+    if grs:
+        names = [str(g.get("gate", "?")) for g in grs if isinstance(g, dict)]
+        return "structural", f"确定性质量门作废本稿（{', '.join(names[:3])}）—必须重做，不可修补"
     # Per-dimension scores; count how many fell materially below threshold.
     threshold = float(cfg.get("quality_threshold", 8.0))
     dims = {
@@ -400,6 +461,65 @@ def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> 
 
 
 
+def _build_writer_tail(paths: Paths, config: dict[str, Any], chapter_num: int) -> str:
+    """Return the previous-chapter tail for the writer prompt, sanitized (O3).
+
+    Repetition is self-reinforcing: when a force-accepted low-score chapter
+    (often itself a near-verbatim re-narration) becomes the next chapter's
+    "上章结尾" context, the writer's most probable continuation is more of the
+    same — observed as suspense_v11's 5-chapter death spiral (5.5/5.5/5.5/3.5/4.5).
+    When the previous chapter was force-accepted below the floor, anchor the
+    tail on the last GOOD chapter's ending instead and reduce the poisoned
+    chapters to factual one-line event summaries (their plot still happened and
+    must not be re-dramatized; their prose must not be imitated).
+    """
+    tail_chars = int(config["novel"]["recent_tail_chars"])
+    raw_tail = tail_text(paths.book, tail_chars)
+    if chapter_num <= 1 or not bool(config["novel"].get("tail_sanitize_enabled", True)):
+        return raw_tail
+    floor = float(config["novel"].get("tail_sanitize_score_floor", 6.0))
+    prev = chapter_num - 1
+    prev_debt = load_checkpoint(paths, prev, "quality_debt.json")
+    if not (isinstance(prev_debt, dict) and safe_score(prev_debt.get("score", 10)) < floor):
+        return raw_tail
+    good: int | None = None
+    skipped: list[int] = []
+    for ch in range(prev, 0, -1):
+        d = load_checkpoint(paths, ch, "quality_debt.json")
+        if isinstance(d, dict) and safe_score(d.get("score", 10)) < floor:
+            skipped.append(ch)
+            continue
+        good = ch
+        break
+    if good is None or not skipped:
+        return raw_tail
+    good_text = read_text(chapter_path(paths, good))
+    if not good_text.strip():
+        return raw_tail
+    summaries: list[str] = []
+    for ch in sorted(skipped):
+        extraction = load_checkpoint(paths, ch, "extraction.json") or {}
+        title = str(extraction.get("title") or f"Ch{ch}")
+        evs = [
+            str(e.get("summary", "")).strip()
+            for e in (extraction.get("events") or [])
+            if isinstance(e, dict) and str(e.get("summary", "")).strip()
+        ][:3]
+        summaries.append(f"- 第{ch}章「{title}」：" + ("；".join(evs) if evs else "（无事件摘要）"))
+    log(
+        paths,
+        f"Tail sanitized for Ch{chapter_num}: previous chapter(s) {sorted(skipped)} were "
+        f"force-accepted below {floor}; anchoring on Ch{good} ending + factual summaries.",
+    )
+    return (
+        good_text[-tail_chars:]
+        + f"\n\n【续写衔接说明：以上是第{good}章结尾，仅作文风与场景参照。"
+        f"其后第{min(skipped)}–{max(skipped)}章质量不达标，不提供原文，只给事实梗概——"
+        "这些事件【已经发生】，本章严禁重演或复述它们，只能在其结果之上推进全新剧情：】\n"
+        + "\n".join(summaries)
+    )
+
+
 def generate_one_chapter(
     client: Any,
     paths: Paths,
@@ -414,14 +534,13 @@ def generate_one_chapter(
         # are durable, so memory_context sees current metrics/threads/entities.
         background.wait_label(f"chapter_finalize_ch{chapter_num - 1}")
         prev = chapter_num - 1
-        pack_every = int(config["novel"].get("pack_review_every", 10))
+        cold_every = int(config["novel"].get("cold_reader_every", 10))
         if (
             bool(config["novel"].get("pack_review_barrier", True))
-            and bool(config["novel"].get("pack_review_enabled", True))
-            and pack_every > 0
-            and prev % pack_every == 0
+            and cold_every > 0
+            and prev % cold_every == 0
         ):
-            background.wait_label(f"pack_review_ch{prev}")
+            background.wait_label(f"horizon_review_ch{prev}")
         stage_every = int(config["novel"].get("stage_review_every", 20))
         if (
             bool(config["novel"].get("stage_review_barrier", True))
@@ -433,10 +552,17 @@ def generate_one_chapter(
             # If a prefetch task ran for this chapter, ensure its checkpoint is
             # flushed before create_plan tries to resume from it.
             background.wait_label(f"prefetch_plan_ch{chapter_num}")
-    tail = tail_text(paths.book, int(config["novel"]["recent_tail_chars"]))
+    tail = _build_writer_tail(paths, config, chapter_num)
     cached_memory = memory_context(paths, conn, config)
     # Smaller context for write/revise/review hot path to reduce prefill time.
     writing_memory = writing_memory_context(paths, conn, config)
+    # Build review auxiliary context once per chapter so all review_chapter
+    # calls (main loop + local_fix) share pre-fetched DB/file results.
+    try:
+        from review import build_chapter_aux_cache
+        _chapter_aux: dict | None = build_chapter_aux_cache(paths, conn, config, chapter_num)
+    except Exception:
+        _chapter_aux = None
     final_payload = load_checkpoint(paths, chapter_num, "validated_plan.json")
     if isinstance(final_payload, dict) and final_payload.get("plan") and final_payload.get("decision"):
         log(paths, f"Resuming validated plan Ch{chapter_num}")
@@ -476,14 +602,67 @@ def generate_one_chapter(
     else:
         log(paths, f"Writing Ch{chapter_num}: {plan.get('title', '')}")
         chapter, candidate_review = write_chapter_with_candidates(
-            client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=writing_memory
+            client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=writing_memory,
+            chapter_aux_cache=_chapter_aux,
         )
+        # O1: adjacent-duplicate draft gate. A draft that re-narrates the previous
+        # chapter near-verbatim (observed: clause overlap 0.33-0.81 on the worst
+        # force-accepted chapters vs 0.00-0.07 healthy) is a write-off — review
+        # patches cannot fix "the whole scene already happened". Regenerate ONCE
+        # with an explicit do-not-repeat constraint before entering the review
+        # loop; repetition is self-reinforcing, so catching it pre-review is the
+        # cheapest point. The review-side cap/reject still backstops this.
+        if bool(config["novel"].get("adjacent_repeat_enabled", True)) and chapter_num > 1:
+            try:
+                from quality import adjacent_repetition
+                prev_text = read_text(chapter_path(paths, chapter_num - 1))
+                ar = adjacent_repetition(chapter, prev_text, config)
+                if ar.get("level") == "block":
+                    log(
+                        paths,
+                        f"Adjacent-duplicate draft Ch{chapter_num} metrics={ar.get('metrics')}; "
+                        f"regenerating once with anti-repeat constraint.",
+                    )
+                    retry_decision = dict(decision)
+                    retry_decision["required_constraints"] = list(decision.get("required_constraints") or [])
+                    for d in ar.get("directives", []):
+                        if d not in retry_decision["required_constraints"]:
+                            retry_decision["required_constraints"].append(d)
+                    retry_chapter, retry_review = write_chapter_with_candidates(
+                        client, paths, conn, config, chapter_num, plan, retry_decision, tail,
+                        cached_memory=writing_memory,
+                        chapter_aux_cache=_chapter_aux,
+                    )
+                    ar2 = adjacent_repetition(retry_chapter, prev_text, config)
+                    if ar2.get("level") != "block":
+                        chapter, candidate_review = retry_chapter, retry_review
+                        decision = retry_decision
+                        log(paths, f"Adjacent-duplicate retry Ch{chapter_num} clean (metrics={ar2.get('metrics')})")
+                    elif float(ar2.get("metrics", {}).get("clause_overlap", 1.0)) < float(
+                        ar.get("metrics", {}).get("clause_overlap", 1.0)
+                    ):
+                        chapter, candidate_review = retry_chapter, retry_review
+                        decision = retry_decision
+                        log(
+                            paths,
+                            f"Adjacent-duplicate retry Ch{chapter_num} still high but improved "
+                            f"({ar.get('metrics', {}).get('clause_overlap')} -> "
+                            f"{ar2.get('metrics', {}).get('clause_overlap')}); review gate will judge.",
+                        )
+                    else:
+                        log(paths, f"Adjacent-duplicate retry Ch{chapter_num} did not improve; keeping original draft")
+            except Exception as exc:
+                log(paths, f"Adjacent-duplicate draft gate failed (non-fatal) Ch{chapter_num}: {exc}")
         save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
         if candidate_review is not None:
             save_checkpoint(paths, chapter_num, "review_round0.json", candidate_review)
 
     threshold = float(config["novel"]["quality_threshold"])
     max_rounds = int(config["novel"]["max_revision_rounds"])
+    # Preference pairs (before-text, review verdict, after-text) collected from
+    # this chapter's revise rounds; forwarded to the global telemetry repo by
+    # _do_telemetry after finalize. Pure in-memory, zero IO on the hot path.
+    telemetry_revise_pairs: list[dict[str, Any]] = []
     final_review = load_checkpoint(paths, chapter_num, "final_review.json")
     # A final_review is authoritative on resume in two cases:
     #   1. it met the threshold and was accepted; or
@@ -540,6 +719,8 @@ def generate_one_chapter(
                         )
                         break
                 revised_key = f"chapter_revised_round{round_num}.md"
+                pre_revise_text = chapter
+                pre_revise_review = review
                 revised = load_checkpoint(paths, chapter_num, revised_key)
                 if revised:
                     chapter = normalize_chapter(str(revised))
@@ -559,9 +740,23 @@ def generate_one_chapter(
                 review = cached_review
                 log(paths, f"Resuming cached review Ch{chapter_num} round={round_num} score={review.get('score')}/10")
             else:
-                review = review_chapter(client, paths, conn, config, chapter_num, plan, chapter, tail, cached_memory=writing_memory)
+                review = review_chapter(client, paths, conn, config, chapter_num, plan, chapter, tail, cached_memory=writing_memory, chapter_aux_cache=_chapter_aux)
                 save_checkpoint(paths, chapter_num, review_key, review)
                 log(paths, f"Reviewed Ch{chapter_num} round={round_num} score={review.get('score')}/10")
+            if round_num > 0:
+                # Collect the (before, verdict, after) preference pair now that
+                # both sides have scores; persisted by _do_telemetry later.
+                try:
+                    telemetry_revise_pairs.append({
+                        "round": round_num,
+                        "text_before": pre_revise_text,
+                        "review": pre_revise_review,
+                        "text_after": chapter,
+                        "score_before": safe_score(pre_revise_review.get("score", 0)),
+                        "score_after": safe_score(review.get("score", 0)),
+                    })
+                except Exception:
+                    pass
             previous_best_score = safe_score(best_review.get("score", 0))
             current_score = safe_score(review.get("score", 0))
             if current_score > previous_best_score:
@@ -594,6 +789,17 @@ def generate_one_chapter(
                 # (multi-dimension low / scene雷同 / payoff缺失) trigger a full replan.
                 fail_kind, fail_reason = _classify_replan_failure(review, config)
                 log(paths, f"Quality replan routing Ch{chapter_num}: kind={fail_kind} ({fail_reason})")
+                # Telemetry: deterministic gate rejects are the signal the
+                # self-evolution loop learns from (which gates fire, how often,
+                # and whether the forced replan recovered the score).
+                if review.get("gate_rejects"):
+                    try:
+                        db_event(conn, chapter_num, "gate_reject", {
+                            "gates": [g.get("gate") for g in review.get("gate_rejects", []) if isinstance(g, dict)],
+                            "score": review.get("score"),
+                        })
+                    except Exception:
+                        pass
 
                 if fail_kind == "local" and bool(config["novel"].get("local_fix_before_replan", True)):
                     local_rounds = int(config["novel"].get("local_fix_max_rounds", 2))
@@ -614,6 +820,7 @@ def generate_one_chapter(
                         local_review = review_chapter(
                             client, paths, conn, config, chapter_num, plan,
                             local_chapter, tail, cached_memory=writing_memory,
+                            chapter_aux_cache=_chapter_aux,
                         )
                         log(
                             paths,
@@ -646,8 +853,15 @@ def generate_one_chapter(
                     paths,
                     f"Quality replan Ch{chapter_num}: best score={review.get('score')}/10 below threshold={threshold}",
                 )
-                replan_tail = tail_text(paths.book, int(config["novel"]["recent_tail_chars"]))
-                replan_memory = memory_context(paths, conn, config)
+                replan_tail = _build_writer_tail(paths, config, chapter_num)
+                # Reuse the chapter-level cached_memory built at the top of
+                # generate_one_chapter. Within this chapter no extract/finalize has
+                # run yet (it is submitted only after save_chapter, far below), so
+                # the only DB write before here is the gate_reject event — which is
+                # not read by any memory tier. The cached context is therefore still
+                # current, and rebuilding it would re-fire 4 SQLite reads + reread
+                # bible/characters/state/threads/timeline for no change.
+                replan_memory = cached_memory
                 replan_fb = _build_replan_feedback(review)
                 # V3-#3: diagnose BEFORE regenerating the plan. A structural replan
                 # regenerates the whole plan, and historically often came back "did
@@ -730,6 +944,7 @@ def generate_one_chapter(
                     cached_memory=writing_memory,
                     num_candidates_override=max(1, sr_candidates),
                     base_temp_override=sr_temp,
+                    chapter_aux_cache=_chapter_aux,
                 )
                 if replan_review is None:
                     # n<=1 path returned no review (or only 1 valid draft); review now.
@@ -743,6 +958,7 @@ def generate_one_chapter(
                         replan_chapter,
                         replan_tail,
                         cached_memory=writing_memory,
+                        chapter_aux_cache=_chapter_aux,
                     )
                 save_checkpoint(
                     paths,
@@ -809,6 +1025,10 @@ def generate_one_chapter(
                     "em_dash_per_kchar": sh_metrics.get("em_dash_per_kchar"),
                     "fragment_line_ratio": sh_metrics.get("fragment_line_ratio"),
                     "had_contract_violation": bool(review.get("contract_violations")),
+                    "gate_rejects": [
+                        str(g.get("gate", "?")) for g in (review.get("gate_rejects") or [])
+                        if isinstance(g, dict)
+                    ],
                     "patches_applied": review.get("quality_debt_patches_applied", 0),
                     "patch_total": review.get("quality_debt_patch_total", 0),
                     "problems": [str(p)[:160] for p in (review.get("problems") or [])[:5]],
@@ -828,10 +1048,42 @@ def generate_one_chapter(
             hook_min = float(config["novel"].get("opening_hook_strength_min", 7.0))
         hook_revise_enabled = bool(config["novel"].get("hook_revise_enabled", True))
         hook_strength = safe_score(review.get("hook_strength", hook_min))
+        # O1: recycled-hook detection. A recurring force-accept debt across books
+        # is "章末钩子与上章完全相同" — and the reviewer still rates the recycled
+        # hook 9/10 because it never sees the previous endings side by side. If
+        # the deterministic check finds this chapter's ending clauses repeated
+        # from recent chapters' endings, force the hook-only mini revise even
+        # when hook_strength looks healthy.
+        hook_recycled = False
+        recycled_clauses: list[str] = []
         if (
             hook_revise_enabled
-            and hook_strength > 0
-            and hook_strength < hook_min
+            and chapter_num > 1
+            and not is_final_chapter(config, chapter_num)
+            and bool(config["novel"].get("adjacent_repeat_enabled", True))
+        ):
+            try:
+                from quality import hook_tail_repetition
+                lookback = int(config["novel"].get("hook_repeat_lookback", 3))
+                prev_tails = []
+                for num in range(max(1, chapter_num - lookback), chapter_num):
+                    t = read_text(chapter_path(paths, num))
+                    if t:
+                        prev_tails.append(t)
+                hr = hook_tail_repetition(chapter, prev_tails, config)
+                if hr.get("repeat"):
+                    hook_recycled = True
+                    recycled_clauses = list(hr.get("repeated_clauses") or [])
+                    log(
+                        paths,
+                        f"Hook-recycled Ch{chapter_num}: ending reuses prior chapter endings "
+                        f"(ratio={hr.get('ratio')}, clauses={recycled_clauses[:2]}); forcing hook revise.",
+                    )
+            except Exception as exc:
+                log(paths, f"hook_tail_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+        if (
+            hook_revise_enabled
+            and (hook_recycled or (hook_strength > 0 and hook_strength < hook_min))
             and not is_final_chapter(config, chapter_num)
             and not load_checkpoint(paths, chapter_num, "hook_revised.json")
         ):
@@ -839,10 +1091,20 @@ def generate_one_chapter(
                 from writing import revise_hook_only as _revise_hook_only
                 log(
                     paths,
-                    f"Hook-only mini-revise Ch{chapter_num} hook_strength={hook_strength}/10 < {hook_min}",
+                    f"Hook-only mini-revise Ch{chapter_num} hook_strength={hook_strength}/10 < {hook_min}"
+                    + (" [recycled hook]" if hook_recycled else ""),
                 )
+                hook_review = review
+                if hook_recycled and recycled_clauses:
+                    hook_review = dict(review)
+                    wd = list(hook_review.get("writer_directives_for_next_chapter") or [])
+                    wd.insert(0,
+                        "章末钩子与前几章结尾重复（确定性检测）。以下句子/意象严禁出现在新结尾里："
+                        + "；".join(f"“{c}”" for c in recycled_clauses[:3])
+                        + "。必须换一个全新的悬念抓手（新的物证/新的威胁/新的人物动作），不得复用旧钩子。")
+                    hook_review["writer_directives_for_next_chapter"] = wd
                 new_chapter = _revise_hook_only(
-                    client, paths, config, chapter, plan, review,
+                    client, paths, config, chapter, plan, hook_review,
                     tail_to_revise_chars=int(config["novel"].get("hook_revise_tail_chars", 400)),
                 )
                 if len(new_chapter.strip()) >= max(500, int(len(chapter) * 0.85)):
@@ -862,7 +1124,11 @@ def generate_one_chapter(
     if not load_checkpoint(paths, chapter_num, "chapter_saved.json"):
         if chapter_path(paths, chapter_num).exists():
             log(paths, f"Chapter file already exists Ch{chapter_num}; skipping duplicate save")
-            rebuild_book(paths)
+            # book.md is normally append-built by save_chapter, so it is already
+            # complete in the common case; only rebuild (O(n) glob+read+sort) when
+            # the on-disk book.md is actually inconsistent with chapters/.
+            if not book_is_consistent(paths):
+                rebuild_book(paths)
         else:
             save_chapter(paths, chapter_num, chapter, review, plan)
         save_checkpoint(paths, chapter_num, "chapter_saved.json", {"saved": True})
@@ -977,59 +1243,15 @@ def generate_one_chapter(
     # background tasks have finished writing — which is the existing semantic
     # (stage_review and memory_compress only update derived/aggregated files).
     run_stage_review = chapter_num % int(config["novel"]["stage_review_every"]) == 0
-    pack_every = int(config["novel"].get("pack_review_every", 10))
-    run_pack_review = bool(config["novel"].get("pack_review_enabled", True)) and pack_every > 0 and chapter_num % pack_every == 0
     run_replan = run_stage_review and chapter_num >= 40
 
     def _do_stage_review() -> None:
         stage_review(client, paths, conn, config, chapter_num)
         log(paths, f"Completed stage review Ch{chapter_num}")
 
-    def _do_pack_review() -> None:
-        try:
-            pack_review(client, paths, conn, config, chapter_num)
-            log(paths, f"Completed pack review Ch{chapter_num}")
-        except Exception as exc:
-            log(paths, f"Pack review failed (non-fatal) Ch{chapter_num}: {exc}")
-
-    def _do_cold_reader() -> None:
-        try:
-            cr = cold_reader_review(client, paths, config, chapter_num, chapter)
-            log(
-                paths,
-                f"Cold-reader Ch{chapter_num} prose={cr.get('readable_prose')}/10 "
-                f"progression={cr.get('plot_progression')}/10 verdict={cr.get('verdict')} "
-                f"problem={str(cr.get('worst_problem'))[:80]!r}",
-            )
-            db_event(conn, chapter_num, "cold_reader", cr)
-            # If the cold reader flags broken prose/progression, push a corrective
-            # directive into this chapter's review so the NEXT chapter improves.
-            bad = (
-                str(cr.get("verdict")) == "broken"
-                or safe_score(cr.get("readable_prose", 10)) < 6
-                or safe_score(cr.get("plot_progression", 10)) < 5
-            )
-            if bad:
-                try:
-                    from checkpoint import load_checkpoint as _load, save_checkpoint as _save
-                    existing = _load(paths, chapter_num, "final_review.json")
-                    if isinstance(existing, dict):
-                        wd = list(existing.get("writer_directives_for_next_chapter") or [])
-                        msg = f"冷读者警示（陌生读者视角）：{cr.get('worst_problem','')}。下一章必须针对性修正。"
-                        if msg not in wd:
-                            wd.append(msg)
-                        existing["writer_directives_for_next_chapter"] = wd[:12]
-                        _save(paths, chapter_num, "final_review.json", existing)
-                except Exception:
-                    pass
-        except Exception as exc:
-            log(paths, f"Cold-reader review failed (non-fatal) Ch{chapter_num}: {exc}")
-
-    def _do_macro_progress() -> None:
-        try:
-            macro_progress_check(client, paths, conn, config, chapter_num)
-        except Exception as exc:
-            log(paths, f"Macro-progress check failed (non-fatal) Ch{chapter_num}: {exc}")
+    def _do_horizon_review() -> None:
+        horizon_review(client, paths, conn, config, chapter_num, chapter)
+        log(paths, f"Completed horizon review Ch{chapter_num}")
 
     def _do_memory_compress() -> None:
         log(paths, f"Compressing memory files at Ch{chapter_num}")
@@ -1040,22 +1262,69 @@ def generate_one_chapter(
             log(paths, f"Triggering adaptive replan at Ch{chapter_num}")
             adaptive_replan(client, paths, conn, config, chapter_num)
 
+    _telemetry_novel = paths.logs_dir.parent.name
+    _telemetry_genre = str(config["novel"].get("genre", "_default") or "_default")
+
+    def _do_telemetry() -> None:
+        """Double-write this chapter's quality signals to the global telemetry
+        repository. Strictly an observer: every failure is swallowed so the
+        generation pipeline never stalls because of telemetry."""
+        try:
+            sh = (review.get("style_health") or {}) if isinstance(review, dict) else {}
+            sh_metrics = sh.get("metrics") or {}
+            metrics_row = {
+                "title": plan.get("title") if isinstance(plan, dict) else None,
+                "score": safe_score(review.get("score", 0)),
+                "readthrough_score": safe_score(review.get("readthrough_score", 0)),
+                "hook_score": safe_score(review.get("hook_score", review.get("hook_strength", 0))),
+                "payoff_score": safe_score(review.get("payoff_score", 0)),
+                "novelty_score": safe_score(review.get("novelty_score", 0)),
+                "prose_score": safe_score(review.get("prose_score", review.get("aesthetic_score", 0))),
+                "continuity_score": safe_score(review.get("continuity_score", 0)),
+                "hook_strength": safe_score(review.get("hook_strength", 0)),
+                "accepted": 1 if review.get("accepted") else 0,
+                "em_dash_per_kchar": sh_metrics.get("em_dash_per_kchar"),
+                "style_penalty": sh.get("penalty"),
+            }
+            telemetry.record_chapter_metrics(_telemetry_novel, _telemetry_genre, chapter_num, metrics_row)
+            # NOTE: plan_arbitration / strategy_outcomes are double-written at
+            # the source (planning.arbitrate_plan), which is the only place the
+            # full candidate-plans list exists.
+            for pair in telemetry_revise_pairs:
+                telemetry.record_revise_pair(
+                    _telemetry_novel, _telemetry_genre, chapter_num,
+                    pair["round"], pair["text_before"], pair["review"],
+                    pair["text_after"], pair["score_before"], pair["score_after"],
+                )
+            log(paths, f"Telemetry recorded Ch{chapter_num} (revise_pairs={len(telemetry_revise_pairs)})")
+        except Exception as exc:
+            log(paths, f"Telemetry record failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    def _do_reader_panel() -> None:
+        try:
+            from reader_panel import run_reader_panel
+            run_reader_panel(client, paths, conn, config, chapter_num, chapter)
+        except Exception as exc:
+            log(paths, f"Reader panel failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    telemetry_on = bool(config["novel"].get("telemetry_enabled", True))
+    panel_every = int(config["novel"].get("reader_panel_every", 5) or 5)
+    run_reader_panel_now = (
+        bool(config["novel"].get("reader_panel_enabled", False))
+        and panel_every > 0
+        and chapter_num % panel_every == 0
+    )
+
     if background is not None:
+        if telemetry_on:
+            background.submit(f"telemetry_ch{chapter_num}", _do_telemetry)
+        if run_reader_panel_now:
+            background.submit(f"reader_panel_ch{chapter_num}", _do_reader_panel)
         if run_stage_review:
             background.submit(f"stage_review_ch{chapter_num}", _do_stage_review)
-        if run_pack_review:
-            background.submit(f"pack_review_ch{chapter_num}", _do_pack_review)
         cold_every = int(config["novel"].get("cold_reader_every", 10))
-        if bool(config["novel"].get("cold_reader_enabled", True)) and cold_every > 0 and chapter_num % cold_every == 0:
-            background.submit(f"cold_reader_ch{chapter_num}", _do_cold_reader)
-        macro_every = int(config["novel"].get("macro_progress_every", 10))
-        if (
-            bool(config["novel"].get("macro_progress_enabled", True))
-            and macro_every > 0
-            and chapter_num % macro_every == 0
-            and chapter_num >= 20
-        ):
-            background.submit(f"macro_progress_ch{chapter_num}", _do_macro_progress)
+        if cold_every > 0 and chapter_num % cold_every == 0:
+            background.submit(f"horizon_review_ch{chapter_num}", _do_horizon_review)
         if should_compress_memory(paths, config, chapter_num):
             background.submit(f"memory_compress_ch{chapter_num}", _do_memory_compress)
         if run_replan:
@@ -1117,21 +1386,15 @@ def generate_one_chapter(
 
         background.prune_done()
     else:
+        if telemetry_on:
+            _do_telemetry()
+        if run_reader_panel_now:
+            _do_reader_panel()
         if run_stage_review:
             _do_stage_review()
-        if run_pack_review:
-            _do_pack_review()
         cold_every = int(config["novel"].get("cold_reader_every", 10))
-        if bool(config["novel"].get("cold_reader_enabled", True)) and cold_every > 0 and chapter_num % cold_every == 0:
-            _do_cold_reader()
-        macro_every = int(config["novel"].get("macro_progress_every", 10))
-        if (
-            bool(config["novel"].get("macro_progress_enabled", True))
-            and macro_every > 0
-            and chapter_num % macro_every == 0
-            and chapter_num >= 20
-        ):
-            _do_macro_progress()
+        if cold_every > 0 and chapter_num % cold_every == 0:
+            _do_horizon_review()
         if should_compress_memory(paths, config, chapter_num):
             _do_memory_compress()
         if run_replan:
@@ -1200,6 +1463,37 @@ def main() -> None:
             f"endpoints={len(review_clients)}",
         )
 
+    # Pre-flight: if a prior bootstrap run left partial artifacts (state.md
+    # exists but is too short, contains the placeholder sentinel, or any
+    # sibling memory file is missing/empty), clean up now so this run
+    # re-bootstraps cleanly instead of proceeding with broken world-state.
+    _bootstrap_memory_files = [
+        paths.bible, paths.characters, paths.timeline,
+        paths.threads, paths.volume_plan,
+    ]
+    if paths.state.exists():
+        try:
+            _st = read_text(paths.state)
+            _missing_siblings = [
+                p.name for p in _bootstrap_memory_files
+                if not p.exists() or p.stat().st_size < 100
+            ]
+            _is_partial = (
+                len(_st) < 500
+                or "待连载补全" in _st
+                or bool(_missing_siblings)
+            )
+            if _is_partial:
+                paths.state.unlink()
+                log(
+                    paths,
+                    f"Pre-flight: removed partial state.md "
+                    f"(len={len(_st)}, missing_or_empty_siblings={_missing_siblings}) "
+                    f"so bootstrap reruns cleanly",
+                )
+        except Exception:
+            pass
+
     if not paths.state.exists() or not read_text(paths.state).strip():
         try:
             bootstrap(client, paths, conn, config)
@@ -1221,9 +1515,24 @@ def main() -> None:
                 # A bootstrap that died mid-write may have left a stub state.md.
                 # Remove it so the next launch re-bootstraps from scratch rather
                 # than treating the stub as a valid (but empty) project.
-                if st and ("待连载补全" in st or len(st) < 200) and paths.state.exists():
+                # Improved threshold: 500 chars (real state.md is always larger)
+                # and also checks for missing sibling memory files.
+                _exc_missing = [
+                    p.name for p in _bootstrap_memory_files
+                    if not p.exists() or p.stat().st_size < 100
+                ]
+                if st and (
+                    "待连载补全" in st
+                    or len(st) < 500
+                    or _exc_missing
+                ) and paths.state.exists():
                     paths.state.unlink()
-                    log(paths, "Removed partial state.md so a later run can re-bootstrap cleanly")
+                    log(
+                        paths,
+                        f"Removed partial state.md "
+                        f"(len={len(st)}, missing_or_empty_siblings={_exc_missing}) "
+                        f"so a later run can re-bootstrap cleanly",
+                    )
             except Exception:
                 pass
             if is_quota:
@@ -1259,7 +1568,19 @@ def main() -> None:
     anchor_gate_enabled = bool(config["novel"].get("anchor_gate_enabled", True))
     anchor_gate_max_extra = int(config["novel"].get("anchor_gate_max_extra", 3))
     anchor_extra_used = 0
-    background = BackgroundTasks(paths)
+    halted_by_breaker = False
+    # P0 graceful-close guard: when the quality circuit breaker trips in
+    # short-novel mode, we pull the climax forward (make the next chapter the
+    # finale) instead of halting with an unfinished book. This flag (a) caps
+    # that to ONE graceful close (a second breaker trip falls back to HALT),
+    # and (b) suppresses the anchor-completion gate's +1 re-extension so it
+    # can't undo the early close on an exhausted premise.
+    graceful_close_used = False
+    # Cache the last-written chapter number to avoid repeated glob scans.
+    # Updated at the end of each iteration; find_last_chapter is still called
+    # at loop entry points where accuracy is critical.
+    last_written = find_last_chapter(paths)
+    background = BackgroundTasks(paths, conn)
     try:
         while True:
             if book_reached_target(paths.book, target):
@@ -1272,6 +1593,7 @@ def main() -> None:
                     and max_chapters
                     and (stop_for_chapters or book_reached_target(paths.book, target))
                     and anchor_extra_used < anchor_gate_max_extra
+                    and not graceful_close_used
                 ):
                     background.wait_label(f"chapter_finalize_ch{last_chapter}")
                     try:
@@ -1307,6 +1629,12 @@ def main() -> None:
                     else:
                         log(paths, "Anchor gate: all must-hit anchors realized; stopping.")
                         break
+                elif graceful_close_used and find_last_chapter(paths) < max_chapters:
+                    # Graceful close pulled the climax forward: the char/chapter
+                    # target is already met, but the finale chapter (max_chapters,
+                    # just bumped to last+1) has NOT been written yet. Fall through
+                    # to write it instead of stopping on the target short-circuit.
+                    pass
                 else:
                     break
             last_chapter = find_last_chapter(paths)
@@ -1340,11 +1668,87 @@ def main() -> None:
             else:
                 chapter_num = last_chapter + 1
             generate_one_chapter(client, paths, conn, config, chapter_num, background=background, resume=is_resume)
+            last_written = find_last_chapter(paths)  # refresh once after write
             total = count_chars(paths.book)
             log(paths, f"Progress chars={total}/{target} pct={total / target * 100:.2f}%")
+            # O3: consecutive-low-quality circuit breaker. suspense_v11 burned
+            # 21 replans across 5 consecutive force-accepted chapters
+            # (5.5/5.5/5.5/3.5/4.5) with nobody pulling the cord — every chapter
+            # cost ~4 full drafts and made the context worse. When N consecutive
+            # chapters were force-accepted below the breaker floor, the engine
+            # is in a failure mode more tokens won't fix: halt loudly and leave
+            # the decision to a human (resume works as usual after intervention).
+            breaker_n = int(config["novel"].get("quality_breaker_consecutive", 2))
+            breaker_floor = float(config["novel"].get("quality_breaker_score_floor", 6.0))
+            if breaker_n > 0:
+                last = last_written  # already refreshed above, no glob needed
+                consecutive = 0
+                for ch in range(last, 0, -1):
+                    d = load_checkpoint(paths, ch, "quality_debt.json")
+                    if isinstance(d, dict) and safe_score(d.get("score", 10)) < breaker_floor:
+                        consecutive += 1
+                    else:
+                        break
+                if consecutive >= breaker_n:
+                    graceful_ok = (
+                        bool(config["novel"].get("quality_breaker_graceful_close", True))
+                        and max_chapters
+                        and not graceful_close_used
+                        and last < max_chapters
+                    )
+                    if graceful_ok:
+                        # P0 fix: premise exhaustion in short-novel mode. Rather
+                        # than HALT with an unfinished book, pull the climax
+                        # forward — make the NEXT chapter the finale. Bumping the
+                        # loop-local is not enough: is_final_chapter() and the
+                        # CLOSING_RULES_BLOCK gate re-read config["novel"]
+                        # ["max_chapters"] (the dict), so write the new cap there
+                        # too or the "finale" degrades to an ordinary chapter and
+                        # the story never closes.
+                        max_chapters = last + 1
+                        config["novel"]["max_chapters"] = last + 1
+                        graceful_close_used = True
+                        log(
+                            paths,
+                            f"QUALITY CIRCUIT BREAKER (graceful close): {consecutive} "
+                            f"consecutive chapter(s) force-accepted below {breaker_floor} "
+                            f"(Ch{last - consecutive + 1}-Ch{last}). Premise looks "
+                            f"exhausted; pulling the climax forward — Ch{last + 1} will "
+                            f"be the finale (CLOSING_RULES fires) so the book ends "
+                            f"cleanly instead of halting unfinished.",
+                        )
+                        db_event(conn, last, "quality_circuit_breaker_graceful", {
+                            "consecutive": consecutive,
+                            "floor": breaker_floor,
+                            "chapters": list(range(last - consecutive + 1, last + 1)),
+                            "finale_chapter": last + 1,
+                        })
+                        # Do NOT break: fall through to write the finale chapter.
+                    else:
+                        log(
+                            paths,
+                            f"QUALITY CIRCUIT BREAKER: {consecutive} consecutive chapter(s) "
+                            f"force-accepted below {breaker_floor} "
+                            f"(Ch{last - consecutive + 1}-Ch{last}). The pipeline is in a "
+                            f"failure mode that more LLM calls will not fix (likely premise "
+                            f"exhaustion or context poisoning). HALTING. Inspect the recent "
+                            f"chapters/quality_debt, adjust prompt.md/config, then re-run — "
+                            f"the run resumes from checkpoint.",
+                        )
+                        db_event(conn, last, "quality_circuit_breaker", {
+                            "consecutive": consecutive,
+                            "floor": breaker_floor,
+                            "chapters": list(range(last - consecutive + 1, last + 1)),
+                        })
+                        halted_by_breaker = True
+                        break
     finally:
         log(paths, "Waiting for background tasks to finish before exit...")
         background.wait_pending()
+
+    if halted_by_breaker:
+        log(paths, f"Halted by quality circuit breaker at total_chars={count_chars(paths.book)}; refine pass skipped.")
+        return
 
     log(paths, f"Done total_chars={count_chars(paths.book)}")
 

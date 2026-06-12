@@ -13,12 +13,33 @@ because the model's own voice has drifted with the prose.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
 # Sentence-ending punctuation for Chinese prose.
 _SENTENCE_ENDERS = "。！？…"
 _EM_DASH = "——"
+
+# Process-level cache: maps a fast text fingerprint -> normalized clause set.
+# This avoids re-parsing the same prior chapter texts on every review call.
+# Each entry is small (~1-3 KB), so 500 entries ≈ 1-2 MB max.
+_CLAUSE_SET_CACHE: dict[str, frozenset[str]] = {}
+_CLAUSE_CACHE_MAX = 500
+
+
+def _get_cached_clause_set(text: str) -> frozenset[str]:
+    """Return the normalized clause set for `text`, using a process-level cache."""
+    # Use first 200 + last 100 chars as the fingerprint key — fast and collision-resistant enough.
+    key = hashlib.md5((text[:200] + text[-100:]).encode("utf-8", errors="replace")).hexdigest()
+    if key not in _CLAUSE_SET_CACHE:
+        if len(_CLAUSE_SET_CACHE) >= _CLAUSE_CACHE_MAX:
+            # Evict oldest half when full (simple FIFO via dict insertion order).
+            evict = list(_CLAUSE_SET_CACHE.keys())[: _CLAUSE_CACHE_MAX // 2]
+            for k in evict:
+                del _CLAUSE_SET_CACHE[k]
+        _CLAUSE_SET_CACHE[key] = frozenset(_normalize_clause(c) for c in _clause_segments(text))
+    return _CLAUSE_SET_CACHE[key]
 
 
 def _strip_title_line(text: str) -> str:
@@ -228,6 +249,106 @@ def text_similarity(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Adjacent-chapter repetition gate (O1): the deadliest observed failure mode is
+# a chapter that re-narrates the previous chapter's ending scene near-verbatim
+# (suspense_v11 Ch3 clause-overlap 0.73, Ch8 0.33; suspense_v8 Ch6 0.81 — all
+# force-accepted at 3.5-5.5 while healthy chapters sit at 0.00-0.07). The LLM
+# reviewer scores each chapter in isolation, so it rated an identical hook 9/10.
+# This is the deterministic gate: measured against the previous chapter's text,
+# fed into both the draft loop (regenerate) and review (cap + reject).
+# ---------------------------------------------------------------------------
+
+def adjacent_repetition(
+    text: str,
+    prev_text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure how much of `text` re-narrates `prev_text`.
+
+    Returns {"metrics", "level" (ok/warn/block), "penalty", "flags",
+    "directives", "examples"}. Calibrated on real books:
+      healthy adjacent chapters: clause_overlap 0.00-0.07, bigram_sim ~0.1-0.2
+      duplicated chapters:       clause_overlap 0.33-0.81, bigram_sim 0.42-0.84
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "metrics": {}, "level": "ok", "penalty": 0.0,
+        "flags": [], "directives": [], "examples": [],
+    }
+    if not bool(cfg.get("adjacent_repeat_enabled", True)) or not text or not prev_text:
+        return result
+    sim = text_similarity(text, prev_text)
+    prev_set = _get_cached_clause_set(prev_text)
+    cur_clauses = _clause_segments(text)
+    hits = [c for c in cur_clauses if _normalize_clause(c) in prev_set]
+    ratio = (len(hits) / len(cur_clauses)) if cur_clauses else 0.0
+    result["metrics"] = {
+        "bigram_sim": round(sim, 3),
+        "clause_overlap": round(ratio, 3),
+        "clause_hits": len(hits),
+    }
+    warn = float(cfg.get("adjacent_repeat_clause_warn", 0.10))
+    block = float(cfg.get("adjacent_repeat_clause_block", 0.30))
+    bigram_block = float(cfg.get("adjacent_repeat_bigram_block", 0.50))
+    # Longest verbatim clauses make the most actionable avoid-list.
+    result["examples"] = sorted(set(hits), key=len, reverse=True)[:5]
+    if ratio >= block or sim >= bigram_block:
+        result["level"] = "block"
+        result["penalty"] = float(cfg.get("adjacent_repeat_block_penalty", 3.0))
+        result["flags"].append(f"adjacent_duplicate(clause={ratio:.2f},bigram={sim:.2f})")
+        result["directives"].append(
+            f"本章有 {ratio:.0%} 的句子逐字复述上一章内容，属于复读废稿。"
+            "必须从上一章结尾之后的【新】事件写起：上一章已发生的场景、对话、推理结论只许一笔带过引用，"
+            "严禁重演。以下句子严禁再次出现：" + "；".join(f"“{c}”" for c in result["examples"][:3])
+        )
+    elif ratio >= warn:
+        result["level"] = "warn"
+        result["penalty"] = float(cfg.get("adjacent_repeat_warn_penalty", 1.0))
+        result["flags"].append(f"adjacent_overlap(clause={ratio:.2f})")
+        result["directives"].append(
+            f"本章约 {ratio:.0%} 的句子与上一章重复，有原地复读倾向。"
+            "请删去对上一章场景的复述，把篇幅用在新事件与新信息上。"
+        )
+    return result
+
+
+def hook_tail_repetition(
+    text: str,
+    prev_texts: list[str] | None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect a chapter-end hook recycled from recent chapters' endings.
+
+    Recurring debt across books: "章末钩子与上章完全相同，锐利度被严重稀释"
+    (the LLM reviewer still rated such hooks 9/10 because it never sees the
+    previous endings side by side). Compares the clause set of this chapter's
+    final ~300 chars against the final ~800 chars of each recent chapter.
+    Returns {"repeat": bool, "repeated_clauses", "ratio"}.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {"repeat": False, "repeated_clauses": [], "ratio": 0.0}
+    if not text or not prev_texts:
+        return result
+    tail_chars = int(cfg.get("hook_repeat_tail_chars", 300))
+    cur = [c for c in _clause_segments(text[-tail_chars:]) if len(c) >= 8]
+    if not cur:
+        return result
+    repeated: set[str] = set()
+    for pt in prev_texts:
+        prev_tail_set = {_normalize_clause(c) for c in _clause_segments(pt[-max(tail_chars * 2, 600):])}
+        for c in cur:
+            if _normalize_clause(c) in prev_tail_set:
+                repeated.add(c)
+    ratio = len(repeated) / len(cur)
+    result["repeated_clauses"] = sorted(repeated, key=len, reverse=True)[:4]
+    result["ratio"] = round(ratio, 3)
+    min_clauses = int(cfg.get("hook_repeat_min_clauses", 2))
+    min_ratio = float(cfg.get("hook_repeat_min_ratio", 0.25))
+    result["repeat"] = len(repeated) >= min_clauses or ratio >= min_ratio
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Cross-chapter repetition: catch sentence/metaphor "fossils" reused verbatim.
 # ---------------------------------------------------------------------------
 
@@ -269,6 +390,7 @@ def cross_chapter_repetition(
     enabled = bool(cfg.get("style_cross_repeat_enabled", True))
     result: dict[str, Any] = {
         "metrics": {}, "penalty": 0.0, "flags": [], "directives": [], "repeats": [],
+        "level": "pass",
     }
     if not enabled or not prior_texts:
         return result
@@ -276,10 +398,7 @@ def cross_chapter_repetition(
     # Build a frequency map of normalized clauses across prior chapters.
     prior_counts: dict[str, int] = {}
     for pt in prior_texts:
-        seen_in_chap: set[str] = set()
-        for c in _clause_segments(pt):
-            seen_in_chap.add(_normalize_clause(c))
-        for c in seen_in_chap:
+        for c in _get_cached_clause_set(pt):
             prior_counts[c] = prior_counts.get(c, 0) + 1
 
     cur_clauses = _clause_segments(text)
@@ -312,12 +431,23 @@ def cross_chapter_repetition(
             "文体复读预警：以下标志性句子/比喻在前面多章反复出现，已成为口癖，"
             f"本章必须改写或避免：{examples}。同一意象请换新的具体写法。"
         )
+        result["level"] = "advise"
+        # Escalation: a chapter carrying MANY entrenched fossils is not a tic to
+        # warn about — it is style collapse already in motion (suspense_v11 ran
+        # 6 consecutive chapters at fossils 9-25 with only advisory directives,
+        # and the prose never recovered). Past this count the verdict becomes
+        # "reject": the pipeline must regenerate, not annotate.
+        reject_count = int(cfg.get("style_cross_repeat_reject_count", 8))
+        if len(fossils) >= reject_count:
+            result["level"] = "reject"
+            result["flags"].append(f"cross_chapter_fossil_collapse({len(fossils)})")
     elif len(repeats) >= int(cfg.get("style_cross_repeat_warn_count", 4)):
         result["penalty"] = 0.5
         result["flags"].append(f"cross_chapter_repeats({len(repeats)})")
         result["directives"].append(
             "本章有多处句子与前文几乎雷同，存在复读倾向，请用不同措辞重写这些重复表达。"
         )
+        result["level"] = "advise"
     return result
 
 

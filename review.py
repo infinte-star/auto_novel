@@ -174,8 +174,6 @@ def established_facts_for_chapter(
     """Compact, budget-limited block of established facts the chapter must not
     contradict: current state of plan-focused characters/entities, relevant open
     threads, and overdue reader promises. Reuses store query helpers."""
-    from store import JsonStoryStore  # local import to avoid cycle at module load
-
     lines: list[str] = []
     seen: set[tuple[str, str]] = set()
 
@@ -199,14 +197,13 @@ def established_facts_for_chapter(
 
     # Open threads referenced by the plan's thread_actions, plus overdue promises.
     try:
-        if not isinstance(conn, JsonStoryStore):
-            from store import db_lock
-            with db_lock():
-                rows = conn.execute(
-                    "SELECT id, description, thread_type FROM open_threads WHERE status='open' ORDER BY updated_chapter DESC LIMIT 12",
-                ).fetchall()
-            for r in rows:
-                lines.append(f"- [thread:{r['thread_type']}] {r['id']}: {r['description']}")
+        from store import db_lock
+        with db_lock():
+            rows = conn.execute(
+                "SELECT id, description, thread_type FROM open_threads WHERE status='open' ORDER BY updated_chapter DESC LIMIT 12",
+            ).fetchall()
+        for r in rows:
+            lines.append(f"- [thread:{r['thread_type']}] {r['id']}: {r['description']}")
     except Exception:
         pass
 
@@ -322,6 +319,29 @@ def _platform_guidance(config: dict[str, Any]) -> str:
     except Exception:
         return "通用网文读者：开篇卖点清晰、章节推进稳定、承诺及时兑现、重复模式不过度。"
 
+
+def build_chapter_aux_cache(paths: Paths, conn: Any, config: dict[str, Any], chapter_num: int) -> dict[str, Any]:
+    """Pre-build the per-chapter auxiliary context used by review_chapter.
+
+    Called once before parallel candidate reviews so each thread reuses the
+    same pre-fetched DB/file results instead of re-querying N times.
+    """
+    cache: dict[str, Any] = {}
+    try:
+        cache["writing_memory"] = writing_memory_context(paths, conn, config)
+    except Exception:
+        pass
+    try:
+        cache["rhythm_diagnostics"] = rhythm_diagnostics(conn, config)
+    except Exception:
+        pass
+    try:
+        cache["recent_quality_feedback"] = recent_quality_feedback(paths)
+    except Exception:
+        pass
+    return cache
+
+
 def review_chapter(
     client: OpenAI,
     paths: Paths,
@@ -332,8 +352,12 @@ def review_chapter(
     chapter: str,
     tail: str,
     cached_memory: str | None = None,
+    chapter_aux_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    mem = cached_memory or writing_memory_context(paths, conn, config)
+    if chapter_aux_cache is not None and "writing_memory" in chapter_aux_cache:
+        mem = chapter_aux_cache["writing_memory"]
+    else:
+        mem = cached_memory or writing_memory_context(paths, conn, config)
     silence_threshold = int(config["novel"].get("thread_silence_threshold", 10))
     silent_threads = get_silent_threads(conn, chapter_num, silence_threshold=silence_threshold)
     preset = str(config["novel"].get("style_preset", "history"))
@@ -385,6 +409,13 @@ def review_chapter(
             "- 信息密度：是否在抓人的同时高效给出信息，而非堆砌世界观设定拖慢节奏。\n"
             "- 若钩子偏弱、金手指迟迟不亮相、或开篇大段铺设定，hook_strength 应明显压低并在 problems 指出。\n\n"
         )
+    _review_chars = int(config.get("novel", {}).get("review_chapter_chars", 16000))
+    _rhythm = chapter_aux_cache.get("rhythm_diagnostics") if chapter_aux_cache else None
+    if _rhythm is None:
+        _rhythm = rhythm_diagnostics(conn, config)
+    _quality_fb = chapter_aux_cache.get("recent_quality_feedback") if chapter_aux_cache else None
+    if _quality_fb is None:
+        _quality_fb = recent_quality_feedback(paths)
 
     # Deterministic entity-drift shortlist. The reviewer's hallucinated_entities
     # field is otherwise LLM-only; this surfaces proper-noun surface forms that
@@ -434,19 +465,19 @@ def review_chapter(
 {tail[-1500:]}
 
 ## 近期质量反馈JSON
-{json.dumps(recent_quality_feedback(paths), ensure_ascii=False, indent=2)}
+{json.dumps(_quality_fb, ensure_ascii=False, indent=2)}
 
 ## 沉默伏线JSON（沉默 >{silence_threshold} 章；核查本章是否推进了其中任何一条，或有充分理由跳过）
 {json.dumps(silent_threads, ensure_ascii=False, indent=2) if silent_threads else "None"}
 
 ## 节奏诊断JSON（留意 chapters_since_payoff 与 payoff_max_gap 以判断爽点拖欠）
-{json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
+{json.dumps(_rhythm, ensure_ascii=False, indent=2)}
 
 ## 选定大纲JSON
 {json.dumps(plan, ensure_ascii=False, indent=2)}
 
 ## 章节正文
-{chapter[:12000]}"""
+{chapter[:_review_chars]}"""
     raw = call_llm(
         client, paths, config, REVIEW_SYSTEM, json_prompt(user),
         max_tokens=32000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
@@ -676,8 +707,82 @@ def review_chapter(
                     f"Cross-repeat Ch{chapter_num} penalty={cr_penalty} "
                     f"flags={cr.get('flags')} fossils={cr.get('metrics', {}).get('cross_repeat_fossils')}",
                 )
+            # L2 escalation: entrenched-fossil collapse is a regenerate-not-revise
+            # condition. Mark the report with a structured gate_reject so the
+            # pipeline can route this chapter into a forced replan with the fossil
+            # list as hard evidence (advisory directives alone demonstrably failed:
+            # suspense_v11 carried fossils 9-25 for 6 straight chapters).
+            if str(cr.get("level", "")) == "reject":
+                report["accepted"] = False
+                gr = report.setdefault("gate_rejects", [])
+                gr.append({
+                    "gate": "cross_chapter_repetition",
+                    "evidence": {
+                        "fossils": cr.get("metrics", {}).get("cross_repeat_fossils"),
+                        "examples": [r.get("clause") for r in (cr.get("repeats") or [])[:6]],
+                    },
+                    "directives": cr.get("directives", []),
+                })
+                report.setdefault("problems", []).append(
+                    "GATE: 文体化石句复读已达坍塌级（确定性检测），本稿必须作废重做，"
+                    "禁止沿用本稿的句式与比喻。"
+                )
+                log(
+                    paths,
+                    f"Cross-repeat GATE-REJECT Ch{chapter_num}: fossil collapse "
+                    f"({cr.get('metrics', {}).get('cross_repeat_fossils')} fossils) — chapter must be regenerated.",
+                )
         except Exception as exc:
             log(paths, f"cross_chapter_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # O1: adjacent-chapter duplication gate. The deadliest observed failure is a
+    # chapter that re-narrates the previous chapter's ending near-verbatim
+    # (suspense_v11 Ch3 clause-overlap 0.73 / Ch8 0.33, suspense_v8 Ch6 0.81 vs
+    # 0.00-0.07 for healthy chapters) — and the LLM reviewer, scoring each
+    # chapter in isolation, rated those identical hooks 9/10. Deterministic
+    # measurement against the previous chapter's actual text: warn-level adds a
+    # penalty + avoid-list directive, block-level caps the score AND rejects so
+    # the chapter is driven into rewrite instead of force-accept.
+    if bool(config["novel"].get("adjacent_repeat_enabled", True)) and chapter_num > 1:
+        try:
+            from quality import adjacent_repetition
+
+            prev_text = read_text(chapter_path(paths, chapter_num - 1))
+            ar = adjacent_repetition(chapter, prev_text, config)
+            report["adjacent_repetition"] = ar
+            ar_penalty = float(ar.get("penalty", 0.0))
+            if ar_penalty > 0:
+                penalties += ar_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in ar.get("flags", []):
+                    tag = f"repeat:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in ar.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(
+                    paths,
+                    f"Adjacent-repeat Ch{chapter_num} level={ar.get('level')} "
+                    f"penalty={ar_penalty} metrics={ar.get('metrics')}",
+                )
+            if ar.get("level") == "block":
+                caps.append(float(config["novel"].get("adjacent_repeat_score_cap", 5.0)))
+                report["accepted"] = False
+                report.setdefault("problems", []).append(
+                    "REPEAT: 本章大量逐字复述上一章内容（确定性检测，clause_overlap="
+                    f"{ar.get('metrics', {}).get('clause_overlap')}）。"
+                    "必须从上一章结尾之后的【新】事件重写，前章场景只许一笔带过。"
+                )
+                gr = report.setdefault("gate_rejects", [])
+                gr.append({
+                    "gate": "adjacent_repetition",
+                    "evidence": {"metrics": ar.get("metrics", {})},
+                    "directives": ar.get("directives", []),
+                })
+        except Exception as exc:
+            log(paths, f"adjacent_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Creative-contract violations: author-declared hard rules (ability whitelist/
     # modality, blacklist, banned tropes, must-hold). This is the layer that
@@ -1014,8 +1119,9 @@ def cold_reader_review(
     chapters), it judges the prose as a stranger would — which is exactly what
     catches style collapse and in-place spinning that self-review ratifies.
     """
+    _review_chars = int(config.get("novel", {}).get("review_chapter_chars", 16000))
     user = f"""## 这一章的全文（你对本书一无所知）
-{chapter[:12000]}
+{chapter[:_review_chars]}
 
 请以陌生读者视角评估这一章。"""
     raw = call_llm(
@@ -1112,8 +1218,77 @@ def macro_progress_check(
     return data
 
 
+def horizon_review(
+    client: "OpenAI",
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    chapter: str,
+) -> None:
+    """Unified periodic review fired every `cold_reader_every` chapters (default 10).
+
+    Combines cold_reader_review + pack_review + macro_progress_check into a single
+    background task, reducing the number of independent submit() calls while
+    preserving every detection dimension.
+
+    Every trigger: cold_reader (no cacheable_prefix) + pack_review
+    chapter_num >= 20: additionally runs macro_progress_check
+    chapter_num % stage_review_every == 0: stage_review fires separately (unchanged)
+    """
+    # --- 1. Cold reader (always, no cacheable_prefix) ---
+    try:
+        cr = cold_reader_review(client, paths, config, chapter_num, chapter)
+        log(
+            paths,
+            f"Cold-reader Ch{chapter_num} prose={cr.get('readable_prose')}/10 "
+            f"progression={cr.get('plot_progression')}/10 verdict={cr.get('verdict')} "
+            f"problem={str(cr.get('worst_problem'))[:80]!r}",
+        )
+        db_event(conn, chapter_num, "cold_reader", cr)
+        bad = (
+            str(cr.get("verdict")) == "broken"
+            or safe_score(cr.get("readable_prose", 10)) < 6
+            or safe_score(cr.get("plot_progression", 10)) < 5
+        )
+        if bad:
+            try:
+                from checkpoint import load_checkpoint as _load, save_checkpoint as _save
+                existing = _load(paths, chapter_num, "final_review.json")
+                if isinstance(existing, dict):
+                    wd = list(existing.get("writer_directives_for_next_chapter") or [])
+                    msg = f"冷读者警示（陌生读者视角）：{cr.get('worst_problem','')}。下一章必须针对性修正。"
+                    if msg not in wd:
+                        wd.append(msg)
+                    existing["writer_directives_for_next_chapter"] = wd[:12]
+                    _save(paths, chapter_num, "final_review.json", existing)
+            except Exception as exc:
+                log(paths, f"Failed to persist cold-reader directive Ch{chapter_num}: {exc}")
+    except Exception as exc:
+        log(paths, f"Cold-reader review failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # --- 2. Pack review (always) ---
+    try:
+        pack_review(client, paths, conn, config, chapter_num)
+        log(paths, f"Completed pack review Ch{chapter_num}")
+    except Exception as exc:
+        log(paths, f"Pack review failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # --- 3. Macro progress check (only from Ch20 onwards) ---
+    macro_every = int(config["novel"].get("macro_progress_every", 10))
+    if (
+        bool(config["novel"].get("macro_progress_enabled", True))
+        and macro_every > 0
+        and chapter_num >= 20
+    ):
+        try:
+            macro_progress_check(client, paths, conn, config, chapter_num)
+        except Exception as exc:
+            log(paths, f"Macro-progress check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+
 ANCHOR_GATE_SYSTEM = """你是一部连载小说的"完成度审计员"。
-你会收到全书卷纲（含每卷的"大事件锚点"与"本卷兑现"）和迄今所有章节的标题与梗概。
+你会收到全书卷纲（含每卷的"大事件锚点"与"本卷兑现"）、终章结尾的正文原文、以及迄今所有章节的标题与梗概。
 你的唯一任务是判断：本书在叙事上是否已经把卷纲承诺的**必达大事件锚点**都真正落地兑现了，
 而不是字数/章数到了就草草收尾、把关键锚点（真相揭露、主线对峙、核心代价兑现）漏在页面之外。
 
@@ -1127,11 +1302,15 @@ ANCHOR_GATE_SYSTEM = """你是一部连载小说的"完成度审计员"。
   "unrealized_anchors": [
     {"anchor": "卷纲里被漏掉或只是口头提及、未在正文落地的必达锚点简述",
      "why": "为什么判定它尚未兑现（缺了哪个揭露/对峙/代价）",
+     "new_scene": "加写一章将新增的、终章结尾里【完全没有出现过】的新场景/新信息/新动作（必须具体到谁、在哪、做什么）。如果想不出终章里没有的新内容，说明锚点其实已兑现，不要列入本数组",
      "directive": "若要补齐，下一章必须落地的具体场景任务（谁、在哪、做了什么、读者看到什么）"}
   ]
 }
-判定从严：只有当某锚点对应的**具体场景**确实出现在某一章正文里（真相被当面说破、对峙真的发生、代价真的落到人物身上），才算 realized；
-仅在梗概/状态里"提到""暗示""计划"都不算兑现。宁可判未兑现，也不要放过被跳过的高潮。"""
+判定规则（按优先级）：
+1. **终章结尾原文是首要证据**：凡是结尾原文里已经发生的揭露/对峙/代价/签字/指认，一律判 realized——哪怕章节列表的梗概里没提。
+2. 只有当某锚点对应的**具体场景**确实没有出现在任何一章正文里（真相没被当面说破、对峙没有发生、代价没有落到人物身上），才算 unrealized；仅在梗概/状态里"提到""暗示""计划"不算兑现。
+3. **加写一章必须带来新内容**：每个 unrealized 锚点必须给出 new_scene——一个终章结尾里完全没有的新画面。若加写章只会把终章结尾换一种说法重演一遍，那不是未兑现，是已兑现；判 realized。
+误判加写的代价极高（每多写一章都在复述前章、稀释结局），宁可判已兑现，也不要为"再演一遍"开绿灯。"""
 
 
 def anchor_completion_gate(
@@ -1178,6 +1357,23 @@ def anchor_completion_gate(
         f"tone={str(r.get('emotional_tone',''))[:40]}"
         for r in rows
     ]
+    # O2: the auditor previously judged anchors against one-line metric history
+    # only, so an anchor that WAS dramatized in the final chapter's ending still
+    # got audited as "未兑现" (observed: suspense_v11 was extended +3 chapters,
+    # each a near-verbatim re-narration of the previous ending, scores 3.5-5.5).
+    # Give the auditor the actual final-chapter ending text so "already on the
+    # page" is verifiable, and require it to name the NEW content an extra
+    # chapter would add — no new content, no extension.
+    final_tail = ""
+    try:
+        final_tail = read_text(chapter_path(paths, chapter_num))[-4000:]
+    except Exception:
+        final_tail = ""
+    final_tail_block = (
+        f"\n## 终章（第 {chapter_num} 章）结尾原文（判定的首要依据）\n{final_tail}\n"
+        if final_tail.strip()
+        else ""
+    )
     # Short-novel cap context: when the volume_plan was written for a longer book
     # than max_chapters allows (e.g. a 60-70 章 plan in a 6-章 novel), its远期
     # anchors sit beyond the cap and would be audited as永远"未兑现", dragging the
@@ -1194,11 +1390,12 @@ def anchor_completion_gate(
         )
     user = f"""## 全书卷纲（含必达大事件锚点与本卷兑现）
 {volume_plan[:16000]}
-{cap_block}
+{cap_block}{final_tail_block}
 ## 迄今全部章节（最旧在前，共 {len(history_lines)} 章）
 {chr(10).join(history_lines)}
 
-当前已写到第 {chapter_num} 章，引擎即将判断是否可以收尾。审计必达锚点是否都已在正文落地兑现。"""
+当前已写到第 {chapter_num} 章，引擎即将判断是否可以收尾。审计必达锚点是否都已在正文落地兑现。
+注意：上方"终章结尾原文"是正文实拍——凡是其中已经发生的揭露/对峙/代价，一律判 realized，不要因为章节列表里没写细节就误判未兑现。"""
     raw = call_llm(
         client, paths, config, ANCHOR_GATE_SYSTEM, json_prompt(user),
         max_tokens=2500, temperature=0.2, tag="anchor_gate",
@@ -1208,14 +1405,32 @@ def anchor_completion_gate(
         fallback={"all_anchors_realized": True, "unrealized_anchors": []},
     )
     unrealized = [u for u in (data.get("unrealized_anchors") or []) if isinstance(u, dict)]
+    # O2: an extra chapter must bring NEW content. An unrealized entry that
+    # cannot name a concrete new scene (one absent from the final ending) is the
+    # exact misfire that produced 3 consecutive re-narration chapters — drop it.
+    kept: list[dict[str, Any]] = []
+    for u in unrealized:
+        ns = str(u.get("new_scene", "")).strip()
+        if len(ns) < 10:
+            log(
+                paths,
+                f"Anchor gate Ch{chapter_num}: dropping unrealized anchor without a concrete "
+                f"new_scene ({str(u.get('anchor',''))[:40]!r}) — no new content to dramatize.",
+            )
+            continue
+        kept.append(u)
+    unrealized = kept
     directives: list[str] = []
     for u in unrealized:
         d = str(u.get("directive", "")).strip()
         anchor = str(u.get("anchor", "")).strip()
+        ns = str(u.get("new_scene", "")).strip()
         if d:
             directives.append(d if (anchor and anchor in d) or not anchor else f"必达锚点未兑现：{anchor}。{d}")
         elif anchor:
             directives.append(f"必达锚点未兑现，本章必须落地：{anchor}")
+        if ns:
+            directives.append(f"加写章必须包含终章里没有的新场景：{ns}。严禁复述前一章已发生的场景与对话。")
     result = {
         "all_anchors_realized": bool(data.get("all_anchors_realized", True)) and not unrealized,
         "unrealized_anchors": unrealized,
