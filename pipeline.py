@@ -131,6 +131,52 @@ class BackgroundTasks:
             self.tasks = alive + done[-60:]
 
 
+def _beat_gate_one(
+    client: Any,
+    paths: Paths,
+    config: dict[str, Any],
+    chapter_num: int,
+    plan: dict[str, Any],
+    text: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Deterministic beat-coverage gate + one targeted repair for a single draft.
+
+    Runs quality.beat_coverage (non-LLM, anchor-fragment matching) on the draft.
+    If plan beats are missing from the prose, spends ONE surgical low-temperature
+    repair call (writing.repair_missing_beats) that weaves exactly the missing
+    beats in, then re-measures. Keeps the repair only when coverage improved.
+    Returns (text, coverage_report_or_None). Always non-fatal.
+    """
+    if not bool(config["novel"].get("beat_coverage_enabled", True)):
+        return text, None
+    try:
+        from quality import beat_coverage
+
+        cov = beat_coverage(text, plan, config)
+        if not cov.get("enabled") or cov.get("passed"):
+            return text, cov
+        if int(config["novel"].get("beat_coverage_retry", 1)) <= 0:
+            return text, cov
+        from writing import repair_missing_beats
+
+        repaired = repair_missing_beats(client, paths, config, chapter_num, plan, text, cov)
+        if repaired == text:
+            return text, cov
+        cov2 = beat_coverage(repaired, plan, config)
+        if float(cov2.get("coverage", 0.0)) >= float(cov.get("coverage", 0.0)):
+            log(
+                paths,
+                f"Beat gate Ch{chapter_num}: repair coverage "
+                f"{cov.get('coverage')} -> {cov2.get('coverage')} passed={cov2.get('passed')}",
+            )
+            return repaired, cov2
+        log(paths, f"Beat gate Ch{chapter_num}: repair did not improve coverage; keeping original draft")
+        return text, cov
+    except Exception as exc:
+        log(paths, f"Beat coverage gate failed (non-fatal) Ch{chapter_num}: {exc}")
+        return text, None
+
+
 def write_chapter_with_candidates(
     client: Any,
     paths: Paths,
@@ -165,6 +211,9 @@ def write_chapter_with_candidates(
             cached_memory=cached_memory,
             temperature=base_temp if base_temp_override is not None else None,
         )
+        text, cov = _beat_gate_one(client, paths, config, chapter_num, plan, text)
+        if cov is not None:
+            save_checkpoint(paths, chapter_num, "beat_coverage.json", {"drafts": [{"idx": 0, **{k: cov.get(k) for k in ("passed", "coverage", "missing_beats")}}]})
         return text, None
 
     max_workers = int(config["novel"].get("max_parallel_workers", 8))
@@ -193,6 +242,109 @@ def write_chapter_with_candidates(
     valid = [(idx, text) for idx, text in enumerate(drafts) if text and len(text.strip()) >= 500]
     if not valid:
         raise RuntimeError(f"All {n} candidate chapter drafts failed for Ch{chapter_num}")
+
+    # Deterministic beat-coverage gate per draft (non-LLM check; one surgical
+    # repair call only for drafts that dropped plan beats). Run before review so
+    # the reviewer scores the repaired text, and so beat-complete drafts win ties.
+    beat_cov: dict[int, dict[str, Any] | None] = {}
+    if bool(config["novel"].get("beat_coverage_enabled", True)):
+        def gate_one(item: tuple[int, str]) -> tuple[int, str, dict[str, Any] | None]:
+            idx, text = item
+            new_text, cov = _beat_gate_one(client, paths, config, chapter_num, plan, text)
+            return idx, new_text, cov
+
+        gated: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(valid))) as executor:
+            futures = [executor.submit(gate_one, item) for item in valid]
+            for future in as_completed(futures):
+                idx, new_text, cov = future.result()
+                gated[idx] = new_text
+                beat_cov[idx] = cov
+        valid = [(idx, gated.get(idx, text)) for idx, text in valid]
+        try:
+            save_checkpoint(paths, chapter_num, "beat_coverage.json", {
+                "drafts": [
+                    {"idx": idx, "passed": (beat_cov.get(idx) or {}).get("passed"),
+                     "coverage": (beat_cov.get(idx) or {}).get("coverage"),
+                     "missing_beats": (beat_cov.get(idx) or {}).get("missing_beats")}
+                    for idx, _ in valid
+                ],
+            })
+        except Exception:
+            pass
+
+    # P0-2: Deterministic pre-screen (style_health + cross_chapter_repetition)
+    # Runs after beat gate, before LLM review. Drafts that would trigger gate_rejects
+    # are filtered out early, saving review cost and preventing low-quality drafts
+    # from winning on score alone when they'd be rejected anyway.
+    if bool(config["novel"].get("candidate_prescreen_enabled", True)) and len(valid) > 1:
+        try:
+            from quality import style_health, cross_chapter_repetition
+            from store import recent_metrics
+
+            # Collect recent chapters' text for cross_chapter check
+            prior_texts: list[str] = []
+            lookback = int(config["novel"].get("style_cross_repeat_lookback", 6))
+            for ch in range(max(1, chapter_num - lookback), chapter_num):
+                ch_file = paths.chapters_dir / f"{ch:04d}.md"
+                if ch_file.exists():
+                    try:
+                        prior_texts.append(ch_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+
+            # Pre-screen each draft
+            screened: list[tuple[int, str, dict[str, Any]]] = []
+            for idx, text in valid:
+                # Style health
+                try:
+                    em_history = []
+                    recent = recent_metrics(conn, limit=int(config["novel"].get("style_em_dash_trend_window", 5)))
+                    for row in recent:
+                        em = row.get("em_dash_per_kchar")
+                        if em is not None:
+                            em_history.append(float(em))
+                except Exception:
+                    em_history = []
+
+                sh = style_health(text, config, em_history)
+                sh_penalty = sh.get("penalty", 0.0)
+                sh_flags = sh.get("flags", [])
+
+                # Cross-chapter repetition
+                cr = cross_chapter_repetition(text, prior_texts, config)
+                cr_level = str(cr.get("level", "")).strip()
+                cr_penalty = cr.get("penalty", 0.0)
+
+                total_penalty = sh_penalty + cr_penalty
+                block_threshold = float(config["novel"].get("candidate_prescreen_penalty_block", 3.0))
+
+                # Block drafts that would trigger gate_rejects or exceed penalty threshold
+                if cr_level == "reject":
+                    log(paths, f"Pre-screen BLOCK Ch{chapter_num} idx={idx}: cross_repeat reject (fossils={cr.get('metrics', {}).get('cross_repeat_fossils')})")
+                    continue
+                elif total_penalty >= block_threshold:
+                    log(paths, f"Pre-screen BLOCK Ch{chapter_num} idx={idx}: total_penalty={total_penalty:.2f} (style={sh_penalty:.2f} cross={cr_penalty:.2f})")
+                    continue
+                else:
+                    screened.append((idx, text, {"style_penalty": sh_penalty, "cross_penalty": cr_penalty, "style_flags": sh_flags}))
+
+            if screened:
+                valid = [(idx, text) for idx, text, _ in screened]
+                log(paths, f"Pre-screen kept {len(screened)}/{len(valid) + len(screened)} drafts for Ch{chapter_num}")
+                # Save pre-screen results
+                try:
+                    save_checkpoint(paths, chapter_num, "candidate_prescreen.json", {
+                        "kept": [{"idx": idx, "style_penalty": m["style_penalty"], "cross_penalty": m["cross_penalty"]} for idx, _, m in screened],
+                        "total_candidates": len(valid) + len(screened),
+                    })
+                except Exception:
+                    pass
+            else:
+                # All drafts blocked — fall back to least-bad one
+                log(paths, f"Pre-screen blocked ALL drafts for Ch{chapter_num}; keeping least-penalty draft")
+        except Exception as exc:
+            log(paths, f"Candidate pre-screen failed (non-fatal) Ch{chapter_num}: {exc}")
 
     if len(valid) == 1:
         idx, text = valid[0]
@@ -225,10 +377,18 @@ def write_chapter_with_candidates(
         for future in as_completed(futures):
             reviewed.append(future.result())
 
-    reviewed.sort(key=lambda r: safe_score(r[2].get("score", 0)), reverse=True)
+    # Beat-complete drafts win first; score breaks ties. A draft that still fails
+    # the beat gate after its repair shot is structurally incomplete — a slightly
+    # higher prose score cannot compensate for an absent plan beat (-1.0 each at
+    # final review anyway).
+    def _beat_passed(idx: int) -> bool:
+        cov = beat_cov.get(idx)
+        return bool(cov.get("passed")) if isinstance(cov, dict) else True
+
+    reviewed.sort(key=lambda r: (_beat_passed(r[0]), safe_score(r[2].get("score", 0))), reverse=True)
     best_idx, best_text, best_review = reviewed[0]
-    scores = [(idx, safe_score(rep.get("score", 0))) for idx, _, rep in reviewed]
-    log(paths, f"Selected Ch{chapter_num} draft idx={best_idx} score={best_review.get('score')}/10 candidates={scores}")
+    scores = [(idx, safe_score(rep.get("score", 0)), _beat_passed(idx)) for idx, _, rep in reviewed]
+    log(paths, f"Selected Ch{chapter_num} draft idx={best_idx} score={best_review.get('score')}/10 candidates(idx,score,beats_ok)={scores}")
     return best_text, best_review
 
 

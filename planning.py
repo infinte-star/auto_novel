@@ -92,13 +92,35 @@ ARBITER_SYSTEM = """你是长篇小说引擎中的仲裁层。
     "location": "...", "info_source": "...",
     "thread_actions": ["..."], "hook": "...", "risk": "..."
   },
-  "required_constraints": ["作者必须遵守的硬性约束"],
+  "required_constraints": [
+    {
+      "id": "唯一标识符（如 beat_X_concrete, payoff_visible, character_Y_motive）",
+      "type": "beat_fidelity|character_consistency|world_logic|payoff_delivery|hook_setup|other",
+      "constraint": "具体的、可验证的约束条款（一句话，必须陈述可检查的事实）",
+      "check_method": "keyword|character_name|location|object|action|dialogue|logic",
+      "target": "关键词/人名/地点/物件/动作/对话片段/逻辑关系（供评审验证）"
+    }
+  ],
   "reader_expectation_delta": "为何这样能提升或损害读者的追读欲"
 }
 merged_plan 必须包含上述全部键，不得缺字段。改写 beats 时，每个 beat 仍须是完整主谓宾句子，禁止破折号状态短语堆叠。
 对以下大纲予以否决或降分：把已知审校问题停留在抽象层面、依赖在页面之外解决、重复相同的物理调度、或留有未解决的时间线/物流漏洞。
 若候选采用 "reversal"（反转）策略，当其反转没有铺垫（事先建立并强化过一个事实/信任源，再将其推翻）时降分——
 没有铺垫的反转只是突兀的转折，而非兑现。请改进 merged_plan，让作者拿到的是具体的场景任务，而非含糊的意图。
+
+## required_constraints 结构化要求（P0-4）
+每条约束必须包含：
+- id: 唯一标识（如 beat_3_location, character_zhao_motive, payoff_object_visible）
+- type: 约束类型（beat_fidelity=beat 必须落地、character_consistency=人物一致性、world_logic=世界观逻辑、payoff_delivery=兑现交付、hook_setup=钩子铺垫、other）
+- constraint: 具体的验收条款，必须可验证（例如："beat 3 提到的'药箱搭扣'必须在正文中出现角色触摸搭扣的动作"）
+- check_method: 验证方法（keyword=关键词检查、character_name=人名出现、location=地点提及、object=物件出现、action=动作实演、dialogue=对话内容、logic=逻辑关系）
+- target: 验证目标（关键词/人名/物件名/动作描述/对话片段，供评审时机械检查）
+
+示例：
+{"id": "beat_2_object", "type": "beat_fidelity", "constraint": "beat 2 中的'灯塔二层走廊'必须在正文中明确出现", "check_method": "location", "target": "灯塔二层走廊"}
+{"id": "payoff_visual", "type": "payoff_delivery", "constraint": "核心 payoff 必须通过可见物证（照片 vs 现场）展示，而非口头推理", "check_method": "object", "target": "照片"}
+{"id": "character_motive", "type": "character_consistency", "constraint": "祝寒做出选择前必须展示内心挣扎（不少于 50 字独白或动作犹豫）", "check_method": "keyword", "target": "犹豫|挣扎|迟疑|踟蹰"}
+
 最后再次确认：你的 score 是"可落地性分"——payoff/高潮 beat 若仍是抽象意图（无具体动作+物体+可见结果），score 必须 ≤7.0。"""
 
 FUSED_PLAN_REVIEW_SYSTEM = """你是一部中国历史/玄幻网文的多维度大纲审校者。
@@ -186,21 +208,42 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
     """Aggregate per-strategy stats from past plan_arbitration events.
 
     Returns {strategy_name: {"trials": N, "score_sum": X, "wins": K}}.
-    "wins" counts how often a candidate with that strategy was the
-    arbiter-selected one.
+
+    P1-1: "wins" now counts terminal chapter quality (final score from chapter_metrics)
+    rather than arbiter selection. This upgrades the bandit's reward signal from
+    "仲裁者认为哪个大纲好" to "哪个大纲真正写出了高质量成稿", closing the plan→execution gap.
+    A score >= 8.0 counts as a full win; scores 5-8 get partial credit linearly scaled.
     """
     try:
         with db_lock():
             rows = conn.execute(
-                "SELECT payload FROM events WHERE event_type='plan_arbitration' "
+                "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
                 "ORDER BY id DESC LIMIT ?",
                 (lookback,),
             ).fetchall()
-        events = [{"payload": json.loads(r["payload"])} for r in rows]
+        events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
     except Exception:
         return {}
-    stats: dict[str, dict[str, float]] = {}
+
+    # Load terminal quality scores (chapter_metrics)
+    terminal_scores: dict[int, float] = {}
+    try:
+        with db_lock():
+            metric_rows = conn.execute(
+                "SELECT chapter, score FROM chapter_metrics ORDER BY chapter DESC LIMIT ?",
+                (lookback,)
+            ).fetchall()
+        for row in metric_rows:
+            ch = row["chapter"]
+            score = row["score"]
+            if ch and score is not None:
+                terminal_scores[int(ch)] = float(score)
+    except Exception:
+        pass
+
+    stats: dict[str, dict[str, float]] =
     for ev in events:
+        chapter = ev.get("chapter")
         payload = ev.get("payload") if isinstance(ev, dict) else None
         if not isinstance(payload, dict):
             continue
@@ -212,6 +255,10 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
         sel_idx = int(decision.get("selected_index", 0))
         scores = decision.get("scores") or []
         score_map = {int(s.get("index", -1)): safe_score(s.get("score", 0)) for s in scores}
+
+        # Get terminal quality for this chapter (if available)
+        terminal_score = terminal_scores.get(int(chapter), None) if chapter else None
+
         for i, plan in enumerate(plans):
             if not isinstance(plan, dict):
                 continue
@@ -221,8 +268,20 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
             entry = stats.setdefault(strat, {"trials": 0.0, "score_sum": 0.0, "wins": 0.0})
             entry["trials"] += 1
             entry["score_sum"] += float(score_map.get(i, 5.0))
+
+            # P1-1: Count wins based on terminal quality (selected plans only)
             if i == sel_idx:
-                entry["wins"] += 1
+                if terminal_score is not None:
+                    # A score >= 8.0 counts as a full win
+                    win_threshold = 8.0
+                    if terminal_score >= win_threshold:
+                        entry["wins"] += 1.0
+                    else:
+                        # Partial credit: linearly scale from 0 (score=5) to 1 (score=8)
+                        entry["wins"] += max(0.0, (terminal_score - 5.0) / (win_threshold - 5.0))
+                else:
+                    # Fallback: arbiter selection (when metrics not yet written)
+                    entry["wins"] += 1.0
     return stats
 
 

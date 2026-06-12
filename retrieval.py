@@ -396,6 +396,160 @@ def retrieval_block(
     return "\n".join(lines)
 
 
+def exemplar_block(
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    chapter_num: int,
+) -> str:
+    """P0-3: Build a '黄金范例' block from top-scoring chapters matching the plan's type.
+
+    Selects chapters with score >= threshold from chapter_metrics, filters by
+    payoff_type/conflict_type match when available, retrieves text snippets matching
+    the plan's concrete fields, and formats them as positive exemplars with their
+    scores and what made them succeed.
+
+    This block MUST stay in the variable (non-cacheable) prompt segment — it's
+    injected alongside retrieval_block in write_chapter's user message, never in
+    cacheable_prefix, so changing selection logic doesn't invalidate the cache.
+    """
+    if not bool(config["novel"].get("exemplar_rag_enabled", True)):
+        return ""
+    if chapter_num <= int(config["novel"].get("exemplar_rag_min_chapter", 8)):
+        return ""
+
+    try:
+        from store import recent_metrics
+        # Get all chapters with metrics
+        all_metrics = []
+        try:
+            # Fetch more chapters to find top performers
+            candidates = recent_metrics(conn, limit=min(chapter_num - 1, 100))
+            all_metrics = [m for m in candidates if isinstance(m, dict)]
+        except Exception:
+            pass
+
+        if not all_metrics:
+            return ""
+
+        # Filter by score threshold
+        threshold = float(config["novel"].get("exemplar_rag_score_min", 8.8))
+        high_scorers = [
+            m for m in all_metrics
+            if m.get("score") is not None and float(m.get("score", 0)) >= threshold
+        ]
+
+        if not high_scorers:
+            return ""
+
+        # Optional: filter by payoff_type or conflict_type match
+        plan_payoff = str(plan.get("payoff_type", "")).strip() if isinstance(plan, dict) else ""
+        plan_conflict = str(plan.get("conflict_type", "")).strip() if isinstance(plan, dict) else ""
+
+        matched = []
+        for m in high_scorers:
+            ch_payoff = str(m.get("payoff_type", "")).strip()
+            ch_conflict = str(m.get("conflict_type", "")).strip()
+            # Prefer same type, but accept any high scorer if no match
+            if plan_payoff and ch_payoff == plan_payoff:
+                matched.append((m, 2))  # strong match
+            elif plan_conflict and ch_conflict == plan_conflict:
+                matched.append((m, 1))  # weak match
+            else:
+                matched.append((m, 0))  # no type match
+
+        # Sort by match score then by chapter score
+        matched.sort(key=lambda x: (x[1], x[0].get("score", 0)), reverse=True)
+        top_exemplars = [m for m, _ in matched[:int(config["novel"].get("exemplar_rag_top_k", 3))]]
+
+        if not top_exemplars:
+            return ""
+
+        # Build query from plan fields (same as retrieval_block)
+        query_parts: list[str] = []
+        for key in ("title", "goal", "conflict", "payoff", "pressure"):
+            v = plan.get(key)
+            if v:
+                query_parts.append(str(v))
+        query = " ".join(query_parts).strip()
+
+        lines = [
+            "## 黄金范例（本书高分章节，供学习节奏与执行手法）",
+            "以下章节在终局质量评分中达到高分（≥8.8/10）。参考其节奏把控、beat 落地方式、钩子设计，",
+            "但**必须用你自己的措辞和场景重写**，严禁照搬原句或结构。",
+        ]
+
+        for ex in top_exemplars:
+            ch = ex.get("chapter")
+            score = ex.get("score")
+            if ch is None:
+                continue
+
+            # Read chapter text
+            from config import chapter_path
+            ch_text = ""
+            try:
+                ch_path = chapter_path(paths, ch)
+                if ch_path.exists():
+                    ch_text = ch_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+            if not ch_text:
+                continue
+
+            # Extract snippet matching query (use TF-IDF scoring)
+            snippet = ""
+            if query:
+                try:
+                    # Simple TF-IDF match: split into sentences, score by query term overlap
+                    sentences = re.split(r'[。！？\n]', ch_text)
+                    query_terms = set(_tokenize(query))
+                    if query_terms:
+                        scored = []
+                        for sent in sentences:
+                            sent = sent.strip()
+                            if len(sent) >= 20:
+                                sent_terms = set(_tokenize(sent))
+                                overlap = len(query_terms & sent_terms)
+                                if overlap > 0:
+                                    scored.append((overlap, sent))
+                        if scored:
+                            scored.sort(reverse=True)
+                            # Take top 1-2 matching sentences
+                            snippet = "".join(s for _, s in scored[:2])
+                except Exception:
+                    pass
+
+            if not snippet:
+                # Fallback: take first ~200 chars
+                snippet = ch_text[:200]
+
+            if len(snippet) > 400:
+                snippet = snippet[:400] + "…"
+
+            # Format strengths
+            strengths = []
+            if ex.get("hook_score") and float(ex.get("hook_score", 0)) >= 8.5:
+                strengths.append(f"强钩子({ex.get('hook_score')}/10)")
+            if ex.get("payoff_score") and float(ex.get("payoff_score", 0)) >= 8.5:
+                strengths.append(f"高兑现({ex.get('payoff_score')}/10)")
+            if ex.get("novelty_score") and float(ex.get("novelty_score", 0)) >= 8.0:
+                strengths.append(f"新意({ex.get('novelty_score')}/10)")
+            strength_text = "、".join(strengths) if strengths else "整体高分"
+
+            lines.append(f"\n- **Ch{ch} 终评 {score}/10** ({strength_text})")
+            lines.append(f"  {snippet.replace(chr(10), ' ')[:300]}")
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        from config import log
+        log(paths, f"Exemplar RAG failed (non-fatal) Ch{chapter_num}: {exc}")
+        return ""
+
+
 def candidate_new_entities(
     paths: Paths,
     chapter_text: str,

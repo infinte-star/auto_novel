@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
-from quality import plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
+from quality import _beat_anchor_fragments, beat_coverage, plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
@@ -206,7 +206,7 @@ class VisualPayoffTests(unittest.TestCase):
 
 
 class FirstDraftExecutionLedgerTests(unittest.TestCase):
-    def test_ledger_maps_beats_to_page_execution(self):
+    def test_ledger_keeps_global_rules_without_per_beat_duplication(self):
         plan = {
             "beats": [
                 "沈澜把验尸单压在桌沿，对照两处伤口位置逼罗鹤改口。",
@@ -215,9 +215,11 @@ class FirstDraftExecutionLedgerTests(unittest.TestCase):
         }
         out = _first_draft_execution_ledger({"novel": {"chapter_words": 4000}}, plan)
         self.assertIn("首稿页面执行账本", out)
-        self.assertIn("beat1", out)
-        self.assertIn("谁在什么场地", out)
-        self.assertIn("风险：该 beat 含抽象实现词", out)
+        self.assertIn("节奏预算", out)
+        self.assertIn("细节保真", out)
+        # Per-beat enumeration moved to the tail-of-prompt acceptance checklist
+        # in write_chapter (recency anchor); the ledger must NOT duplicate it.
+        self.assertNotIn("beat1", out)
 
     def test_ledger_can_be_disabled(self):
         plan = {"beats": ["她发现证词矛盾。"]}
@@ -230,6 +232,77 @@ class FirstDraftExecutionLedgerTests(unittest.TestCase):
     def test_concretization_heuristic_ignores_action_anchored_beats(self):
         self.assertFalse(_beat_needs_concretization("她把证词摊在桌上，证明罗鹤说谎。"))
         self.assertTrue(_beat_needs_concretization("她意识到证词存在矛盾。"))
+
+
+class BeatCoverageTests(unittest.TestCase):
+    """Deterministic beat-coverage gate (quality.beat_coverage)."""
+
+    @staticmethod
+    def _body(extra: str = "") -> str:
+        # >500 chars of filler so the short-text auto-pass doesn't trigger.
+        return "第10章 残响\n\n" + ("林夕沿着走廊往前走，灯光在地面投下长长的影子。" * 20) + extra
+
+    def test_missing_concrete_beat_fails(self):
+        plan = {"beats": [
+            "林夕发现安瓿碎裂方向与针孔方向矛盾，意识到现场被布置过。",
+        ]}
+        report = beat_coverage(self._body(), plan, {"novel": {}})
+        self.assertTrue(report["enabled"])
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["missing_beats"]), 1)
+        self.assertIn("安瓿", report["missing_beats"][0])
+
+    def test_realized_beat_passes_exact(self):
+        plan = {"beats": [
+            "林夕发现安瓿碎裂方向与针孔方向矛盾。",
+        ]}
+        body = self._body("她蹲下身，注意到安瓿碎裂方向朝外，而针孔方向却指向床头——两者矛盾。")
+        report = beat_coverage(body, plan, {"novel": {}})
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["missing_beats"], [])
+
+    def test_reworded_beat_passes_via_bigram_fallback(self):
+        plan = {"beats": ["她检查药箱搭扣上的指纹划痕。"]}
+        # "药箱的搭扣" rewords "药箱搭扣"; bigram coverage should still hit.
+        body = self._body("她俯身检查药箱的搭扣，指纹划痕在灯下清晰可见。")
+        report = beat_coverage(body, plan, {"novel": {}})
+        self.assertTrue(report["passed"])
+
+    def test_abstract_beat_auto_passes(self):
+        plan = {"beats": ["她意识到自己可能错了。"]}
+        report = beat_coverage(self._body(), plan, {"novel": {}})
+        self.assertTrue(report["passed"])
+
+    def test_short_text_auto_passes(self):
+        plan = {"beats": ["林夕发现安瓿碎裂方向矛盾。"]}
+        report = beat_coverage("太短", plan, {"novel": {}})
+        self.assertTrue(report["passed"])
+
+    def test_disabled_via_config(self):
+        plan = {"beats": ["林夕发现安瓿碎裂方向矛盾。"]}
+        report = beat_coverage(self._body(), plan, {"novel": {"beat_coverage_enabled": False}})
+        self.assertFalse(report["enabled"])
+        self.assertTrue(report["passed"])
+
+    def test_coverage_floor_fails_even_when_each_beat_hits_once(self):
+        # Both beats hit one anchor each, but overall anchor hit-rate is low;
+        # a strict min coverage should still fail the gate.
+        plan = {"beats": [
+            "林夕用镊子夹起安瓿，对照护士站的交接记录核对批号与给药时间。",
+            "周临舟拦在配药室门口，亮出调岗通知逼她交出钥匙。",
+        ]}
+        body = self._body("她夹起安瓿看了一眼。周临舟站在配药室门口。")
+        report = beat_coverage(body, plan, {"novel": {"beat_coverage_min": 0.95}})
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["missing_beats"], [])
+        self.assertLess(report["coverage"], 0.95)
+
+    def test_anchor_fragments_skip_stop_tokens_and_generic(self):
+        anchors = _beat_anchor_fragments("她发现了一个东西，意识到事情不对。")
+        self.assertEqual(anchors, ["不对"])
+        anchors2 = _beat_anchor_fragments("林夕把安瓿碎片收进证物袋。")
+        self.assertIn("安瓿碎片", anchors2)
+        self.assertIn("证物袋", anchors2)
 
 
 class QualityDebtPatchTests(unittest.TestCase):

@@ -674,6 +674,92 @@ def review_chapter(
         except Exception as exc:
             log(paths, f"style_health check failed (non-fatal) Ch{chapter_num}: {exc}")
 
+    # P0-4: Structured constraint verification (required_constraints from arbitrate_plan)
+    # Each constraint carries an id/type/constraint/check_method/target; verify each one
+    # mechanically and report violations with concrete evidence.
+    if bool(config["novel"].get("constraint_verification_enabled", True)):
+        try:
+            from checkpoint import load_checkpoint
+            decision = load_checkpoint(paths, chapter_num, "plan_initial_attempt0_arbitration.json")
+            if not decision:
+                decision = load_checkpoint(paths, chapter_num, "plan_initial_selected.json")
+            constraints = decision.get("required_constraints", []) if isinstance(decision, dict) else []
+
+            if isinstance(constraints, list) and constraints:
+                failed_constraints: list[dict[str, Any]] = []
+                for c in constraints:
+                    if not isinstance(c, dict):
+                        continue
+
+                    c_id = str(c.get("id", "")).strip()
+                    c_type = str(c.get("type", "")).strip()
+                    c_constraint = str(c.get("constraint", "")).strip()
+                    c_method = str(c.get("check_method", "")).strip()
+                    c_target = str(c.get("target", "")).strip()
+
+                    if not c_id or not c_method or not c_target:
+                        continue
+
+                    passed = False
+                    # Mechanical verification based on check_method
+                    if c_method == "keyword":
+                        # Split target by | for OR keywords
+                        keywords = [kw.strip() for kw in c_target.split("|")]
+                        passed = any(kw in chapter for kw in keywords if kw)
+                    elif c_method in ("character_name", "location", "object"):
+                        passed = c_target in chapter
+                    elif c_method == "action":
+                        # Action descriptors should appear as part of prose
+                        passed = c_target in chapter or any(word in chapter for word in c_target.split() if len(word) >= 2)
+                    elif c_method == "dialogue":
+                        # Check if dialogue fragment appears (approximate)
+                        passed = c_target in chapter
+                    elif c_method == "logic":
+                        # Logic checks require LLM; skip mechanical check, rely on LLM report
+                        passed = True
+
+                    if not passed:
+                        failed_constraints.append({
+                            "id": c_id,
+                            "type": c_type,
+                            "constraint": c_constraint,
+                            "check_method": c_method,
+                            "target": c_target,
+                        })
+
+                if failed_constraints:
+                    # Add penalty and surface violations
+                    constraint_penalty = min(
+                        len(failed_constraints) * float(config["novel"].get("constraint_violation_penalty_each", 0.5)),
+                        float(config["novel"].get("constraint_violation_penalty_cap", 2.0))
+                    )
+                    penalties += constraint_penalty
+
+                    report["constraint_violations_structured"] = failed_constraints
+                    report.setdefault("problems", []).append(
+                        f"CONSTRAINT: {len(failed_constraints)} 条仲裁契约未兑现（{', '.join(c['id'] for c in failed_constraints[:3])}...）"
+                    )
+
+                    # Feed violations back to writer for next chapter
+                    wd = report.setdefault("writer_directives_for_next_chapter", [])
+                    for fc in failed_constraints[:3]:
+                        directive = f"修复契约 {fc['id']}: {fc['constraint']}"
+                        if directive not in wd:
+                            wd.append(directive)
+
+                    log(
+                        paths,
+                        f"Constraint violations Ch{chapter_num}: {len(failed_constraints)} failed, penalty={constraint_penalty:.2f}"
+                    )
+
+                    # Block accept if too many critical constraints failed
+                    block_threshold = int(config["novel"].get("constraint_violation_block_count", 3))
+                    if len(failed_constraints) >= block_threshold:
+                        report["accepted"] = False
+                        log(paths, f"Constraint block Ch{chapter_num}: {len(failed_constraints)} >= {block_threshold}")
+        except Exception as exc:
+            log(paths, f"Constraint verification failed (non-fatal) Ch{chapter_num}: {exc}")
+
     # Cross-chapter repetition: signature clauses/metaphors reused verbatim across
     # chapters ("像一颗心脏在缓慢地跳动", "不是暂时的，是永久的", "锁扣声每N秒一次")
     # become tics that self-review treats as motif. Deterministically penalize the

@@ -683,6 +683,87 @@ def writer_directives_for_chapter(paths: Paths, chapter_num: int, limit: int = 6
     return directives
 
 
+def _preflight_negative_list(
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    lookback: int = 5,
+) -> dict[str, Any]:
+    """Build a pre-write negative list from recent failure modes.
+
+    Collects gate_rejects (cross-chapter fossils, adjacent repetition),
+    style collapse flags (em-dash density, fragment lines), and concrete
+    fossil clauses from the last N chapters to front-load avoidance directives
+    BEFORE the first draft is generated, rather than discovering them only
+    after a low review score.
+
+    Returns {"items": [...], "fossils": [...], "style_warnings": [...]}
+    """
+    if chapter_num <= 1:
+        return {"items": [], "fossils": [], "style_warnings": []}
+
+    items: list[str] = []
+    fossils: set[str] = set()
+    style_warnings: list[str] = []
+    seen_gates: set[str] = set()
+
+    start = max(1, chapter_num - lookback)
+    for ch in range(start, chapter_num):
+        # Check final_review for gate_rejects
+        for key in ("final_review.json", "review_round1.json", "review_round0.json"):
+            data = load_checkpoint(paths, ch, key)
+            if not isinstance(data, dict):
+                continue
+
+            gate_rejects = data.get("gate_rejects", [])
+            if isinstance(gate_rejects, list):
+                for gr in gate_rejects:
+                    if not isinstance(gr, dict):
+                        continue
+                    gate = str(gr.get("gate", "")).strip()
+                    if not gate or gate in seen_gates:
+                        continue
+                    seen_gates.add(gate)
+
+                    evidence = gr.get("evidence", {})
+                    if gate == "cross_chapter_repetition":
+                        examples = evidence.get("examples", [])
+                        if isinstance(examples, list):
+                            for ex in examples[:4]:
+                                clause = str(ex).strip()
+                                if clause and len(clause) >= 6:
+                                    fossils.add(clause)
+                        items.append(
+                            f"近期检测到跨章节化石句（逐字复读）；本章严禁再现以下措辞或结构相似的表达。"
+                        )
+                    elif gate == "adjacent_repetition":
+                        metrics = evidence.get("metrics", {})
+                        overlap = metrics.get("clause_overlap")
+                        if overlap:
+                            items.append(
+                                f"Ch{ch} 大量逐字复述前章内容（overlap={overlap:.2f}）；"
+                                "本章必须从新事件开始，前章场景只许一笔带过。"
+                            )
+
+            # Collect style flags
+            flags = data.get("style_flags", [])
+            if isinstance(flags, list):
+                for flag in flags[:3]:
+                    flag_text = str(flag).strip()
+                    if flag_text and flag_text not in style_warnings:
+                        style_warnings.append(flag_text)
+
+            if gate_rejects or flags:
+                break
+
+    return {
+        "items": items[:6],
+        "fossils": sorted(fossils)[:12],
+        "style_warnings": style_warnings[:4],
+    }
+
+
 ABSTRACT_BEAT_MARKERS = (
     "推导出",
     "意识到",
@@ -792,15 +873,10 @@ def _first_draft_execution_ledger(config: dict[str, Any], plan: dict[str, Any]) 
         "严禁用它的“结果”或“声音”替代动作本身（例如 beat 写“她另一只手在药箱搭扣上摸了一下”，正文只写“搭扣发出一声轻响”即判不合格——必须写出“摸”这个动作和沈澜看到的手），"
         "严禁用“一笔带过/读了也读不出/总结一句”抹掉 beat 里要求的内心挣扎或动机铺垫。删一个具体细节就少一分。",
     ]
-    for i, beat in enumerate(beat_list[:9], 1):
-        risk = "；风险：该 beat 含抽象实现词，正文必须补出具体物件、身体动作、对手反应和可见结果" if _beat_needs_concretization(beat) else ""
-        fidelity = ""
-        details = _beat_concrete_details(beat)
-        if details:
-            fidelity = "；必须逐项实演不得删减或用结果替代：" + "、".join(details[:6])
-        lines.append(
-            f"- beat{i}: {beat[:150]} -> 正文落点必须回答“谁在什么场地，为了什么目标，顶着什么阻力，做/说了什么，页面上留下什么后果”{risk}{fidelity}。"
-        )
+    # Per-beat enumeration intentionally removed: each beat (with its concrete
+    # acceptance details) is re-stated once in the tail-of-prompt 验收清单 built
+    # by write_chapter, where recency makes it actually bind. Duplicating the
+    # list here diluted that anchor and roughly doubled the beat token cost.
     return "\n".join(lines) + "\n"
 
 
@@ -890,9 +966,10 @@ def _prewrite_quality_contract(
     if plan_risk:
         lines.append(f"\n### 大纲已点名的首要风险（本章主动规避，不要踩中）\n- {plan_risk[:240]}")
     if beat_list:
-        lines.append("\n### 本章 beat 戏剧化清单（写完前内部确认每条都是 realized，而非 partial/absent）")
-        for i, b in enumerate(beat_list[:9], 1):
-            lines.append(f"- beat{i}: {b[:160]} —— 它在正文里对应哪个可见动作/对话/后果？")
+        # Per-beat enumeration is deliberately NOT repeated here: the full beat
+        # acceptance checklist is appended at the very END of the user message
+        # (recency anchor in write_chapter), where attention is strongest.
+        # Repeating it mid-prompt diluted the tail anchor and wasted tokens.
         ledger = _first_draft_execution_ledger(config, plan)
         if ledger:
             lines.append("\n" + ledger.rstrip())
@@ -1008,6 +1085,13 @@ def write_chapter(
     partial_beats = carried_over_partial_beats(paths, chapter_num)
     directives = writer_directives_for_chapter(paths, chapter_num)
     carryover_block = ""
+    # P0-1: Pre-flight negative list (gate_rejects + style collapse flags + fossils)
+    preflight_neg = None
+    if bool(config["novel"].get("preflight_constraints_enabled", True)):
+        preflight_neg = _preflight_negative_list(
+            paths, conn, config, chapter_num,
+            lookback=int(config["novel"].get("preflight_constraints_lookback", 5)),
+        )
     contract_text = contract_block(paths, config)
     if contract_text:
         carryover_block += (
@@ -1018,6 +1102,21 @@ def write_chapter(
             "黑名单与禁止套路同样不得触碰。\n"
             f"{contract_text}\n"
         )
+    if preflight_neg and (preflight_neg["items"] or preflight_neg["fossils"] or preflight_neg["style_warnings"]):
+        carryover_block += "\n## 本章绝对禁止（前置负面清单·来自近期质量门禁）\n"
+        carryover_block += "以下失败模式已在前几章触发质量门禁拒收。本章动笔前必须规避：\n"
+        if preflight_neg["items"]:
+            for item in preflight_neg["items"]:
+                carryover_block += f"- {item}\n"
+        if preflight_neg["fossils"]:
+            carryover_block += "\n**已检测到的化石句（严禁复现原句或结构相似表达）：**\n"
+            for fossil in preflight_neg["fossils"]:
+                carryover_block += f"  • 「{fossil}」\n"
+        if preflight_neg["style_warnings"]:
+            carryover_block += "\n**近期风格问题：**\n"
+            for warn in preflight_neg["style_warnings"]:
+                carryover_block += f"  • {warn}\n"
+        carryover_block += "\n"
     prewrite_contract = _prewrite_quality_contract(paths, config, chapter_num, plan, decision)
     if prewrite_contract:
         carryover_block += "\n" + prewrite_contract + "\n"
@@ -1074,6 +1173,18 @@ def write_chapter(
             _log(paths, f"RAG block build failed (non-fatal) Ch{chapter_num}: {exc}")
     if rag_block:
         carryover_block += "\n" + rag_block + "\n"
+    # P0-3: Golden exemplar RAG (top-scoring chapters matching plan type)
+    exemplar_block_text = ""
+    if bool(config["novel"].get("exemplar_rag_enabled", True)):
+        try:
+            from retrieval import exemplar_block
+
+            exemplar_block_text = exemplar_block(paths, conn, config, plan, chapter_num)
+        except Exception as exc:
+            from config import log as _log
+            _log(paths, f"Exemplar RAG block build failed (non-fatal) Ch{chapter_num}: {exc}")
+    if exemplar_block_text:
+        carryover_block += "\n" + exemplar_block_text + "\n"
     try:
         from benchmark import benchmark_context, platform_guidance
 
@@ -1134,7 +1245,28 @@ def write_chapter(
 {json.dumps(decision.get("required_constraints", []), ensure_ascii=False, indent=2)}
 
 写第 {chapter_num} 章。"""
-    # Recency anchor: the full contract sits high in the prompt where long context
+    # Recency anchor #1: the beat acceptance checklist. Beats sit mid-prompt inside
+    # the plan JSON where long context dilutes them (v13 Ch10 shipped with its core
+    # payoff beat entirely absent from the prose). Re-state every beat as the
+    # last-read acceptance checklist, with the concrete details each beat promises
+    # named as non-negotiable items. This replaces the duplicated mid-prompt beat
+    # enumerations that used to live in _prewrite_quality_contract /
+    # _first_draft_execution_ledger.
+    beat_list = [str(b).strip() for b in (plan.get("beats") or []) if str(b).strip()] if isinstance(plan, dict) else []
+    if beat_list:
+        checklist_lines = []
+        for i, b in enumerate(beat_list[:9], 1):
+            details = _beat_concrete_details(b)
+            anchor = ("｜必须实演的具体物件/动作：" + "、".join(details[:4])) if details else ""
+            risk = "｜含抽象实现词，必须落成可见动作+对手反应" if _beat_needs_concretization(b) else ""
+            checklist_lines.append(f"{i}. {b[:150]}{anchor}{risk}")
+        user += (
+            "\n\n## ⚠ 交稿前逐条核对：本章 beat 验收清单（每条都必须在正文中实演为可见动作/对话/后果，缺一条即作废）\n"
+            "每个 beat 写明的具体动作、物件、数字、动机都是硬验收项；严禁用结果或声音替代动作本身，"
+            "严禁用总结句带过，严禁与大纲的具体描述矛盾。\n"
+            + "\n".join(checklist_lines)
+        )
+    # Recency anchor #2: the full contract sits high in the prompt where long context
     # dilutes it (v4 breached the ability whitelist/modality in 5/6 chapters). Re-
     # state ONLY the hard ability boundaries as the very last thing the writer
     # reads, where attention is strongest. Appended AFTER "写第N章" so it is the
@@ -1154,6 +1286,99 @@ def write_chapter(
     raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix, tag="write")
     log(paths, f"write_chapter Ch{chapter_num} LLM returned {len(raw)} chars")
     return normalize_chapter(raw)
+
+
+BEAT_REPAIR_SYSTEM = """你是一位中文网文定向补写专家。
+给你一份章节草稿和一份「缺失节拍清单」——大纲承诺、但正文没有实演出来的节拍。
+任务：把每个缺失节拍编织进正文最合适的场景，用可见动作、对话交锋或具体后果把它实演出来。
+
+约束：
+- 输出完整章节正文。除被补写/衔接的段落外，其余内容逐字保留原样，不要重写无关段落。
+- 每个缺失节拍必须落成页面上的具体动作/物件/对话；节拍里点名的具体细节（谁的手做了什么、什么物件、什么数字）必须原样出现。严禁用结果或声音替代动作本身，严禁用一句总结带过。
+- 补写要顺着上下文因果自然嵌入，不得与已有正文矛盾，不得引入大纲之外的新设定或新人物。
+- 维持原有叙事声音与节奏；补写后总长度增幅控制在 25% 以内。
+- 只输出章节正文，不要解释、不要输出清单。"""
+
+
+def repair_missing_beats(
+    client: Any,
+    paths: Paths,
+    config: dict[str, Any],
+    chapter_num: int,
+    plan: dict[str, Any],
+    chapter: str,
+    coverage: dict[str, Any],
+) -> str:
+    """One targeted low-temperature repair call that weaves missing plan beats
+    into an existing draft.
+
+    The deterministic gate `quality.beat_coverage` found beats the draft never
+    acted out (v13 Ch10 shipped with its core payoff beat entirely absent and the
+    LLM reviewer only caught it post-hoc at -1.0 per beat). Instead of burning a
+    full revision round later, spend ONE surgical call now that targets exactly
+    the missing beats. Returns the repaired text, or the original draft unchanged
+    when the repair fails sanity checks (too short, shrank, or ballooned).
+    """
+    missing = coverage.get("missing_beats") or []
+    if not missing or not chapter:
+        return chapter
+    # Per-beat anchor details (the concrete fragments the gate could not find).
+    beat_missing_anchors: dict[str, list[str]] = {}
+    for entry in coverage.get("beats") or []:
+        if isinstance(entry, dict) and not entry.get("hit"):
+            beat_missing_anchors[str(entry.get("beat", ""))] = [
+                str(a) for a in (entry.get("missing") or []) if str(a).strip()
+            ]
+    items: list[str] = []
+    for mb in missing[:6]:
+        if isinstance(mb, dict):
+            beat = str(mb.get("beat", "")).strip()
+            anchors = [str(a) for a in (mb.get("missing") or []) if str(a).strip()]
+        else:
+            beat = str(mb).strip()
+            anchors = []
+        if not beat:
+            continue
+        if not anchors:
+            for key, vals in beat_missing_anchors.items():
+                if key and (key in beat or beat[:120] in key or key[:120] in beat):
+                    anchors = vals
+                    break
+        anchor_note = ("（正文必须出现的具体细节：" + "、".join(anchors[:4]) + "）") if anchors else ""
+        items.append(f"- {beat[:200]}{anchor_note}")
+    if not items:
+        return chapter
+    user = f"""## 选定大纲JSON（提供节拍语境，不要改变剧情走向）
+{json.dumps(plan, ensure_ascii=False, indent=2)}
+
+## 缺失节拍清单（每条都必须补演进正文对应场景）
+{chr(10).join(items)}
+
+## 章节草稿（除补写处外逐字保留）
+{chapter}
+
+把缺失节拍补演进对应场景，输出完整章节正文。"""
+    base_temp = float(config["api"]["temperature"])
+    temp = min(0.4, base_temp)
+    prefix = cacheable_prefix(paths, config)
+    from config import log
+    log(paths, f"beat repair Ch{chapter_num}: weaving {len(items)} missing beat(s), coverage={coverage.get('coverage')}")
+    try:
+        raw = call_llm(
+            client, paths, config, BEAT_REPAIR_SYSTEM, user,
+            temperature=temp, cacheable_prefix=prefix, tag="beat_repair",
+        )
+    except Exception as exc:
+        log(paths, f"beat repair LLM call failed Ch{chapter_num} (non-fatal): {exc}")
+        return chapter
+    repaired = normalize_chapter(raw or "")
+    if not repaired or len(repaired.strip()) < 500:
+        return chapter
+    if len(repaired) < len(chapter) * 0.7 or len(repaired) > len(chapter) * 1.6:
+        log(paths, f"beat repair Ch{chapter_num} rejected: length {len(chapter)} -> {len(repaired)}")
+        return chapter
+    return repaired
+
 
 def apply_review_patches(chapter: str, patches: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """Apply review-provided patches to chapter text in-place.

@@ -452,6 +452,169 @@ def cross_chapter_repetition(
 
 
 # ---------------------------------------------------------------------------
+# Beat-coverage gate: deterministic "did the prose actually stage each beat?".
+#
+# The single biggest first-pass score sink (v13 Ch10: the plan's core payoff
+# beat — 安瓿碎裂方向矛盾 — never appeared in the prose AT ALL, despite three
+# layers of prompt emphasis; the LLM reviewer then charged -1.0 per absent
+# beat). An absent beat is detectable with plain substring/bigram matching:
+# if the beat promises a concrete object ("安瓿"), the chapter must at least
+# MENTION it. This gate runs at the writer layer (before any LLM review) so a
+# vanished beat costs one cheap targeted repair call instead of a full
+# review→revise→replan cycle.
+#
+# Design bias: CONSERVATIVE. A false "miss" wastes a repair call and may
+# splice awkward prose; a false "pass" just falls through to the existing LLM
+# beats_audit (current behaviour). So anchors are only the beat's distinctive
+# content fragments, matching accepts loose rewording via bigram coverage,
+# and beats with no extractable anchors auto-pass.
+# ---------------------------------------------------------------------------
+
+# Tokens that never carry beat-specific content: particles, copulas, pronouns,
+# numerals/classifiers, and the abstract realization verbs whose objects (not
+# the verbs themselves) are what must appear on the page. Multi-char tokens
+# must come before their prefixes in the regex alternation (sorted by length).
+_BEAT_STOP_TOKENS = (
+    "意识到", "注意到", "反应过来",
+    "发现", "看到", "看见", "听到", "听见", "想到", "想起", "认出", "确认",
+    "开始", "决定", "进行", "出现", "通过", "利用", "试图", "准备", "继续",
+    "随后", "然后", "同时", "必须", "可以", "已经", "没有", "不再", "再次",
+    "终于", "突然", "悄悄", "暗中", "立刻", "马上",
+    "他们", "她们", "我们", "你们",
+    "一个", "一种", "一次", "一道", "一张", "一份", "一句", "一段",
+    "的", "地", "得", "了", "着", "过", "是", "在", "把", "将", "被",
+    "对", "向", "从", "给", "让", "使", "和", "与", "或", "及", "并",
+    "而", "但", "又", "也", "都", "就", "才", "再", "很", "更", "最",
+    "他", "她", "它", "我", "你", "这", "那", "其", "某", "并且", "因为",
+    "所以", "如果", "虽然", "于是",
+)
+
+# Generic fragments that survive splitting but identify nothing specific.
+_BEAT_GENERIC_FRAGMENTS = frozenset({
+    "时候", "东西", "事情", "地方", "样子", "一下", "起来", "出来", "下来",
+    "过来", "之后", "之前", "面前", "身上", "心里", "眼前", "此刻", "现在",
+    "可能", "似乎", "仿佛", "其中", "之间", "内心", "情绪", "感觉", "目光",
+    "动作", "反应", "结果", "过程", "方式", "问题",
+})
+
+_BEAT_SPLIT_RE = re.compile(
+    "(?:" + "|".join(re.escape(t) for t in sorted(_BEAT_STOP_TOKENS, key=len, reverse=True)) + ")"
+    "|[^一-鿿A-Za-z0-9]+"
+)
+
+
+def _beat_anchor_fragments(beat: str, max_anchors: int = 6) -> list[str]:
+    """Extract the distinctive content fragments a beat promises.
+
+    Splits the beat on particles/common verbs/punctuation and keeps 2-8 char
+    CJK fragments that aren't generic filler. Longer fragments are preferred
+    (more distinctive). Returns [] for fully abstract beats — those cannot be
+    judged deterministically and auto-pass.
+    """
+    text = str(beat or "").strip()
+    if not text:
+        return []
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for frag in _BEAT_SPLIT_RE.split(text):
+        frag = (frag or "").strip()
+        if not (2 <= len(frag) <= 8):
+            continue
+        if not re.search(r"[一-鿿]", frag):
+            continue
+        if frag in _BEAT_GENERIC_FRAGMENTS or frag in seen:
+            continue
+        seen.add(frag)
+        fragments.append(frag)
+    fragments.sort(key=len, reverse=True)
+    return fragments[:max_anchors]
+
+
+def _fragment_hit(fragment: str, chapter_text: str, chapter_bigrams: set[str], min_bigram_cov: float = 0.7) -> bool:
+    """True when the chapter plausibly realizes this anchor fragment.
+
+    Exact substring first; for fragments >=3 chars, fall back to bigram
+    coverage so loose rewording ("安瓿碎裂方向" vs "安瓿的碎裂方向") still
+    counts. A chapter that never mentions the object at all fails both.
+    """
+    if fragment in chapter_text:
+        return True
+    if len(fragment) < 3 or not chapter_bigrams:
+        return False
+    grams = {fragment[i: i + 2] for i in range(len(fragment) - 1)}
+    if not grams:
+        return False
+    return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= min_bigram_cov
+
+
+def beat_coverage(
+    chapter_text: str,
+    plan: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic check that each plan beat's concrete anchors appear in prose.
+
+    Returns:
+      {
+        "enabled": bool,
+        "passed": bool,          # every anchored beat hit >=1 anchor AND
+                                 # overall anchor hit-rate >= beat_coverage_min
+        "coverage": float,       # matched anchors / total anchors (1.0 if none)
+        "beats": [{"beat","anchors","missing","hit"}],
+        "missing_beats": [...],  # beats with ZERO anchor hits (the repair list)
+        "missing_anchors": [...] # flat list of all unmatched anchors
+      }
+
+    Conservative: beats with no extractable anchors auto-pass; matching accepts
+    bigram-level rewording. A "pass" here is necessary, not sufficient — the
+    LLM beats_audit still judges whether a mentioned beat was truly DRAMATIZED.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    enabled = bool(cfg.get("beat_coverage_enabled", True))
+    result: dict[str, Any] = {
+        "enabled": enabled, "passed": True, "coverage": 1.0,
+        "beats": [], "missing_beats": [], "missing_anchors": [],
+    }
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    if not enabled or not isinstance(beats, list) or not beats:
+        return result
+    body = _strip_title_line(str(chapter_text or ""))
+    if len(body) < 500:
+        # Too short to judge (provider refusal guard elsewhere refuses <500 anyway).
+        return result
+
+    min_cov = float(cfg.get("beat_coverage_min", 0.6))
+    frag_bigram_cov = float(cfg.get("beat_coverage_fragment_bigram", 0.7))
+    chapter_bigrams = _text_bigrams(body)
+
+    total_anchors = 0
+    total_hits = 0
+    all_anchored_beats_hit = True
+    for raw_beat in beats[:12]:
+        beat = str(raw_beat or "").strip()
+        if not beat:
+            continue
+        anchors = _beat_anchor_fragments(beat)
+        hits = [a for a in anchors if _fragment_hit(a, body, chapter_bigrams, frag_bigram_cov)]
+        missing = [a for a in anchors if a not in hits]
+        beat_hit = (not anchors) or bool(hits)
+        result["beats"].append({
+            "beat": beat[:160], "anchors": anchors, "missing": missing, "hit": beat_hit,
+        })
+        total_anchors += len(anchors)
+        total_hits += len(hits)
+        result["missing_anchors"].extend(missing)
+        if not beat_hit:
+            all_anchored_beats_hit = False
+            result["missing_beats"].append(beat[:200])
+
+    coverage = (total_hits / total_anchors) if total_anchors else 1.0
+    result["coverage"] = round(coverage, 3)
+    result["passed"] = all_anchored_beats_hit and coverage >= min_cov
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Scene-skeleton dedupe: stop the engine from infinitely slicing one scene.
 # ---------------------------------------------------------------------------
 
