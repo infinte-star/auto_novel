@@ -1169,6 +1169,32 @@ def cmd_stats(name: str) -> int:
 # ----------------------------------------------------------------------------
 # telemetry (global cross-novel repository)
 # ----------------------------------------------------------------------------
+def cmd_package(name: str) -> int:
+    """Generate book packaging (titles/intros/tags/synopsis) for a finished novel.
+
+    Writes novels/<name>/package.md + novels/<name>/logs/package.json. Does not
+    touch chapters/ or book.md. Requires a non-empty book.md.
+    """
+    _validate_name(name)
+    _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
+    from config import get_paths, load_config, read_text  # noqa: E402
+    from package import build_package, _build_client  # noqa: E402
+
+    config = load_config()
+    paths = get_paths(config)
+    if not paths.book.exists() or not read_text(paths.book).strip():
+        print(f"[novel] ERROR: no book.md content for '{name}'. Run/finish the novel first.")
+        return 2
+    client = _build_client(config, paths)
+    pkg = build_package(client, paths, config)
+    if not pkg:
+        print(f"[novel] package generation produced nothing for '{name}' (check logs).")
+        return 1
+    print(f"[novel] package written: {paths.book.with_name('package.md')}")
+    print(f"[novel]   json: {paths.logs_dir / 'package.json'}")
+    return 0
+
+
 def cmd_telemetry_backfill() -> int:
     """Import every novel's historical metrics/arbitrations/revise pairs into
     telemetry/global.db. Idempotent: INSERT OR REPLACE on composite keys, so
@@ -1202,6 +1228,33 @@ def cmd_telemetry_backfill() -> int:
     print(f"{'TOTAL':<24} {grand['chapter_metrics']:>8} {grand['events']:>8}"
           f" {grand['strategy_outcomes']:>9} {grand['revise_pairs']:>7}")
     print(f"[novel] global DB: {telemetry.TELEMETRY_DB}")
+    return 0
+
+
+def cmd_distill(output: str, genre: str | None, min_novels: int) -> int:
+    """Distill cross-book craft rules into craft_rules.json so the runtime
+    writer/planner can consume them (closes the distillation feedback loop).
+    Wraps distill.scan_novels; pure DB scan, no LLM calls."""
+    try:
+        import distill
+    except Exception as exc:
+        print(f"[novel] distill module unavailable: {exc}")
+        return 1
+    result = distill.scan_novels(genre_filter=genre, min_novels=min_novels)
+    out_path = (PROJECT_DIR / output) if not Path(output).is_absolute() else Path(output)
+    try:
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[novel] failed to write {out_path}: {exc}")
+        return 1
+    meta = result.get("meta", {})
+    rules = result.get("rules", [])
+    print(f"[novel] distilled {len(rules)} rules from {meta.get('novels_scanned', 0)} novels "
+          f"({meta.get('total_chapters', 0)} chapters) -> {out_path}")
+    for r in rules[:5]:
+        print(f"  [{r.get('category')}] {str(r.get('pattern',''))[:54]} "
+              f"(conf={r.get('confidence')}, n={r.get('evidence_count')}, "
+              f"Δ={r.get('avg_score_after',0)-r.get('avg_score_before',0):+.2f})")
     return 0
 
 
@@ -1275,6 +1328,9 @@ def main() -> int:
     p_stats = sub.add_parser("stats", help="rich quality + cost report for a novel (per-chapter scores, penalties, LLM cost)")
     p_stats.add_argument("name")
 
+    p_package = sub.add_parser("package", help="generate book packaging (titles/intros/tags/synopsis) for a finished novel")
+    p_package.add_argument("name")
+
     p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
     p_compare.add_argument("name_a")
     p_compare.add_argument("name_b")
@@ -1290,6 +1346,11 @@ def main() -> int:
     telemetry_sub.add_parser("backfill", help="import all novels' historical data into telemetry/global.db (idempotent)")
     p_tel_stats = telemetry_sub.add_parser("stats", help="show cross-book strategy win-rates and totals")
     p_tel_stats.add_argument("--genre", default=None, help="filter by genre bucket")
+
+    p_distill = sub.add_parser("distill", help="distill cross-book craft rules -> craft_rules.json (consumed by writer/planner)")
+    p_distill.add_argument("--output", default="craft_rules.json", help="output JSON path (default craft_rules.json)")
+    p_distill.add_argument("--genre", default=None, help="filter by genre (or '_all' for no filter)")
+    p_distill.add_argument("--min-novels", type=int, default=3, dest="min_novels", help="min novels co-occurring for a rule (default 3)")
 
     p_stop = sub.add_parser("stop", help="kill the running process for a novel")
     p_stop.add_argument("name")
@@ -1327,6 +1388,8 @@ def main() -> int:
         return cmd_list()
     if args.command == "stats":
         return cmd_stats(args.name)
+    if args.command == "package":
+        return cmd_package(args.name)
     if args.command == "compare":
         from compare import cmd_compare
         return cmd_compare(args.name_a, args.name_b)
@@ -1338,6 +1401,8 @@ def main() -> int:
             return cmd_telemetry_backfill()
         if args.telemetry_command == "stats":
             return cmd_telemetry_stats(genre=args.genre)
+    if args.command == "distill":
+        return cmd_distill(output=args.output, genre=args.genre, min_novels=args.min_novels)
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

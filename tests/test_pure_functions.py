@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
 from quality import _beat_anchor_fragments, beat_coverage, plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
+from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
@@ -38,6 +39,7 @@ def _make_paths(root):
         voices=root / "memory" / "voices.md",
         voice=root / "memory" / "voice.md",
         contract=root / "memory" / "contract.md",
+        glossary=root / "memory" / "glossary.md",
         chapters_dir=root / "chapters",
         logs_dir=root / "logs",
         database=root / "story_state.db",
@@ -176,6 +178,75 @@ class SceneSimilarityTests(unittest.TestCase):
         res = scene_similarity({"conflict": "x"}, [])
         self.assertEqual(res["max_sim"], 0.0)
         self.assertIsNone(res["most_similar_to"])
+
+
+class NarrativePatternTests(unittest.TestCase):
+    # The failure scene_similarity is blind to: same procedural flow, totally
+    # different concrete subject matter (suspense_10ch Ch3→Ch8 monotony).
+    SAME_FLOW_A = {"beats": [
+        "周岩进入十八楼机房翻找记录",
+        "他取证拍照采集粉尘样本",
+        "把数据与限速器日志比对",
+        "推断出钢丝绳是被人为割断",
+    ]}
+    SAME_FLOW_B = {"beats": [
+        "周岩开车到金华小区门口",
+        "他查看现场提取通讯录照片",
+        "把笔迹与签字记录核对",
+        "断定签字人另有其人",
+    ]}
+    DIFFERENT_FLOW = {"beats": [
+        "对手先行动尾随周岩",
+        "周岩被威胁险些出事",
+        "真相反转原来是嫁祸",
+        "他摊牌对峙质问凶手",
+    ]}
+
+    def test_same_flow_different_subject_is_high_sim(self):
+        #字面 Jaccard would rate these LOW (no shared tokens); the abstract
+        # move-sequence must rate them HIGH.
+        seq_a = _narrative_pattern_sequence(self.SAME_FLOW_A)
+        seq_b = _narrative_pattern_sequence(self.SAME_FLOW_B)
+        self.assertEqual(seq_a, ["enter_space", "collect_evidence", "compare_data", "deduce_conclusion"])
+        self.assertGreaterEqual(_sequence_similarity(seq_a, seq_b), 0.7)
+        # And字面 scene_similarity should be FOOLED (proving the new gate is needed).
+        self.assertLess(scene_similarity(self.SAME_FLOW_A, [self.SAME_FLOW_B])["max_sim"], 0.5)
+
+    def test_different_flow_is_low_sim(self):
+        seq_a = _narrative_pattern_sequence(self.SAME_FLOW_A)
+        seq_c = _narrative_pattern_sequence(self.DIFFERENT_FLOW)
+        self.assertLess(_sequence_similarity(seq_a, seq_c), 0.4)
+
+    def test_block_on_consecutive_streak(self):
+        # Two recent chapters both share the flow → streak == block_streak (2).
+        res = narrative_pattern_repetition(
+            self.SAME_FLOW_A, [self.SAME_FLOW_B, self.SAME_FLOW_B], {"novel": {}}
+        )
+        self.assertEqual(res["level"], "block")
+        self.assertEqual(res["consecutive"], 2)
+        self.assertTrue(res["directives"])
+
+    def test_ok_on_distinct_flow(self):
+        res = narrative_pattern_repetition(
+            self.DIFFERENT_FLOW, [self.SAME_FLOW_A, self.SAME_FLOW_B], {"novel": {}}
+        )
+        self.assertEqual(res["level"], "ok")
+        self.assertEqual(res["penalty"], 0.0)
+
+    def test_short_sequence_is_ignored(self):
+        # A plan with < min_moves recognisable moves carries no flow signal.
+        res = narrative_pattern_repetition(
+            {"beats": ["周岩走进机房"]}, [self.SAME_FLOW_A], {"novel": {}}
+        )
+        self.assertEqual(res["level"], "ok")
+
+    def test_disabled_returns_ok(self):
+        res = narrative_pattern_repetition(
+            self.SAME_FLOW_A, [self.SAME_FLOW_B, self.SAME_FLOW_B],
+            {"novel": {"narrative_pattern_enabled": False}},
+        )
+        self.assertEqual(res["level"], "ok")
+        self.assertEqual(res["max_sim"], 0.0)
 
 
 class VisualPayoffTests(unittest.TestCase):
@@ -329,6 +400,7 @@ class QualityDebtPatchTests(unittest.TestCase):
                 voices=root / "memory" / "voices.md",
                 voice=root / "memory" / "voice.md",
                 contract=root / "memory" / "contract.md",
+                glossary=root / "memory" / "glossary.md",
                 chapters_dir=root / "chapters",
                 logs_dir=root / "logs",
                 database=root / "story_state.db",
@@ -628,6 +700,182 @@ class ThreadLocalConnTests(unittest.TestCase):
             self.assertEqual(len(events), 30)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class CraftRulesTests(unittest.TestCase):
+    """Cross-book craft-rule consumption layer (closes the distillation loop)."""
+
+    def _write_rules(self, rules):
+        import tempfile, json as _json
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "craft_rules.json")
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump({"rules": rules, "meta": {}}, f, ensure_ascii=False)
+        return p
+
+    def test_missing_file_is_silent_noop(self):
+        import craft
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": "/no/such/file.json"}}
+        self.assertEqual(craft.load_craft_rules(cfg), {"rules": [], "meta": {}})
+        self.assertEqual(craft.craft_writer_block(cfg), "")
+        self.assertEqual(craft.craft_planner_hints(cfg), "")
+
+    def test_disabled_flag_returns_empty(self):
+        import craft
+        p = self._write_rules([
+            {"category": "style", "pattern": "碎片化破折号", "fix": "用完整长句", "confidence": 0.9, "evidence_count": 5}
+        ])
+        cfg = {"novel": {"craft_rules_enabled": False, "craft_rules_path": p}}
+        self.assertEqual(craft.craft_writer_block(cfg), "")
+
+    def test_confidence_filter(self):
+        import craft
+        p = self._write_rules([
+            {"category": "style", "pattern": "低置信噪声", "fix": "忽略", "confidence": 0.1, "evidence_count": 2},
+            {"category": "style", "pattern": "高置信化石句", "fix": "换措辞", "confidence": 0.8, "evidence_count": 6},
+        ])
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_min_confidence": 0.3}}
+        block = craft.craft_writer_block(cfg)
+        self.assertIn("高置信化石句", block)
+        self.assertNotIn("低置信噪声", block)
+
+    def test_category_routing(self):
+        import craft
+        p = self._write_rules([
+            {"category": "style", "pattern": "文体问题", "fix": "修文体", "confidence": 0.7, "evidence_count": 4},
+        ])
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p}}
+        # style is a writer category, not a planner category
+        self.assertIn("文体问题", craft.craft_writer_block(cfg))
+        self.assertEqual(craft.craft_planner_hints(cfg), "")
+
+    def test_top_k_limit(self):
+        import craft
+        rules = [
+            {"category": "hook_technique", "pattern": f"模式{i}", "fix": f"修复{i}",
+             "confidence": 0.9, "evidence_count": 10 - i}
+            for i in range(10)
+        ]
+        p = self._write_rules(rules)
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_top_k": 3}}
+        block = craft.craft_writer_block(cfg)
+        # exactly 3 rule lines (each rule renders a "失败模式：" line)
+        self.assertEqual(block.count("失败模式："), 3)
+
+    def test_score_delta_ranks_first(self):
+        import craft
+        p = self._write_rules([
+            {"category": "payoff_setup", "pattern": "无收益证据", "fix": "A",
+             "confidence": 0.9, "evidence_count": 20, "avg_score_before": 0.0, "avg_score_after": 0.0},
+            {"category": "payoff_setup", "pattern": "有正收益", "fix": "B",
+             "confidence": 0.4, "evidence_count": 3, "avg_score_before": 6.0, "avg_score_after": 8.0},
+        ])
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_top_k": 1}}
+        block = craft.craft_planner_hints(cfg)
+        self.assertIn("有正收益", block)
+        self.assertNotIn("无收益证据", block)
+
+    def test_malformed_rules_skipped(self):
+        import craft
+        p = self._write_rules([
+            "not a dict",
+            {"category": "style", "pattern": "", "fix": "x", "confidence": 0.9},  # empty pattern
+            {"category": "style", "pattern": "有效", "fix": "y", "confidence": 0.9, "evidence_count": 5},
+        ])
+        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p}}
+        block = craft.craft_writer_block(cfg)
+        self.assertIn("有效", block)
+
+
+class SceneBreakdownBlockTests(unittest.TestCase):
+    def test_empty_breakdown_renders_nothing(self):
+        from scene_breakdown import scene_breakdown_block
+        self.assertEqual(scene_breakdown_block({}, 1), "")
+        self.assertEqual(scene_breakdown_block({"scenes": []}, 1), "")
+        self.assertEqual(scene_breakdown_block(None, 1), "")
+
+    def test_renders_scenes_with_fields(self):
+        from scene_breakdown import scene_breakdown_block
+        bd = {
+            "scenes": [
+                {
+                    "goal": "主角识破伪证",
+                    "location": "县衙后堂",
+                    "time": "深夜",
+                    "characters": ["林照", "县令"],
+                    "visible_actions": ["林照展开那张被烧残的契书", "县令的手抖了一下"],
+                    "beats_covered": ["揭穿契书造假"],
+                    "exit_state": "县令认罪，新的幕后名字浮出",
+                }
+            ],
+            "carryover_to_next_chapter": "幕后之人是谁",
+        }
+        out = scene_breakdown_block(bd, 7)
+        self.assertIn("CH7", out)
+        self.assertIn("县衙后堂", out)
+        self.assertIn("林照展开那张被烧残的契书", out)
+        self.assertIn("退出状态", out)
+        self.assertIn("幕后之人是谁", out)
+
+    def test_skips_malformed_scenes(self):
+        from scene_breakdown import scene_breakdown_block
+        bd = {"scenes": ["not a dict", {"goal": "ok", "visible_actions": ["做事"]}]}
+        out = scene_breakdown_block(bd, 2)
+        self.assertIn("做事", out)
+
+
+class ChapterTitleTests(unittest.TestCase):
+    def test_apply_replaces_only_title_keeps_body(self):
+        from package import apply_chapter_title
+        text = "第12章 旧标题\n\n正文第一行。\n正文第二行。\n"
+        out = apply_chapter_title(text, 12, "新钩子标题")
+        self.assertTrue(out.startswith("第12章 新钩子标题"))
+        self.assertIn("正文第一行。", out)
+        self.assertIn("正文第二行。", out)
+        self.assertNotIn("旧标题", out)
+
+    def test_apply_chinese_numeral_prefix(self):
+        from package import apply_chapter_title
+        text = "第三章 起\n\n内容。"
+        out = apply_chapter_title(text, 3, "暗涌")
+        self.assertTrue(out.startswith("第三章 暗涌"))
+        self.assertIn("内容。", out)
+
+    def test_apply_noop_when_no_title_line(self):
+        from package import apply_chapter_title
+        text = "没有章节标记的正文。\n第二行。"
+        self.assertEqual(apply_chapter_title(text, 1, "X"), text)
+
+    def test_apply_noop_when_empty_title(self):
+        from package import apply_chapter_title
+        text = "第1章 标题\n\n正文。"
+        self.assertEqual(apply_chapter_title(text, 1, ""), text)
+        self.assertEqual(apply_chapter_title(text, 1, "   "), text)
+
+
+class PackageRenderTests(unittest.TestCase):
+    def test_render_package_md_sections(self):
+        from package import _render_package_md
+        pkg = {
+            "one_line": "一句话卖点",
+            "titles": ["书名一", "书名二"],
+            "intros": ["简介一"],
+            "tags": [["标签A", "标签B"]],
+            "synopsis_clean": "无剧透简介内容",
+            "synopsis_spoiler": "含剧透概要内容",
+        }
+        md = _render_package_md(pkg)
+        self.assertIn("一句话卖点", md)
+        self.assertIn("书名一", md)
+        self.assertIn("标签A、标签B", md)
+        self.assertIn("无剧透简介", md)
+        self.assertIn("含剧透概要内容", md)
+
+    def test_render_skips_absent_sections(self):
+        from package import _render_package_md
+        md = _render_package_md({"titles": ["仅书名"]})
+        self.assertIn("仅书名", md)
+        self.assertNotIn("无剧透简介", md)
 
 
 if __name__ == "__main__":

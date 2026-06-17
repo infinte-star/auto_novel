@@ -28,6 +28,7 @@ class Paths:
     voices: Path
     voice: Path
     contract: Path
+    glossary: Path
     chapters_dir: Path
     logs_dir: Path
     database: Path
@@ -212,8 +213,36 @@ def configured_api_keys(config: dict[str, Any]) -> list[str]:
     return deduped
 
 def configured_api_endpoints(config: dict[str, Any]) -> tuple[list[tuple[str, str]], int]:
+    endpoints, primary_count, _models = configured_api_endpoints_with_models(config)
+    return endpoints, primary_count
+
+
+def configured_api_endpoints_with_models(
+    config: dict[str, Any],
+) -> tuple[list[tuple[str, str]], int, list[str | None]]:
+    """Like configured_api_endpoints, but also returns a per-endpoint model name.
+
+    api.api_key_groups items may carry an OPTIONAL third pipe-delimited field
+    naming the model for that endpoint:  ``base_url|key1,key2|model_name``.
+    When present, every key in that group is tagged with that model so the
+    client pool sends the right model name on fallback (e.g. the primary
+    100xlabs endpoint speaks claude-opus-4-8 while a mimo fallback speaks
+    mimo-v2.5-pro). When absent (or for the primary api_key/api_keys fallback),
+    the model is ``None`` and call_llm uses the global api.model.
+
+    Ordering / primary boundary:
+      - When api.api_key_groups is NON-empty, the LEGACY layout is preserved:
+        every group endpoint is primary (rotated first), and base_url/api_key
+        are the final fallback. This keeps the historical mimo-multi-endpoint
+        configs unchanged.
+      - api.primary_base_url (optional) overrides which base_url marks the
+        primary boundary: endpoints whose base_url equals it are primary, the
+        rest are fallback (order preserved). Use this to make ONE endpoint the
+        sole primary (e.g. 100xlabs) while mimo endpoints sit behind it.
+    """
     api = config["api"]
     endpoints: list[tuple[str, str]] = []
+    models: list[str | None] = []
     seen: set[tuple[str, str]] = set()
 
     groups = str(api.get("api_key_groups", "")).strip()
@@ -224,8 +253,10 @@ def configured_api_endpoints(config: dict[str, Any]) -> tuple[list[tuple[str, st
                 continue
             if "|" not in group:
                 raise ValueError("Invalid api.api_key_groups item, expected base_url|key1,key2")
-            base_url, keys_text = group.split("|", 1)
-            base_url = base_url.strip()
+            parts = group.split("|")
+            base_url = parts[0].strip()
+            keys_text = parts[1] if len(parts) > 1 else ""
+            group_model = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
             for key in re.split(r"[,\s]+", keys_text):
                 key = key.strip()
                 if not base_url or not key:
@@ -234,16 +265,33 @@ def configured_api_endpoints(config: dict[str, Any]) -> tuple[list[tuple[str, st
                 if endpoint not in seen:
                     seen.add(endpoint)
                     endpoints.append(endpoint)
+                    models.append(group_model)
 
-    primary_count = len(endpoints)
+    group_count = len(endpoints)
     fallback_base_url = str(api["base_url"]).strip()
     for key in configured_api_keys(config):
         endpoint = (fallback_base_url, key)
         if endpoint not in seen:
             seen.add(endpoint)
             endpoints.append(endpoint)
+            models.append(None)
 
-    return endpoints, primary_count
+    # primary_base_url lets one endpoint be the sole primary; all endpoints
+    # whose base_url matches it become primary, the rest fallback. Order is
+    # preserved within each bucket. When unset, fall back to the legacy rule:
+    # group endpoints primary, base_url/api_key fallback.
+    primary_base_url = str(api.get("primary_base_url", "")).strip()
+    if primary_base_url:
+        primary_idx = [i for i, (url, _) in enumerate(endpoints) if url == primary_base_url]
+        fallback_idx = [i for i, (url, _) in enumerate(endpoints) if url != primary_base_url]
+        order = primary_idx + fallback_idx
+        endpoints = [endpoints[i] for i in order]
+        models = [models[i] for i in order]
+        primary_count = len(primary_idx) or len(endpoints)
+    else:
+        primary_count = group_count or len(endpoints)
+
+    return endpoints, primary_count, models
 
 def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]:
     """Endpoints for the separate reviewer model (main writer = primary model).
@@ -288,6 +336,7 @@ def get_paths(config: dict[str, Any]) -> Paths:
         voices=ROOT / str(raw.get("voices", "memory/voices.md")),
         voice=ROOT / str(raw.get("voice", "memory/voice.md")),
         contract=ROOT / str(raw.get("contract", str(Path(str(raw.get("voice", "memory/voice.md"))).parent / "contract.md"))),
+        glossary=ROOT / str(raw.get("glossary", str(Path(str(raw.get("voice", "memory/voice.md"))).parent / "glossary.md"))),
         chapters_dir=ROOT / str(raw["chapters_dir"]),
         logs_dir=ROOT / str(raw["logs_dir"]),
         database=ROOT / str(raw["database"]),

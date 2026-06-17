@@ -239,6 +239,7 @@ class LLMClientPool:
         primary_count: int | None = None,
         endpoints: list[tuple[str, str]] | None = None,
         log_fn: Callable[[str], None] | None = None,
+        endpoint_models: list[str | None] | None = None,
     ) -> None:
         if not clients:
             raise ValueError("LLMClientPool requires at least one client")
@@ -250,6 +251,13 @@ class LLMClientPool:
         self.next_index = 0
         self.dead: set[int] = set()
         self.log_fn = log_fn
+        # Per-endpoint model override (None => use the request's model verbatim).
+        # Lets a fallback endpoint that speaks a different model name (e.g. a
+        # mimo endpoint behind a claude-opus-4-8 primary) receive its own model.
+        if endpoint_models is not None and len(endpoint_models) == len(clients):
+            self.endpoint_models = list(endpoint_models)
+        else:
+            self.endpoint_models = [None] * len(clients)
         if endpoints is not None and len(endpoints) == len(clients):
             self.endpoint_labels = [f"{base_url} ...{key[-4:]}" for base_url, key in endpoints]
         else:
@@ -290,8 +298,16 @@ class LLMClientPool:
         first_error: Exception | None = None
         for index in attempts:
             client = self.clients[index]
+            # Per-endpoint model override: a fallback endpoint may speak a
+            # different model name than the primary. Apply it per-attempt so
+            # rotation/fallback always sends the model this endpoint accepts.
+            call_kwargs = kwargs
+            override_model = self.endpoint_models[index]
+            if override_model and kwargs.get("model") != override_model:
+                call_kwargs = dict(kwargs)
+                call_kwargs["model"] = override_model
             try:
-                return client.chat.completions.create(**kwargs)
+                return client.chat.completions.create(**call_kwargs)
             except Exception as exc:
                 status_code = getattr(exc, "status_code", None)
                 if status_code is not None and int(status_code) in {401, 403}:

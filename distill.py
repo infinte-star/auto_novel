@@ -84,6 +84,22 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
 
+            # Load per-chapter scores so distilled rules can carry a REAL
+            # before/after delta instead of a 0.0 placeholder. A rule's "fix"
+            # is logged at chapter C; the chapter that actually applies the fix
+            # is C+1. We treat score(C) as "before" and score(C+1) as "after".
+            chapter_score: dict[int, float] = {}
+            try:
+                for mrow in conn.execute(
+                    "SELECT chapter, score FROM chapter_metrics WHERE score IS NOT NULL"
+                ).fetchall():
+                    try:
+                        chapter_score[int(mrow["chapter"])] = float(mrow["score"])
+                    except (TypeError, ValueError):
+                        continue
+            except sqlite3.OperationalError:
+                chapter_score = {}
+
             # Scan agent_reports for gate_rejects and fixes
             try:
                 rows = conn.execute(
@@ -99,6 +115,12 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
                     content = json.loads(content_str)
                 except json.JSONDecodeError:
                     continue
+                try:
+                    _ch_int = int(chapter)
+                except (TypeError, ValueError):
+                    _ch_int = None
+                score_before = chapter_score.get(_ch_int) if _ch_int is not None else None
+                score_after = chapter_score.get(_ch_int + 1) if _ch_int is not None else None
 
                 total_chapters += 1
 
@@ -129,6 +151,8 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
                                 "chapter": chapter,
                                 "fix": str(directive),
                                 "evidence": evidence_data,
+                                "score_before": score_before,
+                                "score_after": score_after,
                             })
 
                 # Extract problems with fixes
@@ -162,6 +186,8 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
                             "chapter": chapter,
                             "fix": fix_text[:200],
                             "evidence": {},
+                            "score_before": score_before,
+                            "score_after": score_after,
                         })
 
             conn.close()
@@ -193,14 +219,18 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
         confidence = min(1.0, len(evidences) / 10.0 * len(source_novels) / max(scanned_count, 1))
 
         rule_id = f"{category}_{len(rules) + 1}"
+        befores = [e["score_before"] for e in evidences if isinstance(e.get("score_before"), (int, float))]
+        afters = [e["score_after"] for e in evidences if isinstance(e.get("score_after"), (int, float))]
+        avg_before = round(sum(befores) / len(befores), 2) if befores else 0.0
+        avg_after = round(sum(afters) / len(afters), 2) if afters else 0.0
         rules.append({
             "id": rule_id,
             "category": category,
             "pattern": pattern_text,
             "fix": most_common_fix,
             "evidence_count": len(evidences),
-            "avg_score_before": 0.0,  # Placeholder: would need chapter_metrics join
-            "avg_score_after": 0.0,   # Placeholder
+            "avg_score_before": avg_before,
+            "avg_score_after": avg_after,
             "source_novels": source_novels[:10],
             "confidence": round(confidence, 2),
         })

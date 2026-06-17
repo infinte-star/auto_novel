@@ -349,6 +349,80 @@ def hook_tail_repetition(
 
 
 # ---------------------------------------------------------------------------
+# Intra-chapter self-repetition: catch a chapter that re-states its own content.
+# ---------------------------------------------------------------------------
+
+# Observed failure (suspense_10ch Ch7, mimo): a chapter ends with a "summary
+# paragraph" that re-states reasoning/conclusions already delivered in the body
+# (章末总结段与正文推理段高度重复, 信息量零增量). The LLM reviewer often rates
+# this fine because each paragraph reads well in isolation. This deterministic
+# check measures how much the chapter's TAIL re-states its own EARLIER content.
+
+def intra_chapter_repetition(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure how much the chapter's ending re-states its own earlier content.
+
+    Splits the chapter into a head (everything but the last `tail_chars`) and a
+    tail. Counts how many distinctive tail clauses already appeared (verbatim or
+    near-verbatim) in the head. A high ratio means the ending is a zero-增量
+    summary recap rather than a forward-moving hook.
+
+    Returns {"metrics", "level" (ok/warn/block), "penalty", "flags",
+    "directives", "examples"}.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "metrics": {}, "level": "ok", "penalty": 0.0,
+        "flags": [], "directives": [], "examples": [],
+    }
+    if not bool(cfg.get("intra_repeat_enabled", True)) or not text:
+        return result
+    body = _strip_title_line(text)
+    if len(body) < int(cfg.get("intra_repeat_min_chars", 1500)):
+        return result
+    tail_chars = int(cfg.get("intra_repeat_tail_chars", 600))
+    if len(body) <= tail_chars + 200:
+        return result
+    head = body[:-tail_chars]
+    tail = body[-tail_chars:]
+    head_set = {_normalize_clause(c) for c in _clause_segments(head)}
+    tail_clauses = _clause_segments(tail)
+    if not tail_clauses:
+        return result
+    hits = [c for c in tail_clauses if _normalize_clause(c) in head_set]
+    ratio = len(hits) / len(tail_clauses)
+    result["metrics"] = {
+        "tail_recap_ratio": round(ratio, 3),
+        "tail_clauses": len(tail_clauses),
+        "recap_hits": len(hits),
+    }
+    result["examples"] = sorted(set(hits), key=len, reverse=True)[:4]
+    warn = float(cfg.get("intra_repeat_warn", 0.25))
+    block = float(cfg.get("intra_repeat_block", 0.45))
+    if ratio >= block:
+        result["level"] = "block"
+        result["penalty"] = float(cfg.get("intra_repeat_block_penalty", 2.0))
+        result["flags"].append(f"intra_chapter_recap(ratio={ratio:.2f})")
+        result["directives"].append(
+            f"本章结尾有 {ratio:.0%} 的句子在复述正文已给出的推理/结论（零增量总结段）。"
+            "章末必须是【前进的钩子】——抛出新疑问、新动作、新危机，而不是把已讲过的线索再列一遍。"
+            "删去总结复述，让结尾推动剧情往下走。以下复述句严禁出现：" +
+            "；".join(f"“{c}”" for c in result["examples"][:3])
+        )
+    elif ratio >= warn:
+        result["level"] = "warn"
+        result["penalty"] = float(cfg.get("intra_repeat_warn_penalty", 0.8))
+        result["flags"].append(f"intra_chapter_recap(ratio={ratio:.2f})")
+        result["directives"].append(
+            f"本章结尾约 {ratio:.0%} 在复述正文已有信息，有总结收尾倾向。"
+            "请把结尾改成推动剧情的钩子，而非已知信息的回顾。"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Cross-chapter repetition: catch sentence/metaphor "fossils" reused verbatim.
 # ---------------------------------------------------------------------------
 
@@ -660,6 +734,248 @@ def scene_similarity(plan: dict[str, Any], recent_plans: list[dict[str, Any]]) -
             best = sim
             best_i = i
     return {"max_sim": round(best, 3), "most_similar_to": best_i}
+
+
+# ---------------------------------------------------------------------------
+# Plan executability gate: mechanize the arbiter's own stated "abstract-intent
+# hard cap". The arbiter prompt repeats (3x, as prose) that a payoff/climax beat
+# whose verb is "推导出/意识到/想通/完成/还原/引导/心算" with no concrete action +
+# concrete object + visible result must score <=7.0 — but nothing ever enforced
+# it. History (plan 8.0 -> draft 5-6) shows the LLM honour-system ignores it.
+# This converts that rule into a deterministic check on the FINAL merged_plan.
+# ---------------------------------------------------------------------------
+
+# Verbs that signal a payoff stranded at "abstract realization" with no shootable
+# action — the documented #1 cause of plan->draft score collapse.
+_ABSTRACT_PAYOFF_VERBS = re.compile(
+    r"(推导出|推理出|意识到|想通|想明白|明白了|反应过来|回过神|领悟|顿悟|"
+    r"完成闭合|完成推演|还原(?:了)?真相|理清|厘清|心算|在心中|暗自推断|得出结论)"
+)
+# Concrete physical-action signals: a character operating a concrete object with a
+# reader-visible result. If any of these co-occur with the abstract verb, the beat
+# is doing real staging and is NOT blocked.
+_CONCRETE_ACTION_SIG = re.compile(
+    r"(把|将|抓住|按住?|压住?|划|举起?|摔|扔|递|撕|拼|对齐|并排|画(?:出|了)?|拍|掀|拽|"
+    r"翻开|摊开|指着|塞进|拔出|插入|拧|敲|砸|拖|拎|捡起|铺开|贴在|钉在|挂在)"
+)
+
+
+def plan_executability_gate(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic check that the plan's payoff/climax is a shootable action.
+
+    Returns {"blocked": bool, "evidence": str}. Blocked when the core payoff (and
+    final beats) read as abstract realization with NO concrete physical action —
+    exactly the failure the arbiter is told to cap at 7.0 but never mechanically
+    enforces. Gated by `plan_executability_gate_enabled` (default true).
+    """
+    if not bool(config["novel"].get("plan_executability_gate_enabled", True)):
+        return {"blocked": False, "evidence": ""}
+    beats = plan.get("beats")
+    tail_beats = [str(b) for b in beats[-3:]] if isinstance(beats, list) else []
+    core = str(plan.get("payoff", "")) + " " + " ".join(tail_beats)
+    if not core.strip():
+        return {"blocked": False, "evidence": ""}
+    if _ABSTRACT_PAYOFF_VERBS.search(core) and not _CONCRETE_ACTION_SIG.search(core):
+        ev = (plan.get("payoff") or (tail_beats[-1] if tail_beats else ""))
+        return {"blocked": True, "evidence": str(ev)[:160]}
+    return {"blocked": False, "evidence": ""}
+
+
+# ---------------------------------------------------------------------------
+# Narrative-pattern dedupe: catch the "same procedural skeleton, different
+# wording" failure that字面 Jaccard (scene_similarity) is blind to.
+#
+# scene_similarity matches on concrete tokens (新故事 vs 换水位 share almost no
+# bigrams → max_sim low → passes), but the *abstract action flow* can be
+# identical: 进入封闭空间 → 现场取证 → 数据比对 → 得出结论, chapter after chapter.
+# That is exactly what dragged suspense_10ch Ch3(8.0)→Ch8(6.5): reviewers flagged
+# "同一套流程骨架，只是把取证对象替换" as reader_fatigue, but no deterministic gate
+# caught it. This classifies each plan into an ordered sequence of abstract
+# "moves" and measures how identical that move-sequence is to recent chapters.
+# ---------------------------------------------------------------------------
+
+# Abstract narrative "moves". Each move maps to trigger lexemes that may appear
+# anywhere in the plan's goal/conflict/payoff/beats free text. Order is detected
+# from first-occurrence position in the concatenated beats, so two chapters that
+# run the same moves in the same order score as duplicates regardless of wording.
+_NARRATIVE_MOVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("enter_space", (
+        "进入", "走进", "来到", "抵达", "推开门", "打开门", "下到", "爬进",
+        "钻进", "返回", "回到", "赶到", "开车到", "停在", "进了",
+    )),
+    ("collect_evidence", (
+        "取证", "勘查", "勘察", "查看", "检查", "翻找", "搜查", "采集",
+        "拍照", "记录", "测量", "提取", "采样", "调取", "翻出", "找到",
+        "发现", "翻看", "查阅", "调档", "调取记录", "调日志",
+    )),
+    ("compare_data", (
+        "比对", "对照", "核对", "对比", "比照", "印证", "吻合", "一致",
+        "不一致", "对上", "对不上", "校验", "复核", "交叉", "比一比",
+    )),
+    ("deduce_conclusion", (
+        "推断", "推理", "推导", "得出", "结论", "断定", "判定", "认定",
+        "意识到", "明白", "想通", "反推", "证明", "说明", "确认", "看穿",
+    )),
+    ("confront_person", (
+        "对峙", "质问", "逼问", "追问", "摊牌", "对质", "找上", "盘问",
+        "拦住", "堵住", "面对面", "约见", "见面", "谈判",
+    )),
+    ("new_threat", (
+        "威胁", "跟踪", "尾随", "被盯", "危险", "袭击", "警告", "恐吓",
+        "逃", "追", "险些", "差点", "失踪", "失联", "出事", "意外",
+    )),
+    ("reveal_twist", (
+        "反转", "翻转", "颠覆", "竟然", "原来", "真相", "其实", "并非",
+        "另有", "嫁祸", "栽赃", "误导", "假象", "骗局",
+    )),
+)
+
+
+def _narrative_pattern_sequence(plan: dict[str, Any]) -> list[str]:
+    """Detect the ordered sequence of abstract narrative moves in a plan.
+
+    Builds one position-tagged text from beats (ordered) plus the free-text
+    plan fields, finds the first character offset at which each move's lexemes
+    appear, and returns the moves sorted by that offset — i.e. the chapter's
+    abstract "shape" (enter → collect → compare → deduce …) independent of the
+    concrete subject matter.
+    """
+    beats = plan.get("beats")
+    ordered_parts: list[str] = []
+    if isinstance(beats, list):
+        ordered_parts.extend(str(b) for b in beats[:12])
+    # Append free-text fields after beats so a move mentioned only in
+    # conflict/payoff still registers, but ordering is driven by the beats.
+    for key in ("goal", "conflict", "pressure", "payoff", "hook"):
+        v = plan.get(key)
+        if v:
+            ordered_parts.append(str(v))
+    text = "\n".join(ordered_parts)
+    if not text.strip():
+        return []
+    first_pos: dict[str, int] = {}
+    for move, lexemes in _NARRATIVE_MOVES:
+        best = -1
+        for lex in lexemes:
+            idx = text.find(lex)
+            if idx != -1 and (best == -1 or idx < best):
+                best = idx
+        if best != -1:
+            first_pos[move] = best
+    return [m for m, _ in sorted(first_pos.items(), key=lambda kv: kv[1])]
+
+
+def _sequence_similarity(a: list[str], b: list[str]) -> float:
+    """Similarity of two ordered move-sequences.
+
+    Blends set overlap (which moves appear) with ordered-bigram overlap (the
+    flow), so "enter→collect→compare→deduce" twice scores ~1.0 while a plan that
+    swaps in confront/threat/reveal moves scores low even if it still collects
+    evidence somewhere.
+    """
+    if not a or not b:
+        return 0.0
+    set_sim = _jaccard(set(a), set(b))
+    bigrams_a = {(a[i], a[i + 1]) for i in range(len(a) - 1)}
+    bigrams_b = {(b[i], b[i + 1]) for i in range(len(b) - 1)}
+    if bigrams_a or bigrams_b:
+        order_sim = (
+            len(bigrams_a & bigrams_b) / len(bigrams_a | bigrams_b)
+            if (bigrams_a | bigrams_b) else 0.0
+        )
+    else:
+        # Single-move sequences: ordering carries no information, lean on set_sim.
+        order_sim = set_sim
+    # Weight set-overlap higher than exact order: real monotony (suspense_10ch
+    # Ch5-Ch7) reused the SAME moves (set jaccard 0.67-0.83) merely reshuffled,
+    # so an even split would let "same moves, different order" slip under warn.
+    # Reusing the move *vocabulary* is itself the fatigue; order is secondary.
+    return 0.7 * set_sim + 0.3 * order_sim
+
+
+def narrative_pattern_repetition(
+    plan: dict[str, Any],
+    recent_plans: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect a plan that reruns the same abstract narrative flow as recent ones.
+
+    Unlike ``scene_similarity`` (字面 token Jaccard), this compares the ORDERED
+    sequence of abstract moves (enter_space → collect_evidence → compare_data →
+    deduce_conclusion → …). It is the gate against "同一套流程骨架，只换取证对象"
+    monotony — the documented cause of the Ch3→Ch8 score decline in suspense_10ch.
+
+    Returns {"metrics", "level" (ok/warn/block), "max_sim", "most_similar_to",
+    "sequence", "consecutive", "penalty", "flags", "directives"}.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "metrics": {}, "level": "ok", "max_sim": 0.0, "most_similar_to": None,
+        "sequence": [], "consecutive": 0,
+        "penalty": 0.0, "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("narrative_pattern_enabled", True)):
+        return result
+    cur = _narrative_pattern_sequence(plan)
+    result["sequence"] = cur
+    # A sequence too short to be a recognisable "flow" carries no signal.
+    if len(cur) < int(cfg.get("narrative_pattern_min_moves", 3)):
+        return result
+    sims: list[float] = []
+    best = 0.0
+    best_i: int | None = None
+    warn = float(cfg.get("narrative_pattern_sim_warn", 0.7))
+    for i, rp in enumerate(recent_plans):
+        if not isinstance(rp, dict):
+            sims.append(0.0)
+            continue
+        sim = _sequence_similarity(cur, _narrative_pattern_sequence(rp))
+        sims.append(sim)
+        if sim > best:
+            best = sim
+            best_i = i
+    # Consecutive run of recent chapters (newest-first ordering expected) that
+    # share this flow ≥ warn — a single dup is tolerable, a *streak* is the
+    # fatigue signal.
+    consecutive = 0
+    for s in sims:
+        if s >= warn:
+            consecutive += 1
+        else:
+            break
+    result["metrics"] = {
+        "max_sim": round(best, 3),
+        "consecutive_similar": consecutive,
+        "compared": len(sims),
+    }
+    result["max_sim"] = round(best, 3)
+    result["most_similar_to"] = best_i
+    result["consecutive"] = consecutive
+
+    block_streak = int(cfg.get("narrative_pattern_block_streak", 2))
+    block_sim = float(cfg.get("narrative_pattern_sim_block", 0.85))
+    seq_label = "→".join(cur)
+    if consecutive >= block_streak or best >= block_sim:
+        result["level"] = "block"
+        result["penalty"] = float(cfg.get("narrative_pattern_block_penalty", 1.5))
+        result["flags"].append(
+            f"narrative_pattern_repeat(streak={consecutive},max_sim={best:.2f})"
+        )
+        result["directives"].append(
+            f"本章叙事流程骨架（{seq_label}）与近 {consecutive or 1} 章高度雷同，"
+            "属于'同一套流程换个取证对象'的审美疲劳模式。必须改变章节的叙事形状："
+            "例如把'静态取证→比对→推理'换成由人物对峙/外部威胁/时间压力驱动的场景，"
+            "或调整信息揭示顺序（先抛结论再倒查、让对手先行动），不得再走一遍线性取证流程。"
+        )
+    elif best >= warn:
+        result["level"] = "warn"
+        result["penalty"] = float(cfg.get("narrative_pattern_warn_penalty", 0.6))
+        result["flags"].append(f"narrative_pattern_repeat(max_sim={best:.2f})")
+        result["directives"].append(
+            f"本章叙事流程（{seq_label}）与近期相似度偏高，有流程化倾向。"
+            "请让本章的推进方式与上一章不同——换一种场景驱动力或信息揭示顺序，避免连续线性取证。"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

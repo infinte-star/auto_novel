@@ -30,11 +30,23 @@ python novel.py run <name> --foreground  # run in the current console
 python novel.py list                     # list every novel: chapters / chars / running? / last log line
 python novel.py stop <name>              # kill ONLY this novel's process (token-exact `run <name>` match)
 python novel.py restart <name>           # stop + relaunch (resumes from checkpoint)
+python novel.py stats <name>             # rich per-novel quality+cost report (per-chapter scores/penalties/LLM cost)
+python novel.py trial <name>             # generate opening trial variants WITHOUT touching chapters/book (-> logs/opening_trials/)
+python novel.py adopt-trial <name> [id]  # adopt a trial's best opening route into memory/opening_route.md
+python novel.py benchmark list|add ...   # manage the local 爆款 sample library (structural recall, never copies prose)
 python novel.py script --input PATH      # convert ANY novel text file -> 短剧 screenplay (standalone)
 python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/<name>/
 python novel.py compare <a> <b>          # deterministic side-by-side report (scores/penalties/fossils/cost/config diff) -> experiments/
 python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped
+python novel.py telemetry backfill       # import every novel's history into telemetry/global.db (idempotent)
+python novel.py telemetry stats [--genre G]  # cross-book strategy win-rates + totals
+python novel.py distill [--output craft_rules.json] [--genre G] [--min-novels 3]  # mine cross-book failure->fix rules
 ```
+
+`novel.py` is the **only** entry point — there is no longer any root-level
+`run.py`/`restart.py` (the README still mentions them, but they have been
+removed; ignore that section). All argument parsing and command dispatch lives
+in `novel.py` (`cmd_*` functions + an argparse subparser tree).
 
 How it works (no engine changes — pure scaffolding around the existing pipeline):
 - `create` copies `config_template.yaml` replacing the `__NOVEL__` placeholder so
@@ -198,6 +210,40 @@ to catch its own degeneration.
   against the source. Metadata saved under `experiments/ablate_*.json`. Every
   engine change should carry an ablation report instead of a hand-compared full
   rerun.
+
+### Cross-book learning (`telemetry.py`, `distill.py`, `craft.py`, `reader_panel.py`)
+Each novel runs as an isolated process with its own `story_state.db`. These four
+modules are how the engine learns **across** books instead of cold-starting every
+new novel. All four are strict observers / safe no-ops: any failure (db missing,
+locked, malformed) returns an empty value and never stalls a chapter.
+
+- **`telemetry.py`** — the ONE shared sink: `telemetry/global.db` (WAL, one fresh
+  connection per write so N novel processes write concurrently). Live double-writes
+  from the pipeline (`record_chapter_metrics`/`record_event`/`record_arbitration`/
+  `record_revise_pair`) plus idempotent `backfill_novel` (`novel.py telemetry
+  backfill`). `record_arbitration` flattens each plan into `strategy_outcomes`
+  (one row per candidate strategy) so the planning bandit reads a cross-book prior
+  via a single indexed GROUP BY. `global_strategy_history(genre)` is that read path
+  — falls back to the whole library when a genre bucket is empty.
+- **`distill.py`** — `python -m distill` (or `novel.py distill`) scans every
+  `novels/*/story_state.db`'s `agent_reports`/`gate_rejects`/problems→fixes for
+  recurring failure→fix patterns appearing in ≥ `--min-novels` books, and writes
+  `craft_rules.json` (rules with category/pattern/fix/evidence_count/confidence and
+  a real before/after score delta computed as score(C) vs score(C+1)).
+- **`craft.py`** — the consumption last-mile that closes the distillation loop
+  (historically `craft_rules.json` was written but never read). `craft_writer_block`
+  / `craft_planner_hints` load and rank the rules (positive measured delta ranks
+  first, else confidence×evidence) and render prompt blocks injected into the writer
+  and planner so a brand-new book inherits the library's lessons from chapter 1.
+  Gated by `novel.craft_rules_enabled` (inert when the file is absent — the common
+  fresh-install case).
+- **`reader_panel.py`** — a PANEL of fixed reader personas (vs `cold_reader`'s single
+  stranger) each deciding "would I keep reading?", aggregated into drop_rate/pay_rate
+  persisted to both the book's store and global telemetry, and injected as a
+  corrective writer directive when drop_rate crosses the threshold. Like
+  `cold_reader`, it **must NOT pass the cacheable_prefix**. Gated by
+  `reader_panel_enabled` (default false), `reader_panel_every`,
+  `reader_panel_drop_threshold`.
 
 ### Memory layers (`memory.py`)
 Two distinct context builders feed different LLM calls:

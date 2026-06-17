@@ -241,7 +241,7 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
     except Exception:
         pass
 
-    stats: dict[str, dict[str, float]] =
+    stats: dict[str, dict[str, float]] = {}
     for ev in events:
         chapter = ev.get("chapter")
         payload = ev.get("payload") if isinstance(ev, dict) else None
@@ -629,6 +629,27 @@ def generate_candidate_plans(
         )
         if led.get("device_usage") or led.get("evidence"):
             used_element_block = json.dumps(led, ensure_ascii=False)
+    # Narrative-pattern ledger: the ordered abstract move-sequence of recent
+    # chapters, so the generator can SEE the procedural骨架 it must break instead
+    # of unknowingly repeating "enter→collect→compare→deduce" a sixth time. This
+    # is the up-front, positive-pressure counterpart to narrative_pattern_repetition
+    # (which only fires after a near-dup plan is already chosen).
+    narrative_pattern_block = "None"
+    if bool(config["novel"].get("narrative_pattern_enabled", True)):
+        try:
+            from quality import _narrative_pattern_sequence
+
+            window = int(config["novel"].get("narrative_pattern_window", 3))
+            recent_np = _recent_selected_plans(conn, lookback=window, exclude_chapter=chapter_num)
+            seqs = []
+            for rp in recent_np:
+                seq = _narrative_pattern_sequence(rp)
+                if seq:
+                    seqs.append("→".join(seq))
+            if seqs:
+                narrative_pattern_block = json.dumps(seqs, ensure_ascii=False)
+        except Exception:
+            narrative_pattern_block = "None"
     quality_threshold = float(config["novel"].get("quality_threshold", 8.0))
     dimension_floor = float(config["novel"].get("prewrite_dimension_floor", max(7.2, quality_threshold - 0.3)))
     base_user = f"""## 记忆
@@ -681,6 +702,9 @@ def generate_candidate_plans(
 
 ## 近期已反复使用的金手指用法 / 物证 / 兑现类型（硬性·防后期重复坍缩：device_usage=已用过的能力使用方式，evidence=已反复出现的物证，payoff_types=已用兑现类型。本章若再次使用核心能力，其"动作+作用物体+解读路径"必须与 device_usage 列表里的写法有可见区别；核心物证不得继续锁定在 evidence 列表的同一件上反复演示同一结论；payoff_type 不得与列表近项重复。除非剧情确有必要追踪同一物件，否则换新的具体物证/新的能力用法）
 {used_element_block}
+
+## 近期叙事流程骨架（硬性·防审美疲劳：下列是最近几章的抽象推进流程，如 enter_space→collect_evidence→compare_data→deduce_conclusion。本章绝对不能再走一遍同样形状的线性流程——哪怕换了取证对象，读者仍会感到"上一章看过了"。必须改变章节的叙事驱动力：用人物对峙/外部威胁/时间压力来推进，或调整信息揭示顺序——先抛结论再倒查、让对手先行动、把推理拆散到对话里，而不是静态地"进入→取证→比对→推理"）
+{narrative_pattern_block}
 
 {beat_block}
 
@@ -764,6 +788,18 @@ def generate_candidate_plans(
 - 不要只换措辞或换场景名；要针对上面的每条缺陷，在 goal/conflict/payoff/beats 里给出可见的修复动作。
 - 若上一版因文体碎片化/破折号堆砌失分，本章 beats 必须明确要求用完整主谓宾长句叙事、控制破折号。
 - 若上一版因能力越界/视角越界失分，本章必须在 risk 字段写明如何严守能力模态与限制视角。"""
+    # Cross-book craft hints (distillation loop): inject library-wide structural
+    # lessons so a new book inherits accumulated planning experience from Ch1.
+    # Silent no-op when craft_rules.json is absent or yields no qualifying rules.
+    if bool(config["novel"].get("craft_rules_enabled", True)):
+        try:
+            from craft import craft_planner_hints
+
+            ch = craft_planner_hints(config)
+            if ch:
+                base_user += "\n\n" + ch
+        except Exception:
+            pass
     num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
     # Temperature spread across candidates. A wider spread is the cheapest lever
@@ -1553,6 +1589,42 @@ def create_plan(
                     )
             except Exception:
                 pass
+        # Narrative-pattern dedupe (abstract flow骨架), complementary to the
+        #字面-Jaccard scene_similarity above. scene_similarity is blind to "same
+        # procedural flow, different subject" (新故事→换水位 share no tokens) — the
+        # documented cause of suspense_10ch's Ch3(8.0)→Ch8(6.5) decline. This
+        # folds into the same duplicate_blocked retry path.
+        if bool(config["novel"].get("narrative_pattern_enabled", True)):
+            try:
+                from quality import narrative_pattern_repetition
+
+                recent_seq = _recent_selected_plans(
+                    conn,
+                    lookback=int(config["novel"].get("narrative_pattern_window", 3)),
+                    exclude_chapter=chapter_num,
+                )
+                npr = narrative_pattern_repetition(plan, recent_seq, config)
+                decision["narrative_pattern"] = npr
+                if npr.get("flags"):
+                    log(
+                        paths,
+                        f"Narrative-pattern Ch{chapter_num}: level={npr.get('level')} "
+                        f"max_sim={npr.get('max_sim')} streak={npr.get('consecutive')} "
+                        f"seq={'→'.join(npr.get('sequence', []))}",
+                    )
+                    for directive in npr.get("directives", []):
+                        if directive not in decision.setdefault("required_constraints", []):
+                            decision["required_constraints"].append(directive)
+                if npr.get("level") == "block":
+                    duplicate_blocked = True
+                    db_event(
+                        conn,
+                        chapter_num,
+                        "narrative_pattern_retry",
+                        {"score": score, "narrative_pattern": npr, "plan": plan},
+                    )
+            except Exception as exc:
+                log(paths, f"narrative_pattern check failed (non-fatal) Ch{chapter_num}: {exc}")
         if duplicate_blocked and attempt < max_attempts - 1:
             db_event(
                 conn,
@@ -1609,6 +1681,38 @@ def create_plan(
             log(
                 paths,
                 f"Visual-payoff BLOCK Ch{chapter_num}: retrying plan attempt {attempt + 1}/{max_attempts - 1}",
+            )
+            continue
+        # Executability gate (deterministic): the merged_plan's payoff/climax must
+        # be a shootable action, not abstract realization. Mechanizes the arbiter's
+        # own stated <=7.0 cap, which it ignores under honour-system prompting.
+        exec_blocked = False
+        try:
+            from quality import plan_executability_gate
+
+            execg = plan_executability_gate(plan, config)
+            decision["executability_gate"] = execg
+            if execg.get("blocked"):
+                decision.setdefault("required_constraints", []).append(
+                    "硬性重规划：核心 payoff/高潮 beat 停留在抽象领悟（推导出/意识到/想通…），"
+                    "无具体动作+具体物体+可见结果。必须改写成'角色用具体动作操作具体物体、"
+                    f"产生读者一眼可见结果'的可拍句子。问题句：{execg.get('evidence', '')}"
+                )
+                db_event(
+                    conn,
+                    chapter_num,
+                    "executability_retry",
+                    {"score": score, "gate": execg, "decision": decision, "plan": plan},
+                )
+                if attempt < max_attempts - 1:
+                    exec_blocked = True
+        except Exception as exc:
+            log(paths, f"Executability gate failed (non-fatal) Ch{chapter_num}: {exc}")
+        if exec_blocked:
+            log(
+                paths,
+                f"Executability BLOCK Ch{chapter_num}: abstract payoff, retrying plan "
+                f"attempt {attempt + 1}/{max_attempts - 1}",
             )
             continue
         if score > best_score:

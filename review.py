@@ -440,10 +440,33 @@ def review_chapter(
         except Exception:
             entity_suspect_block = "None"
 
+    # Reviewer de-contamination: the shared cacheable_prefix carries the CURRENT
+    # voice.md, which refresh_voice_anchors mutates from recent (possibly drifted)
+    # prose — so the main reviewer can normalize the very drift it should catch.
+    # Inject the FROZEN voice_baseline.md as the authoritative anchor and tell the
+    # reviewer it overrides any voice reference in the cached prefix. Falls back to
+    # current voice.md before the baseline is first captured. Gated by
+    # review_use_frozen_voice (default true).
+    frozen_voice_block = ""
+    if bool(config["novel"].get("review_use_frozen_voice", True)):
+        try:
+            baseline_path = paths.voice.with_name("voice_baseline.md")
+            bl = read_text(baseline_path) if baseline_path.exists() else read_text(paths.voice)
+            bl = (bl or "").strip()
+            if bl:
+                frozen_voice_block = (
+                    "## 冻结文风基线（权威——优先级高于上文缓存中的任何声音参照）\n"
+                    "下面是本书最初确立的健康文风基线。请以它为准绳评判本章是否发生文体塌缩/漂移，"
+                    "不要把近期正文已漂移的特征当作'本书风格'而放行。\n"
+                    f"{bl[:4000]}\n\n"
+                )
+        except Exception:
+            frozen_voice_block = ""
+
     user = f"""## 风格预设：{preset}
 {preset_hint}
 
-{opening_block}## 平台/读者画像
+{frozen_voice_block}{opening_block}## 平台/读者画像
 {_platform_guidance(config)}
 
 ## 记忆
@@ -870,6 +893,44 @@ def review_chapter(
         except Exception as exc:
             log(paths, f"adjacent_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
 
+    # O1b: intra-chapter self-repetition gate. A chapter that ends with a
+    # zero-增量 summary paragraph re-stating its own earlier reasoning (observed:
+    # suspense_10ch Ch7, mimo, tail recapped the body's deduction) drags
+    # readthrough without adding anything. warn adds penalty + directive; block
+    # caps the score so the chapter is driven into a rewrite of its ending.
+    if bool(config["novel"].get("intra_repeat_enabled", True)):
+        try:
+            from quality import intra_chapter_repetition
+
+            ir = intra_chapter_repetition(chapter, config)
+            report["intra_chapter_repetition"] = ir
+            ir_penalty = float(ir.get("penalty", 0.0))
+            if ir_penalty > 0:
+                penalties += ir_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in ir.get("flags", []):
+                    tag = f"repeat:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in ir.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(
+                    paths,
+                    f"Intra-repeat Ch{chapter_num} level={ir.get('level')} "
+                    f"penalty={ir_penalty} metrics={ir.get('metrics')}",
+                )
+            if ir.get("level") == "block":
+                caps.append(float(config["novel"].get("intra_repeat_score_cap", 6.0)))
+                report.setdefault("problems", []).append(
+                    "RECAP: 本章结尾大段复述正文已给出的信息（确定性检测，tail_recap_ratio="
+                    f"{ir.get('metrics', {}).get('tail_recap_ratio')}）。"
+                    "章末必须改写成推动剧情的新钩子，删去零增量的总结复述。"
+                )
+        except Exception as exc:
+            log(paths, f"intra_chapter_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+
     # Creative-contract violations: author-declared hard rules (ability whitelist/
     # modality, blacklist, banned tropes, must-hold). This is the layer that
     # catches "self-consistent but off-contract" drift (e.g. a text-only memory
@@ -926,7 +987,7 @@ def review_chapter(
             f"CONTRACT: {len(contract_hard)} 条硬违约（能力越界/模态漂移/黑名单/禁止套路/破坏必守设定）必须修复。"
         )
     # Optionally block acceptance when a HARD contradiction is detected, so the
-    if bool(config["novel"].get("factcheck_hard_blocks_accept", False)):
+    if bool(config["novel"].get("factcheck_hard_blocks_accept", True)):
         hard = [c for c in report.get("contradictions", []) if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
         if hard:
             report["accepted"] = False
@@ -1030,6 +1091,13 @@ def stage_review(
         refresh_voice_anchors(client, paths, conn, config, chapter_num, recent_text="\n\n".join(recent))
     except Exception as exc:
         log(paths, f"Voice anchor refresh failed at Ch{chapter_num}: {exc}")
+
+    # Refresh the proper-noun glossary from the same recent prose window so
+    #专有名词/硬设定 stay consistent across chapters. Best-effort.
+    try:
+        refresh_glossary(client, paths, conn, config, chapter_num, recent_text="\n\n".join(recent))
+    except Exception as exc:
+        log(paths, f"Glossary refresh failed at Ch{chapter_num}: {exc}")
 
 
 def pack_review(
@@ -1174,6 +1242,145 @@ def refresh_voice_anchors(
     if new_voices:
         write_text(paths.voices, new_voices + "\n")
         log(paths, f"Updated voices.md at Ch{chapter_num} (len={len(new_voices)})")
+
+
+GLOSSARY_SYSTEM = """你是本书的设定词条/名词表维护编辑。
+你的职责是维护一份【可被作者随手查阅的名词表(glossary)】，确保全书的专有名词
+(人名/地名/组织/功法/物品/称号/术语)在每一章里写法一致、设定不漂移。
+
+只返回恰好一个合法 JSON 对象，不要输出其它内容：
+{
+  "entries": [
+    {
+      "term": "<规范名词(唯一写法)>",
+      "type": "person|place|org|item|skill|title|term|other",
+      "canonical": "<本书认定的唯一正确写法/称呼>",
+      "aliases": ["允许的别称/简称"],
+      "definition": "<一句话设定，含关键不可变属性，如阵营/能力边界/与主角关系>",
+      "do_not": "<最容易写错/写漂的点，如'勿写成另一个相似名''其能力不含X'，可留空>"
+    }
+  ],
+  "contradiction_warnings": ["近期章节中疑似出现的名词不一致/设定矛盾(若无则空数组)"]
+}
+
+要求：
+- 在【现有词条表】基础上增量更新：保留既有正确条目，只新增本批新出现的名词，并修正明显漂移。
+- canonical 必须唯一；同一实体的多种写法收进 aliases，不要拆成多条。
+- definition 只记跨章不可变的硬设定，不要写剧情进展。
+- 名词总数控制在合理范围(优先保留主角/高频/易混名词)，不要堆砌一次性龙套。"""
+
+
+def glossary_block(paths: Paths, config: dict[str, Any]) -> str:
+    """Render memory/glossary.md as a compact writer-prompt injection block.
+
+    Read-only and best-effort: returns "" when the glossary is missing/empty or
+    the feature is disabled. Rides in the writer's variable carryover section —
+    it is NOT part of cacheable_prefix, so updating it never invalidates the
+    prompt cache for prior chapters.
+    """
+    if not bool(config["novel"].get("glossary_enabled", True)):
+        return ""
+    try:
+        text = read_text(paths.glossary).strip()
+    except Exception:
+        return ""
+    # Skip when empty or only a scaffold heading with no real entries.
+    if len(text) < 40:
+        return ""
+    budget = int(config["novel"].get("glossary_inject_chars", 1800) or 1800)
+    snippet = text[:budget]
+    return (
+        "## 名词表 / 设定一致性(写作时严格遵守，勿改写专有名词)\n"
+        "以下是本书已确立的专有名词与硬设定。本章涉及这些名词时，必须使用其 canonical 写法，"
+        "不得擅自改名、改设定或赋予白名单外的能力；如需引入全新名词，确保与下列不冲突。\n"
+        f"{snippet}"
+    )
+
+
+def refresh_glossary(
+    client: OpenAI,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    recent_text: str,
+) -> None:
+    """Incrementally update memory/glossary.md from recent prose.
+
+    Called from stage_review alongside refresh_voice_anchors (every N chapters).
+    Feeds the LLM (a) the existing glossary and (b) a deterministic shortlist of
+    candidate NEW proper-noun surface forms harvested from the recent window, so
+    the model focuses on genuinely new/edge terms rather than re-deriving the
+    whole table. Best-effort: any failure leaves the existing file untouched.
+    """
+    if not bool(config["novel"].get("glossary_enabled", True)):
+        return
+    if not recent_text.strip():
+        return
+    try:
+        existing = read_text(paths.glossary).strip()
+        suspects: list[str] = []
+        try:
+            from retrieval import candidate_new_entities
+            suspects = candidate_new_entities(
+                paths, recent_text,
+                limit=int(config["novel"].get("glossary_candidate_limit", 20)),
+            )
+        except Exception:
+            suspects = []
+        user = f"""## 现有词条表(glossary.md，可能为空)
+{existing if existing else "(空——请从近期正文新建)"}
+
+## 确定性挑出的疑似新名词(供参考，非全部都需收录)
+{json.dumps(suspects, ensure_ascii=False)}
+
+## 近期章节正文
+{recent_text[:16000]}
+
+更新截至第 {chapter_num} 章的名词表。"""
+        max_tokens = int(config["novel"].get("glossary_max_tokens", 4000) or 4000)
+        raw = call_llm(
+            client, paths, config, GLOSSARY_SYSTEM, json_prompt(user),
+            max_tokens=max_tokens, temperature=0.2, tag="glossary",
+        )
+        data = load_json_with_repair(client, paths, config, raw, fallback={})
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list) or not entries:
+            log(paths, f"Glossary refresh Ch{chapter_num}: no entries returned; keeping existing.")
+            return
+        # Render a stable, human-readable markdown table the writer block reads.
+        lines: list[str] = [f"# 名词表 / Glossary（截至第{chapter_num}章）", ""]
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            term = str(e.get("canonical") or e.get("term") or "").strip()
+            if not term:
+                continue
+            typ = str(e.get("type", "")).strip()
+            aliases = [str(a).strip() for a in (e.get("aliases") or []) if str(a).strip()]
+            definition = str(e.get("definition", "")).strip()
+            do_not = str(e.get("do_not", "")).strip()
+            head = f"## {term}" + (f" [{typ}]" if typ else "")
+            lines.append(head)
+            if aliases:
+                lines.append(f"- 别称：{'、'.join(aliases)}")
+            if definition:
+                lines.append(f"- 设定：{definition}")
+            if do_not:
+                lines.append(f"- 勿写错：{do_not}")
+            lines.append("")
+        warns = data.get("contradiction_warnings") or []
+        if isinstance(warns, list) and warns:
+            lines.append("## 一致性警告")
+            for w in warns:
+                if str(w).strip():
+                    lines.append(f"- {str(w).strip()}")
+            lines.append("")
+        write_text(paths.glossary, "\n".join(lines).rstrip() + "\n")
+        log(paths, f"Updated glossary.md at Ch{chapter_num} ({len(entries)} entries, suspects={len(suspects)})")
+    except Exception as exc:
+        log(paths, f"Glossary refresh failed (non-fatal) Ch{chapter_num}: {exc}")
+
 
 COLD_READER_SYSTEM = """你是一名**没有读过本书前文**、第一次拿到这一章的挑剔读者兼资深编辑。
 你不知道作者的任何设定、声音锚或写作意图——你只看这一章的文字本身。

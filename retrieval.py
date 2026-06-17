@@ -282,11 +282,17 @@ def retrieve(
     top_k: int = 4,
     exclude_recent_chapters: int = 6,
     current_chapter: int | None = None,
+    min_score: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Return top-k passages most relevant to `query`.
 
     Recent chapters are excluded (they're already in the tail/memory window); the
     value of retrieval is surfacing OLDER, summarized-away facts.
+
+    `min_score` is an absolute cosine floor: passages below it are dropped even if
+    they would fill the top_k. This prevents a generic query from anchoring the
+    writer to weakly-related noise it is told to "stay consistent with" — better to
+    return fewer (or zero) hits than to surface irrelevant passages as facts.
     """
     data = _load_index(paths)
     if not data:
@@ -332,6 +338,8 @@ def retrieve(
             continue
         d_norm = math.sqrt(d_norm_sq) or 1.0
         score = dot / (q_norm * d_norm)
+        if score < min_score:
+            continue
         scored.append((score, p))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -358,13 +366,23 @@ def retrieval_block(
         return ""
     top_k = int(config["novel"].get("rag_top_k", 4))
     exclude = int(config["novel"].get("rag_exclude_recent", 6))
-    # Build a query from the plan's most concrete fields.
+    min_score = float(config["novel"].get("rag_min_score", 0.04))
+    # Build a query from the plan's most concrete fields. The recall TARGET is
+    # exact facts (names/numbers/places), so concrete fields (location, info_source,
+    # character names) must dominate over abstract intent (goal/conflict). Entity
+    # names from character_focus are repeated (weight x2) so the TF-IDF query vector
+    # is anchored on the entities whose continuity we actually need to protect.
     parts: list[str] = []
-    for key in ("title", "goal", "conflict", "payoff", "pressure"):
+    for key in ("title", "goal", "conflict", "payoff", "pressure", "location", "info_source"):
         v = plan.get(key)
         if v:
             parts.append(str(v))
-    for key in ("character_focus", "thread_actions", "beats"):
+    focus = plan.get("character_focus")
+    if isinstance(focus, list):
+        names = [str(x) for x in focus[:6]]
+        parts.extend(names)
+        parts.extend(names)  # repeat: weight entity names higher in the query vector
+    for key in ("thread_actions", "beats"):
         v = plan.get(key)
         if isinstance(v, list):
             parts.extend(str(x) for x in v[:6])
@@ -373,7 +391,12 @@ def retrieval_block(
         return ""
     try:
         hits = retrieve(
-            paths, query, top_k=top_k, exclude_recent_chapters=exclude, current_chapter=chapter_num
+            paths,
+            query,
+            top_k=top_k,
+            exclude_recent_chapters=exclude,
+            current_chapter=chapter_num,
+            min_score=min_score,
         )
     except Exception as exc:
         log(paths, f"RAG retrieve failed (non-fatal) Ch{chapter_num}: {exc}")

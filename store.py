@@ -231,12 +231,33 @@ def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
         ).fetchall()
     return [dict(row) for row in rows]
 
-def recent_events(conn: Any, limit: int = 80) -> list[dict[str, Any]]:
+def recent_events(conn: Any, limit: int = 80, event_types: Any = None) -> list[dict[str, Any]]:
+    """Return the most recent events, newest first.
+
+    When `event_types` is a non-empty iterable, only events whose `event_type`
+    is in that set are returned. The `events` table doubles as a full audit /
+    telemetry log (it holds bulky diagnostic dumps such as `chapter_completed`,
+    `plan_arbitration`, `chapter_extraction` whose JSON payloads are several KB
+    each). Callers that only need plot continuity (e.g. `memory_context`) must
+    pass `event_types={"story_event"}` so those multi-KB diagnostic payloads do
+    not flood the prompt — left unfiltered, the injected event JSON grows by
+    tens of KB per chapter and eventually overflows the model's real context
+    limit (observed: plan prompt ballooning to ~300K chars by Ch5).
+    """
+    types = [t for t in (event_types or [])]
     with db_lock():
-        rows = conn.execute(
-            "SELECT id, chapter, event_type, payload, created_at FROM events ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if types:
+            placeholders = ",".join("?" for _ in types)
+            rows = conn.execute(
+                f"SELECT id, chapter, event_type, payload, created_at FROM events "
+                f"WHERE event_type IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*types, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, chapter, event_type, payload, created_at FROM events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
     out = []
     for row in rows:
         item = dict(row)

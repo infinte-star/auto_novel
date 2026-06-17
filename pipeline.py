@@ -16,6 +16,7 @@ from config import (
     book_reached_target,
     chapter_path,
     configured_api_endpoints,
+    configured_api_endpoints_with_models,
     configured_review_endpoints,
     count_chars,
     ensure_project,
@@ -190,6 +191,7 @@ def write_chapter_with_candidates(
     num_candidates_override: int | None = None,
     base_temp_override: float | None = None,
     chapter_aux_cache: dict | None = None,
+    scene_breakdown: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate N candidate chapter drafts in parallel, review each, keep the best.
 
@@ -210,6 +212,7 @@ def write_chapter_with_candidates(
             client, paths, conn, config, chapter_num, plan, decision, tail,
             cached_memory=cached_memory,
             temperature=base_temp if base_temp_override is not None else None,
+            scene_breakdown=scene_breakdown,
         )
         text, cov = _beat_gate_one(client, paths, config, chapter_num, plan, text)
         if cov is not None:
@@ -226,6 +229,7 @@ def write_chapter_with_candidates(
             text = write_chapter(
                 client, paths, conn, config, chapter_num, plan, decision, tail,
                 cached_memory=cached_memory, temperature=temp,
+                scene_breakdown=scene_breakdown,
             )
             return text
         except Exception as exc:
@@ -341,8 +345,30 @@ def write_chapter_with_candidates(
                 except Exception:
                     pass
             else:
-                # All drafts blocked — fall back to least-bad one
-                log(paths, f"Pre-screen blocked ALL drafts for Ch{chapter_num}; keeping least-penalty draft")
+                # All drafts blocked — check if this is catastrophic (all fossils >= threshold)
+                # If so, trigger plan-level replan instead of accepting garbage
+                all_fossil_counts = []
+                for idx, text in valid:
+                    cr_check = cross_chapter_repetition(text, prior_texts, config)
+                    fossils = cr_check.get("metrics", {}).get("cross_repeat_fossils", 0)
+                    all_fossil_counts.append(fossils)
+
+                min_fossils = min(all_fossil_counts) if all_fossil_counts else 0
+                fossil_catastrophe_threshold = int(config["novel"].get("prescreen_fossil_catastrophe_threshold", 5))
+
+                if min_fossils >= fossil_catastrophe_threshold:
+                    # All candidates have >= threshold fossils — plan is generating garbage
+                    # Signal to caller that plan-level replan is needed
+                    log(
+                        paths,
+                        f"Pre-screen CATASTROPHE Ch{chapter_num}: ALL candidates have fossils >= {fossil_catastrophe_threshold} "
+                        f"(min={min_fossils}, counts={all_fossil_counts}). Plan-level replan required.",
+                    )
+                    # Return None to signal catastrophic failure to caller
+                    return None, {"catastrophe": "fossil_prescreen", "min_fossils": min_fossils, "all_counts": all_fossil_counts}
+                else:
+                    # Fall back to least-bad one (original behavior for non-catastrophic blocks)
+                    log(paths, f"Pre-screen blocked ALL drafts for Ch{chapter_num}; keeping least-penalty draft")
         except Exception as exc:
             log(paths, f"Candidate pre-screen failed (non-fatal) Ch{chapter_num}: {exc}")
 
@@ -592,6 +618,20 @@ def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> 
     # Scene雷同 / payoff缺失 are inherently structural — the scene design is wrong.
     blob = " ".join(str(p) for p in (review.get("problems") or []))
     rr = " ".join(str(p) for p in (review.get("rhythm_risks") or []))
+    # Intra-chapter recap (a zero-增量 summary ENDING) is the exception: the scene
+    # itself is fine, only the last ~600 chars re-state earlier content. That's a
+    # surgical ending rewrite, NOT a whole-scene replan (which kept coming back
+    # "did not improve" on suspense_10ch Ch7). Route it to local fix so the revise
+    # patch path can rewrite just the tail.
+    intra = review.get("intra_chapter_repetition") or {}
+    only_intra_recap = (
+        str(intra.get("level")) in ("warn", "block")
+        and "RECAP" in blob
+        and not any(m in (blob + rr) for m in ("雷同", "原地打转", "审美疲劳", "payoff", "兑现", "没有推进", "停滞", "scene_dedupe"))
+    )
+    if only_intra_recap:
+        return "local", f"章末零增量总结（tail_recap={intra.get('metrics', {}).get('tail_recap_ratio')}）—只需重写结尾，非全章重做"
+
     structural_markers = ("雷同", "重复", "原地打转", "审美疲劳", "payoff", "兑现", "没有推进", "停滞", "scene_dedupe")
     if any(m in (blob + rr) for m in structural_markers):
         return "structural", f"命中结构性问题标记（{[m for m in structural_markers if m in (blob+rr)][:3]}）"
@@ -754,6 +794,29 @@ def generate_one_chapter(
         else:
             decision.setdefault("required_constraints", []).extend(violations)
 
+    # Scene-breakdown middle layer: decompose the validated plan into an ordered
+    # shot list (goal/location/visible_actions/beats_covered/exit_state) and feed
+    # it to the writer. Built once per chapter, checkpointed for resume, threaded
+    # into every write_chapter_with_candidates call below. Disabled / failed =>
+    # {} and the writer falls back to the plan-only prompt (current behaviour).
+    scene_breakdown: dict[str, Any] = {}
+    if bool(config["novel"].get("scene_breakdown_enabled", True)):
+        cached_sb = load_checkpoint(paths, chapter_num, "scene_breakdown.json")
+        if isinstance(cached_sb, dict) and cached_sb.get("scenes"):
+            scene_breakdown = cached_sb
+            log(paths, f"Resuming scene breakdown Ch{chapter_num} ({len(cached_sb.get('scenes') or [])} scenes)")
+        else:
+            try:
+                from scene_breakdown import build_scene_breakdown
+                scene_breakdown = build_scene_breakdown(
+                    client, paths, config, chapter_num, plan, decision, cached_memory=cached_memory
+                )
+                if scene_breakdown:
+                    save_checkpoint(paths, chapter_num, "scene_breakdown.json", scene_breakdown)
+            except Exception as exc:
+                log(paths, f"Scene breakdown failed (non-fatal) Ch{chapter_num}: {exc}")
+                scene_breakdown = {}
+
     existing_chapter = read_text(chapter_path(paths, chapter_num))
     chapter = load_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT) or existing_chapter
     if chapter:
@@ -764,7 +827,51 @@ def generate_one_chapter(
         chapter, candidate_review = write_chapter_with_candidates(
             client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=writing_memory,
             chapter_aux_cache=_chapter_aux,
+            scene_breakdown=scene_breakdown,
         )
+
+        # Handle catastrophic pre-screen failure (all candidates have high fossils)
+        if chapter is None and isinstance(candidate_review, dict) and candidate_review.get("catastrophe") == "fossil_prescreen":
+            log(
+                paths,
+                f"CATASTROPHIC PRE-SCREEN FAILURE Ch{chapter_num}: all candidates blocked by fossils. "
+                f"Triggering PLAN-LEVEL replan to break the repetition cycle."
+            )
+            # Trigger a real structural replan via create_plan (the previous code
+            # called planning.adaptive_replan + _build_tail — neither exists, so it
+            # always threw and force-accepted the fossilized draft). create_plan
+            # generates a fresh plan; the fossil constraints are injected as
+            # replan_feedback so the new plan is steered off the repeated track.
+            try:
+                fossil_feedback = (
+                    "【结构性重规划·化石灾难】前几章已大量复读签名句（化石句累积），"
+                    "所有候选草稿都被化石门拦截。本章必须从【全新】角度切入：\n"
+                    "- 严禁复刻已用过的场景设计、人物动作、对话模式；\n"
+                    "- 改变叙述视角、物理场所、或对话方式；宁可另起炉灶，也不许在旧轨道上微调。"
+                )
+                replan_tail = _build_writer_tail(paths, config, chapter_num)
+                replan_plan, replan_decision = create_plan(
+                    client, paths, conn, config, chapter_num, replan_tail,
+                    checkpoint_label="fossil_catastrophe",
+                    cached_memory=cached_memory,
+                    replan_feedback=fossil_feedback,
+                )
+                chapter, candidate_review = write_chapter_with_candidates(
+                    client, paths, conn, config, chapter_num, replan_plan, replan_decision, replan_tail,
+                    cached_memory=writing_memory, chapter_aux_cache=_chapter_aux,
+                )
+                # If still None after replan, we're truly stuck — let it fall through to normal error handling
+                if chapter is not None:
+                    plan = replan_plan
+                    decision = replan_decision
+                    save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
+                    log(paths, f"Fossil-catastrophe replan Ch{chapter_num} completed")
+            except Exception as exc:
+                log(paths, f"Fossil-catastrophe replan Ch{chapter_num} failed: {exc}")
+                # Fall through to raise below
+
+        if chapter is None:
+            raise RuntimeError(f"Failed to generate any valid chapter text for Ch{chapter_num}")
         # O1: adjacent-duplicate draft gate. A draft that re-narrates the previous
         # chapter near-verbatim (observed: clause overlap 0.33-0.81 on the worst
         # force-accepted chapters vs 0.00-0.07 healthy) is a write-off — review
@@ -792,6 +899,7 @@ def generate_one_chapter(
                         client, paths, conn, config, chapter_num, plan, retry_decision, tail,
                         cached_memory=writing_memory,
                         chapter_aux_cache=_chapter_aux,
+                        scene_breakdown=scene_breakdown,
                     )
                     ar2 = adjacent_repetition(retry_chapter, prev_text, config)
                     if ar2.get("level") != "block":
@@ -1092,6 +1200,20 @@ def generate_one_chapter(
                 # keep the best-reviewed one instead of betting on one roll.
                 sr_candidates = int(config["novel"].get("structural_replan_candidates", 3))
                 sr_temp = float(config["novel"].get("structural_replan_temperature", 0.65))
+                # The replan regenerated the whole plan, so the old scene
+                # breakdown no longer matches. Rebuild it for the new plan (best
+                # effort; {} falls back to the plan-only writer prompt).
+                replan_breakdown: dict[str, Any] = {}
+                if bool(config["novel"].get("scene_breakdown_enabled", True)):
+                    try:
+                        from scene_breakdown import build_scene_breakdown
+                        replan_breakdown = build_scene_breakdown(
+                            client, paths, config, chapter_num, replan_plan, replan_decision,
+                            cached_memory=replan_memory,
+                        )
+                    except Exception as exc:
+                        log(paths, f"Replan scene breakdown failed (non-fatal) Ch{chapter_num}: {exc}")
+                        replan_breakdown = {}
                 replan_chapter, replan_review = write_chapter_with_candidates(
                     client,
                     paths,
@@ -1105,6 +1227,7 @@ def generate_one_chapter(
                     num_candidates_override=max(1, sr_candidates),
                     base_temp_override=sr_temp,
                     chapter_aux_cache=_chapter_aux,
+                    scene_breakdown=replan_breakdown,
                 )
                 if replan_review is None:
                     # n<=1 path returned no review (or only 1 valid draft); review now.
@@ -1139,6 +1262,8 @@ def generate_one_chapter(
                     best_review = dict(review)
                     save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
                     save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
+                    if replan_breakdown:
+                        save_checkpoint(paths, chapter_num, "scene_breakdown.json", replan_breakdown)
                     save_checkpoint(paths, chapter_num, "final_review.json", review)
                     log(paths, f"Quality replan Ch{chapter_num} improved score to {review.get('score')}/10")
                 else:
@@ -1156,13 +1281,116 @@ def generate_one_chapter(
         if safe_score(review.get("score", 0)) < threshold or not review.get("accepted", True):
             chapter = best_chapter
             review = best_review
-            chapter, review = _apply_force_accept_patches(paths, config, chapter_num, chapter, review)
-            log(
-                paths,
-                f"Ch{chapter_num} did not meet threshold {threshold} after {max_rounds + 1} rounds "
-                f"(best score={review.get('score')}/10). Accepting anyway to avoid pipeline halt.",
-            )
-            review["accepted"] = True
+            # HARD FLOOR: if gate_rejects exist AND score is catastrophically low (≤3.0),
+            # this is a structural collapse (e.g. adjacent-repeat block with 1.5/10 score).
+            # Force-accept would ship garbage; trigger a STRUCTURAL replan instead.
+            gate_rejects = review.get("gate_rejects", [])
+            hard_floor = 3.0
+            if gate_rejects and safe_score(review.get("score", 0)) <= hard_floor:
+                log(
+                    paths,
+                    f"Ch{chapter_num} HARD FLOOR violation: score={review.get('score')}/10 "
+                    f"with gate_rejects={[g['gate'] for g in gate_rejects]}. "
+                    f"Triggering STRUCTURAL replan instead of force-accept.",
+                )
+                # Real structural replan via create_plan (previous code called the
+                # non-existent planning.adaptive_replan + _build_tail, so it always
+                # threw and force-accepted the collapsed chapter). Inject the gate
+                # directives as replan_feedback so the fresh plan avoids the blocks.
+                try:
+                    gate_dirs: list[str] = []
+                    for gr in gate_rejects:
+                        gate_dirs.extend(gr.get("directives", []))
+                    replan_feedback = _build_replan_feedback(review)
+                    if gate_dirs:
+                        replan_feedback += "\n【确定性质量门作废本稿，必须结构性重做，不可修补】\n- " + "\n- ".join(
+                            str(d) for d in gate_dirs[:8]
+                        )
+                    replan_tail = _build_writer_tail(paths, config, chapter_num)
+                    replan_plan, replan_decision = create_plan(
+                        client, paths, conn, config, chapter_num, replan_tail,
+                        checkpoint_label="hard_floor",
+                        cached_memory=cached_memory,
+                        replan_feedback=replan_feedback,
+                    )
+                    replan_chapter, replan_review = write_chapter_with_candidates(
+                        client, paths, conn, config, chapter_num, replan_plan, replan_decision, replan_tail,
+                        cached_memory=writing_memory, chapter_aux_cache=_chapter_aux,
+                    )
+                    if replan_review is None:
+                        replan_review = review_chapter(
+                            client, paths, conn, config, chapter_num, replan_plan, replan_chapter, replan_tail,
+                            cached_memory=writing_memory, chapter_aux_cache=_chapter_aux
+                        )
+                    # Accept replan result unconditionally (even if still low) to avoid infinite loop
+                    chapter = normalize_chapter(replan_chapter)
+                    review = replan_review
+                    plan = replan_plan
+                    best_chapter = chapter
+                    best_review = dict(review)
+                    save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
+                    save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": replan_decision})
+                    save_checkpoint(paths, chapter_num, "final_review.json", review)
+                    log(paths, f"Hard-floor replan Ch{chapter_num} completed: new score={review.get('score')}/10")
+                except Exception as exc:
+                    log(paths, f"Hard-floor replan Ch{chapter_num} failed: {exc}. Falling back to force-accept.")
+                    # Fall through to force-accept below if replan fails
+
+            # Standard force-accept path (no hard-floor violation or replan failed)
+            if safe_score(review.get("score", 0)) < threshold or not review.get("accepted", True):
+                # CIRCUIT BREAKER: check for consecutive force-accepts
+                # If the previous N chapters were all force-accepted BELOW a low
+                # floor (not merely below the 8.0 target), we're in a quality death
+                # spiral where each low-quality chapter pollutes context for the next.
+                # Use a dedicated floor (default 7.0) — NOT the main threshold — so a
+                # healthy 7.8 chapter isn't mistaken for a force-accept. HALT instead.
+                consecutive_force_accept_limit = int(config["novel"].get("consecutive_force_accept_limit", 2))
+                breaker_floor = float(config["novel"].get("circuit_breaker_score_floor", 7.0))
+                if consecutive_force_accept_limit > 0 and chapter_num > consecutive_force_accept_limit:
+                    try:
+                        # Include the CURRENT chapter (about to be force-accepted) in the streak.
+                        recent_force_accepts = []
+                        cur_score = safe_score(review.get("score", 0))
+                        if cur_score < breaker_floor:
+                            recent_force_accepts.append((chapter_num, cur_score))
+                        for ch_back in range(chapter_num - 1, chapter_num - consecutive_force_accept_limit, -1):
+                            if ch_back < 1:
+                                break
+                            try:
+                                past_review = conn.execute(
+                                    "SELECT score FROM chapter_metrics WHERE chapter = ?", (ch_back,)
+                                ).fetchone()
+                                if past_review and float(past_review[0]) < breaker_floor:
+                                    recent_force_accepts.append((ch_back, float(past_review[0])))
+                                else:
+                                    break  # streak broken by a healthy chapter
+                            except Exception:
+                                break
+
+                        if len(recent_force_accepts) >= consecutive_force_accept_limit:
+                            streak = sorted(recent_force_accepts)
+                            log(
+                                paths,
+                                f"CIRCUIT BREAKER Ch{chapter_num}: {len(streak)} consecutive chapters below floor {breaker_floor} "
+                                f"({streak}). Refusing to force-accept another — quality death spiral detected.",
+                            )
+                            raise RuntimeError(
+                                f"Circuit breaker: {len(streak)} consecutive force-accepts below {breaker_floor} "
+                                f"(Ch{streak[0][0]}-{streak[-1][0]}). "
+                                f"Manual intervention required — consider adjusting prompt/config/model or stopping."
+                            )
+                    except RuntimeError:
+                        raise
+                    except Exception as exc:
+                        log(paths, f"Circuit breaker check failed (non-fatal): {exc}")
+
+                chapter, review = _apply_force_accept_patches(paths, config, chapter_num, chapter, review)
+                log(
+                    paths,
+                    f"Ch{chapter_num} did not meet threshold {threshold} after {max_rounds + 1} rounds "
+                    f"(best score={review.get('score')}/10). Accepting anyway to avoid pipeline halt.",
+                )
+                review["accepted"] = True
             # Mark this as a force-accept and persist the chosen best as the
             # authoritative final_review + current chapter text. On resume, the
             # final_is_authoritative check honours force_accepted reviews, so the
@@ -1271,8 +1499,27 @@ def generate_one_chapter(
                     chapter = new_chapter
                     save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
                     save_checkpoint(paths, chapter_num, "hook_revised.json", {"done": True, "hook_strength_before": hook_strength})
-                    # Bump the hook field; full re-review skipped for speed.
-                    review["hook_strength"] = max(hook_strength, hook_min)
+                    # Re-review the rewritten chapter instead of fabricating the
+                    # hook metric. The old code did `review["hook_strength"] =
+                    # max(hook_strength, hook_min)`, persisting an unmeasured floor
+                    # value into chapter_metrics — polluting the bandit reward and
+                    # stats, and letting the new tail bypass the style/fossil gates.
+                    # Gated by hook_revise_rereview (default true); on disable or
+                    # failure we keep the ORIGINAL measured value (never bump up).
+                    if bool(config["novel"].get("hook_revise_rereview", True)):
+                        try:
+                            review = review_chapter(
+                                client, paths, conn, config, chapter_num, plan, chapter, tail,
+                                cached_memory=writing_memory, chapter_aux_cache=_chapter_aux,
+                            )
+                            log(
+                                paths,
+                                f"Hook revise re-review Ch{chapter_num}: "
+                                f"hook_strength={safe_score(review.get('hook_strength', 0))}/10 "
+                                f"score={safe_score(review.get('score', 0))}",
+                            )
+                        except Exception as exc:
+                            log(paths, f"Hook revise re-review failed (non-fatal) Ch{chapter_num}: {exc}")
                 else:
                     log(paths, f"Hook revise produced too-short output ({len(new_chapter)} chars); keeping original")
             except Exception as exc:
@@ -1282,6 +1529,22 @@ def generate_one_chapter(
         save_checkpoint(paths, chapter_num, "final_review.json", review)
 
     if not load_checkpoint(paths, chapter_num, "chapter_saved.json"):
+        # Optional hook-y, non-spoilery chapter title: rewrite ONLY the first
+        # 第N章 title line (body prose untouched). Gated + fully reversible; on
+        # any failure the chapter keeps its plan-derived title. Skipped on the
+        # already-exists branch since that text was titled on its first pass.
+        if (
+            bool(config["novel"].get("chapter_title_refine_enabled", False))
+            and not chapter_path(paths, chapter_num).exists()
+        ):
+            try:
+                from package import refine_chapter_title, apply_chapter_title
+                new_title = refine_chapter_title(client, paths, config, chapter_num, plan, chapter)
+                if new_title and new_title != str(plan.get("title") or "").strip():
+                    chapter = apply_chapter_title(chapter, chapter_num, new_title)
+                    save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
+            except Exception as exc:
+                log(paths, f"Chapter title refine failed (non-fatal) Ch{chapter_num}: {exc}")
         if chapter_path(paths, chapter_num).exists():
             log(paths, f"Chapter file already exists Ch{chapter_num}; skipping duplicate save")
             # book.md is normally append-built by save_chapter, so it is already
@@ -1571,7 +1834,7 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         raise RuntimeError("Missing dependency: run `pip install -r requirements.txt` before generation.") from exc
 
-    api_endpoints, primary_endpoint_count = configured_api_endpoints(config)
+    api_endpoints, primary_endpoint_count, endpoint_models = configured_api_endpoints_with_models(config)
     if not api_endpoints:
         raise RuntimeError("Missing API key: set api.api_key, api.api_keys, or api.api_key_groups in config.yaml")
     stream_timeout = int(api_endpoints and config["api"].get("stream_timeout", 300))
@@ -1593,7 +1856,13 @@ def main() -> None:
         for base_url, api_key in api_endpoints
     ]
     client: Any = (
-        LLMClientPool(clients, primary_endpoint_count, endpoints=api_endpoints, log_fn=lambda msg: log(paths, msg))
+        LLMClientPool(
+            clients,
+            primary_endpoint_count,
+            endpoints=api_endpoints,
+            log_fn=lambda msg: log(paths, msg),
+            endpoint_models=endpoint_models,
+        )
         if len(clients) > 1
         else clients[0]
     )
@@ -1911,6 +2180,17 @@ def main() -> None:
         return
 
     log(paths, f"Done total_chars={count_chars(paths.book)}")
+
+    # Post-completion book packaging: titles / intros / tags / synopsis ->
+    # package.md + logs/package.json. Runs before refine so it describes the
+    # canonical chapters/book.md. Gated + best-effort; never touches prose.
+    if bool(config["novel"].get("package_after_complete", False)):
+        try:
+            from package import build_package
+            log(paths, "Generating book package (titles/intros/synopsis)")
+            build_package(client, paths, config)
+        except Exception as exc:
+            log(paths, f"Package generation failed (non-fatal): {exc}")
 
     # Post-completion refine pass. Re-reads the finished book in 5-chapter
     # groups and emits chapters_refined/ + book_refined.md. Original chapters/
