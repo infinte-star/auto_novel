@@ -173,17 +173,44 @@ def run_reader_panel(
     # Corrective feedback loop: when too many personas drop, push a directive
     # into this chapter's final_review so the NEXT chapter's writer reacts —
     # the exact channel cold_reader uses (pipeline.py _do_cold_reader).
-    threshold = float(novel_cfg.get("reader_panel_drop_threshold", 0.4))
+    # 下沉/免费流读者更没耐心，弃书阈值下调（不动 5 个固定 persona——保 telemetry 可比性，
+    # 只调阈值与挽回指令措辞），让免费流的"留存生死线"更早触发挽回。
+    _plat = str(novel_cfg.get("platform_preset", "")).strip().lower()
+    _low_barrier = (
+        _plat in {"fanqie_free", "qimao_free"}
+        or bool(novel_cfg.get("style_low_barrier_register", False))
+    )
+    if _low_barrier:
+        threshold = float(novel_cfg.get("reader_panel_drop_threshold_sinking", 0.35))
+        hard_threshold = float(novel_cfg.get("reader_panel_hard_drop_sinking", 0.55))
+    else:
+        threshold = float(novel_cfg.get("reader_panel_drop_threshold", 0.4))
+        hard_threshold = float(novel_cfg.get("reader_panel_hard_drop", 0.6))
     if report["drop_rate"] >= threshold:
         try:
             existing = load_checkpoint(paths, chapter_num, "final_review.json")
             if isinstance(existing, dict):
                 wd = list(existing.get("writer_directives_for_next_chapter") or [])
                 reasons = "；".join(report["drop_reasons"][:3]) or "多名模拟读者弃书"
-                msg = (
-                    f"读者面板警示：{report['drop_rate']:.0%} 的模拟读者在本章弃书"
-                    f"（{reasons}）。下一章必须针对性挽回追读。"
-                )
+                if report["drop_rate"] >= hard_threshold:
+                    if _low_barrier:
+                        msg = (
+                            f"【紧急·下沉留存】{report['drop_rate']:.0%} 的免费读者弃书（{reasons}）。"
+                            f"下一章必须：①开头100字内有正在发生的冲突；②对话占比50%+、大白话；"
+                            f"③给出具体可见的强爽点/情感冲击；④章末留强钩子。通勤5分钟内必须抓住读者。"
+                        )
+                    else:
+                        msg = (
+                            f"【紧急】读者面板严重警告：{report['drop_rate']:.0%} 的模拟读者弃书"
+                            f"（{reasons}）。下一章必须做出根本性调整：加入强爽点/情感冲击/"
+                            f"关键揭示来挽回读者。不要延续本章的节奏和模式。"
+                        )
+                else:
+                    msg = (
+                        f"读者面板警示：{report['drop_rate']:.0%} 的模拟读者在本章弃书"
+                        f"（{reasons}）。下一章必须针对性挽回追读"
+                        + ("（下沉读者无耐心，开头即给冲突、对话优先、爽点前置）。" if _low_barrier else "。")
+                    )
                 if msg not in wd:
                     wd.append(msg)
                 existing["writer_directives_for_next_chapter"] = wd[:12]
@@ -191,5 +218,24 @@ def run_reader_panel(
                 log(paths, f"Reader panel Ch{chapter_num}: drop_rate >= {threshold:.0%}, directive injected")
         except Exception as exc:
             log(paths, f"Reader panel directive injection failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Hard drop alert: persist a panel_alert.json so next chapter's planning
+    # can read it and force structural adjustments.
+    if report["drop_rate"] >= hard_threshold:
+        try:
+            alert = {
+                "chapter": chapter_num,
+                "drop_rate": report["drop_rate"],
+                "pay_rate": report["pay_rate"],
+                "avg_excitement": report["avg_excitement"],
+                "drop_reasons": report["drop_reasons"][:5],
+                "worst_moments": report["worst_moments"][:5],
+                "severity": "critical" if report["drop_rate"] >= 0.8 else "high",
+            }
+            save_checkpoint(paths, chapter_num, "panel_alert.json", alert)
+            log(paths, f"Reader panel Ch{chapter_num}: HARD DROP ({report['drop_rate']:.0%}), "
+                f"panel_alert.json saved for next chapter planning")
+        except Exception as exc:
+            log(paths, f"Reader panel alert save failed (non-fatal) Ch{chapter_num}: {exc}")
 
     return report

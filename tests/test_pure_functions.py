@@ -16,10 +16,14 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
-from quality import _beat_anchor_fragments, beat_coverage, plan_visual_payoff_check, scene_similarity, style_health  # noqa: E402
+from quality import _beat_anchor_fragments, beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
+from quality import store_chapter_fingerprint, check_plan_against_fingerprints  # noqa: E402
+from quality import prose_texture, emotional_cadence  # noqa: E402
+from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
+from memory import _recency_aware_state  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
-from llm import _enhance_system_prompt, _repair_truncated_json, json_prompt, safe_json_loads  # noqa: E402
+from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 
 
@@ -36,6 +40,7 @@ def _make_paths(root):
         timeline=root / "memory" / "timeline.md",
         threads=root / "memory" / "threads.md",
         volume_plan=root / "memory" / "volume_plan.md",
+        compass=root / "memory" / "compass.md",
         voices=root / "memory" / "voices.md",
         voice=root / "memory" / "voice.md",
         contract=root / "memory" / "contract.md",
@@ -397,6 +402,7 @@ class QualityDebtPatchTests(unittest.TestCase):
                 timeline=root / "memory" / "timeline.md",
                 threads=root / "memory" / "threads.md",
                 volume_plan=root / "memory" / "volume_plan.md",
+                compass=root / "memory" / "compass.md",
                 voices=root / "memory" / "voices.md",
                 voice=root / "memory" / "voice.md",
                 contract=root / "memory" / "contract.md",
@@ -876,6 +882,967 @@ class PackageRenderTests(unittest.TestCase):
         md = _render_package_md({"titles": ["仅书名"]})
         self.assertIn("仅书名", md)
         self.assertNotIn("无剧透简介", md)
+
+
+class ReduceEmDashDensityTests(unittest.TestCase):
+    """Tests for the programmatic em-dash density reduction (Layer 3)."""
+
+    EM = "——"
+    LQ = "“"
+    RQ = "”"
+
+    def test_no_change_when_below_target(self):
+        text = "这是一段正常的文字，没有破折号。" * 10
+        self.assertEqual(reduce_em_dash_density(text), text)
+
+    def test_chained_fragments_replaced(self):
+        em = self.EM
+        seg = "他站在原地" + em + "沉默" + em + "犹豫" + em + "最终转身离开。这是一个漫长的夜晚。"
+        text = seg * 5
+        result = reduce_em_dash_density(text, target_per_kchar=1.0)
+        self.assertLess(result.count(em), text.count(em))
+
+    def test_dialogue_preserved(self):
+        em = self.EM
+        lq, rq = self.LQ, self.RQ
+        dialogue_line = lq + "不要" + em + rq + "她喊道。"
+        narrative_line = "他缓缓转身" + em + "目光扫过每一个人" + em + "最终停在她身上。"
+        text = (dialogue_line + "\n" + narrative_line + "\n") * 5
+        result = reduce_em_dash_density(text, target_per_kchar=1.0)
+        self.assertIn(lq + "不要" + em + rq, result)
+
+    def test_density_reaches_target(self):
+        em = self.EM
+        base = "简短句子。" * 20
+        em_heavy = "他看到" + em + "远方" + em + "火焰" + em + "浓烟" + em + "一切都在燃烧。"
+        text = base + (em_heavy + "普通文字。") * 8
+        target = 2.0
+        result = reduce_em_dash_density(text, target_per_kchar=target)
+        density = result.count(em) / (len(result) / 1000) if len(result) > 0 else 0
+        self.assertLessEqual(density, target + 0.5)
+
+    def test_empty_and_no_em_dash(self):
+        self.assertEqual(reduce_em_dash_density(""), "")
+        self.assertEqual(reduce_em_dash_density("普通文字"), "普通文字")
+
+    def test_respects_config_target(self):
+        em = self.EM
+        text = ("他" + em + "她" + em + "它" + em + "我" + em + "你" + em + "他们。") * 10
+        cfg = {"novel": {"em_dash_reduce_target_per_kchar": "5.0"}}
+        result = reduce_em_dash_density(text, config=cfg)
+        density = result.count(em) / (len(result) / 1000) if len(result) > 0 else 0
+        self.assertLessEqual(density, 6.0)
+
+
+
+class ResolveThinkingParamTests(unittest.TestCase):
+    """Tests for _resolve_thinking_param (thinking mode config resolution)."""
+
+    def test_mode_disabled(self):
+        result = _resolve_thinking_param({"thinking_mode": "disabled"})
+        self.assertEqual(result, {"type": "disabled"})
+
+    def test_mode_auto(self):
+        result = _resolve_thinking_param({"thinking_mode": "auto"})
+        self.assertIsNone(result)
+
+    def test_mode_enabled_no_budget(self):
+        result = _resolve_thinking_param({"thinking_mode": "enabled"})
+        self.assertEqual(result, {"type": "enabled"})
+
+    def test_mode_enabled_with_budget(self):
+        result = _resolve_thinking_param({"thinking_mode": "enabled", "thinking_budget_tokens": 10000})
+        self.assertEqual(result, {"type": "enabled", "budget_tokens": 10000})
+
+    def test_mode_enabled_zero_budget_omitted(self):
+        result = _resolve_thinking_param({"thinking_mode": "enabled", "thinking_budget_tokens": 0})
+        self.assertEqual(result, {"type": "enabled"})
+
+    def test_legacy_disabled_true(self):
+        result = _resolve_thinking_param({"thinking_disabled": True})
+        self.assertEqual(result, {"type": "disabled"})
+
+    def test_legacy_disabled_false(self):
+        result = _resolve_thinking_param({"thinking_disabled": False})
+        self.assertIsNone(result)
+
+    def test_legacy_disabled_string_true(self):
+        result = _resolve_thinking_param({"thinking_disabled": "true"})
+        self.assertEqual(result, {"type": "disabled"})
+
+    def test_legacy_disabled_string_false(self):
+        result = _resolve_thinking_param({"thinking_disabled": "false"})
+        self.assertIsNone(result)
+
+    def test_mode_overrides_legacy(self):
+        result = _resolve_thinking_param({"thinking_mode": "enabled", "thinking_disabled": True, "thinking_budget_tokens": 5000})
+        self.assertEqual(result, {"type": "enabled", "budget_tokens": 5000})
+
+    def test_default_disabled(self):
+        result = _resolve_thinking_param({})
+        self.assertEqual(result, {"type": "disabled"})
+
+    def test_default_disabled_false(self):
+        result = _resolve_thinking_param({}, default_disabled=False)
+        self.assertIsNone(result)
+
+    def test_reviewer_keys(self):
+        result = _resolve_thinking_param(
+            {"review_thinking_mode": "enabled", "review_thinking_budget_tokens": 8000},
+            mode_key="review_thinking_mode",
+            disabled_key="review_thinking_disabled",
+            budget_key="review_thinking_budget_tokens",
+        )
+        self.assertEqual(result, {"type": "enabled", "budget_tokens": 8000})
+
+    def test_budget_string_parsed(self):
+        result = _resolve_thinking_param({"thinking_mode": "enabled", "thinking_budget_tokens": "16000"})
+        self.assertEqual(result, {"type": "enabled", "budget_tokens": 16000})
+
+
+class RecencyAwareStateTests(unittest.TestCase):
+    """Tests for _recency_aware_state (Feature 4: memory budget truncation)."""
+
+    def test_no_chapter_sections(self):
+        raw = "# 进度\n- 总字数：5000\n## 主角状态\n详情"
+        result = _recency_aware_state(raw, {"novel": {}})
+        self.assertEqual(result, raw)
+
+    def test_keeps_recent_n_sections(self):
+        header = "# 进度\n- 总字数：10000\n\n"
+        sections = "".join(f"## Ch{i}\n- thread_{i} open\n\n" for i in range(1, 11))
+        raw = header + sections
+        result = _recency_aware_state(raw, {"novel": {"state_recent_chapters": "3"}})
+        self.assertIn("# 进度", result)
+        self.assertNotIn("## Ch1\n", result)
+        self.assertNotIn("## Ch7\n", result)
+        self.assertIn("## Ch8\n", result)
+        self.assertIn("## Ch9\n", result)
+        self.assertIn("## Ch10\n", result)
+
+    def test_keeps_all_when_fewer_than_n(self):
+        header = "# 进度\n"
+        sections = "## Ch1\n- a\n\n## Ch2\n- b\n"
+        raw = header + sections
+        result = _recency_aware_state(raw, {"novel": {"state_recent_chapters": "5"}})
+        self.assertIn("## Ch1", result)
+        self.assertIn("## Ch2", result)
+
+    def test_respects_max_chars(self):
+        header = "# 进度\n" * 50
+        sections = "## Ch1\n- a\n## Ch2\n- b\n"
+        raw = header + sections
+        result = _recency_aware_state(raw, {"novel": {}}, max_chars=200)
+        self.assertLessEqual(len(result), 220)
+
+    def test_default_recent_5(self):
+        header = "# 进度\n"
+        sections = "".join(f"## Ch{i}\n- data\n" for i in range(1, 21))
+        raw = header + sections
+        result = _recency_aware_state(raw, {"novel": {}})
+        self.assertNotIn("## Ch15", result)
+        self.assertIn("## Ch16", result)
+        self.assertIn("## Ch20", result)
+
+
+class ChapterFingerprintTests(unittest.TestCase):
+    """Tests for store/check chapter fingerprints (Feature 3)."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chapter_fingerprints (
+                chapter INTEGER PRIMARY KEY,
+                skeleton_tokens TEXT NOT NULL,
+                narrative_moves TEXT NOT NULL,
+                payoff_type TEXT,
+                conflict_type TEXT,
+                created_at TEXT NOT NULL
+            );
+        """)
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _mock_db_lock(self):
+        import contextlib
+        @contextlib.contextmanager
+        def _noop_lock():
+            yield
+        return _noop_lock
+
+    def test_store_and_check_identical(self):
+        import store
+        orig_lock = store.db_lock
+        store.db_lock = self._mock_db_lock()
+        try:
+            plan = {
+                "conflict": "发现密室中的血迹方向不对",
+                "payoff": "推翻原有的死亡时间结论",
+                "pressure": "凶手即将离开城市",
+                "goal": "锁定真正的死亡时间",
+                "beats": ["进入密室检查", "发现血迹喷溅角度异常", "对比法医报告", "推翻原结论"],
+                "payoff_type": "reveal",
+                "conflict_type": "evidence_contradiction",
+            }
+            store_chapter_fingerprint(self.conn, 1, plan)
+            rows = self.conn.execute("SELECT * FROM chapter_fingerprints").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], 1)
+            result = check_plan_against_fingerprints(self.conn, plan, {"novel": {}})
+            self.assertGreater(result["max_sim"], 0.8)
+            self.assertEqual(result["most_similar_chapter"], 1)
+        finally:
+            store.db_lock = orig_lock
+
+    def test_different_plan_low_similarity(self):
+        import store
+        orig_lock = store.db_lock
+        store.db_lock = self._mock_db_lock()
+        try:
+            plan1 = {
+                "conflict": "发现密室中的血迹方向不对",
+                "payoff": "推翻原有的死亡时间结论",
+                "goal": "锁定真正的死亡时间",
+                "beats": ["进入密室检查", "发现血迹异常", "对比法医报告"],
+            }
+            plan2 = {
+                "conflict": "公司财务报表出现异常",
+                "payoff": "揭露内部贪腐网络",
+                "goal": "追踪资金流向",
+                "beats": ["调取银行记录", "发现关联账户", "约谈知情人"],
+            }
+            store_chapter_fingerprint(self.conn, 1, plan1)
+            result = check_plan_against_fingerprints(self.conn, plan2, {"novel": {}})
+            self.assertLess(result["max_sim"], 0.5)
+        finally:
+            store.db_lock = orig_lock
+
+    def test_empty_db_returns_zero(self):
+        result = check_plan_against_fingerprints(self.conn, {"conflict": "test"}, {"novel": {}})
+        self.assertEqual(result["max_sim"], 0.0)
+        self.assertIsNone(result["most_similar_chapter"])
+        self.assertEqual(result["directives"], [])
+
+    def test_directives_generated_above_threshold(self):
+        import store
+        orig_lock = store.db_lock
+        store.db_lock = self._mock_db_lock()
+        try:
+            plan = {
+                "conflict": "调查古墓里的线索",
+                "payoff": "发现古墓的秘密",
+                "goal": "解开古墓谜题",
+                "beats": ["进入古墓", "发现壁画", "解读符号", "找到密室"],
+            }
+            store_chapter_fingerprint(self.conn, 1, plan)
+            result = check_plan_against_fingerprints(
+                self.conn, plan, {"novel": {"fingerprint_warn_threshold": "0.5"}}
+            )
+            self.assertTrue(len(result["directives"]) > 0)
+        finally:
+            store.db_lock = orig_lock
+
+
+class ReviewerCalibrationTests(unittest.TestCase):
+    """Tests for the three-layer reviewer calibration (optimization #6).
+
+    These test the numerical behavior of the calibration logic by simulating
+    the same variable flow as review_chapter's scoring pipeline.
+    """
+
+    def _simulate_scoring(self, raw_score, sh_penalty, prose_score,
+                          mismatch=False, rep_em=0.0, det_em=0.0,
+                          config_overrides=None):
+        """Simulate the review_chapter scoring pipeline with calibration.
+
+        Returns (final_score, prose_score, calibrations).
+        """
+        config = {"novel": {}}
+        if config_overrides:
+            config["novel"].update(config_overrides)
+
+        caps = [10.0]
+        penalties = 0.0
+        calibrations = []
+
+        # style_health penalty (existing)
+        penalties += sh_penalty
+
+        # Layer B: prose calibration
+        if bool(config["novel"].get("prose_calibration_enabled", True)):
+            if sh_penalty == 0 and prose_score < 6.0:
+                calibrations.append(f"prose raised {prose_score}→6.0")
+                prose_score = 6.0
+            elif sh_penalty >= 1.0 and prose_score > 7.5:
+                calibrations.append(f"prose lowered {prose_score}→7.5")
+                prose_score = 7.5
+
+        # Layer C: mismatch penalty
+        if mismatch:
+            mm_pen = float(config["novel"].get("style_audit_mismatch_penalty", 0.5))
+            if mm_pen > 0:
+                penalties += mm_pen
+                calibrations.append(f"mismatch +{mm_pen}")
+
+        # Layer A: deterministic floor
+        det_floor = float(config["novel"].get("deterministic_score_floor", 5.0))
+        if sh_penalty == 0 and raw_score < det_floor:
+            calibrations.append(f"floor {raw_score}→{det_floor}")
+            raw_score = det_floor
+
+        final = max(1.0, min(min(caps), raw_score) - penalties)
+        return final, prose_score, calibrations
+
+    def test_layer_a_floors_catastrophic_score(self):
+        """When style_health is clean (penalty=0), raw_score can't go below 5.0."""
+        final, _, cals = self._simulate_scoring(
+            raw_score=1.0, sh_penalty=0, prose_score=7.0)
+        self.assertGreaterEqual(final, 5.0)
+        self.assertTrue(any("floor" in c for c in cals))
+
+    def test_layer_a_no_floor_when_penalty(self):
+        """When style_health has penalty, floor doesn't apply."""
+        final, _, cals = self._simulate_scoring(
+            raw_score=3.0, sh_penalty=1.5, prose_score=6.0)
+        self.assertLess(final, 3.0)
+        self.assertFalse(any("floor" in c for c in cals))
+
+    def test_layer_b_raises_prose_when_healthy(self):
+        """Healthy text (penalty=0) can't have prose < 6.0."""
+        _, prose, cals = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=4.0)
+        self.assertEqual(prose, 6.0)
+        self.assertTrue(any("prose raised" in c for c in cals))
+
+    def test_layer_b_lowers_prose_when_collapsed(self):
+        """Collapsed text (penalty>=1.0) can't have prose > 7.5."""
+        _, prose, cals = self._simulate_scoring(
+            raw_score=8.0, sh_penalty=1.5, prose_score=9.0)
+        self.assertEqual(prose, 7.5)
+        self.assertTrue(any("prose lowered" in c for c in cals))
+
+    def test_layer_b_no_change_in_range(self):
+        """Prose in valid range stays unchanged."""
+        _, prose, cals = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=7.0)
+        self.assertEqual(prose, 7.0)
+        self.assertFalse(any("prose" in c for c in cals))
+
+    def test_layer_c_mismatch_penalty(self):
+        """When mismatch detected, 0.5 penalty applied."""
+        final_no_mm, _, _ = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=7.0, mismatch=False)
+        final_mm, _, cals = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=7.0, mismatch=True)
+        self.assertAlmostEqual(final_no_mm - final_mm, 0.5)
+        self.assertTrue(any("mismatch" in c for c in cals))
+
+    def test_layer_c_configurable(self):
+        """Mismatch penalty is configurable."""
+        final, _, _ = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=7.0, mismatch=True,
+            config_overrides={"style_audit_mismatch_penalty": "1.0"})
+        self.assertAlmostEqual(final, 6.0)
+
+    def test_all_layers_combined(self):
+        """All three layers work together correctly."""
+        # raw=2.0, penalty=0, prose=4.0, mismatch=True
+        # Layer A: raw 2.0→5.0 (penalty=0 floor)
+        # Layer B: prose 4.0→6.0 (penalty=0 healthy)
+        # Layer C: +0.5 mismatch
+        # Final: 5.0 - 0.0 - 0.5 = 4.5
+        final, prose, cals = self._simulate_scoring(
+            raw_score=2.0, sh_penalty=0, prose_score=4.0, mismatch=True)
+        self.assertAlmostEqual(final, 4.5)
+        self.assertEqual(prose, 6.0)
+        self.assertEqual(len(cals), 3)
+
+    def test_disabled_by_config(self):
+        """Calibration can be disabled."""
+        _, prose, cals = self._simulate_scoring(
+            raw_score=7.0, sh_penalty=0, prose_score=4.0,
+            config_overrides={"prose_calibration_enabled": False})
+        self.assertEqual(prose, 4.0)
+
+
+class ProseTextureTests(unittest.TestCase):
+    """Tests for prose_texture: quantitative vs poetic balance detection."""
+
+    def test_balanced_text(self):
+        text = "他缓步走进大殿，目光扫过群臣的脸庞，心中已有了决断。" * 20
+        result = prose_texture(text)
+        self.assertEqual(result["balance"], "balanced")
+        self.assertEqual(result["directives"], [])
+
+    def test_over_quantitative(self):
+        # Use number-heavy text WITHOUT sensory single chars (温/湿/冰/热 etc)
+        text = ("报告显示第3区有17%的偏差，数值37.5比正常高出2.3，"
+                "总计42个站点中有15个达到百分之十五的偏离率。" * 20)
+        result = prose_texture(text)
+        self.assertEqual(result["balance"], "over_quantitative")
+        self.assertTrue(len(result["directives"]) > 0)
+        self.assertIn("数据密度", result["directives"][0])
+
+    def test_over_poetic(self):
+        text = ("她的目光像是一道光芒，温暖如春风，仿佛整个世界都在阴影中苏醒。"
+                "气味芬芳似花园，触感如丝绸般柔滑，声响恍若远方的钟声回荡。" * 15)
+        result = prose_texture(text)
+        self.assertEqual(result["balance"], "over_poetic")
+        self.assertTrue(len(result["directives"]) > 0)
+
+    def test_metrics_present(self):
+        text = "正常的叙事文字。" * 50
+        result = prose_texture(text)
+        self.assertIn("num_per_kchar", result["metrics"])
+        self.assertIn("metaphor_per_kchar", result["metrics"])
+        self.assertIn("sensory_per_kchar", result["metrics"])
+        self.assertIn("poetic_density", result["metrics"])
+
+    def test_empty_text(self):
+        result = prose_texture("")
+        self.assertEqual(result["balance"], "balanced")
+
+    def test_config_thresholds(self):
+        # Text with moderate number density (~5/kchar) and zero poetic
+        text = "共计5个站点偏差3%。他走到门口，看了看四周。" * 30
+        result_strict = prose_texture(text, {"novel": {"texture_num_high_per_kchar": "2.0"}})
+        result_loose = prose_texture(text, {"novel": {"texture_num_high_per_kchar": "999.0"}})
+        self.assertEqual(result_strict["balance"], "over_quantitative")
+        self.assertEqual(result_loose["balance"], "balanced")
+
+
+class EmotionalCadenceTests(unittest.TestCase):
+    """Tests for emotional_cadence: consecutive same-mood detection."""
+
+    def test_no_tones(self):
+        result = emotional_cadence([])
+        self.assertFalse(result["monotony"])
+        self.assertEqual(result["streak"], 0)
+
+    def test_single_tone(self):
+        result = emotional_cadence(["紧张"])
+        self.assertFalse(result["monotony"])
+
+    def test_varied_tones(self):
+        result = emotional_cadence(["紧张", "温情", "压抑", "兴奋"])
+        self.assertFalse(result["monotony"])
+        self.assertEqual(result["streak"], 1)
+
+    def test_monotony_detected(self):
+        result = emotional_cadence(["温情", "紧张", "紧张", "紧张"])
+        self.assertTrue(result["monotony"])
+        self.assertEqual(result["streak"], 3)
+        self.assertTrue(len(result["directives"]) > 0)
+        self.assertIn("紧张", result["directives"][0])
+
+    def test_configurable_max_same(self):
+        tones = ["紧张", "紧张"]
+        result_strict = emotional_cadence(tones, {"novel": {"emotional_cadence_max_same": "2"}})
+        result_loose = emotional_cadence(tones, {"novel": {"emotional_cadence_max_same": "5"}})
+        self.assertTrue(result_strict["monotony"])
+        self.assertFalse(result_loose["monotony"])
+
+    def test_alternatives_for_known_tones(self):
+        result = emotional_cadence(["悲伤", "悲伤", "悲伤"])
+        self.assertTrue(result["monotony"])
+        directive = result["directives"][0]
+        self.assertTrue("希望" in directive or "温情" in directive or "坚定" in directive)
+
+
+class RelationshipStoreTests(unittest.TestCase):
+    """Tests for character_relationships table and helpers."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS character_relationships (
+                pair_key TEXT PRIMARY KEY,
+                char_a TEXT NOT NULL,
+                char_b TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'contact',
+                intensity REAL DEFAULT 0.0,
+                label TEXT DEFAULT '',
+                last_event TEXT DEFAULT '',
+                updated_chapter INTEGER DEFAULT 0,
+                history_json TEXT DEFAULT '[]'
+            );
+        """)
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_upsert_new_relationship(self):
+        from store import upsert_relationship, get_relationships
+        upsert_relationship(self.conn, 1, "林夕", "周临舟",
+                            stage="tension", intensity=0.6,
+                            event_desc="林夕质问周临舟偷改记录")
+        rels = get_relationships(self.conn)
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["stage"], "tension")
+        self.assertAlmostEqual(float(rels[0]["intensity"]), 0.6)
+        self.assertEqual(len(rels[0]["history"]), 1)
+
+    def test_upsert_updates_existing(self):
+        from store import upsert_relationship, get_relationships
+        upsert_relationship(self.conn, 1, "林夕", "周临舟",
+                            stage="contact", intensity=0.3, event_desc="初次相遇")
+        upsert_relationship(self.conn, 5, "林夕", "周临舟",
+                            stage="trust", intensity=0.7, event_desc="共同破案")
+        rels = get_relationships(self.conn)
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["stage"], "trust")
+        self.assertEqual(len(rels[0]["history"]), 2)
+
+    def test_pair_key_order_independent(self):
+        from store import upsert_relationship, get_relationships
+        upsert_relationship(self.conn, 1, "周临舟", "林夕",
+                            stage="contact", event_desc="A")
+        upsert_relationship(self.conn, 2, "林夕", "周临舟",
+                            stage="tension", event_desc="B")
+        rels = get_relationships(self.conn)
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["stage"], "tension")
+
+    def test_stale_relationships(self):
+        from store import upsert_relationship, get_stale_relationships
+        upsert_relationship(self.conn, 1, "A", "B", stage="contact", intensity=0.5)
+        upsert_relationship(self.conn, 10, "C", "D", stage="trust", intensity=0.8)
+        stale = get_stale_relationships(self.conn, chapter_num=12, stale_threshold=8)
+        self.assertEqual(len(stale), 1)
+        self.assertIn("A", stale[0]["char_a"] + stale[0]["char_b"])
+
+    def test_invalid_stage_falls_back(self):
+        from store import upsert_relationship, get_relationships
+        upsert_relationship(self.conn, 1, "A", "B", stage="invalid_stage")
+        rels = get_relationships(self.conn)
+        self.assertEqual(rels[0]["stage"], "contact")
+
+
+class InfoRevelationStoreTests(unittest.TestCase):
+    """Tests for info_revelations table and helpers."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS info_revelations (
+                id TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                reveal_type TEXT NOT NULL DEFAULT 'mystery',
+                status TEXT NOT NULL DEFAULT 'planted',
+                planted_chapter INTEGER,
+                hint_chapters TEXT DEFAULT '[]',
+                due_chapter INTEGER,
+                revealed_chapter INTEGER,
+                importance INTEGER DEFAULT 5,
+                created_at TEXT NOT NULL
+            );
+        """)
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_upsert_new_revelation(self):
+        from store import upsert_info_revelation, get_pending_revelations
+        upsert_info_revelation(self.conn, 3, {
+            "id": "secret-1",
+            "description": "密室里的血迹指向第二嫌疑人",
+            "status": "planted",
+            "due_chapter": 10,
+            "importance": 8,
+        })
+        pending = get_pending_revelations(self.conn, 5)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["id"], "secret-1")
+        self.assertEqual(pending[0]["importance"], 8)
+
+    def test_upsert_updates_status(self):
+        from store import upsert_info_revelation, get_pending_revelations
+        upsert_info_revelation(self.conn, 3, {
+            "id": "secret-2", "description": "隐藏身份",
+            "status": "planted", "importance": 7,
+        })
+        upsert_info_revelation(self.conn, 6, {
+            "id": "secret-2", "status": "hinted",
+        })
+        pending = get_pending_revelations(self.conn, 7)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["status"], "hinted")
+
+    def test_revealed_not_pending(self):
+        from store import upsert_info_revelation, get_pending_revelations
+        upsert_info_revelation(self.conn, 3, {
+            "id": "secret-3", "description": "已揭秘",
+            "status": "planted", "importance": 9,
+        })
+        upsert_info_revelation(self.conn, 8, {
+            "id": "secret-3", "status": "revealed",
+        })
+        pending = get_pending_revelations(self.conn, 9)
+        self.assertEqual(len(pending), 0)
+
+    def test_overdue_revelations(self):
+        from store import upsert_info_revelation, get_overdue_revelations
+        upsert_info_revelation(self.conn, 2, {
+            "id": "overdue-1", "description": "过期线索",
+            "status": "planted", "due_chapter": 5, "importance": 7,
+        })
+        overdue = get_overdue_revelations(self.conn, chapter_num=15, grace=5)
+        self.assertEqual(len(overdue), 1)
+        self.assertGreater(overdue[0]["overdue_by"], 0)
+
+    def test_not_overdue_within_grace(self):
+        from store import upsert_info_revelation, get_overdue_revelations
+        upsert_info_revelation(self.conn, 2, {
+            "id": "recent-1", "description": "近期线索",
+            "status": "planted", "due_chapter": 8, "importance": 5,
+        })
+        overdue = get_overdue_revelations(self.conn, chapter_num=10, grace=5)
+        self.assertEqual(len(overdue), 0)
+
+
+class BookWideFossilTests(unittest.TestCase):
+    """Tests for book_wide_fossils: whole-book micro-phrase tic detection."""
+
+    def _book(self, fossil, n_with, n_without):
+        # Per-chapter UNIQUE filler so only `fossil` recurs across chapters;
+        # otherwise identical filler would (correctly) be flagged as a fossil too.
+        texts = {}
+        ch = 1
+        for _ in range(n_with):
+            uniq = f"第{ch}章独有的过渡叙述编号{ch}{ch}{ch}在此推进剧情向前发展不重复"
+            texts[ch] = f"第{ch}章\n{uniq}所以现在，{fossil}。再写一些{uniq}收尾。"
+            ch += 1
+        for _ in range(n_without):
+            uniq = f"第{ch}章完全不同的内容编号{ch}{ch}{ch}叙述其他事件推进情节走向结局"
+            texts[ch] = f"第{ch}章\n{uniq}。这一段没有那个口癖。{uniq}收尾。"
+            ch += 1
+        return texts
+
+    def _has_fossil(self, phrases, fossil):
+        # The fossil may surface as a boundary-shifted window; match on a 4-char run.
+        return any(
+            any(fossil[i:i + 4] in p for i in range(len(fossil) - 3))
+            for p in phrases
+        )
+
+    def test_detects_book_wide_fossil(self):
+        from quality import book_wide_fossils
+        # 6-char fossil present in 8 of 10 chapters → above frac 0.30 & min 6
+        texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
+        res = book_wide_fossils(texts, {"novel": {}})
+        self.assertTrue(res["fossils"], "expected at least one book-wide fossil")
+        self.assertTrue(self._has_fossil(res["phrases"], "陆知白抬起左手"))
+        self.assertTrue(res["directives"])
+
+    def test_below_threshold_not_flagged(self):
+        from quality import book_wide_fossils
+        # fossil only in 3 of 12 chapters → below both frac and min_chapters(6)
+        texts = self._book("陆知白抬起左手", n_with=3, n_without=9)
+        res = book_wide_fossils(texts, {"novel": {}})
+        self.assertFalse(self._has_fossil(res["phrases"], "陆知白抬起左手"))
+
+    def test_overlapping_windows_collapsed(self):
+        from quality import book_wide_fossils
+        texts = self._book("陆知白抬起左手", n_with=9, n_without=1)
+        res = book_wide_fossils(texts, {"novel": {}})
+        # shifted 6-grams of the same stub must not all survive as separate fossils
+        for a in range(len(res["phrases"])):
+            for b in range(a + 1, len(res["phrases"])):
+                pa, pb = res["phrases"][a], res["phrases"][b]
+                shared = any(pa[i:i + 4] in pb for i in range(len(pa) - 3))
+                self.assertFalse(shared, f"overlapping fossils not collapsed: {pa} / {pb}")
+
+    def test_empty_and_disabled(self):
+        from quality import book_wide_fossils
+        self.assertEqual(book_wide_fossils({}, {"novel": {}})["fossils"], [])
+        texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
+        off = book_wide_fossils(texts, {"novel": {"book_fossil_enabled": False}})
+        self.assertEqual(off["fossils"], [])
+
+
+class EndingZoneTests(unittest.TestCase):
+    """Tests for config.ending_zone_distance gradual收束 gating."""
+
+    def _cfg(self, **kw):
+        base = {"ending_aware": True, "max_chapters": 50, "ending_zone_chapters": 5}
+        base.update(kw)
+        return {"novel": base}
+
+    def test_inside_zone(self):
+        from config import ending_zone_distance
+        self.assertEqual(ending_zone_distance(self._cfg(), 47), 3)
+        self.assertEqual(ending_zone_distance(self._cfg(), 46), 4)
+
+    def test_final_chapter_returns_none(self):
+        from config import ending_zone_distance
+        self.assertIsNone(ending_zone_distance(self._cfg(), 50))  # finale owned by is_final_chapter
+
+    def test_outside_zone(self):
+        from config import ending_zone_distance
+        self.assertIsNone(ending_zone_distance(self._cfg(), 45))  # remaining=5 == zone, not < zone
+        self.assertIsNone(ending_zone_distance(self._cfg(), 30))
+
+    def test_no_max_chapters(self):
+        from config import ending_zone_distance
+        self.assertIsNone(ending_zone_distance(self._cfg(max_chapters=0), 47))
+
+    def test_ending_aware_off(self):
+        from config import ending_zone_distance
+        self.assertIsNone(ending_zone_distance(self._cfg(ending_aware=False), 47))
+
+
+class PayoffDensityTests(unittest.TestCase):
+    """Tests for payoff_beat_density: 爽点 cadence."""
+
+    def test_payoff_markers_counted(self):
+        from quality import payoff_beat_density
+        text = "他当众揭穿了对方的伪证，全场目瞪口呆，对手脸色骤变，败下阵来。" * 5
+        res = payoff_beat_density(text, ["reveal"], {"novel": {}})
+        self.assertGreater(res["metrics"]["payoff_markers"], 0)
+
+    def test_drought_directive(self):
+        from quality import payoff_beat_density
+        # recent payoff_types all setup → drought beyond max_gap (1/0.34≈3)
+        flat = "他翻看着资料，慢慢整理着思路，又记下了几行笔记。" * 5
+        res = payoff_beat_density(flat, ["setup", "setup", "emotional", "setup"], {"novel": {}})
+        self.assertTrue(res["directives"])
+        self.assertIn("爽点", res["directives"][0])
+
+    def test_recent_strong_payoff_no_drought(self):
+        from quality import payoff_beat_density
+        flat = "他翻看着资料，慢慢整理着思路。" * 5
+        res = payoff_beat_density(flat, ["reveal", "setup", "setup"], {"novel": {}})
+        self.assertEqual(res["metrics"]["chapters_since_payoff"], 0)
+        self.assertFalse(res["directives"])
+
+
+class InformationDensityTests(unittest.TestCase):
+    """Tests for information_density: pure-transition-chapter detection."""
+
+    def test_transition_chapter_flagged(self):
+        from quality import information_density
+        text = "他在房间里来回踱步，回想着这些天发生的事，没有结论。" * 5
+        plan = {"payoff_type": "setup", "info_reveals": []}
+        review = {"beats_audit": [{"status": "absent"}, {"status": "absent"}]}
+        res = information_density(text, plan, review, {"novel": {}})
+        self.assertTrue(res["low_information"])
+        self.assertTrue(res["directives"])
+
+    def test_rich_chapter_not_flagged(self):
+        from quality import information_density
+        text = "他当众揭穿了伪证，真相大白。" * 5
+        plan = {"payoff_type": "reveal", "info_reveals": ["secret-1"]}
+        review = {"beats_audit": [{"status": "realized"}]}
+        res = information_density(text, plan, review, {"novel": {}})
+        self.assertFalse(res["low_information"])
+
+    def test_disabled(self):
+        from quality import information_density
+        res = information_density("x", {}, {}, {"novel": {"info_density_enabled": False}})
+        self.assertFalse(res["low_information"])
+
+
+class RecentDimensionScoreTests(unittest.TestCase):
+    """Tests for store.recent_dimension_scores (dimension de-inflation input)."""
+
+    def setUp(self):
+        import sqlite3, tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.conn = sqlite3.connect(os.path.join(self.tmpdir, "t.db"))
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE chapter_metrics (
+                chapter INTEGER PRIMARY KEY, hook_score REAL, readthrough_score REAL
+            );
+        """)
+        for ch, hk in enumerate([9.5, 10.0, 10.0, 9.8, 10.0, 7.0], start=1):
+            self.conn.execute(
+                "INSERT INTO chapter_metrics(chapter, hook_score, readthrough_score) VALUES (?,?,?)",
+                (ch, hk, hk))
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_returns_newest_first(self):
+        from store import recent_dimension_scores
+        vals = recent_dimension_scores(self.conn, "hook_score", 3)
+        self.assertEqual(vals[0], 7.0)  # chapter 6, newest
+
+    def test_before_chapter_excludes(self):
+        from store import recent_dimension_scores
+        vals = recent_dimension_scores(self.conn, "hook_score", 10, before_chapter=6)
+        self.assertNotIn(7.0, vals)
+        self.assertEqual(len(vals), 5)
+
+    def test_saturation_average(self):
+        from store import recent_dimension_scores
+        vals = recent_dimension_scores(self.conn, "hook_score", 5, before_chapter=6)
+        self.assertGreaterEqual(sum(vals) / len(vals), 9.3)  # saturated window
+
+
+class ReplanRoiTests(unittest.TestCase):
+    """Tests for pipeline._recent_replan_ineffective ROI breaker."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = __import__("pathlib").Path(tempfile.mkdtemp())
+        self.paths = _make_paths(self.tmpdir)
+        (self.tmpdir / "logs").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_replan(self, ch, before, after):
+        from checkpoint import save_checkpoint
+        save_checkpoint(self.paths, ch, "quality_replan_done.json",
+                        {"score_before": before, "score_after": after})
+
+    def test_ineffective_when_recent_gains_small(self):
+        from pipeline import _recent_replan_ineffective
+        self._write_replan(8, 7.0, 7.1)
+        self._write_replan(9, 7.2, 7.0)
+        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
+        self.assertTrue(_recent_replan_ineffective(self.paths, 10, cfg))
+
+    def test_effective_when_a_recent_replan_worked(self):
+        from pipeline import _recent_replan_ineffective
+        self._write_replan(8, 7.0, 7.1)
+        self._write_replan(9, 6.5, 8.0)  # big gain
+        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
+        self.assertFalse(_recent_replan_ineffective(self.paths, 10, cfg))
+
+    def test_no_history_not_ineffective(self):
+        from pipeline import _recent_replan_ineffective
+        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
+        self.assertFalse(_recent_replan_ineffective(self.paths, 10, cfg))
+
+
+class OpeningHookGateTests(unittest.TestCase):
+    _BG = (
+        "清晨的阳光透过窗帘洒在地板上，空气里浮着淡淡的尘埃。窗外的天空泛着鱼肚白，"
+        "微风拂过院子里的老槐树，叶子轻轻摇动。这座小城安静得仿佛还在沉睡，远处的山峦"
+        "笼罩在一层薄雾里，看不真切。街道上空无一人，时间仿佛在这一刻凝固，整个世界都"
+        "显得格外宁静而悠远，像一幅褪了色的旧画，挂在记忆深处某个无人问津的角落里。"
+        "院墙边的老藤一年年绿了又黄，墙根的青苔在湿润的早晨泛着幽幽的光泽。屋檐下"
+        "燕子去年筑的旧巢还在，泥点斑驳，无声地诉说着一段又一段被岁月覆盖的寻常日子，"
+        "仿佛连风都不忍心惊扰这一方沉静的小院与它漫长而又平淡的清晨时光。"
+    )
+    _CRISIS = (
+        "「住手！」陆江一把抓住对方的手腕，用力往回拽。那人手里的刀离他的喉咙只剩半寸，"
+        "血珠已经渗了出来。他来不及多想，膝盖狠狠撞上去，两个人一起摔倒在地。周围的人惊叫着"
+        "后退，有人喊着报警。他死死压住那只握刀的手，指节发白，心脏在胸口擂鼓一样狂跳。"
+        "刀尖在地砖上划出刺耳的声响，他用尽全身力气把那只手往墙根砸去，一下，两下，"
+        "直到那把刀脱手飞出，叮当一声弹到了墙角。他喘着粗气，死死把人按在地上不敢松开。"
+    )
+
+    def test_background_opener_penalized_ch1(self):
+        res = opening_hook_gate(self._BG, 1, None)
+        self.assertGreater(res["penalty"], 0.0)
+        self.assertTrue(res["flags"])
+        self.assertTrue(res["directives"])
+
+    def test_crisis_opener_not_penalized(self):
+        res = opening_hook_gate(self._CRISIS, 1, None)
+        self.assertEqual(res["penalty"], 0.0)
+
+    def test_gate_inactive_past_opening_chapters(self):
+        res = opening_hook_gate(self._BG, 9, {"novel": {"opening_chapters": 3}})
+        self.assertEqual(res["penalty"], 0.0)
+
+    def test_disabled(self):
+        res = opening_hook_gate(self._BG, 1, {"novel": {"opening_golden_gate_enabled": False}})
+        self.assertEqual(res["penalty"], 0.0)
+
+    def test_block_flag_when_configured(self):
+        res = opening_hook_gate(
+            self._BG, 1, {"novel": {"opening_golden_gate_block": True}})
+        self.assertTrue(res["block"])
+
+
+class LengthBandCheckTests(unittest.TestCase):
+    CFG = {"novel": {"chapter_min_chars": 2200, "chapter_max_chars": 3600,
+                     "length_band_penalty_enabled": True}}
+
+    def test_over_length_penalized(self):
+        res = length_band_check("字" * 5000, self.CFG)
+        self.assertGreater(res["penalty"], 0.0)
+        self.assertTrue(any("too_long" in f for f in res["flags"]))
+
+    def test_in_band_clean(self):
+        res = length_band_check("字" * 3000, self.CFG)
+        self.assertEqual(res["penalty"], 0.0)
+        self.assertEqual(res["flags"], [])
+
+    def test_very_short_penalized(self):
+        res = length_band_check("字" * 1000, self.CFG)
+        self.assertGreater(res["penalty"], 0.0)
+        self.assertTrue(any("too_short" in f for f in res["flags"]))
+
+    def test_penalty_off_is_advisory_only(self):
+        cfg = {"novel": {"chapter_min_chars": 2200, "chapter_max_chars": 3600,
+                         "length_band_penalty_enabled": False}}
+        res = length_band_check("字" * 5000, cfg)
+        self.assertEqual(res["penalty"], 0.0)
+        self.assertTrue(res["directives"])  # still advises
+
+    def test_gross_overshoot_blocks_when_enabled(self):
+        cfg = {"novel": {"chapter_min_chars": 2200, "chapter_max_chars": 3600,
+                         "length_band_penalty_enabled": True, "length_band_block": True}}
+        res = length_band_check("字" * 9000, cfg)  # 2.5x over
+        self.assertTrue(res["block"])
+
+
+class FlatChapterStreakTests(unittest.TestCase):
+    CFG = {"novel": {"flat_chapters_max_consecutive": 3, "flat_impact_floor": 5.0}}
+
+    def _flat(self, n):
+        return [{"payoff_type": "setup", "emotional_impact": 3.0} for _ in range(n)]
+
+    def test_flat_streak_penalized(self):
+        res = flat_chapter_streak(self._flat(3), self.CFG)
+        self.assertEqual(res["streak"], 3)
+        self.assertGreater(res["penalty"], 0.0)
+
+    def test_recent_strong_payoff_breaks_streak(self):
+        rows = [{"payoff_type": "reveal", "emotional_impact": 3.0}] + self._flat(3)
+        res = flat_chapter_streak(rows, self.CFG)
+        self.assertEqual(res["streak"], 0)
+        self.assertEqual(res["penalty"], 0.0)
+
+    def test_high_emotion_breaks_streak(self):
+        rows = [{"payoff_type": "setup", "emotional_impact": 8.0}] + self._flat(3)
+        res = flat_chapter_streak(rows, self.CFG)
+        self.assertEqual(res["streak"], 0)
+
+    def test_disabled(self):
+        cfg = {"novel": {"flat_streak_gate_enabled": False}}
+        res = flat_chapter_streak(self._flat(5), cfg)
+        self.assertEqual(res["penalty"], 0.0)
 
 
 if __name__ == "__main__":

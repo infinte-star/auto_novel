@@ -51,10 +51,210 @@ CHAPTER_TITLE_SYSTEM = """你是中文网文的章节起名编辑。
 要求：标题要勾人想点开，但不能把本章的核心反转/结局写进标题；不要书名号、不要标点堆砌。"""
 
 
+HOOK_PACKAGE_SYSTEM = """你是免费阅读平台（番茄为主）的爆款选品/运营，负责在作品【开写之前】先定下"吸量包"。
+吸量是流量漏斗第一层：书名/简介决定点击率，烂书名能直接干掉九成机会。请据下方设定产出可 A/B 的吸量素材。
+只返回恰好一个合法 JSON 对象，不要输出其它内容：
+{
+  "titles": ["5 个候选书名，按吸量从高到低"],
+  "intros": ["2-3 个候选简介，每个 80-120 字，三段式"],
+  "one_line": "一句话最大卖点/爽点(<=30字)",
+  "tags": ["题材/卖点标签词，4-8个"],
+  "hook_directives": ["3-5 条给开篇作者的吸量落地指令：开篇必须兑现书名/简介承诺的哪个爽点"]
+}
+书名公式：用大白话一句话剧透最大爽点或冲突，强画面、可短剧化；男频突出系统/无敌/重生/战神，女频突出甜宠/闪婚/马甲/重生/团宠；禁文艺腔、禁抽象、禁看不懂的双关。
+简介三段式：①主角身份+开局困境（一句话给标签，不铺垫）②核心反差/独家能力（最值钱的一句，卖设定，越具体越好）③情绪承诺+钩子收尾（留未解谜团，禁剧透结局）；禁形容词大杂烩、禁全程"TA"指代。
+要求：紧扣下方实际设定，不要营销空话；若平台画像非番茄，按其调性微调，但仍以"点击率优先"为准。"""
+
+
+HOOK_SCORE_SYSTEM = """你是免费阅读平台（番茄为主）的爆款选品总监，专门给【尚未开写】作品的吸量素材打分。
+吸量是流量漏斗第一层：书名/简介决定封面点击率，烂书名直接干掉九成机会。你要像算法+下沉读者那样冷酷判断"会不会点进去"。
+给你一组候选书名、候选简介、标签和题材设定，请独立打分排序。只返回恰好一个合法 JSON 对象，不要输出其它内容：
+{
+  "ranked_titles": [{"title": "<原候选书名>", "ctr_score": 1-10, "reason": "<=40字打分理由"}],
+  "best_title": "<ctr_score 最高的那个书名原文>",
+  "ranked_intros": [{"intro": "<原候选简介前20字…>", "score": 1-10, "reason": "<=40字理由"}],
+  "track_eval": {
+    "verdict": "蓝海|偏蓝海|偏红海|红海",
+    "differentiation": "<这本在赛道里的差异化空间，一句话>",
+    "suggestion": "<提升吸量/差异化的一条最关键建议>"
+  }
+}
+书名打分维度（点击率优先）：①大白话、零阅读门槛 ②强画面/强冲突、一句话剧透最大爽点 ③可短剧化（强人设+强反转）④差异化（避免与红海同质化的歪嘴龙王/烂大街标题）⑤男频突出系统/无敌/重生/战神，女频突出甜宠/闪婚/马甲/团宠。
+扣分项：文艺腔、抽象、看不懂的双关、形容词大杂烩、与海量同类雷同。
+ranked_titles 必须覆盖每一个候选书名并按 ctr_score 从高到低排序；best_title 必须是其中分最高的一个。"""
+
+
 def _build_client(config: dict[str, Any], paths: Paths) -> Any:
     """Reuse trial._build_client so `novel.py package` can run standalone."""
     from trial import _build_client as _bc
     return _bc(config, paths)
+
+
+def score_hook_package(
+    client: Any,
+    paths: Paths,
+    config: dict[str, Any],
+    pkg: dict[str, Any],
+) -> dict[str, Any]:
+    """Independently score/rank a hook package's titles & intros + evaluate the赛道.
+
+    Runs an independent "吸量评判" LLM call (deliberately WITHOUT cacheable_prefix,
+    like cold_reader/reader_panel — it must judge click-through cold, not be
+    steeped in the book's own framing). Writes logs/hook_package_scored.json and
+    appends a section to hook_package.md. Optionally adopts the best-scored title
+    into paths.title (title.txt is NOT a cacheable_prefix source, so zero cache
+    impact). Returns {} and logs on any failure; never raises.
+    """
+    if not bool(config["novel"].get("hook_package_scoring_enabled", True)):
+        return {}
+    titles = [str(t).strip() for t in (pkg.get("titles") or []) if str(t).strip()]
+    intros = [str(i).strip() for i in (pkg.get("intros") or []) if str(i).strip()]
+    if not titles:
+        return {}
+    try:
+        from benchmark import platform_guidance
+        platform = platform_guidance(config)
+    except Exception:
+        platform = ""
+    try:
+        user = f"""## 平台/读者画像
+{platform}
+
+## 候选书名
+{json.dumps(titles, ensure_ascii=False, indent=2)}
+
+## 候选简介
+{json.dumps(intros, ensure_ascii=False, indent=2)}
+
+## 一句话卖点
+{pkg.get("one_line", "")}
+
+## 标签
+{json.dumps(pkg.get("tags") or [], ensure_ascii=False)}
+
+请按点击率优先独立给书名/简介打分排序，并评估赛道（红海/蓝海+差异化空间）。"""
+        raw = call_llm(
+            client, paths, config, HOOK_SCORE_SYSTEM, json_prompt(user),
+            max_tokens=int(config["novel"].get("hook_package_score_max_tokens", 3000) or 3000),
+            temperature=0.3, tag="hook_package_score",
+        )
+        scored = load_json_with_repair(client, paths, config, raw, fallback={})
+        if not isinstance(scored, dict) or not scored.get("ranked_titles"):
+            return {}
+    except Exception as exc:
+        log(paths, f"Hook package scoring failed (non-fatal): {exc}")
+        return {}
+
+    # Persist machine-readable scores.
+    try:
+        write_text(paths.logs_dir / "hook_package_scored.json", json.dumps(scored, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        log(paths, f"Failed to write hook_package_scored.json (non-fatal): {exc}")
+
+    # Append a human-readable section to hook_package.md (if it exists).
+    try:
+        md_path = paths.book.with_name("hook_package.md")
+        existing = read_text(md_path) if md_path.exists() else "# 吸量包\n"
+        lines = ["\n## 吸量评分（独立评判·点击率优先）\n"]
+        for rt in scored.get("ranked_titles", [])[:10]:
+            if isinstance(rt, dict):
+                lines.append(f"- [{rt.get('ctr_score', '?')}] {rt.get('title', '')} — {rt.get('reason', '')}")
+        if scored.get("best_title"):
+            lines.append(f"\n**采纳书名**：{scored['best_title']}\n")
+        te = scored.get("track_eval") or {}
+        if te:
+            lines.append(f"\n### 赛道评估\n- 判定：{te.get('verdict', '')}\n"
+                         f"- 差异化空间：{te.get('differentiation', '')}\n"
+                         f"- 建议：{te.get('suggestion', '')}\n")
+        write_text(md_path, existing.rstrip() + "\n" + "\n".join(lines) + "\n")
+    except Exception as exc:
+        log(paths, f"Failed to append hook_package.md scores (non-fatal): {exc}")
+
+    # Adopt the best-scored title into title.txt (safe: not a cacheable_prefix source).
+    best = str(scored.get("best_title") or "").strip()
+    if best and bool(config["novel"].get("hook_package_adopt_title", True)):
+        try:
+            write_text(paths.title, best)
+            log(paths, f"Hook package: adopted best title -> {best!r}")
+        except Exception as exc:
+            log(paths, f"Failed to adopt best title (non-fatal): {exc}")
+    log(paths, f"Hook package scored ({len(scored.get('ranked_titles', []))} titles ranked); best={best!r}")
+    return scored
+
+
+def build_hook_package(
+    client: Any,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Pre-generation 吸量包: 番茄式书名/三段式简介候选 + 开篇吸量指令.
+
+    Called from bootstrap so naming is decided BEFORE writing (吸量是漏斗第一层).
+    Writes hook_package.md + logs/hook_package.json. Advisory artifact — does NOT
+    feed cacheable_prefix (zero cache impact) and never modifies bible/characters.
+    Returns {} and logs on any failure; never raises (mirrors build_package).
+    """
+    if not bool(config["novel"].get("hook_package_enabled", True)):
+        return {}
+    try:
+        mem = memory_context(paths, conn, config)
+    except Exception:
+        mem = ""
+    try:
+        from benchmark import platform_guidance
+        platform = platform_guidance(config)
+    except Exception:
+        platform = ""
+    try:
+        user = f"""## 平台/读者画像
+{platform}
+
+## 作品设定 / 全局记忆
+{mem}
+
+为这本【尚未开写】的作品产出吸量包（书名候选/三段式简介候选/一句话卖点/标签/开篇吸量指令）。"""
+        raw = call_llm(
+            client, paths, config, HOOK_PACKAGE_SYSTEM, json_prompt(user),
+            max_tokens=int(config["novel"].get("hook_package_max_tokens", 4000) or 4000),
+            temperature=0.8, tag="hook_package",
+        )
+        pkg = load_json_with_repair(client, paths, config, raw, fallback={})
+        if not isinstance(pkg, dict) or not pkg:
+            return {}
+        try:
+            write_text(paths.logs_dir / "hook_package.json", json.dumps(pkg, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            log(paths, f"Failed to write hook_package.json (non-fatal): {exc}")
+        try:
+            md = ["# 吸量包（开写前·书名/简介候选）\n"]
+            if pkg.get("one_line"):
+                md.append(f"> {pkg['one_line']}\n\n")
+            md.append(_render_package_md({
+                "titles": pkg.get("titles"),
+                "intros": pkg.get("intros"),
+                "tags": pkg.get("tags"),
+            }))
+            if pkg.get("hook_directives"):
+                md.append(_section_lines("开篇吸量指令", pkg.get("hook_directives")))
+            write_text(paths.book.with_name("hook_package.md"), "".join(p for p in md if p))
+        except Exception as exc:
+            log(paths, f"Failed to write hook_package.md (non-fatal): {exc}")
+        log(paths, f"Hook package generated (titles/intros/one_line) — {len(pkg.get('titles') or [])} title candidates")
+        return pkg
+    except Exception as exc:
+        log(paths, f"Hook package generation failed (non-fatal): {exc}")
+        return {}
+
+
+def _section_lines(title: str, items: Any) -> str:
+    if not items:
+        return ""
+    if isinstance(items, list):
+        body = "\n".join(f"- {it}" for it in items)
+    else:
+        body = str(items)
+    return f"## {title}\n{body}\n\n"
 
 
 def _gather_book_digest(paths: Paths, config: dict[str, Any], max_chars: int = 24000) -> str:

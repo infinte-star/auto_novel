@@ -586,6 +586,21 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     write_text(paths.timeline, _section("timeline", "时间线", data) + "\n")
     write_text(paths.threads, _section("threads", "伏笔与线索", data) + "\n")
     write_text(paths.volume_plan, _section("volume_plan", "卷纲", data) + "\n")
+    if bool(config["novel"].get("rolling_plan_enabled", False)):
+        try:
+            from rolling_plan import seed_first_arc
+            seed_first_arc(conn, config)
+            compass_text = (
+                "# 全书导航罗盘\n\n"
+                "## 终极目标\n（待首弧完成后由弧总结更新）\n\n"
+                "## 活跃长线\n（待首弧完成后由弧总结更新）\n\n"
+                "## 已完成弧概要\n（无）\n\n"
+                "## 下弧方向\n见 volume_plan.md 第1弧规划\n"
+            )
+            write_text(paths.compass, compass_text)
+            log(paths, "Rolling plan: seeded arc_history + compass.md")
+        except Exception as exc:
+            log(paths, f"Rolling plan bootstrap failed (non-fatal): {exc}")
     # Narrative-voice charter: this is the strongest anti-style-collapse anchor and
     # must exist from chapter 1. Only write it when the model produced one; an empty
     # value falls back to the placeholder created by ensure_project().
@@ -601,6 +616,21 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     # enforce author-declared hard rules. Fail-degrades to {} (never blocks).
     # NOTE: pass the BOOSTED brief so a boost-introduced golden finger is covered.
     contract = extract_contract(client, paths, conn, config, brief=brief)
+    # 吸量包（Gap-4）：开写前先用番茄书名/三段式简介公式产出候选，吸量是流量漏斗第一层。
+    # 纯顾问产物（hook_package.md），不进 cacheable_prefix，失败静默不阻塞 bootstrap。
+    if bool(config["novel"].get("hook_package_enabled", True)):
+        try:
+            from package import build_hook_package
+            pkg = build_hook_package(client, paths, conn, config)
+            # 吸量评分/排序 + 赛道评估 + 采纳最优书名（独立评判，点击率优先）。
+            if pkg and bool(config["novel"].get("hook_package_scoring_enabled", True)):
+                try:
+                    from package import score_hook_package
+                    score_hook_package(client, paths, config, pkg)
+                except Exception as exc:
+                    log(paths, f"Hook package scoring step failed (non-fatal): {exc}")
+        except Exception as exc:
+            log(paths, f"Hook package bootstrap step failed (non-fatal): {exc}")
     if contract:
         log(paths, "Extracted creative contract -> memory/contract.md")
     elif bool(config["novel"].get("contract_enabled", True)):
@@ -643,6 +673,37 @@ def _read_memory_file(path: Path, cap: int) -> str:
     if cap > 0 and len(text) > cap:
         return text[:cap] + "\n...[truncated]"
     return text
+
+
+def _recency_aware_state(raw: str, config: dict[str, Any], max_chars: int = 12000) -> str:
+    """Structured truncation of state.md for writing_memory_context.
+
+    Keeps the header (summary/progress/threads/direction) + the most recent N
+    chapter sections (``## ChN``), dropping middle chapter sections that have
+    already been consolidated by compress_all_memory.
+    """
+    recent_n = int(config["novel"].get("state_recent_chapters", 5))
+    parts = re.split(r"(?=^## Ch\d)", raw, flags=re.MULTILINE)
+    if len(parts) <= 1:
+        if max_chars > 0 and len(raw) > max_chars:
+            return raw[:max_chars] + "\n...[truncated]"
+        return raw
+    header = parts[0]
+    ch_sections = parts[1:]
+    def _ch_num(s: str) -> int:
+        m = re.match(r"## Ch(\d+)", s)
+        return int(m.group(1)) if m else 0
+    ch_sections.sort(key=_ch_num)
+    kept = ch_sections[-recent_n:] if len(ch_sections) > recent_n else ch_sections
+    result = header + "".join(kept)
+    if max_chars > 0 and len(result) > max_chars:
+        kept_text = "".join(kept)
+        avail = max_chars - len(kept_text)
+        if avail > 400:
+            result = header[:avail] + "\n...[truncated]\n" + kept_text
+        else:
+            result = result[:max_chars] + "\n...[truncated]"
+    return result
 
 
 def opening_route_text(paths: Paths, cap: int = 6000) -> str:
@@ -833,7 +894,9 @@ def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> s
     """
     char_budget = int(config["novel"].get("writing_memory_chars", 50000))
 
-    current_state = _read_memory_file(paths.state, int(config["novel"].get("memory_state_chars", 12000)))
+    state_chars = int(config["novel"].get("memory_state_chars", 12000))
+    raw_state = _read_memory_file(paths.state, 0)
+    current_state = _recency_aware_state(raw_state, config, max_chars=state_chars)
     threads_text = _read_memory_file(paths.threads, int(config["novel"].get("memory_threads_chars", 12000)))
     volume_plan = _read_memory_file(paths.volume_plan, int(config["novel"].get("memory_volume_plan_chars", 16000)))
     opening_route = opening_route_text(paths, int(config["novel"].get("memory_opening_route_chars", 6000)))
@@ -950,6 +1013,11 @@ def compress_memory_file(
     system = MEMORY_COMPRESS_SYSTEM.format(max_chars=max_chars)
     compressed = call_llm(client, paths, config, system, old_text, max_tokens=12000, temperature=0.2, tag="memory_compress")
     compressed = normalize_text(compressed)
+    min_chars = int(config["novel"].get("memory_compress_min_chars", 500))
+    if len(compressed.strip()) < min_chars:
+        log(paths, f"Compression of {file_path.name} too aggressive "
+            f"({len(compressed.strip())} chars < {min_chars}), keeping original")
+        return
     new_content = header.rstrip() + "\n\n## Consolidated\n" + compressed + "\n\n" + "".join(recent_sections)
     write_text(file_path, new_content)
 

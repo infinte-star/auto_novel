@@ -33,6 +33,7 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
   "novelty_score": 1-10,
   "prose_score": 1-10,
   "continuity_score": 1-10,
+  "emotional_impact": 1-10,
   "accepted": true,
   "problems": [],
   "fixes": [],
@@ -82,6 +83,11 @@ REVIEW_SYSTEM = """你是连载中文网文的严格终审编辑。
 - prose_score：正文可读性、语言质感、对话、意象、节奏；不要把设定正确当作文笔好。
 - continuity_score：事实、时间线、人物知识、资源流转、因果闭合程度。
 hook_score 与 hook_strength 可以相同，但若章末问题笼统或近期重复，hook_score 必须低于 7。
+- emotional_impact：本章是否有让读者产生真实情感反应的时刻？不是"写了悲伤"而是"读者会因此心痛"。评分锚点：
+  - 9-10：至少一个场景让读者可能产生强烈生理反应（屏息、湿眼眶、心跳加速），情感由具体事件和角色行为挣来，不是用形容词堆砌。
+  - 7-8：有情感触动，但点到即止或铺垫不够充分，未达到"被击中"的程度。
+  - 5-6：情感事件存在但处理平淡——用生理描写替代情感共鸣、用叙述代替体验、或情感点埋在信息流中被冲淡。
+  - <=4：全章纯功能性推进，没有让读者"感受到什么"的时刻。
 score 是综合质量，不得掩盖 readthrough/payoff/novelty 的短板；若任一追读相关维度低于 6.5，score 原则上不应超过 8。
 说明：上面这条"低于 6.5"是 score（综合分）相对追读维度的封顶规则，**不是** novelty 等单维度的评分锚点——给单个维度打分时，请严格按该维度自己的锚点区间（见上）逐项判定，不要把综合分的 6.5 阈值误当成"novelty 默认就该给 7.0 上下"。
 
@@ -342,6 +348,46 @@ def build_chapter_aux_cache(paths: Paths, conn: Any, config: dict[str, Any], cha
     return cache
 
 
+_SETTING_RULE_MARKERS = (
+    "铁律", "法则", "规则", "禁止", "不能", "不可", "无法", "限制", "边界",
+    "上限", "代价", "只能", "必须", "受限", "体系", "等级", "能力", "副作用",
+)
+
+
+def _setting_rules_block(paths: Paths, config: dict[str, Any]) -> str:
+    """Extract world-rule / power-system hard lines from bible.md so the reviewer
+    can cross-check setting violations. Conservative: picks rule-marker lines,
+    caps total length, returns '' if nothing rule-like is found."""
+    try:
+        text = read_text(paths.bible)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    cap = int(config["novel"].get("setting_rules_chars", 1500))
+    picked: list[str] = []
+    total = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if len(line) < 4 or line.startswith("#"):
+            continue
+        if any(m in line for m in _SETTING_RULE_MARKERS):
+            line = line.lstrip("-*0123456789. 　")
+            if line and line not in picked:
+                picked.append(line)
+                total += len(line)
+                if total >= cap:
+                    break
+    if not picked:
+        return ""
+    body = "\n".join(f"- {p}" for p in picked)
+    return (
+        "## 世界观/力量体系铁律（交叉校验，违反记入 contract_violations，type=must_hold）\n"
+        "以下是本书设定中的硬规则，主角能力与世界运行不得越界；若本章出现越界/违背，"
+        "必须登记为 contract_violations。\n" + body
+    )
+
+
 def review_chapter(
     client: OpenAI,
     paths: Paths,
@@ -382,6 +428,18 @@ def review_chapter(
     else:
         facts_block = "None"
     contract_text_block = contract_block(paths, config) or "None"
+    # P2-9: setting/power-system hard rules mined from bible.md, appended to the
+    # contract so the reviewer cross-checks world-rule violations (ability over-
+    # reach, broken铁律) the same way it checks the explicit contract. Reuses the
+    # existing contract_violations channel (no new gate).
+    if bool(config["novel"].get("setting_rules_check_enabled", True)):
+        try:
+            srules = _setting_rules_block(paths, config)
+            if srules:
+                base = "" if contract_text_block == "None" else contract_text_block
+                contract_text_block = (base + "\n\n" if base else "") + srules
+        except Exception:
+            pass
     # Character voice baseline: cross-chapter stance/voice consistency check.
     # Enabled by default for the 爽文 preset; long novel opts in via config to
     # avoid false positives until the signal is validated.
@@ -544,6 +602,7 @@ def review_chapter(
     report["novelty_score"] = safe_score(report.get("novelty_score", report.get("novelty", report["score"])))
     report["prose_score"] = safe_score(report.get("prose_score", report.get("aesthetic_score", report["score"])))
     report["continuity_score"] = safe_score(report.get("continuity_score", report["score"]))
+    report["emotional_impact"] = safe_score(report.get("emotional_impact", report.get("prose_score", report["score"])))
     report.setdefault("contradictions", [])
     report.setdefault("contract_violations", [])
     report.setdefault("hallucinated_entities", [])
@@ -561,11 +620,46 @@ def review_chapter(
     caps: list[float] = [10.0]
     penalties: float = 0.0
 
+    # DIMENSION DE-INFLATION: hook_strength/readthrough drift to a permanent
+    # ceiling (verify_v8: hook=10.0 in 41/50 chapters, readthrough avg 9.6), so
+    # they lose all discrimination and can no longer signal a weak chapter. We
+    # (a) feed a discounted value into the MARKET floor + milestone hook check so
+    # a saturated dim can't silently prop up the ceiling, and (b) when the sheet
+    # is saturated yet a deterministic gate disagrees (style penalty / fossils),
+    # add a small composite penalty — same philosophy as style_audit_mismatch:
+    # don't trust an all-max scoresheet the objective metrics contradict. The
+    # stored dimension scores stay untouched (observation truth).
+    mf_readthrough = report["readthrough_score"]
+    mf_hook = report["hook_score"]
+    dim_saturated_count = 0  # used again before the final clamp (contradiction penalty)
+    if bool(config["novel"].get("dimension_inflation_enabled", True)):
+        try:
+            from store import recent_dimension_scores
+            win = int(config["novel"].get("dim_inflation_window", 8))
+            sat = float(config["novel"].get("dim_inflation_saturate", 9.3))
+            disc = float(config["novel"].get("dim_inflation_discount", 0.5))
+            for dim, cur in (("hook_score", mf_hook), ("readthrough_score", mf_readthrough)):
+                hist = recent_dimension_scores(conn, dim, win, before_chapter=chapter_num)
+                if len(hist) >= max(3, win // 2):
+                    avg = sum(hist) / len(hist)
+                    if avg >= sat and cur >= avg - 0.1:
+                        dim_saturated_count += 1
+                        adj = max(1.0, cur - disc)
+                        if dim == "hook_score":
+                            mf_hook = adj
+                        else:
+                            mf_readthrough = adj
+                        report.setdefault("calibration", []).append(
+                            f"{dim} 去通胀 {cur:.1f}→{adj:.1f}（MARKET/里程碑判定用）："
+                            f"近{len(hist)}章均值{avg:.1f}≥{sat} 已饱和失去区分度")
+        except Exception:
+            pass
+
     # MARKET cap: a strong-prose chapter with weak readthrough/payoff/novelty
     # must not score like a hit. Caps the ceiling rather than subtracting.
     market_floor = min(
-        report["readthrough_score"],
-        report["hook_score"],
+        mf_readthrough,
+        mf_hook,
         report["payoff_score"],
         report["novelty_score"],
     )
@@ -574,6 +668,38 @@ def review_chapter(
         report.setdefault("problems", []).append(
             "MARKET: 追读/兑现/新鲜度存在短板，综合分按爆款维度上限压低。"
         )
+
+    # SERIALIZATION MILESTONE: at key chapter positions (every N chapters),
+    # raise the hook strength bar. These are reader retention inflection points
+    # (free-to-paid, weekly milestone). A weak hook at a milestone caps the score.
+    serial_every = int(config["novel"].get("serial_milestone_every", 10))
+    serial_hook_boost = float(config["novel"].get("serial_milestone_hook_boost", 1.0))
+    serial_free_to_paid = int(config["novel"].get("serial_free_to_paid_chapter", 0))
+    is_milestone = (serial_every > 0 and chapter_num > 0 and chapter_num % serial_every == 0)
+    is_paywall = (serial_free_to_paid > 0 and chapter_num == serial_free_to_paid)
+    if is_milestone or is_paywall:
+        hook = mf_hook  # de-inflated value, so a chronically-saturated hook can't auto-pass
+        min_hook = float(config["novel"].get("hook_strength_min", 6.0)) + serial_hook_boost
+        if hook < min_hook:
+            caps.append(8.0)
+            label = "付费转化章" if is_paywall else f"连载里程碑（每{serial_every}章）"
+            report.setdefault("problems", []).append(
+                f"SERIAL: {label}，钩子强度{hook:.1f}低于里程碑要求{min_hook:.1f}。"
+                f"关键节点必须有强力悬念/揭示/反转来留住读者。"
+            )
+
+    # Emotional impact floor: chapters that score well on plot/prose but have
+    # zero emotional resonance shouldn't score like hits.
+    ei_floor_enabled = bool(config["novel"].get("emotional_impact_floor_enabled", True))
+    if ei_floor_enabled:
+        ei = report.get("emotional_impact", 10.0)
+        ei_min = float(config["novel"].get("emotional_impact_floor", 5.0))
+        if ei < ei_min:
+            caps.append(8.5)
+            report.setdefault("problems", []).append(
+                f"EMOTION: 情感冲击力{ei:.1f}低于地板{ei_min:.1f}——"
+                f"本章缺少让读者产生真实情感反应的时刻。"
+            )
 
     # KEY-DIMENSION HARD FLOOR: novelty/payoff are the two dimensions self-review
     # systematically over-passes — across suspense_v4 every chapter scored
@@ -666,6 +792,18 @@ def review_chapter(
                         "STYLE: prose-health collapse detected (em-dash fragments / telegraphic lines)."
                     )
 
+            if bool(config["novel"].get("prose_calibration_enabled", True)):
+                cur_prose = report.get("prose_score")
+                if cur_prose is not None:
+                    if penalty == 0 and cur_prose < 6.0:
+                        report.setdefault("calibration", []).append(
+                            f"prose_score raised {cur_prose:.1f}→6.0: style_health clean")
+                        report["prose_score"] = 6.0
+                    elif penalty >= 1.0 and cur_prose > 7.5:
+                        report.setdefault("calibration", []).append(
+                            f"prose_score lowered {cur_prose:.1f}→7.5: style_health penalty={penalty:.1f}")
+                        report["prose_score"] = 7.5
+
             # Cross-check: the LLM self-reported style_audit vs the deterministic
             # measurement. A large gap means the reviewer is mis-reporting (often
             # because its own voice has drifted with the prose). We don't re-penalize
@@ -692,10 +830,207 @@ def review_chapter(
                         f"em={rep_em}/frag={rep_frag} but measured em={det_em:.2f}/frag={det_frag:.2f} "
                         f"(reviewer self-report unreliable).",
                     )
+                    mm_penalty = float(config["novel"].get("style_audit_mismatch_penalty", 0.5))
+                    if mm_penalty > 0:
+                        penalties += mm_penalty
+                        report.setdefault("calibration", []).append(
+                            f"mismatch penalty +{mm_penalty:.1f}: "
+                            f"reviewer reported em={rep_em:.1f} but measured {det_em:.1f}")
             except Exception:
                 pass
         except Exception as exc:
             log(paths, f"style_health check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # 黄金三句开篇闸门：前 opening_chapters 章，确定性拦截"景物/时段/设定铺垫"开场。
+    # LLM 自评对文学性氛围开场打分偏高，这是它抓不到的下沉/追读病灶的确定性兜底。
+    if bool(config["novel"].get("opening_golden_gate_enabled", True)):
+        try:
+            from quality import opening_hook_gate
+            og = opening_hook_gate(chapter, chapter_num, config)
+            if og.get("flags"):
+                report["opening_hook_gate"] = og
+                opening_pen = float(og.get("penalty", 0.0))
+                if opening_pen > 0:
+                    penalties += opening_pen
+                    report.setdefault("rhythm_risks", []).append(
+                        f"opening:{','.join(og.get('flags', []))}")
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in og.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Opening gate Ch{chapter_num}: penalty={opening_pen} flags={og.get('flags')}")
+                if og.get("block"):
+                    report["accepted"] = False
+                    report.setdefault("problems", []).append(
+                        "OPENING: 黄金三句开篇未达标（开局铺垫而非进行中的危机）。")
+        except Exception as exc:
+            log(paths, f"opening_hook_gate failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Prose texture: quantitative vs poetic balance — inject variation directives
+    if bool(config["novel"].get("prose_texture_enabled", True)):
+        try:
+            from quality import prose_texture
+            pt = prose_texture(chapter, config)
+            report["prose_texture"] = pt
+            if pt.get("directives"):
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in pt["directives"]:
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Prose-texture Ch{chapter_num}: balance={pt['balance']} "
+                    f"metrics={pt['metrics']}")
+        except Exception as exc:
+            log(paths, f"prose_texture check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Book-wide micro-fossil scan: the sliding-window cross_chapter_repetition
+    # misses 4-6 char action stubs that recur across the WHOLE book (e.g.
+    # '陆知白用左手' in 42/50 chapters). Runs every book_fossil_every chapters,
+    # caches the avoid-list to logs/book_fossils.json so the writer can inject it
+    # on EVERY subsequent chapter (not just the one chapter after this review).
+    if bool(config["novel"].get("book_fossil_enabled", True)):
+        try:
+            every = max(1, int(config["novel"].get("book_fossil_every", 5)))
+            if chapter_num >= int(config["novel"].get("book_fossil_min_chapters", 6)) \
+                    and chapter_num % every == 0:
+                from quality import book_wide_fossils
+                import json as _json
+                texts: dict[int, str] = {}
+                for num in range(1, chapter_num + 1):
+                    p = chapter_path(paths, num)
+                    if p.exists():
+                        texts[num] = read_text(p)
+                bf = book_wide_fossils(texts, config)
+                report["book_fossils"] = bf
+                if bf.get("phrases"):
+                    try:
+                        write_text(
+                            paths.logs_dir / "book_fossils.json",
+                            _json.dumps(bf, ensure_ascii=False, indent=2),
+                        )
+                    except Exception:
+                        pass
+                    struct_count = int(config["novel"].get("book_fossil_struct_count", 10))
+                    log(paths, f"Book fossils Ch{chapter_num}: {len(bf['phrases'])} phrases "
+                        f"(threshold={bf['metrics'].get('threshold_chapters')}ch) "
+                        f"examples={bf['phrases'][:5]}")
+                    if bf.get("directives"):
+                        wd = report.setdefault("writer_directives_for_next_chapter", [])
+                        for d in bf["directives"]:
+                            if d not in wd:
+                                wd.append(d)
+                    # Many entrenched book-wide fossils = structural monotony, not a
+                    # one-chapter tic. Surface as a gate-reject-style marker so
+                    # pipeline._classify_replan_failure routes to STRUCTURAL replan.
+                    if len(bf["phrases"]) >= struct_count:
+                        report.setdefault("gate_rejects", []).append({
+                            "gate": "book_wide_fossils",
+                            "count": len(bf["phrases"]),
+                            "phrases": bf["phrases"][:8],
+                        })
+        except Exception as exc:
+            log(paths, f"book_wide_fossils check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Chapter length band: a guard beyond save_chapter's 500-char hard floor.
+    # 番茄短章高频钩子 = 2.5-3k 字/章；超长章把"每章一钩子"稀释成"每5章一钩子"。
+    # Always emits a next-chapter directive (advisory); adds a SCORE PENALTY only
+    # when length_band_penalty_enabled is on (existing novels keep advisory-only).
+    try:
+        from quality import length_band_check
+        lb = length_band_check(chapter, config)
+        report["length_band"] = lb
+        for f in lb.get("flags", []):
+            report.setdefault("style_flags", []).append(f)
+        wd = report.setdefault("writer_directives_for_next_chapter", [])
+        for d in lb.get("directives", []):
+            if d not in wd:
+                wd.append(d)
+        lb_pen = float(lb.get("penalty", 0.0))
+        if lb_pen > 0:
+            penalties += lb_pen
+            log(paths, f"Length band Ch{chapter_num}: chars={lb.get('chars')} penalty={lb_pen} flags={lb.get('flags')}")
+        elif lb.get("flags"):
+            log(paths, f"Length band Ch{chapter_num}: chars={lb.get('chars')} flags={lb.get('flags')} (advisory)")
+        if lb.get("block"):
+            report["accepted"] = False
+            report.setdefault("problems", []).append(
+                f"LENGTH: chapter grossly out of band ({lb.get('chars')} chars).")
+    except Exception as exc:
+        log(paths, f"length_band_check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # P2: 爽点 density — inject a payoff directive when the recent window has gone
+    # too long without a strong reader payoff.
+    if bool(config["novel"].get("payoff_density_enabled", True)):
+        try:
+            from quality import payoff_beat_density
+            from store import recent_metrics as _rm
+            rows = _rm(conn, 6)  # newest-first
+            recent_ptypes = [str(r.get("payoff_type", "")) for r in rows if r.get("payoff_type")]
+            pd = payoff_beat_density(chapter, recent_ptypes, config)
+            report["payoff_density"] = pd
+            if pd.get("directives"):
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in pd["directives"]:
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Payoff density Ch{chapter_num}: {pd['metrics']}")
+        except Exception as exc:
+            log(paths, f"payoff_beat_density check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # 连续平路闸门：连续 N 章无强爽点且情绪冲击偏低 → 扣分 + 强制本章给中爽点/情绪高峰。
+    if bool(config["novel"].get("flat_streak_gate_enabled", True)):
+        try:
+            from quality import flat_chapter_streak
+            from store import recent_metrics as _rm2
+            rows2 = _rm2(conn, int(config["novel"].get("flat_chapters_max_consecutive", 3)) + 2)
+            fs = flat_chapter_streak(rows2, config)
+            report["flat_streak"] = fs
+            fs_pen = float(fs.get("penalty", 0.0))
+            if fs_pen > 0:
+                penalties += fs_pen
+                report.setdefault("rhythm_risks", []).append(f"flat_streak:{fs.get('streak')}")
+            wd = report.setdefault("writer_directives_for_next_chapter", [])
+            for d in fs.get("directives", []):
+                if d not in wd:
+                    wd.append(d)
+            if fs.get("flags"):
+                log(paths, f"Flat streak Ch{chapter_num}: streak={fs.get('streak')} penalty={fs_pen}")
+        except Exception as exc:
+            log(paths, f"flat_chapter_streak check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Gap-9: shareable golden-line (可截图金句/传播性). Advisory — no penalty;
+    # nudges the next chapter to plant a传播性金句 when this one had none.
+    if bool(config["novel"].get("shareable_line_enabled", True)):
+        try:
+            from quality import shareable_line
+            sl = shareable_line(chapter, config)
+            report["shareable_line"] = sl
+            if sl.get("directives"):
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in sl["directives"]:
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Shareable line Ch{chapter_num}: none found (best_score={sl['metrics'].get('best_score')})")
+        except Exception as exc:
+            log(paths, f"shareable_line check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # P2: information density — flag a near-pure transition chapter (no payoff,
+    # no new info, no realized beats) and demand推进 next chapter.
+    if bool(config["novel"].get("info_density_enabled", True)):
+        try:
+            from quality import information_density
+            idr = information_density(chapter, plan, report, config)
+            report["information_density"] = idr
+            if idr.get("low_information"):
+                report.setdefault("style_flags", []).append(
+                    f"low_information_chapter({len(idr.get('signals', []))})")
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in idr.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Info density Ch{chapter_num}: low_information "
+                    f"signals={idr.get('signals')}")
+        except Exception as exc:
+            log(paths, f"information_density check failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # P0-4: Structured constraint verification (required_constraints from arbitrate_plan)
     # Each constraint carries an id/type/constraint/check_method/target; verify each one
@@ -973,6 +1308,29 @@ def review_chapter(
             f"Contract-violation Ch{chapter_num}: hard={len(contract_hard)} "
             f"soft={len(contract_soft)} rules={rules}",
         )
+
+    sh_data = report.get("style_health") or {}
+    sh_penalty_val = float(sh_data.get("penalty", 0.0))
+    det_floor = float(config["novel"].get("deterministic_score_floor", 5.0))
+    if sh_penalty_val == 0 and raw_score < det_floor:
+        report.setdefault("calibration", []).append(
+            f"raw_score floored {raw_score:.1f}→{det_floor:.1f}: "
+            f"style_health penalty=0 (prose objectively healthy)")
+        log(paths, f"Deterministic floor Ch{chapter_num}: "
+            f"raw={raw_score:.1f}→{det_floor:.1f} (style_health clean)")
+        raw_score = det_floor
+
+    # DIMENSION DE-INFLATION (contradiction penalty): hook/readthrough have been
+    # saturated for the whole window (reviewer lost discrimination) AND this
+    # chapter's deterministic gates disagree (style/repetition penalties ≥ 1.0).
+    # Don't trust an all-max scoresheet the objective metrics contradict — same
+    # philosophy as style_audit_mismatch. Applied here so `penalties` is complete.
+    if dim_saturated_count >= 2 and penalties >= 1.0:
+        _disc = float(config["novel"].get("dim_inflation_discount", 0.5))
+        penalties += _disc
+        report.setdefault("calibration", []).append(
+            f"维度通胀惩罚 +{_disc:.1f}：hook/readthrough 长期饱和但本章确定性指标已扣分"
+            f"（penalties={penalties:.1f}），不采信满分评审")
 
     report["score"] = max(1.0, min(min(caps), raw_score) - penalties)
 
@@ -1754,6 +2112,17 @@ def should_replan(conn: Any, config: dict[str, Any]) -> bool:
     # replan trigger — readers disengage when intensity never varies or only sags.
     if structural.get("tension_shape") in {"flat", "monotone_fall"}:
         triggers += 1
+    # Reader-panel retention proxy (Gap-7): a sustained high simulated drop_rate
+    # is the closest signal we have to番茄的追读率掉点，纳入重规划触发条件。
+    if bool(config["novel"].get("reader_panel_enabled", False)):
+        try:
+            from store import recent_panel_drop_rate
+            window = int(config["novel"].get("reader_panel_replan_window", 3))
+            drop = recent_panel_drop_rate(conn, window)
+            if drop is not None and drop >= float(config["novel"].get("reader_panel_replan_drop", 0.5)):
+                triggers += 1
+        except Exception:
+            pass
     return triggers >= 2
 
 def adaptive_replan(

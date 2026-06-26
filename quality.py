@@ -14,12 +14,20 @@ because the model's own voice has drifted with the prose.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from datetime import datetime
 from typing import Any
 
 # Sentence-ending punctuation for Chinese prose.
 _SENTENCE_ENDERS = "。！？…"
 _EM_DASH = "——"
+
+# 书面腔连接词/虚词——下沉语体的反模式（低门槛口语体应改用"但是/所以/结果"等）。
+_BOOKISH_CONNECTIVES = re.compile(
+    r"然而|虽然|尽管|诸如|之于|继而|倘若|纵使|抑或|从而|遂|故而|"
+    r"与此同时|不仅如此|更兼|愈发|颇为|不啻|乃是|实乃|须知"
+)
 
 # Process-level cache: maps a fast text fingerprint -> normalized clause set.
 # This avoids re-parsing the same prior chapter texts on every review call.
@@ -83,6 +91,15 @@ def style_health(
     directives: list[str] = []
     penalty = 0.0
 
+    # Register split (Gap-3): 免费流（番茄/七猫）是下沉口语体，要短句、低阅读门槛，
+    # 平均句长阈值更宽，避免把"健康的下沉短句文"误判为碎句塌缩并反向扣分。
+    # 反碎句塌缩的破折号密度/断行/对话检查不随之放宽——只解耦"书面腔长句"与"碎句塌缩"两个目标。
+    _preset = str(cfg.get("platform_preset", "")).strip().lower()
+    _low_barrier = (
+        _preset in {"fanqie_free", "qimao_free"}
+        or bool(cfg.get("style_low_barrier_register", False))
+    )
+
     if n < 200:
         return {"metrics": {"chars": n}, "penalty": 0.0, "flags": [], "directives": []}
 
@@ -106,40 +123,72 @@ def style_health(
         directives.append(
             "上一章破折号偏多，本章请减少破折号，改用完整句子与正常标点叙事。"
         )
-    else:
-        # --- 1b. TREND term: slow drift below the absolute warn threshold ---
-        # Slow style collapse never trips the static threshold (em can creep
-        # 0.94→4.15 monotonically while always < 6.0). Catch it by comparing
-        # against the recent-chapter mean: a sharp rise is itself a problem.
-        hist = [
-            float(h) for h in (em_history or [])
-            if isinstance(h, (int, float)) and h >= 0
-        ]
-        # Need at least 2 prior points for a meaningful baseline.
-        if len(hist) >= 2:
-            base = sum(hist) / len(hist)
-            metrics["em_dash_recent_mean"] = round(base, 2)
-            # Absolute rise (per-kchar) and multiplicative rise vs the baseline.
-            rise_abs = float(cfg.get("style_em_dash_trend_rise", 1.0))
-            rise_mult = float(cfg.get("style_em_dash_trend_mult", 1.8))
-            # A tiny baseline (≈0) makes the multiplicative test trivially true,
-            # so require the absolute delta too. Only fire when the chapter is
-            # also above a small floor so we don't punish 0.1→0.3 noise.
-            floor = float(cfg.get("style_em_dash_trend_floor", 1.5))
-            delta = em_per_kchar - base
-            if (
-                em_per_kchar >= floor
-                and delta >= rise_abs
-                and em_per_kchar >= base * rise_mult
-            ):
-                penalty += 1.0
-                flags.append(
-                    f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k)"
-                )
+
+    # --- 1b. TREND term: rising em-dash density is itself a collapse signal ----
+    # Two failure modes this catches:
+    #  (a) Slow drift BELOW the absolute warn threshold (em creeps 0.94→4.15
+    #      monotonically while always < 6.0) — never trips the static tier.
+    #  (b) A sustained climb ABOVE warn (6.6→7.8→8.8) — the static tier flat-lines
+    #      at +1.0 and the acceleration is lost exactly when it matters most. This
+    #      check runs REGARDLESS of the static tier (it used to be the static
+    #      `else`, so it died once em crossed warn), so a rising-while-already-high
+    #      chapter compounds static(+1.0) + trend(+1.0) = block. Observed
+    #      gudai50_v2 Ch20-24: em 6.6→8.8 stuck at a flat +1.0 for 5 chapters.
+    hist = [
+        float(h) for h in (em_history or [])
+        if isinstance(h, (int, float)) and h >= 0
+    ]
+    # Need at least 2 prior points for a meaningful baseline.
+    if len(hist) >= 2:
+        base = sum(hist) / len(hist)
+        metrics["em_dash_recent_mean"] = round(base, 2)
+        # Absolute rise (per-kchar) and multiplicative rise vs the baseline.
+        rise_abs = float(cfg.get("style_em_dash_trend_rise", 1.0))
+        rise_mult = float(cfg.get("style_em_dash_trend_mult", 1.8))
+        # A tiny baseline (≈0) makes the multiplicative test trivially true,
+        # so require the absolute delta too. Only fire when the chapter is
+        # also above a small floor so we don't punish 0.1→0.3 noise.
+        floor = float(cfg.get("style_em_dash_trend_floor", 1.5))
+        delta = em_per_kchar - base
+        if (
+            em_per_kchar >= floor
+            and delta >= rise_abs
+            and em_per_kchar >= base * rise_mult
+        ):
+            penalty += 1.0
+            flags.append(
+                f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k)"
+            )
+            # Avoid a near-duplicate directive when the static tier already told
+            # the writer to cut em-dashes; the trend flag still surfaces for logs.
+            if em_per_kchar < em_warn:
                 directives.append(
                     f"文体趋势预警：破折号密度从近几章均值 {base:.1f}/千字升到 "
                     f"{em_per_kchar:.1f}/千字，正在向碎句化滑坡（即使尚未触顶阈值）。"
                     "本章必须主动收敛破折号，回到完整句叙事。"
+                )
+            else:
+                directives.append(
+                    f"破折号密度仍在上升（{base:.1f}→{em_per_kchar:.1f}/千字）且已超阈值，"
+                    "本章必须显著回收破折号，否则判定为文体塌缩。"
+                )
+
+        # Sustained-collapse escalation: once the collapse has run long enough that
+        # the recent MEAN is itself above warn, the multiplicative trend test goes
+        # quiet (each step is < rise_mult× a now-high baseline) — the boiling-frog
+        # gap. A plateau where BOTH the current chapter and its recent mean sit
+        # above warn is not noise, it is the new (collapsed) normal, so add the
+        # escalation that the trend term can no longer supply. This is what turns a
+        # sustained 6.6→8.8 stretch into a block instead of a flat +1.0 forever.
+        if (
+            bool(cfg.get("style_em_dash_sustained_block", True))
+            and em_per_kchar >= em_warn
+            and base >= em_warn
+        ):
+            penalty += 1.0
+            if not any(f.startswith("em_dash_sustained") for f in flags):
+                flags.append(
+                    f"em_dash_sustained({em_per_kchar:.1f}/k, mean {base:.1f}/k≥{em_warn})"
                 )
 
     # --- 2. Average sentence length (collapse → very short sentences) ------
@@ -148,7 +197,11 @@ def style_health(
     if segments:
         avg_seg = sum(len(s.strip()) for s in segments) / len(segments)
         metrics["avg_sentence_chars"] = round(avg_seg, 1)
-        min_avg = float(cfg.get("style_min_avg_sentence_chars", 12.0))
+        # 免费流用更宽的下限（默认 9），起点/付费仍用 12；解决"下沉短句被罚"的冲突。
+        if _low_barrier:
+            min_avg = float(cfg.get("style_min_avg_sentence_chars_free", 9.0))
+        else:
+            min_avg = float(cfg.get("style_min_avg_sentence_chars", 12.0))
         if avg_seg < min_avg:
             penalty += 1.0
             flags.append(f"sentences_too_short(avg={avg_seg:.1f}<{min_avg})")
@@ -157,18 +210,28 @@ def style_health(
             # v5 Ch4: em 0.3/k but avg sentence 11.5 chars). Em-suppression alone
             # is not "healthy" — pair it with an explicit "write fuller compound
             # sentences" directive so the writer doesn't trade one collapse mode
-            # (em-fragments) for another (telegraphic shorts).
+            # (em-fragments) for another (telegraphic shorts). For免费流 the target
+            # is lower (口语成句即可)，避免反向逼出不合下沉调性的书面腔长句。
             em_low = em_per_kchar < float(cfg.get("style_em_dash_per_kchar_warn", 6.0))
+            pull_target = 11 if _low_barrier else 14
             if em_low:
-                directives.append(
-                    f"上一章破折号已收敛，但平均句长仅 {avg_seg:.0f} 字、滑向了另一种碎句化（短促单句堆叠）。"
-                    "本章请用带从句/状语的完整复合长句承载叙事与心理，"
-                    "在不重新堆破折号的前提下把平均句长拉回 14 字以上。"
-                )
+                if _low_barrier:
+                    directives.append(
+                        f"上一章破折号已收敛，但平均句长仅 {avg_seg:.0f} 字、滑向碎句化（单词短句堆叠）。"
+                        f"本章在保持大白话、低阅读门槛的前提下用通顺成句叙事，把平均句长拉回 {pull_target} 字以上，"
+                        "可以短但要成句，不要把一句话拆成多个无谓断句。"
+                    )
+                else:
+                    directives.append(
+                        f"上一章破折号已收敛，但平均句长仅 {avg_seg:.0f} 字、滑向了另一种碎句化（短促单句堆叠）。"
+                        "本章请用带从句/状语的完整复合长句承载叙事与心理，"
+                        f"在不重新堆破折号的前提下把平均句长拉回 {pull_target} 字以上。"
+                    )
             else:
                 directives.append(
-                    f"上一章平均句长仅 {avg_seg:.0f} 字，过于碎片化。本章请写完整、连贯的句子，"
-                    "避免把一句话拆成多个单词短句。"
+                    f"上一章平均句长仅 {avg_seg:.0f} 字，过于碎片化。本章请写"
+                    + ("通顺成句的口语叙事（可短但要成句），" if _low_barrier else "完整、连贯的句子，")
+                    + "避免把一句话拆成多个单词短句。"
                 )
 
     # --- 3. Fragment-line ratio (lines that are tiny standalone clauses) ---
@@ -216,6 +279,37 @@ def style_health(
         flags.append("almost_no_dialogue")
         directives.append("上一章几乎没有对话，本章请加入有潜台词的人物对白。")
 
+    # --- 5. 下沉语体校准（仅 low_barrier 模式）：罚书面腔，奖大白话 ----------
+    # 番茄下沉读者要低阅读门槛口语体。这里在免费流/显式下沉模式下：
+    #  (a) 书面腔连接词密度过高 → 小额扣分 + 改口语指令；
+    #  (b) prose 已是健康大白话（句长在带内、有对话、破折号低、书面腔少）→ 发正向 directive 巩固。
+    if _low_barrier and n >= 500:
+        bookish = len(_BOOKISH_CONNECTIVES.findall(body))
+        bookish_per_kchar = bookish / (n / 1000.0)
+        metrics["bookish_per_kchar"] = round(bookish_per_kchar, 2)
+        bookish_warn = float(cfg.get("style_bookish_per_kchar_warn", 2.0))
+        if bookish_per_kchar >= bookish_warn:
+            penalty += float(cfg.get("style_bookish_penalty", 0.5))
+            flags.append(f"bookish_register({bookish_per_kchar:.1f}/k≥{bookish_warn})")
+            directives.append(
+                "下沉语体校准：上一章书面腔偏重（然而/虽然/尽管/诸如…密度过高）。"
+                "本章改用大白话口语：用「但是/所以/结果/可是」等口语连接，去掉文绉绉的虚词，"
+                "靠对话和具体动作推进，降低阅读门槛。"
+            )
+        else:
+            avg_ok = metrics.get("avg_sentence_chars", 0) and not any(
+                f.startswith("sentences_too_short") for f in flags)
+            if (
+                penalty == 0.0
+                and avg_ok
+                and quote_pairs >= 3
+                and em_per_kchar < em_warn
+            ):
+                directives.append(
+                    "下沉语体执行良好：大白话短句成句、对话充足、无碎句堆叠。本章保持这一调性，"
+                    "继续低门槛口语体，每章给到具体爽点与章末钩子。"
+                )
+
     penalty = round(min(penalty, float(cfg.get("style_penalty_cap", 4.0))), 2)
     metrics["penalty"] = penalty
     return {
@@ -224,6 +318,271 @@ def style_health(
         "flags": flags,
         "directives": directives[:4],
     }
+
+
+# ---------------------------------------------------------------------------
+# 黄金三句开篇闸门 (opening golden-three-sentences gate)
+# ---------------------------------------------------------------------------
+# 番茄 "3 秒定生死"：开篇必须把读者丢进"正在发生的危机"（动作/对话/具体冲突），
+# 而不是景物/天气/时段/世界观铺垫。LLM 自评对文学性氛围开场打分偏高、抓不到这个
+# 病灶，所以用确定性检测【反模式（开局铺垫）】——比正向检测"危机"更可靠。
+_OPENING_BACKGROUND_MARKERS = re.compile(
+    r"清晨|拂晓|黎明|黄昏|傍晚|日暮|夜色|夜幕|月光|月色|星空|阳光|晨光|天空|天色|"
+    r"空气里?|微风|秋风|春风|寒风|细雨|小雨|大雨|雪花|薄雾|云雾|"
+    r"很久很久|很久以前|从前|相传|传说|据说|某年|那一年|多年[前后]|纪元|"
+    r"世界上|这片大陆|这个世界|大陆上|王朝|帝国"
+)
+_OPENING_ACTION_MARKERS = re.compile(
+    r"喊|叫|吼|骂|嚷|扑|抓|拽|拖|拎|踹|踢|砸|摔|撞|冲|逃|跪|爬|血|刀|枪|剑|拳|"
+    r"死|杀|抢|甩|揪|按|掐|捂|嘶|惨|救命|住手|滚|不许|危险|来不及|完了|糟了|"
+    r"最后通牒|滚出去|放开|别动|站住"
+)
+_OPENING_DIALOGUE_OPEN = ("“", "「", "『", '"')
+
+
+def opening_hook_gate(
+    text: str,
+    chapter_num: int,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic 黄金三句 opening gate for the first `opening_chapters` chapters.
+
+    Penalizes the background-dump anti-pattern (opener is scenery / weather /
+    time-of-day / world-setting exposition with no in-progress action or
+    dialogue). Conservative: needs >=2 corroborating signals before it flags, so
+    a legitimately tense narrative opening is not punished. Returns
+    {penalty, flags, directives, block}; `block` is only set when
+    `opening_golden_gate_block` is enabled.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {"penalty": 0.0, "flags": [], "directives": [], "block": False}
+    if not bool(cfg.get("opening_golden_gate_enabled", True)):
+        return result
+    opening_chapters = int(cfg.get("opening_chapters", 3))
+    if chapter_num <= 0 or chapter_num > opening_chapters:
+        return result
+    body = _strip_title_line(text or "").lstrip()
+    if len(body) < 200:
+        return result
+
+    first_para = body.split("\n", 1)[0].strip()
+    segs = [s for s in re.split(f"[{_SENTENCE_ENDERS}]", body) if s.strip()]
+    first_sentence = (segs[0] if segs else body)[:120].strip()
+    head = body[:200]  # opening window for dialogue/action detection
+
+    has_dialogue_head = any(q in head for q in _OPENING_DIALOGUE_OPEN)
+    has_action_head = bool(_OPENING_ACTION_MARKERS.search(head))
+    bg_in_first = bool(_OPENING_BACKGROUND_MARKERS.search(first_sentence))
+
+    signals: list[str] = []
+    # Signal 1: first sentence is scenery/time/setting exposition.
+    if bg_in_first and not has_dialogue_head and not has_action_head:
+        signals.append("opening_first_sentence_background")
+    # Signal 2: a long, static, descriptive first sentence (no action / no dialogue).
+    if len(first_sentence) >= 50 and not has_dialogue_head and not has_action_head:
+        signals.append("opening_first_sentence_long_static")
+    # Signal 3: the whole opening window has neither dialogue nor in-progress action.
+    if not has_dialogue_head and not has_action_head:
+        signals.append("opening_no_action_no_dialogue")
+
+    if len(signals) >= 2:
+        result["penalty"] = round(float(cfg.get("opening_golden_gate_penalty", 1.5)), 2)
+        result["flags"].extend(signals)
+        result["directives"].append(
+            "开篇硬约束（黄金三句·番茄3秒定生死）：本章开头不是「正在发生的危机」，"
+            "而是景物/天气/时段/设定铺垫。请重写开头——"
+            "句1=直接抛出正在发生的冲突/动作/对话（具体、有人物在当下做事），禁止天气/景物/时间/世界观铺垫；"
+            "句2=主角的核心反差（弱外表强承诺或反常行为）；"
+            "句3=可截图金句钩子（情绪爆发/认知颠覆/后果预告，独立成段）。金手指/主角卖点在前 1/4 内亮相。"
+        )
+        result["block"] = bool(cfg.get("opening_golden_gate_block", False))
+
+    # NOTE: "人名≤5" stays as soft guidance in OPENING_RULES_BLOCK (writing.py).
+    # A deterministic name count here proved unreliable (common surname chars
+    # collide with ordinary words like 顾客/方向/林…), so it's intentionally omitted.
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 章节长度带 (chapter-length band): 番茄短章高频钩子 = 2.5-3k 字/章。
+# ---------------------------------------------------------------------------
+
+
+def length_band_check(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic chapter-length band check.
+
+    Always emits a next-chapter directive when out of band (preserves the prior
+    advisory behavior). Adds a SCORE PENALTY only when
+    `length_band_penalty_enabled` is on (so existing novels with the flag unset
+    keep directive-only behavior). Over-length penalty scales with the overshoot;
+    `length_band_block` can escalate a gross overshoot to a hard block.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    cmin = int(cfg.get("chapter_min_chars", 2500))
+    cmax = int(cfg.get("chapter_max_chars", 7000))
+    clen = len((text or "").strip())
+    result: dict[str, Any] = {
+        "penalty": 0.0, "flags": [], "directives": [], "block": False, "chars": clen,
+    }
+    if clen == 0:
+        return result
+    penalty_on = bool(cfg.get("length_band_penalty_enabled", False))
+    if clen < cmin:
+        result["flags"].append(f"chapter_too_short({clen})")
+        result["directives"].append(
+            f"上一章仅 {clen} 字，偏短（目标区间 {cmin}-{cmax}）。本章请把关键场景与对白写足、"
+            f"补足必要过程，达到目标字数区间，不要草草收尾。"
+        )
+        if penalty_on and clen < cmin * 0.75:
+            result["penalty"] = 0.5
+    elif clen > cmax:
+        result["flags"].append(f"chapter_too_long({clen})")
+        result["directives"].append(
+            f"上一章 {clen} 字，超出目标区间（{cmin}-{cmax}，番茄短章高频钩子）。"
+            f"本章压缩冗余的技术性/描写性堆砌，聚焦推进剧情与爽点，章长控制在目标区间内。"
+        )
+        if penalty_on:
+            over = clen / max(cmax, 1)
+            result["penalty"] = round(min(2.0, (over - 1.0) * 2.0), 2)
+            if over >= 1.5 and bool(cfg.get("length_band_block", False)):
+                result["block"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 连续平路闸门 (consecutive-flat-chapter gate): 番茄追读率要求情绪高峰间隔 ≤2 章。
+# ---------------------------------------------------------------------------
+_FLAT_STRONG_PAYOFF_TYPES = {
+    "reveal", "reversal", "court_breakthrough", "military_victory",
+    "policy_payoff", "personnel_payoff", "institutional_fix", "payoff",
+}
+
+
+def flat_chapter_streak(
+    recent_rows: list[dict[str, Any]] | None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Count consecutive recent 'flat' chapters and penalize a too-long plateau.
+
+    A chapter is 'flat' when it has neither a strong payoff_type NOR a meaningful
+    emotional peak (emotional_impact below `flat_impact_floor`). `recent_rows` is
+    the newest-first chapter_metrics list. Complements payoff_beat_density by
+    counting an unbroken run of low-energy chapters (a chapter can lack a "strong
+    payoff type" yet still be a high-emotion peak — that breaks the streak).
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {"streak": 0, "penalty": 0.0, "flags": [], "directives": []}
+    if not bool(cfg.get("flat_streak_gate_enabled", True)):
+        return result
+    impact_floor = float(cfg.get("flat_impact_floor", 5.0))
+    streak = 0
+    for r in (recent_rows or []):  # newest-first
+        ptype = str(r.get("payoff_type", "")).strip()
+        try:
+            impact = float(r.get("emotional_impact", 0) or 0)
+        except (TypeError, ValueError):
+            impact = 0.0
+        is_flat = (ptype not in _FLAT_STRONG_PAYOFF_TYPES) and impact < impact_floor
+        if is_flat:
+            streak += 1
+        else:
+            break
+    result["streak"] = streak
+    max_flat = int(cfg.get("flat_chapters_max_consecutive", 3))
+    if streak >= max_flat:
+        result["flags"].append(f"flat_streak({streak})")
+        result["penalty"] = round(float(cfg.get("flat_streak_penalty", 1.0)), 2)
+        result["directives"].append(
+            f"已连续 {streak} 章「平路」（无强爽点且情绪冲击偏低）。番茄追读率要求情绪高峰间隔 ≤2 章——"
+            "本章必须给出一个明确的中爽点/情绪高峰（打脸/反转/揭晓/能力兑现/情感爆发），"
+            "落到具体可见的当众场面或对手的可见崩溃上，不要再写过渡铺垫。"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Programmatic em-dash density reduction (Layer 3).
+# Deterministic, no-LLM.  Replaces excess em-dashes with comma/period by
+# pattern confidence.  Dialogue interruptions inside quotes are preserved.
+# ---------------------------------------------------------------------------
+
+_QUOTE_CHARS = set(chr(0x201c) + chr(0x201d) + chr(0x300c) + chr(0x300d) + chr(0x300e) + chr(0x300f))
+
+
+def reduce_em_dash_density(
+    text: str,
+    config: dict[str, Any] | None = None,
+    target_per_kchar: float | None = None,
+) -> str:
+    """Replace excess ``——`` with punctuation until density <= *target_per_kchar*.
+
+    Replacement order (highest confidence first):
+    1. Chained fragments  ``A——B——C``  →  ``A，B，C``
+    2. Mid-sentence appositive (no adjacent quotes)  ``A——B``  →  ``A，B``
+    Dialogue interruptions (em-dash near quote marks) are never touched.
+    """
+    cfg = (config or {}).get("novel", config or {})
+    target = target_per_kchar or float(cfg.get("em_dash_reduce_target_per_kchar", 3.0))
+    if not text or _EM_DASH not in text:
+        return text
+
+    def _density(t: str) -> float:
+        return t.count(_EM_DASH) / (len(t) / 1000) if len(t) > 0 else 0.0
+
+    if _density(text) <= target:
+        return text
+
+    lines = text.split("\n")
+    # Build a list of (line_idx, col, confidence) for every em-dash occurrence.
+    # confidence: 2 = chained fragment, 1 = mid-sentence appositive
+    sites: list[tuple[int, int, int]] = []
+    for li, line in enumerate(lines):
+        col = 0
+        while True:
+            pos = line.find(_EM_DASH, col)
+            if pos < 0:
+                break
+            # Skip if near quote marks (dialogue interruption).
+            window = line[max(0, pos - 2) : pos + 4]
+            if any(q in window for q in _QUOTE_CHARS):
+                col = pos + 2
+                continue
+            # Check for chained pattern: another em-dash within 30 chars.
+            next_em = line.find(_EM_DASH, pos + 2)
+            if 0 < next_em - pos <= 30:
+                sites.append((li, pos, 2))
+            else:
+                sites.append((li, pos, 1))
+            col = pos + 2
+
+    # Sort by confidence desc, then line order — replace highest-confidence first.
+    sites.sort(key=lambda s: (-s[2], s[0], s[1]))
+
+    result_lines = list(lines)
+    for li, col, _conf in sites:
+        line = result_lines[li]
+        # Re-locate the em-dash (positions may shift after earlier replacements).
+        pos = line.find(_EM_DASH, max(0, col - 10))
+        if pos < 0:
+            pos = line.find(_EM_DASH)
+        if pos < 0:
+            continue
+        # Skip if it's now near quotes (could happen after prior replacements
+        # exposed a quote boundary).
+        window = line[max(0, pos - 2) : pos + 4]
+        if any(q in window for q in _QUOTE_CHARS):
+            continue
+        # Replace with comma.
+        result_lines[li] = line[:pos] + "，" + line[pos + 2:]
+        # Re-check density after each replacement.
+        candidate = "\n".join(result_lines)
+        if _density(candidate) <= target:
+            break
+
+    return "\n".join(result_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +884,101 @@ def cross_chapter_repetition(
     return result
 
 
+def _overlaps_kept(phrase: str, kept: list[str], min_shared: int = 4) -> bool:
+    """True if `phrase` shares a contiguous run of >= min_shared chars with any
+    already-kept phrase. Used to collapse shifted n-gram windows
+    ('陆知白用左手' / '知白用左手从') into a single representative fossil."""
+    subs = {phrase[i:i + min_shared] for i in range(len(phrase) - min_shared + 1)}
+    for k in kept:
+        for s in subs:
+            if s in k:
+                return True
+    return False
+
+
+def book_wide_fossils(
+    texts_by_chapter: dict[int, str],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect micro-phrase tics recurring across a large fraction of the WHOLE
+    book — the slow habit-stiffening that `cross_chapter_repetition` (6-chapter
+    sliding window, min_len 7) structurally misses.
+
+    A 6-char action stub like '陆知白用左手' reused in 42/50 chapters never trips
+    the sliding-window fossil gate (any 6-chapter window sees it only once or
+    twice), yet it is exactly the monotony a reader feels. This scans every
+    completed chapter, counts the DISTINCT chapters each fixed-length CJK n-gram
+    appears in, and flags those crossing a book-fraction / absolute-chapter
+    threshold. Overlapping windows are collapsed to one representative phrase.
+
+    Returns {"fossils": [{"phrase","chapter_count","frac"}], "phrases": [str],
+    "directives": [str], "metrics": {...}}. Safe no-op on empty input.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "fossils": [], "phrases": [], "directives": [], "metrics": {},
+    }
+    if not texts_by_chapter or not bool(cfg.get("book_fossil_enabled", True)):
+        return result
+
+    n = int(cfg.get("book_fossil_ngram", 6))
+    total = len(texts_by_chapter)
+    gram_chapters: dict[str, set[int]] = {}
+    for ch, text in texts_by_chapter.items():
+        body = _strip_title_line(text or "")
+        ct = "".join(c for c in body if "一" <= c <= "鿿")
+        seen: set[str] = set()
+        for i in range(len(ct) - n + 1):
+            g = ct[i:i + n]
+            if g in seen:
+                continue
+            seen.add(g)
+            gram_chapters.setdefault(g, set()).add(ch)
+
+    frac_thr = float(cfg.get("book_fossil_chapter_frac", 0.30))
+    min_ch = int(cfg.get("book_fossil_min_chapters", 6))
+    # Threshold: at least min_ch chapters AND at least frac of the book. The
+    # absolute floor keeps short/early books from flagging on tiny counts.
+    threshold = max(min_ch, int(frac_thr * total + 0.999))
+
+    candidates = [
+        (g, len(chs)) for g, chs in gram_chapters.items() if len(chs) >= threshold
+    ]
+    candidates.sort(key=lambda x: (-x[1], x[0]))
+
+    kept_phrases: list[str] = []
+    fossils: list[dict[str, Any]] = []
+    cap = int(cfg.get("book_fossil_report_cap", 12))
+    for g, count in candidates:
+        if _overlaps_kept(g, kept_phrases):
+            continue
+        kept_phrases.append(g)
+        fossils.append({
+            "phrase": g,
+            "chapter_count": count,
+            "frac": round(count / max(total, 1), 2),
+        })
+        if len(fossils) >= cap:
+            break
+
+    result["fossils"] = fossils
+    result["phrases"] = kept_phrases
+    result["metrics"] = {
+        "book_fossil_count": len(fossils),
+        "chapters_scanned": total,
+        "threshold_chapters": threshold,
+    }
+    if fossils:
+        examples = "、".join(
+            f"“{f['phrase']}”({f['chapter_count']}章)" for f in fossils[:8]
+        )
+        result["directives"].append(
+            "全书高频僵化短语预警：以下微动作/描写片段已在全书大量章节反复出现，"
+            f"成为机械口癖，本章起必须主动规避并换用不同的动作落点与句式：{examples}。"
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Beat-coverage gate: deterministic "did the prose actually stage each beat?".
 #
@@ -734,6 +1188,135 @@ def scene_similarity(plan: dict[str, Any], recent_plans: list[dict[str, Any]]) -
             best = sim
             best_i = i
     return {"max_sim": round(best, 3), "most_similar_to": best_i}
+
+
+# ---------------------------------------------------------------------------
+# Per-chapter fingerprint library: persistent SQLite store of each chapter's
+# structural signature (skeleton bigrams + narrative moves). Queried during
+# plan generation to inject avoidance directives BEFORE writing, not after.
+# ---------------------------------------------------------------------------
+
+def store_chapter_fingerprint(conn: Any, chapter_num: int, plan: dict[str, Any]) -> None:
+    """Persist a chapter's structural fingerprint into chapter_fingerprints."""
+    from store import db_lock
+    tokens = sorted(_plan_skeleton_tokens(plan))
+    moves = _narrative_pattern_sequence(plan)
+    try:
+        with db_lock():
+            conn.execute(
+                "INSERT OR REPLACE INTO chapter_fingerprints"
+                "(chapter, skeleton_tokens, narrative_moves, payoff_type, conflict_type, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    chapter_num,
+                    json.dumps(tokens, ensure_ascii=False),
+                    json.dumps(moves, ensure_ascii=False),
+                    str(plan.get("payoff_type", "")),
+                    str(plan.get("conflict_type", "")),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def check_plan_against_fingerprints(
+    conn: Any, plan: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Check a candidate plan against ALL stored chapter fingerprints.
+
+    Returns {"max_sim", "most_similar_chapter", "top_similar", "directives"}.
+    """
+    if conn is None:
+        return {"max_sim": 0.0, "most_similar_chapter": None, "top_similar": [], "directives": []}
+    threshold = float(config["novel"].get("fingerprint_warn_threshold", 0.65))
+    cur_tokens = _plan_skeleton_tokens(plan)
+    cur_moves = _narrative_pattern_sequence(plan)
+    try:
+        rows = conn.execute(
+            "SELECT chapter, skeleton_tokens, narrative_moves FROM chapter_fingerprints"
+        ).fetchall()
+    except Exception:
+        return {"max_sim": 0.0, "most_similar_chapter": None, "top_similar": [], "directives": []}
+    best_sim = 0.0
+    best_ch: int | None = None
+    top: list[tuple[int, float]] = []
+    for ch, tok_json, mov_json in rows:
+        try:
+            stored_tokens = set(json.loads(tok_json))
+            stored_moves = json.loads(mov_json)
+        except Exception:
+            continue
+        skel_sim = _jaccard(cur_tokens, stored_tokens)
+        narr_sim = _sequence_similarity(cur_moves, stored_moves)
+        composite = 0.6 * skel_sim + 0.4 * narr_sim
+        if composite > 0.3:
+            top.append((ch, round(composite, 3)))
+        if composite > best_sim:
+            best_sim = composite
+            best_ch = ch
+    top.sort(key=lambda x: x[1], reverse=True)
+    top = top[:5]
+    directives: list[str] = []
+    if best_sim >= threshold and top:
+        avoid_chapters = [f"Ch{ch}(sim={s})" for ch, s in top[:3]]
+        directives.append(
+            f"全书结构指纹检测：当前大纲与 {', '.join(avoid_chapters)} 结构高度相似(max={best_sim:.2f})。"
+            "必须改变叙事驱动力和信息揭示顺序，避免重复同样的章节骨架。"
+        )
+        for ch, s in top[:3]:
+            for row in rows:
+                if row[0] == ch:
+                    try:
+                        moves = json.loads(row[2])
+                        if moves:
+                            directives.append(f"Ch{ch}已用流程: {'→'.join(moves)}")
+                    except Exception:
+                        pass
+                    break
+    return {
+        "max_sim": round(best_sim, 3),
+        "most_similar_chapter": best_ch,
+        "top_similar": top,
+        "directives": directives,
+    }
+
+
+def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
+    """Render the full fingerprint library as avoidance context for plan generation.
+
+    Unlike check_plan_against_fingerprints (which compares a specific plan),
+    this returns a summary of ALL stored narrative move sequences so the
+    generator can see the full structural history and avoid repeating it.
+    """
+    if conn is None:
+        return "None"
+    try:
+        rows = conn.execute(
+            "SELECT chapter, narrative_moves, payoff_type, conflict_type"
+            " FROM chapter_fingerprints ORDER BY chapter"
+        ).fetchall()
+    except Exception:
+        return "None"
+    if not rows:
+        return "None"
+    entries: list[str] = []
+    for ch, mov_json, pt, ct in rows:
+        try:
+            moves = json.loads(mov_json)
+        except Exception:
+            continue
+        if not moves:
+            continue
+        flow = "→".join(moves)
+        meta = ""
+        if pt:
+            meta += f" payoff={pt}"
+        if ct:
+            meta += f" conflict={ct}"
+        entries.append(f"Ch{ch}: {flow}{meta}")
+    return "\n".join(entries) if entries else "None"
 
 
 # ---------------------------------------------------------------------------
@@ -1082,3 +1665,336 @@ def plan_visual_payoff_check(plan: dict[str, Any], config: dict[str, Any] | None
         "concrete_hits": concrete_hits[:12],
         "blocked": blocked,
     }
+
+
+# ---------------------------------------------------------------------------
+# Prose texture analysis: quantitative vs poetic balance
+# ---------------------------------------------------------------------------
+_METAPHOR_MARKERS = re.compile(r"[像如仿佛似若好似犹如宛如恍若好像一如]")
+_SENSORY_WORDS = re.compile(
+    r"[温暖冰凉灼热潮湿干燥刺鼻芬芳苦涩甘甜酥麻沉闷轰鸣寂静回荡]|"
+    r"光芒|阴影|色泽|声响|气味|触感|余温|寒意|热浪|微风"
+)
+_NUMBER_PATTERN = re.compile(
+    r"(?:百分之[一二三四五六七八九十零〇两\d]+|"
+    r"\d+(?:\.\d+)?(?:%|‰|°|℃|赫兹|毫米|厘米|分钟|秒|小时|公斤|千克|米|层|级|阶)?|"
+    r"零点[一二三四五六七八九十零〇两\d]+)"
+)
+
+
+def prose_texture(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure the quantitative vs poetic texture of prose.
+
+    Returns metrics + a suggestion directive if the balance is skewed.
+    """
+    text = _strip_title_line(text)
+    chars = max(len(text), 1)
+    kchars = chars / 1000.0
+
+    numbers = _NUMBER_PATTERN.findall(text)
+    num_per_kchar = round(len(numbers) / max(kchars, 0.1), 2)
+
+    metaphors = _METAPHOR_MARKERS.findall(text)
+    metaphor_per_kchar = round(len(metaphors) / max(kchars, 0.1), 2)
+
+    sensory = _SENSORY_WORDS.findall(text)
+    sensory_per_kchar = round(len(sensory) / max(kchars, 0.1), 2)
+
+    poetic_density = metaphor_per_kchar + sensory_per_kchar
+
+    cfg = (config or {}).get("novel", {})
+    num_high = float(cfg.get("texture_num_high_per_kchar", 8.0))
+    poetic_low = float(cfg.get("texture_poetic_low_per_kchar", 1.0))
+
+    flags: list[str] = []
+    directives: list[str] = []
+    balance = "balanced"
+
+    if num_per_kchar > num_high and poetic_density < poetic_low:
+        balance = "over_quantitative"
+        flags.append("数据密度过高且缺少诗意变奏")
+        directives.append(
+            "本章数字/数据密度偏高（{:.1f}/千字）而比喻/感官描写偏少（{:.1f}/千字）。"
+            "下一章请交替使用：具体数据锚定 + 比喻/通感/感官意象，"
+            "避免连续段落全用精确数值描写。至少 2 处用比喻或感官替代直接数字。".format(
+                num_per_kchar, poetic_density
+            )
+        )
+    elif num_per_kchar < 1.0 and poetic_density > 6.0:
+        balance = "over_poetic"
+        flags.append("诗意过度缺少具体锚定")
+        directives.append(
+            "本章比喻/感官密度高但缺少具体数据锚定。"
+            "下一章请在关键动作/状态处加入 2-3 个具体数字/量级/时限来增加可信度。"
+        )
+
+    return {
+        "metrics": {
+            "num_per_kchar": num_per_kchar,
+            "metaphor_per_kchar": metaphor_per_kchar,
+            "sensory_per_kchar": sensory_per_kchar,
+            "poetic_density": round(poetic_density, 2),
+        },
+        "balance": balance,
+        "flags": flags,
+        "directives": directives,
+    }
+
+
+def emotional_cadence(
+    recent_tones: list[str],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect emotional monotony from recent chapters' emotional_tone values.
+
+    Returns warnings + a target mood suggestion when consecutive chapters
+    share the same emotional tone.
+    """
+    cfg = (config or {}).get("novel", {})
+    max_same = int(cfg.get("emotional_cadence_max_same", 3))
+
+    if not recent_tones or len(recent_tones) < 2:
+        return {"monotony": False, "streak": 0, "directives": []}
+
+    streak = 1
+    current = recent_tones[-1]
+    for tone in reversed(recent_tones[:-1]):
+        if tone and tone == current:
+            streak += 1
+        else:
+            break
+
+    _TONE_ALTERNATIVES = {
+        "紧张": ["舒缓", "温情", "反思"],
+        "压抑": ["释然", "温暖", "决绝"],
+        "悲伤": ["希望", "温情", "坚定"],
+        "愤怒": ["冷静", "释然", "温柔"],
+        "兴奋": ["沉思", "危机", "温情"],
+        "恐惧": ["坚定", "温暖", "释然"],
+    }
+
+    directives: list[str] = []
+    monotony = streak >= max_same
+    if monotony and current:
+        alts = _TONE_ALTERNATIVES.get(current, ["与前章不同的情感基调"])
+        directives.append(
+            f"近{streak}章连续「{current}」基调，情感疲劳风险。"
+            f"本章建议切换到：{'/'.join(alts[:2])}，打破单调。"
+        )
+
+    return {
+        "monotony": monotony,
+        "streak": streak,
+        "current_tone": current if recent_tones else "",
+        "directives": directives,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Payoff-beat density: 爽点 (face-slap / reversal / reveal / power-flex) cadence
+# ---------------------------------------------------------------------------
+# Web-novel retention lives on a steady drip of "爽" moments. This is a coarse,
+# deterministic proxy: it can't judge whether a payoff is *earned*, only whether
+# the prose contains payoff-shaped events at a healthy cadence.
+_PAYOFF_MARKERS = re.compile(
+    r"识破|拆穿|揭穿|当众|反转|逆转|碾压|打脸|一锤定音|真相大白|当场|反将|反咬|"
+    r"哑口无言|无言以对|目瞪口呆|脸色骤变|脸色大变|败下阵|认输|低头|跪|"
+    r"揭晓|水落石出|原形毕露|扳回|翻盘|破局|绝杀|完胜|压制|镇住|震慑"
+)
+
+
+def payoff_beat_density(
+    text: str,
+    recent_payoff_types: list[str] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure 爽点 density: payoff-shaped events in this chapter plus the recent
+    payoff_type cadence. Returns a directive when the recent window has gone too
+    long without a strong reader payoff.
+
+    `recent_payoff_types` is the newest-first list of recent chapters'
+    payoff_type (from chapter_metrics); a 'setup'/'strategic_setup'/'emotional'
+    type does not count as a strong payoff.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    body = _strip_title_line(text or "")
+    kchars = max(len(body) / 1000.0, 0.1)
+    hits = _PAYOFF_MARKERS.findall(body)
+    hits_per_kchar = round(len(hits) / kchars, 2)
+
+    strong_types = {
+        "reveal", "reversal", "court_breakthrough", "military_victory",
+        "policy_payoff", "personnel_payoff", "institutional_fix", "payoff",
+    }
+    rt = recent_payoff_types or []
+    # Chapters since the last STRONG payoff (newest-first list).
+    chapters_since_payoff = 0
+    for t in rt:
+        if str(t).strip() in strong_types:
+            break
+        chapters_since_payoff += 1
+
+    flags: list[str] = []
+    directives: list[str] = []
+    # payoff_density_min is a per-chapter rate (≈0.34 ⇒ 1 strong payoff / 3 ch).
+    min_rate = float(cfg.get("payoff_density_min", 0.34))
+    max_gap = int(round(1.0 / min_rate)) if min_rate > 0 else 3
+    if rt and chapters_since_payoff >= max_gap:
+        flags.append(f"payoff_drought({chapters_since_payoff})")
+        directives.append(
+            f"近 {chapters_since_payoff} 章没有强爽点/高潮（揭晓/反转/打脸/能力兑现）。"
+            "本章必须安排一次明确的读者爽点：让主角的优势/真相/反击落到具体的当众场面或对手的可见崩溃上。"
+        )
+
+    return {
+        "metrics": {
+            "payoff_markers": len(hits),
+            "payoff_per_kchar": hits_per_kchar,
+            "chapters_since_payoff": chapters_since_payoff,
+        },
+        "flags": flags,
+        "directives": directives,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shareable golden-line signal (可截图金句 / 传播性): 番茄书荒广场/段评的传播靠
+# "能截图发出去"的金句钩子（复仇宣言/逆袭宣言/认知颠覆/后果预告）驱动。这是一个
+# 启发式（非 LLM）信号：它无法判断金句"好不好"，只检测本章是否至少有一句够短、够
+# punchy、带强情绪态度的可传播句。缺失时给出建议指令（advisory，不扣分）。
+# ---------------------------------------------------------------------------
+
+# 强态度/宣言/反转标记——金句的高频骨架。
+_SHAREABLE_MARKERS = re.compile(
+    r"从今(?:天|往)?(?:起|以后)|从现在起|记住|凭什么|我偏|我就是|也配|不过如此|活该|"
+    r"早晚|总有一天|莫欺|三十年河|给我跪|你们这些|我说过|谁规定|凭本事|宁可|绝不|"
+    r"不是.{0,12}(?:而是|是)|要么.{0,10}要么|从不|永远记住|欠我的|该还了|轮到"
+)
+_SHAREABLE_PERSON = re.compile(r"[我你]")
+
+
+def _quotable_score(line: str) -> float:
+    """Heuristic 'how截图-able is this line' score (0+)."""
+    s = 0.0
+    if _SHAREABLE_MARKERS.search(line):
+        s += 2.0
+    if _SHAREABLE_PERSON.search(line):
+        s += 1.0
+    if len(line) <= 18:  # punchy short lines screenshot better
+        s += 1.0
+    return s
+
+
+def shareable_line(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect whether the chapter contains a可截图、可传播的金句钩子.
+
+    Scans quoted dialogue across the chapter plus the chapter tail (where宣言式
+    金句 most often lands), scores each candidate, and returns the best. When no
+    candidate clears the threshold, emits an advisory directive (no penalty) so
+    the next chapter plants a传播性金句. Gated by `shareable_line_enabled`.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "metrics": {}, "has_shareable": False, "best_line": "", "score": 0.0,
+        "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("shareable_line_enabled", True)) or not text:
+        return result
+    body = _strip_title_line(text)
+    if len(body) < 500:
+        return result
+    candidates: set[str] = set()
+    # Punchy lines often live in dialogue — pull quoted segments from the whole chapter.
+    for m in re.findall(r"[“「]([^”」\n]{4,40})[”」]", body):
+        candidates.add(m.strip())
+    # Plus the chapter tail's short narration sentences (章末金句).
+    tail = body[-int(cfg.get("shareable_tail_chars", 500)):]
+    for seg in re.split(r"[。！？\n]", tail):
+        seg = seg.strip()
+        if 6 <= len(seg) <= 30:
+            candidates.add(seg)
+    best = 0.0
+    best_line = ""
+    for c in candidates:
+        sc = _quotable_score(c)
+        if sc > best:
+            best = sc
+            best_line = c
+    threshold = float(cfg.get("shareable_min_score", 2.0))
+    has = best >= threshold
+    result["metrics"] = {"candidates": len(candidates), "best_score": round(best, 1)}
+    result["has_shareable"] = has
+    result["best_line"] = best_line[:60]
+    result["score"] = round(best, 1)
+    if not has:
+        result["flags"].append("no_shareable_line")
+        result["directives"].append(
+            "本章缺少可截图、可传播的金句钩子。番茄段评/书荒广场的自然传播靠金句驱动——"
+            "本章请在一个高情绪节点（爆发/对峙/逆袭/反转）放一句够短够狠、独立成段的金句"
+            "（复仇宣言/逆袭宣言/认知颠覆/后果预告），让读者想截图发出去。"
+        )
+    return result
+
+
+def information_density(
+    text: str,
+    plan: dict[str, Any] | None = None,
+    review: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect a 'pure transition chapter' that advances nothing: no payoff, no
+    realized beats, no new information. Heuristic and conservative — it only
+    flags when MULTIPLE signals agree, to avoid punishing a legitimately quiet
+    breather chapter.
+
+    Signals (all derived from already-computed data, no extra LLM call):
+      - payoff_type is setup/emotional (not a concrete reader payoff)
+      - the chapter's payoff markers are ~zero (no 爽点)
+      - the plan opened no new threads / info_reveals
+      - the review's beats_audit shows few/zero realized beats
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("info_density_enabled", True)):
+        return {"low_information": False, "signals": [], "directives": []}
+
+    plan = plan or {}
+    review = review or {}
+    signals: list[str] = []
+
+    ptype = str(plan.get("payoff_type", "")).strip().lower()
+    if ptype in ("", "setup", "strategic_setup", "emotional"):
+        signals.append(f"payoff_type={ptype or 'none'}")
+
+    body = _strip_title_line(text or "")
+    if len(_PAYOFF_MARKERS.findall(body)) == 0:
+        signals.append("no_payoff_markers")
+
+    reveals = plan.get("info_reveals") or []
+    if not reveals:
+        signals.append("no_info_reveals")
+
+    # beats_audit: count realized beats if the reviewer provided it.
+    audit = review.get("beats_audit") or []
+    if isinstance(audit, list) and audit:
+        realized = sum(
+            1 for b in audit
+            if isinstance(b, dict) and str(b.get("status", "")).lower() in ("realized", "present")
+        )
+        if realized == 0:
+            signals.append("no_realized_beats")
+
+    # Require at least 3 agreeing signals before calling it a transition chapter.
+    low_info = len(signals) >= int(cfg.get("info_density_min_signals", 3))
+    directives: list[str] = []
+    if low_info:
+        directives.append(
+            "上一章信息推进不足（近似过渡章：无爽点、无新信息、无伏线推进）。"
+            "本章必须至少做到其一并落到页面上：引入关键新信息、推进/兑现一条伏线、或制造一次冲突升级。"
+        )
+    return {"low_information": low_info, "signals": signals, "directives": directives}
