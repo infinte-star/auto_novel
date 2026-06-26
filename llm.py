@@ -33,11 +33,43 @@ def _get_endpoint_throttle_state(base_url: str) -> tuple[threading.Lock, str]:
             _ENDPOINT_LAST_STARTED_AT[base_url] = 0.0
         return _ENDPOINT_THROTTLE_LOCKS[base_url], base_url
 
-# Tags whose LLM calls should be routed to the separate reviewer model
-# (main writer = primary model, reviewer = GPT) when a reviewer pool is
-# configured and attached to the client. Every other tag stays on the primary
-# model. See call_llm's reviewer-routing block and pipeline.py's reviewer pool
-# construction. When no reviewer pool is attached, this set is inert.
+# Tag-based model routing: when a role-specific pool is attached to the client,
+# calls whose tag belongs to that role's tag set are routed to the role's
+# model+endpoint. Priority order: planning > writing > extraction > review.
+# Tags not in any set stay on the primary model. When no role pool is attached
+# the corresponding tag set is inert.
+PLAN_TAGS = frozenset({
+    "plan_candidate",
+    "plan_screen",
+    "plan_arbitrate",
+    "structural_diagnose",
+    "scene_breakdown",
+    "bootstrap",
+    "bootstrap_bible",
+    "bootstrap_characters",
+    "bootstrap_voice",
+    "bootstrap_volume_plan",
+    "bootstrap_frame",
+    "bootstrap_voice_repair",
+    "replan",
+    "creative_boost",
+    "contract",
+})
+
+WRITE_TAGS = frozenset({
+    "write",
+    "beat_repair",
+    "revise",
+    "em_dash_fix",
+})
+
+EXTRACT_TAGS = frozenset({
+    "extract",
+    "state_update",
+    "state_sections",
+    "memory_compress",
+})
+
 REVIEW_TAGS = frozenset({
     "review",
     "cold_reader",
@@ -47,6 +79,14 @@ REVIEW_TAGS = frozenset({
     "plan_review_fused",
     "plan_review_axis",
 })
+
+# Ordered list of (pool_attr, api_attr, tag_set, model_key) for role routing.
+_ROLE_ROUTING = [
+    ("planning_pool", "planning_api", PLAN_TAGS, "planning_model"),
+    ("writing_pool", "writing_api", WRITE_TAGS, "writing_model"),
+    ("extraction_pool", "extraction_api", EXTRACT_TAGS, "extraction_model"),
+    ("review_pool", "review_api", REVIEW_TAGS, "review_model"),
+]
 
 # Lightweight observability sink. call_llm appends one JSON line per finished
 # call to logs/llm_calls.jsonl. We use a plain file (not the SQLite store) so
@@ -72,6 +112,7 @@ def _record_llm_call(
     salvaged: bool,
     ok: bool,
     error: str = "",
+    reasoning_chars: int = 0,
 ) -> None:
     if not bool(api.get("metrics_enabled", True)):
         return
@@ -89,6 +130,8 @@ def _record_llm_call(
         "salvaged": salvaged,
         "ok": ok,
     }
+    if reasoning_chars:
+        record["reasoning_chars"] = reasoning_chars
     if error:
         record["error"] = error[:200]
     try:
@@ -270,7 +313,10 @@ class LLMClientPool:
                 return
             except Exception:
                 pass
-        print(msg, file=sys.stderr)
+        try:
+            print(msg, file=sys.stderr)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            print(msg.encode("utf-8", errors="replace").decode("ascii", errors="replace"), file=sys.stderr)
 
     def _mark_dead(self, idx: int, exc: Exception) -> None:
         status_code = getattr(exc, "status_code", None)
@@ -311,6 +357,8 @@ class LLMClientPool:
             except Exception as exc:
                 status_code = getattr(exc, "status_code", None)
                 if status_code is not None and int(status_code) in {401, 403}:
+                    if "remote api access" in str(exc).lower():
+                        raise
                     self._mark_dead(index, exc)
                     continue
                 if first_error is None:
@@ -343,6 +391,50 @@ class LLMClientPool:
         if status_code is not None:
             return int(status_code) in {401, 403, 408, 409, 429, 500, 502, 503, 504}
         return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
+
+def _resolve_thinking_param(
+    api_section: dict[str, Any],
+    *,
+    mode_key: str = "thinking_mode",
+    disabled_key: str = "thinking_disabled",
+    budget_key: str = "thinking_budget_tokens",
+    default_disabled: bool = True,
+) -> dict[str, Any] | None:
+    """Build the ``extra_body["thinking"]`` dict from config.
+
+    Supports three modes (set via *mode_key*, e.g. ``api.thinking_mode``):
+      - ``disabled`` — send ``{"type": "disabled"}`` (suppresses reasoning).
+      - ``auto``     — omit the param entirely (provider decides).
+      - ``enabled``  — send ``{"type": "enabled", "budget_tokens": N}``.
+
+    Falls back to the legacy boolean *disabled_key* when *mode_key* is absent:
+      - ``thinking_disabled: true``  → disabled
+      - ``thinking_disabled: false`` → auto
+
+    Returns the dict to put in ``extra_body["thinking"]``, or ``None`` to omit.
+    """
+    raw_mode = str(api_section.get(mode_key, "") or "").strip().lower()
+    if raw_mode == "disabled":
+        return {"type": "disabled"}
+    if raw_mode == "auto":
+        return None
+    if raw_mode == "enabled":
+        budget = api_section.get(budget_key)
+        if budget is not None and str(budget).strip():
+            try:
+                budget_int = int(budget)
+            except (TypeError, ValueError):
+                budget_int = 0
+            if budget_int > 0:
+                return {"type": "enabled", "budget_tokens": budget_int}
+        return {"type": "enabled"}
+
+    # Legacy fallback: thinking_disabled boolean.
+    disabled = api_section.get(disabled_key, default_disabled)
+    if isinstance(disabled, str):
+        disabled = disabled.strip().lower() not in {"false", "0", "no", "off", ""}
+    return {"type": "disabled"} if disabled else None
+
 
 REFUSAL_PATTERNS = (
     "request was rejected because it was considered high risk",
@@ -647,16 +739,23 @@ def call_llm(
     tag: str = "",
 ) -> str:
     api = config["api"]
-    # Reviewer routing: when a reviewer pool is attached to the client (see
-    # pipeline.py) and this call's tag is a scoring/review tag, send it to the
-    # separate reviewer model+endpoint instead of the primary model. Attribute
-    # probing keeps call_llm's signature unchanged across its ~25 call sites.
-    # `review_api` is the same config["api"] dict, read for the review_* keys.
-    review_pool = getattr(client, "review_pool", None)
-    review_api = getattr(client, "review_api", None)
-    use_reviewer = bool(review_pool) and bool(review_api) and tag in REVIEW_TAGS
-    call_client = review_pool if use_reviewer else client
-    model_name = str(review_api["review_model"]) if use_reviewer else api["model"]
+    # Role-based routing: probe the client for role-specific pools attached by
+    # pipeline.py. Check each role in priority order (planning > writing >
+    # extraction > review). First match wins. When no role pool matches, fall
+    # through to the primary model. Attribute probing keeps call_llm's
+    # signature unchanged across its ~25 call sites.
+    call_client = client
+    model_name = api["model"]
+    _active_role_prefix: str = ""
+    for _pool_attr, _api_attr, _tag_set, _model_key in _ROLE_ROUTING:
+        _pool = getattr(client, _pool_attr, None)
+        _rapi = getattr(client, _api_attr, None)
+        if _pool and _rapi and tag in _tag_set:
+            call_client = _pool
+            model_name = str(_rapi[_model_key])
+            _active_role_prefix = _model_key.replace("_model", "_")
+            break
+    use_reviewer = _active_role_prefix == "review_"
     context_window = int(api.get("context_window", 1000000))
     max_input_chars = int(context_window * 1.8)
     # Prepend cacheable_prefix verbatim at the very top of user message so that
@@ -678,6 +777,7 @@ def call_llm(
     salvaged_any = False
     for attempt in range(max_attempts):
         started = time.perf_counter()
+        reasoning_total = 0
         try:
             request = {
                 "model": model_name,
@@ -688,38 +788,38 @@ def call_llm(
                 "max_tokens": _effective_max_tokens(api, max_tokens),
                 "temperature": float(api["temperature"]) if temperature is None else temperature,
             }
-            if use_reviewer and str(review_api.get("review_temperature", "")).strip() != "":
-                try:
-                    request["temperature"] = float(review_api["review_temperature"])
-                except (TypeError, ValueError):
-                    pass
+            if _active_role_prefix:
+                _role_temp_key = f"{_active_role_prefix}temperature"
+                _role_temp = str(api.get(_role_temp_key, "")).strip()
+                if _role_temp:
+                    try:
+                        request["temperature"] = float(_role_temp)
+                    except (TypeError, ValueError):
+                        pass
             extra_body: dict[str, Any] = {}
-            if not use_reviewer and api.get("group"):
+            if not _active_role_prefix and api.get("group"):
                 extra_body["group"] = str(api.get("group"))
-            # Some providers (e.g. mimo-v2.5-pro) default to an unbounded
-            # "thinking" / reasoning phase. On large write prompts this can emit
-            # tens of thousands of reasoning_content chars and NEVER produce
-            # `content`, so the stream runs until stream_timeout (1800s) and the
-            # whole pipeline stalls retrying forever. Disabling thinking makes
-            # content stream within seconds. `api.thinking_disabled` (default
-            # true) sends the documented `extra_body={"thinking": {"type":
-            # "disabled"}}`; set false to restore provider-default reasoning.
-            # Reviewer (GPT) path reads review_thinking_disabled (default False),
-            # since GPT reasoning models reject the Anthropic-style thinking flag.
-            if use_reviewer:
-                thinking_disabled = review_api.get("review_thinking_disabled", False)
+            if _active_role_prefix:
+                thinking_param = _resolve_thinking_param(
+                    api,
+                    mode_key=f"{_active_role_prefix}thinking_mode",
+                    disabled_key=f"{_active_role_prefix}thinking_disabled",
+                    budget_key=f"{_active_role_prefix}thinking_budget_tokens",
+                    default_disabled=(_active_role_prefix != "review_"),
+                )
             else:
-                thinking_disabled = api.get("thinking_disabled", True)
-            if isinstance(thinking_disabled, str):
-                thinking_disabled = thinking_disabled.strip().lower() not in {"false", "0", "no", "off", ""}
-            if thinking_disabled:
-                extra_body["thinking"] = {"type": "disabled"}
-            if api.get("top_p") is not None:
-                request["top_p"] = float(api.get("top_p"))
-            if api.get("frequency_penalty") is not None:
-                request["frequency_penalty"] = float(api.get("frequency_penalty"))
-            if api.get("presence_penalty") is not None:
-                request["presence_penalty"] = float(api.get("presence_penalty"))
+                thinking_param = _resolve_thinking_param(api)
+            if thinking_param is not None:
+                extra_body["thinking"] = thinking_param
+            _top_p = api.get("top_p")
+            if _top_p is not None and str(_top_p).strip() and float(_top_p) != 1.0:
+                request["top_p"] = float(_top_p)
+            _freq = api.get("frequency_penalty")
+            if _freq is not None and str(_freq).strip() and float(_freq) != 0:
+                request["frequency_penalty"] = float(_freq)
+            _pres = api.get("presence_penalty")
+            if _pres is not None and str(_pres).strip() and float(_pres) != 0:
+                request["presence_penalty"] = float(_pres)
             if extra_body:
                 request["extra_body"] = extra_body
             if use_response_format:
@@ -811,6 +911,7 @@ def call_llm(
                     except Exception:
                         pass
                 content = "".join(parts)
+                reasoning_total = sum(len(p) for p in reasoning_parts)
                 elapsed = time.perf_counter() - started
                 min_salvage_chars = int(api.get("stream_salvage_min_chars", 800))
                 if stream_timeout_reason and len(content.strip()) >= min_salvage_chars:
@@ -841,8 +942,19 @@ def call_llm(
                         f"elapsed={elapsed:.1f}s prompt_chars={total_chars} max_tokens={request['max_tokens']}",
                     )
             else:
-                content = resp.choices[0].message.content or ""
+                msg = resp.choices[0].message
+                content = msg.content or ""
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                reasoning_total = len(reasoning)
                 elapsed = time.perf_counter() - started
+                if not content.strip() and reasoning.strip():
+                    log(
+                        paths,
+                        "LLM content empty but reasoning_content present (non-stream), using reasoning fallback "
+                        f"attempt={attempt + 1}/{max_attempts} "
+                        f"reasoning_chars={len(reasoning)} elapsed={elapsed:.1f}s",
+                    )
+                    content = reasoning
             if not content.strip():
                 wait = _backoff_wait(attempt)
                 log(
@@ -866,6 +978,7 @@ def call_llm(
                 tag=tag, model=request["model"], stream=stream, json_mode=wants_json,
                 attempt=attempt, prompt_chars=total_chars, output_chars=len(content),
                 elapsed=elapsed, salvaged=salvaged_any, ok=True,
+                reasoning_chars=reasoning_total,
             )
             return content
         except Exception as exc:
@@ -910,6 +1023,8 @@ def _looks_like_response_format_error(exc: Exception) -> bool:
 def _looks_like_nonretryable_block(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
     text = str(exc).lower()
+    if status_code == 401 and "remote api access" in text:
+        return False
     return (
         status_code in {401, 403}
         or "request was blocked" in text

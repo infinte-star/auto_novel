@@ -25,6 +25,7 @@ class Paths:
     timeline: Path
     threads: Path
     volume_plan: Path
+    compass: Path
     voices: Path
     voice: Path
     contract: Path
@@ -182,17 +183,18 @@ def _validate_config(config: dict[str, Any]) -> None:
                 )
             config[section_name][key] = value
 
-    # Optional reviewer routing (main writer = primary model, reviewer = a
-    # separate model+endpoint). All review_* keys are optional; if review_base_url
-    # is set, review_model becomes mandatory so a half-configured reviewer fails
-    # loudly here instead of sending an empty model name to the provider.
+    # Per-role model routing: each role (review, planning, writing, extraction)
+    # can have its own base_url + model. When *_base_url is set, *_model is
+    # mandatory so a half-configured role fails loudly instead of sending an
+    # empty model name to the provider.
     api = config.get("api", {})
-    review_base_url = str(api.get("review_base_url", "")).strip()
-    if review_base_url and not str(api.get("review_model", "")).strip():
-        raise ValueError(
-            "api.review_base_url is set but api.review_model is missing. "
-            "Either set api.review_model or remove api.review_base_url."
-        )
+    for _role in ("review", "planning", "writing", "extraction"):
+        _role_base = str(api.get(f"{_role}_base_url", "")).strip()
+        if _role_base and not str(api.get(f"{_role}_model", "")).strip():
+            raise ValueError(
+                f"api.{_role}_base_url is set but api.{_role}_model is missing. "
+                f"Either set api.{_role}_model or remove api.{_role}_base_url."
+            )
 
 def configured_api_keys(config: dict[str, Any]) -> list[str]:
     api = config["api"]
@@ -293,23 +295,21 @@ def configured_api_endpoints_with_models(
 
     return endpoints, primary_count, models
 
-def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]:
-    """Endpoints for the separate reviewer model (main writer = primary model).
+def configured_role_endpoints(config: dict[str, Any], role: str) -> list[tuple[str, str]]:
+    """Endpoints for a role-specific model (review, planning, writing, extraction).
 
-    Returns [(base_url, key), ...] built from api.review_base_url plus
-    api.review_api_key and api.review_keys (comma/semicolon/space separated).
-    Returns [] when review_base_url is not configured, so the engine keeps
-    routing every call through the primary model (backward compatible).
+    Reads api.{role}_base_url, api.{role}_api_key, api.{role}_keys.
+    Returns [(base_url, key), ...] or [] when the role's base_url is absent.
     """
     api = config["api"]
-    base_url = str(api.get("review_base_url", "")).strip()
+    base_url = str(api.get(f"{role}_base_url", "")).strip()
     if not base_url:
         return []
     keys: list[str] = []
-    primary = str(api.get("review_api_key", "")).strip()
+    primary = str(api.get(f"{role}_api_key", "")).strip()
     if primary:
         keys.append(primary)
-    extra = str(api.get("review_keys", "")).strip()
+    extra = str(api.get(f"{role}_keys", "")).strip()
     if extra:
         keys.extend(k for k in re.split(r"[,;\s]+", extra) if k)
 
@@ -322,6 +322,11 @@ def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]
             endpoints.append(endpoint)
     return endpoints
 
+
+def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Backward-compatible wrapper: endpoints for the reviewer model."""
+    return configured_role_endpoints(config, "review")
+
 def get_paths(config: dict[str, Any]) -> Paths:
     raw = config["paths"]
     return Paths(
@@ -333,6 +338,8 @@ def get_paths(config: dict[str, Any]) -> Paths:
         timeline=ROOT / str(raw["timeline"]),
         threads=ROOT / str(raw["threads"]),
         volume_plan=ROOT / str(raw["volume_plan"]),
+        compass=ROOT / str(raw.get("compass",
+            str(Path(str(raw.get("volume_plan", "memory/volume_plan.md"))).parent / "compass.md"))),
         voices=ROOT / str(raw.get("voices", "memory/voices.md")),
         voice=ROOT / str(raw.get("voice", "memory/voice.md")),
         contract=ROOT / str(raw.get("contract", str(Path(str(raw.get("voice", "memory/voice.md"))).parent / "contract.md"))),
@@ -360,7 +367,10 @@ def log(paths: Paths, message: str) -> None:
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {message}"
-    print(line)
+    try:
+        print(line)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print(line.encode("utf-8", errors="replace").decode("ascii", errors="replace"))
     append_text(paths.logs_dir / "run.log", line + "\n")
 
 def normalize_text(text: str) -> str:
@@ -433,6 +443,29 @@ def is_final_chapter(config: dict[str, Any], chapter_num: int) -> bool:
         return False
     max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
     return max_chapters > 0 and chapter_num == max_chapters
+
+
+def ending_zone_distance(config: dict[str, Any], chapter_num: int) -> int | None:
+    """Chapters remaining until the finale when inside the gradual收束 zone, else None.
+
+    The last 5 chapters are every book's weakest region (fossils peak, threads
+    pile up unpaid, and CLOSING_RULES only fires on the single final chapter — too
+    late). This returns max_chapters - chapter_num (>=1) when within
+    `ending_zone_chapters` of the end, so the writer/planner can RAMP convergence
+    instead of slamming closure into one chapter. Returns None on the final
+    chapter itself (is_final_chapter owns that) and in pure char-target mode.
+    Gated by `ending_aware`.
+    """
+    if not bool(config["novel"].get("ending_aware", True)):
+        return None
+    max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
+    if max_chapters <= 0:
+        return None
+    zone = int(config["novel"].get("ending_zone_chapters", 5))
+    remaining = max_chapters - chapter_num
+    if 1 <= remaining < zone:
+        return remaining
+    return None
 
 # Valid narrative-mode identifiers. `reasoning` = single-room / precise物证 mode
 # (strengthens closure, fair clues, concrete physical anchors); `serial` =

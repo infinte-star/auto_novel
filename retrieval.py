@@ -573,6 +573,174 @@ def exemplar_block(
         return ""
 
 
+def _extract_focus_names(plan: dict[str, Any]) -> list[str]:
+    """Extract character names from plan's focus_characters, character_focus, and beats."""
+    names: list[str] = []
+    for key in ("focus_characters", "character_focus"):
+        raw = plan.get(key)
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    names.append(item.strip())
+                elif isinstance(item, dict):
+                    n = str(item.get("name") or item.get("角色") or "").strip()
+                    if n:
+                        names.append(n)
+        elif isinstance(raw, str) and raw.strip():
+            names.extend(seg.strip() for seg in raw.split("、") if seg.strip())
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            deduped.append(n)
+    return deduped
+
+
+def structured_recall_block(
+    conn: Any,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    chapter_num: int,
+    max_chars: int | None = None,
+) -> str:
+    """Build a structured context recall block from DB state for the writer.
+
+    Queries entities, threads, relationships, revelations, and constraints
+    relevant to the current chapter's plan. Returns a markdown block or "".
+    """
+    from store import (
+        db_lock,
+        entity_state_as_of,
+        get_active_constraints,
+        get_overdue_reader_promises,
+        get_overdue_revelations,
+        get_pending_revelations,
+        get_relationships,
+    )
+
+    novel_cfg = config.get("novel", {})
+    if max_chars is None:
+        max_chars = int(novel_cfg.get("structured_recall_max_chars", 3000))
+    thread_horizon = int(novel_cfg.get("structured_recall_thread_horizon", 5))
+    focus_names = _extract_focus_names(plan)
+
+    sections: list[str] = []
+
+    # 1. Entities matching focus characters
+    if focus_names:
+        entity_lines: list[str] = []
+        try:
+            with db_lock():
+                rows = conn.execute(
+                    "SELECT entity_type, name, state_json, updated_chapter FROM entities"
+                ).fetchall()
+            for row in rows:
+                name = row["name"]
+                if any(fn in name or name in fn for fn in focus_names):
+                    state = row["state_json"]
+                    if len(state) > 200:
+                        state = state[:200] + "…"
+                    entity_lines.append(
+                        f"- {name}({row['entity_type']}): {state} (Ch{row['updated_chapter']}更新)"
+                    )
+        except Exception:
+            pass
+        if entity_lines:
+            sections.append("### 本章相关人物当前状态\n" + "\n".join(entity_lines[:8]))
+
+    # 2. Open threads due within horizon
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, status, introduced_chapter, due_chapter, updated_chapter
+                   FROM open_threads
+                   WHERE status IN ('open', 'building')
+                   AND due_chapter IS NOT NULL
+                   AND due_chapter BETWEEN ? AND ?
+                   ORDER BY due_chapter ASC LIMIT 8""",
+                (chapter_num - 2, chapter_num + thread_horizon),
+            ).fetchall()
+        if rows:
+            lines = []
+            for r in rows:
+                due = r["due_chapter"]
+                delta = due - chapter_num
+                tag = f"过期{-delta}章" if delta < 0 else (f"本章到期" if delta == 0 else f"还剩{delta}章")
+                lines.append(f"- {r['id']}: \"{r['description']}\"（引入Ch{r['introduced_chapter']}→到期Ch{due}，{tag}）")
+            sections.append("### 即将到期的伏线\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    # 3. Relationships involving focus characters
+    if focus_names:
+        try:
+            all_rels = get_relationships(conn, limit=30)
+            relevant = [
+                r for r in all_rels
+                if any(fn in r.get("char_a", "") or fn in r.get("char_b", "") or
+                       r.get("char_a", "") in fn or r.get("char_b", "") in fn
+                       for fn in focus_names)
+            ][:10]
+            if relevant:
+                lines = []
+                for r in relevant:
+                    lines.append(
+                        f"- {r['char_a']}↔{r['char_b']}: {r.get('stage', '?')}"
+                        f"({r.get('intensity', 0):.1f}) — {r.get('last_event', '?')[:60]}"
+                    )
+                sections.append("### 关键角色关系\n" + "\n".join(lines))
+        except Exception:
+            pass
+
+    # 4. Pending/overdue revelations
+    try:
+        pending = get_pending_revelations(conn, chapter_num, limit=6)
+        overdue = get_overdue_revelations(conn, chapter_num, grace=3, limit=4)
+        rev_ids_shown: set[str] = set()
+        lines = []
+        for r in overdue:
+            rev_ids_shown.add(r["id"])
+            lines.append(
+                f"- ⚠ {r['id']}: \"{r['description']}\"（过期{r.get('overdue_by', '?')}章，importance={r.get('importance', '?')}）"
+            )
+        for r in pending:
+            if r["id"] not in rev_ids_shown:
+                due = r.get("due_chapter")
+                due_note = f"到期Ch{due}" if due else "无到期"
+                lines.append(
+                    f"- {r['id']}: \"{r['description']}\"（{r['status']}，{due_note}，importance={r.get('importance', '?')}）"
+                )
+        if lines:
+            sections.append("### 待揭示信息\n" + "\n".join(lines[:8]))
+    except Exception:
+        pass
+
+    # 5. Active stage constraints
+    try:
+        constraints = get_active_constraints(conn, chapter_num)
+        if constraints:
+            lines = [
+                f"- {c['constraint_type']}: {c['description'][:80]}"
+                for c in constraints[:6]
+            ]
+            sections.append("### 活跃约束\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    if not sections:
+        return ""
+
+    header = "## 结构化回忆（数据库状态快照，写作事实参照）\n"
+    body = "\n\n".join(sections)
+    result = header + body
+
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit("\n", 1)[0] + "\n…[截断]"
+
+    return result
+
+
 def candidate_new_entities(
     paths: Paths,
     chapter_text: str,

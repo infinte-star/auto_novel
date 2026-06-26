@@ -189,6 +189,14 @@ def init_db(paths: Paths) -> Any:
             status TEXT DEFAULT 'open',
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS chapter_fingerprints (
+            chapter INTEGER PRIMARY KEY,
+            skeleton_tokens TEXT NOT NULL,
+            narrative_moves TEXT NOT NULL,
+            payoff_type TEXT,
+            conflict_type TEXT,
+            created_at TEXT NOT NULL
+        );
         """
     )
     # Idempotent migration: classify threads by type (plot/reader_promise/...).
@@ -207,12 +215,64 @@ def init_db(paths: Paths) -> Any:
         "continuity_score REAL",
         "em_dash_per_kchar REAL",
         "style_penalty REAL",
+        "emotional_impact REAL",
     ):
         try:
             conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
             conn.commit()
         except Exception:
             pass
+    # character_relationships: track relationship arcs between character pairs
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS character_relationships (
+                pair_key TEXT PRIMARY KEY,
+                char_a TEXT NOT NULL,
+                char_b TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'potential',
+                intensity REAL DEFAULT 0.0,
+                label TEXT DEFAULT '',
+                last_event TEXT DEFAULT '',
+                updated_chapter INTEGER NOT NULL,
+                history_json TEXT NOT NULL DEFAULT '[]'
+            );
+        """)
+    except Exception:
+        pass
+    # info_revelations: track mystery/secret lifecycle
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS info_revelations (
+                id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                reveal_type TEXT NOT NULL DEFAULT 'mystery',
+                status TEXT NOT NULL DEFAULT 'planted',
+                planted_chapter INTEGER NOT NULL,
+                hint_chapters TEXT DEFAULT '[]',
+                due_chapter INTEGER,
+                revealed_chapter INTEGER,
+                importance INTEGER DEFAULT 5,
+                created_at TEXT NOT NULL
+            );
+        """)
+    except Exception:
+        pass
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS arc_history (
+                arc_number INTEGER PRIMARY KEY,
+                start_chapter INTEGER NOT NULL,
+                end_chapter INTEGER,
+                arc_title TEXT,
+                summary TEXT,
+                key_outcomes TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+        """)
+    except Exception:
+        pass
     return conn
 
 def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) -> None:
@@ -230,6 +290,36 @@ def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+def recent_dimension_scores(
+    conn: Any, dim: str, limit: int, before_chapter: int | None = None
+) -> list[float]:
+    """Return up to `limit` recent values of ONE chapter_metrics dimension
+    (e.g. 'hook_score'), newest-first, optionally excluding chapters >=
+    before_chapter. Built on recent_metrics so it inherits JsonStoryStore
+    compatibility and locking. Used by review.py's dimension de-inflation to
+    detect a reviewer dimension that has saturated (lost discrimination)."""
+    try:
+        rows = recent_metrics(conn, int(limit) + 5)
+    except Exception:
+        return []
+    out: list[float] = []
+    for r in rows:  # newest-first
+        try:
+            ch = int(r.get("chapter", 0))
+        except Exception:
+            ch = 0
+        if before_chapter is not None and ch >= int(before_chapter):
+            continue
+        v = r.get(dim)
+        if v is not None:
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        if len(out) >= int(limit):
+            break
+    return out
 
 def recent_events(conn: Any, limit: int = 80, event_types: Any = None) -> list[dict[str, Any]]:
     """Return the most recent events, newest first.
@@ -267,6 +357,33 @@ def recent_events(conn: Any, limit: int = 80, event_types: Any = None) -> list[d
             pass
         out.append(item)
     return out
+
+def recent_panel_drop_rate(conn: Any, limit: int = 3) -> float | None:
+    """Mean drop_rate over the most recent `limit` reader_panel reports.
+
+    The reader panel (reader_panel.py) is the pipeline's only proxy for the
+    real-platform 追读率/弃书率 signal番茄 never exposes back to the engine. This
+    surfaces a rolling drop_rate that `should_replan` / `_effective_candidate_count`
+    can act on. Returns None when there is no panel data (panel disabled, or too
+    early), so callers can treat "no signal" distinctly from "low drop". Never
+    raises — any store/JSON-fallback failure degrades to None.
+    """
+    try:
+        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
+    except Exception:
+        return None
+    drops: list[float] = []
+    for r in rows:
+        payload = r.get("payload") if isinstance(r, dict) else None
+        if isinstance(payload, dict) and payload.get("drop_rate") is not None:
+            try:
+                drops.append(float(payload["drop_rate"]))
+            except (TypeError, ValueError):
+                continue
+    if not drops:
+        return None
+    return sum(drops) / len(drops)
+
 
 def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
     try:
@@ -406,6 +523,44 @@ def get_silent_threads(conn: Any, chapter_num: int, silence_threshold: int = 10,
             }
             for row in rows
         ]
+    except Exception:
+        return []
+
+def get_open_threads(conn: Any, chapter_num: int | None = None, limit: int = 12) -> list[dict[str, Any]]:
+    """Return currently open/active threads, prioritizing those with an
+    upcoming (or overdue) due_chapter, then the rest by recency. Used for
+    arc-level planning (rolling_plan) and structured recall.
+
+    Active = any thread not yet closed. The extraction schema marks threads
+    open|advanced|recovered|dropped; 'advanced' threads are still unresolved
+    (pushed forward this chapter), so they count as open. 'recovered' (paid
+    off) and 'dropped' (abandoned) are excluded."""
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, status, introduced_chapter, due_chapter, updated_chapter
+                   FROM open_threads
+                   WHERE status IN ('open', 'building', 'advanced')
+                   ORDER BY (due_chapter IS NULL),
+                            due_chapter ASC,
+                            updated_chapter DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = {
+                "id": row["id"],
+                "description": row["description"],
+                "status": row["status"],
+                "introduced_chapter": row["introduced_chapter"],
+                "due_chapter": row["due_chapter"],
+                "updated_chapter": row["updated_chapter"],
+            }
+            if chapter_num is not None and row["due_chapter"] is not None:
+                item["chapters_to_due"] = int(row["due_chapter"]) - chapter_num
+            out.append(item)
+        return out
     except Exception:
         return []
 
@@ -672,3 +827,239 @@ def recent_quality_feedback(paths: Paths, limit: int = 5, max_items: int = 18) -
         with _QUALITY_FEEDBACK_CACHE_LOCK:
             _QUALITY_FEEDBACK_CACHE[cache_key] = (signature, [dict(row) for row in trimmed])
     return trimmed
+
+
+# ---------------------------------------------------------------------------
+# Character relationship tracking
+# ---------------------------------------------------------------------------
+_RELATIONSHIP_STAGES = (
+    "potential", "contact", "tension", "trust",
+    "conflict", "resolution", "deepened", "broken",
+)
+
+
+def _pair_key(a: str, b: str) -> tuple[str, str, str]:
+    """Return (pair_key, char_a, char_b) with deterministic ordering."""
+    pair = tuple(sorted([a.strip(), b.strip()]))
+    return f"{pair[0]}|{pair[1]}", pair[0], pair[1]
+
+
+def upsert_relationship(
+    conn: Any, chapter_num: int, char_a: str, char_b: str,
+    stage: str = "", intensity: float | None = None,
+    label: str = "", event_desc: str = "",
+) -> None:
+    pk, ca, cb = _pair_key(char_a, char_b)
+    stage = stage if stage in _RELATIONSHIP_STAGES else ""
+    with db_lock():
+        row = conn.execute(
+            "SELECT stage, intensity, history_json FROM character_relationships WHERE pair_key=?",
+            (pk,),
+        ).fetchone()
+        if row:
+            old_stage = row["stage"]
+            old_intensity = float(row["intensity"] or 0.0)
+            history = json.loads(row["history_json"] or "[]")
+            new_stage = stage or old_stage
+            new_intensity = intensity if intensity is not None else old_intensity
+            if event_desc:
+                history.append({"ch": chapter_num, "event": event_desc[:120], "stage": new_stage})
+                history = history[-20:]
+            conn.execute(
+                """UPDATE character_relationships
+                   SET stage=?, intensity=?, label=?, last_event=?,
+                       updated_chapter=?, history_json=?
+                   WHERE pair_key=?""",
+                (new_stage, new_intensity, label or "", event_desc[:120],
+                 chapter_num, json.dumps(history, ensure_ascii=False), pk),
+            )
+        else:
+            history = []
+            if event_desc:
+                history.append({"ch": chapter_num, "event": event_desc[:120], "stage": stage or "contact"})
+            conn.execute(
+                """INSERT INTO character_relationships
+                   (pair_key, char_a, char_b, stage, intensity, label, last_event,
+                    updated_chapter, history_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (pk, ca, cb, stage or "contact", intensity or 0.0,
+                 label or "", event_desc[:120], chapter_num,
+                 json.dumps(history, ensure_ascii=False)),
+            )
+        conn.commit()
+
+
+def get_relationships(conn: Any, limit: int = 15) -> list[dict[str, Any]]:
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT pair_key, char_a, char_b, stage, intensity, label,
+                          last_event, updated_chapter, history_json
+                   FROM character_relationships
+                   ORDER BY updated_chapter DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["history"] = json.loads(item.pop("history_json", "[]"))
+            except Exception:
+                item["history"] = []
+            out.append(item)
+        return out
+    except Exception:
+        return []
+
+
+def get_stale_relationships(conn: Any, chapter_num: int, stale_threshold: int = 8, limit: int = 6) -> list[dict[str, Any]]:
+    """Relationships not updated in `stale_threshold` chapters — need advancement."""
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT pair_key, char_a, char_b, stage, intensity, last_event, updated_chapter
+                   FROM character_relationships
+                   WHERE stage NOT IN ('broken', 'resolution')
+                   AND (? - updated_chapter) >= ?
+                   ORDER BY intensity DESC LIMIT ?""",
+                (chapter_num, stale_threshold, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Information revelation tracking
+# ---------------------------------------------------------------------------
+_REVEAL_STATUSES = ("planted", "hinted", "misdirected", "partial_reveal", "revealed", "abandoned")
+
+
+def upsert_info_revelation(
+    conn: Any, chapter_num: int, revelation: dict[str, Any],
+) -> None:
+    rid = str(revelation.get("id") or f"info-ch{chapter_num}-{abs(hash(json.dumps(revelation, ensure_ascii=False))) % 100000}")
+    status = str(revelation.get("status", "planted"))
+    if status not in _REVEAL_STATUSES:
+        status = "planted"
+    with db_lock():
+        existing = conn.execute("SELECT status, hint_chapters FROM info_revelations WHERE id=?", (rid,)).fetchone()
+        if existing:
+            hints = json.loads(existing["hint_chapters"] or "[]")
+            if status == "hinted" and chapter_num not in hints:
+                hints.append(chapter_num)
+            upd = {"status": status, "hint_chapters": json.dumps(hints)}
+            if revelation.get("due_chapter"):
+                upd["due_chapter"] = int(revelation["due_chapter"])
+            if status in ("revealed", "partial_reveal"):
+                upd["revealed_chapter"] = chapter_num
+            sets = ", ".join(f"{k}=?" for k in upd)
+            conn.execute(f"UPDATE info_revelations SET {sets} WHERE id=?", (*upd.values(), rid))
+        else:
+            conn.execute(
+                """INSERT INTO info_revelations
+                   (id, description, reveal_type, status, planted_chapter,
+                    hint_chapters, due_chapter, importance, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (rid, str(revelation.get("description", ""))[:200],
+                 str(revelation.get("reveal_type", "mystery")),
+                 status, chapter_num, "[]",
+                 revelation.get("due_chapter"),
+                 int(revelation.get("importance", 5)),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+        conn.commit()
+
+
+def get_pending_revelations(conn: Any, chapter_num: int, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, reveal_type, status, planted_chapter,
+                          due_chapter, importance
+                   FROM info_revelations
+                   WHERE status IN ('planted', 'hinted', 'misdirected', 'partial_reveal')
+                   ORDER BY importance DESC, COALESCE(due_chapter, 999999) ASC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            due = item.get("due_chapter")
+            item["overdue_by"] = chapter_num - int(due) if due is not None and int(due) < chapter_num else 0
+            out.append(item)
+        return out
+    except Exception:
+        return []
+
+
+def get_overdue_revelations(conn: Any, chapter_num: int, grace: int = 5, limit: int = 6) -> list[dict[str, Any]]:
+    cutoff = chapter_num - max(0, grace)
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, status, planted_chapter, due_chapter, importance
+                   FROM info_revelations
+                   WHERE status IN ('planted', 'hinted', 'misdirected')
+                   AND due_chapter IS NOT NULL AND due_chapter < ?
+                   ORDER BY due_chapter ASC LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
+        return [
+            {**dict(row), "overdue_by": chapter_num - int(row["due_chapter"])}
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Arc history (rolling planning)
+# ---------------------------------------------------------------------------
+
+def get_current_arc(conn: Any) -> dict[str, Any] | None:
+    try:
+        with db_lock():
+            row = conn.execute(
+                "SELECT * FROM arc_history WHERE status='active' ORDER BY arc_number DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def get_arc_summaries(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        with db_lock():
+            rows = conn.execute(
+                "SELECT * FROM arc_history WHERE status='completed' ORDER BY arc_number DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def start_arc(conn: Any, arc_number: int, start_chapter: int, arc_title: str = "") -> None:
+    with db_lock():
+        conn.execute(
+            """INSERT OR REPLACE INTO arc_history(arc_number, start_chapter, arc_title, status, created_at)
+               VALUES (?, ?, ?, 'active', ?)""",
+            (arc_number, start_chapter, arc_title, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+
+
+def complete_arc(
+    conn: Any, arc_number: int, end_chapter: int, summary: str, key_outcomes: str = ""
+) -> None:
+    with db_lock():
+        conn.execute(
+            """UPDATE arc_history
+               SET end_chapter=?, summary=?, key_outcomes=?, status='completed', completed_at=?
+               WHERE arc_number=?""",
+            (end_chapter, summary, key_outcomes,
+             datetime.now().isoformat(timespec="seconds"), arc_number),
+        )
+        conn.commit()

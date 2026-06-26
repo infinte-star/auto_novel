@@ -508,6 +508,25 @@ def used_element_ledger(
     }
 
 
+def _serial_milestone_block(config: dict[str, Any], chapter_num: int) -> str:
+    """Return a planning constraint block if this chapter is a serialization milestone."""
+    serial_every = int(config["novel"].get("serial_milestone_every", 10))
+    free_to_paid = int(config["novel"].get("serial_free_to_paid_chapter", 0))
+    is_milestone = serial_every > 0 and chapter_num > 0 and chapter_num % serial_every == 0
+    is_paywall = free_to_paid > 0 and chapter_num == free_to_paid
+    if not is_milestone and not is_paywall:
+        return ""
+    label = "付费转化章" if is_paywall else f"连载里程碑（每{serial_every}章）"
+    return (
+        f"## 连载节奏：{label}（硬性——本章是读者留存的关键节点）\n"
+        f"- 本章必须包含至少一个强力爽点/反转/揭示/情感高潮，不得纯铺垫。\n"
+        f"- hook 字段必须是全书级别的强悬念，让读者非追读不可。\n"
+        f"- payoff_type 不得为 strategic_setup；必须给读者一个实质性的兑现。\n"
+        f"- 章末的 hook_strength 目标 ≥ 8（比普通章节更高）。\n"
+        f"{'- 这是免费→付费转化章：读者在此决定是否花钱。必须让这一章成为全书到目前为止最精彩的一章。' + chr(10) if is_paywall else ''}\n"
+    )
+
+
 def generate_candidate_plans(
     client: OpenAI,
     paths: Paths,
@@ -529,6 +548,59 @@ def generate_candidate_plans(
     overdue_promises = get_overdue_reader_promises(conn, chapter_num, grace=promise_grace)
     active_promises = get_reader_promises(conn, chapter_num, limit=12)
     carried_over_risks = _carried_over_risks_from_prev(paths, chapter_num)
+    # Character relationships, info revelations, emotional cadence, reader panel alerts
+    relationships_block = "None"
+    stale_rels_block = "None"
+    try:
+        from store import get_relationships, get_stale_relationships
+        rels = get_relationships(conn, limit=12)
+        if rels:
+            relationships_block = json.dumps(
+                [{k: v for k, v in r.items() if k != "history"} for r in rels],
+                ensure_ascii=False, indent=2)
+        stale = get_stale_relationships(conn, chapter_num, stale_threshold=8)
+        if stale:
+            stale_rels_block = json.dumps(stale, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    info_rev_block = "None"
+    overdue_rev_block = "None"
+    try:
+        from store import get_pending_revelations, get_overdue_revelations
+        pending = get_pending_revelations(conn, chapter_num, limit=8)
+        if pending:
+            info_rev_block = json.dumps(pending, ensure_ascii=False, indent=2)
+        overdue = get_overdue_revelations(conn, chapter_num, grace=5)
+        if overdue:
+            overdue_rev_block = json.dumps(overdue, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    emotional_cadence_block = ""
+    try:
+        from quality import emotional_cadence as _ec
+        tone_rows = recent_metrics(conn, 6)
+        tones = [str(r.get("emotional_tone", "")) for r in reversed(tone_rows) if r.get("emotional_tone")]
+        ec = _ec(tones, config)
+        if ec.get("directives"):
+            emotional_cadence_block = "\n".join(ec["directives"])
+    except Exception:
+        pass
+    panel_alert_block = ""
+    try:
+        from checkpoint import load_checkpoint as _lc
+        if chapter_num > 1:
+            alert = _lc(paths, chapter_num - 1, "panel_alert.json")
+            if isinstance(alert, dict) and alert.get("drop_rate", 0) > 0:
+                reasons = "；".join(alert.get("drop_reasons", [])[:3])
+                panel_alert_block = (
+                    f"## 读者面板紧急警报（上一章 Ch{chapter_num - 1}）\n"
+                    f"弃读率：{alert['drop_rate']:.0%}，严重等级：{alert.get('severity', 'high')}\n"
+                    f"弃书原因：{reasons}\n"
+                    f"本章必须做出根本性调整以挽回读者——不要延续上章的节奏/模式/情感基调。\n"
+                    f"必须包含：强爽点 或 情感冲击 或 关键揭示 或 关系突破。\n"
+                )
+    except Exception:
+        pass
     mem = cached_memory or memory_context(paths, conn, config)
     # Whole-book beat scheduler: locate this chapter against the volume_plan
     # milestones so the planner is told which payoff/高潮 should land around now.
@@ -650,6 +722,13 @@ def generate_candidate_plans(
                 narrative_pattern_block = json.dumps(seqs, ensure_ascii=False)
         except Exception:
             narrative_pattern_block = "None"
+    fingerprint_block = "None"
+    if bool(config["novel"].get("fingerprint_enabled", True)):
+        try:
+            from quality import fingerprint_avoidance_context
+            fingerprint_block = fingerprint_avoidance_context(conn, config)
+        except Exception:
+            fingerprint_block = "None"
     quality_threshold = float(config["novel"].get("quality_threshold", 8.0))
     dimension_floor = float(config["novel"].get("prewrite_dimension_floor", max(7.2, quality_threshold - 0.3)))
     base_user = f"""## 记忆
@@ -669,8 +748,8 @@ def generate_candidate_plans(
 ## 近期质量反馈JSON（必须修复，不得重复）
 {json.dumps(quality_feedback, ensure_ascii=False, indent=2) if quality_feedback else "None"}
 
-## 首稿质量前置门槛（必须落实到本章大纲，而不是留给正文重写）
-- 目标：后续首稿总分达到 {quality_threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。把它们逐一落到字段上：readthrough→hook 要让读者非看下一章不可；payoff→必须是挣来的、可拍的兑现；novelty→location/info_source/payoff_type 相对近期要换新；prose→beats 用完整长句、控破折号；continuity→risk 字段写明本章如何不踩时间线/物流/能力越界。
+{_serial_milestone_block(config, chapter_num)}## 首稿质量前置门槛（必须落实到本章大纲，而不是留给正文重写）
+- 目标：后续首稿总分达到 {quality_threshold:.1f}+；readthrough/payoff/novelty/prose/continuity/emotional_impact 六个维度都不得低于 {dimension_floor:.1f}。把它们逐一落到字段上：readthrough→hook 要让读者非看下一章不可；payoff→必须是挣来的、可拍的兑现；novelty→location/info_source/payoff_type 相对近期要换新；prose→beats 用完整长句、控破折号；continuity→risk 字段写明本章如何不踩时间线/物流/能力越界；emotional_impact→本章必须有至少一个让读者产生真实情感反应的场景（不是形容词堆砌，而是通过具体行为和选择挣来的情感时刻）。
 - goal/conflict/payoff/hook 必须分别回答：本章推进什么、谁阻碍、读者得到什么、为什么要看下一章。
 - 至少一个 beat 必须正面修复"近期质量反馈JSON"里的具体问题；若反馈为空，也必须避免重复近期场景骨架。
 - （system 已说明可落地性与文体硬约束；下面是本书题材的专项落地要求）
@@ -706,6 +785,22 @@ def generate_candidate_plans(
 ## 近期叙事流程骨架（硬性·防审美疲劳：下列是最近几章的抽象推进流程，如 enter_space→collect_evidence→compare_data→deduce_conclusion。本章绝对不能再走一遍同样形状的线性流程——哪怕换了取证对象，读者仍会感到"上一章看过了"。必须改变章节的叙事驱动力：用人物对峙/外部威胁/时间压力来推进，或调整信息揭示顺序——先抛结论再倒查、让对手先行动、把推理拆散到对话里，而不是静态地"进入→取证→比对→推理"）
 {narrative_pattern_block}
 
+## 全书结构指纹库（硬性·防全局重复：下列是本书所有已完成章节的叙事流程指纹。与"近期叙事流程骨架"仅覆盖最近3章不同，这里是全书累积记录。本章必须与全部历史章节在叙事驱动力和信息揭示顺序上有可见区别——特别是那些高频出现的流程组合）
+{fingerprint_block}
+
+## 角色关系状态（pair_key=角色对，stage=阶段，intensity=亲密度/紧张度0-10）
+{relationships_block}
+
+## 停滞的角色关系（这些关系长期未推进，本章应让其中至少一对有可见变化——哪怕是一个微妙的态度转变或一次有新信息量的对话）
+{stale_rels_block}
+
+## 信息/秘密/谜团揭示计划（status: planted=已埋→hinted=已给线索→revealed=已揭晓。本章可以推进其中 1-2 条的状态）
+{info_rev_block}
+
+## 逾期未揭示的信息（硬性：这些谜团/秘密已过了计划揭示时间，本章必须至少推进或揭示其中一条）
+{overdue_rev_block}
+
+{panel_alert_block}{f"## 情感节奏警告{chr(10)}{emotional_cadence_block}{chr(10)}" if emotional_cadence_block else ""}
 {beat_block}
 
 ## 上章结尾
@@ -715,8 +810,13 @@ def generate_candidate_plans(
 为第 {chapter_num} 章生成候选大纲。
 避免近期重复。保留因果债务。提升读者追读欲。
 若上方存在沉默伏线，大纲必须在 beats/thread_actions 中推进其中之一，或在 "risk" 中明确说明为何本章均不可行。
-若 "节奏诊断JSON" 报告了爽点拖欠警告（chapters_since_payoff >= payoff_max_gap），本章的 payoff_type 必须是一个具体的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），而非 strategic_setup 或 emotional。"""
-    from config import is_final_chapter
+若 "节奏诊断JSON" 报告了爽点拖欠警告（chapters_since_payoff >= payoff_max_gap），本章的 payoff_type 必须是一个具体的读者兑现（court_breakthrough/policy_payoff/military_victory/reveal/reversal/personnel_payoff/institutional_fix），而非 strategic_setup 或 emotional。
+若上方有停滞的角色关系，本章的 beats 中至少安排一个推动关系变化的具体场景（不是旁白交代，而是通过对话/行为/冲突让关系发生可见转变）。
+若上方有逾期未揭示的信息/谜团，本章必须至少推进一条的状态（给出新线索/部分揭示/全面揭示）。
+必须在大纲中包含 "relationship_beats" 字段：列出本章要推进的角色关系对和目标变化方向。
+必须在大纲中包含 "info_reveals" 字段：列出本章计划揭示/推进的信息条目id。"""
+    from config import is_final_chapter, ending_zone_distance
+    _ending_remaining = ending_zone_distance(config, chapter_num)
     if is_final_chapter(config, chapter_num):
         base_user += """
 
@@ -728,6 +828,15 @@ def generate_candidate_plans(
 - 严禁引入任何新人物、新势力、新案件、新悬念、新危机、新反转钩子；终章只收束已有元素。
 - "hook" 字段不再是抛给读者的新悬念，而是一句收束/余韵/主题升华；严禁以全新未解决危机作结。
 - beats 的最后 1-2 拍必须落在"结局兑现 + 情绪落点"，而非开启新冲突。"""
+    elif _ending_remaining is not None:
+        base_user += f"""
+
+## 收束区要求（距全书结局仅剩 {_ending_remaining} 章，规划硬性约束）
+- 停止开新坑：本章 beats/thread_actions 不得引入新的重大线索、新势力、新谜团；只允许推进与兑现已有伏线。
+- 汇流主线：本章必须正面推进或兑现至少 1 条关键 open thread，向全书核心矛盾的总爆发汇聚。
+- payoff_type 倾向收束型兑现（reveal/reversal/personnel_payoff/institutional_fix），避免 strategic_setup。
+- relationship_beats / info_reveals 优先选择"接近收尾"的关系对与谜团，而非新铺设。
+- hook 转为"既有矛盾收紧/摊牌临近"的收口张力，而非抛出新危机。"""
     else:
         from config import narrative_mode
         mode = narrative_mode(config)
@@ -800,6 +909,15 @@ def generate_candidate_plans(
                 base_user += "\n\n" + ch
         except Exception:
             pass
+    # Platform golden-finger constraints (免费流偏好简单/有代价的金手指；Gap-5).
+    # Silent no-op (returns "") for non-free presets, so long-line体系文 unaffected.
+    try:
+        from benchmark import platform_golden_finger
+        gf = platform_golden_finger(config)
+        if gf:
+            base_user += "\n\n" + gf
+    except Exception:
+        pass
     num_candidates = int(num_candidates_override) if num_candidates_override else int(config["novel"]["candidate_plans"])
     max_workers = int(config["novel"].get("max_parallel_workers", 5))
     # Temperature spread across candidates. A wider spread is the cheapest lever
@@ -1314,6 +1432,20 @@ def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> f
             return safe_score(score.get("score", 0))
     return safe_score(scores[0].get("score", 0))
 
+def _recovery_active(paths: Paths, chapter_num: int) -> bool:
+    """True when a mid-book degradation recovery directive (written by
+    pipeline._detect_quality_degradation) is still in force for this chapter."""
+    try:
+        from config import read_text as _read_text
+        cache = paths.logs_dir / "recovery_directive.json"
+        if not cache.exists():
+            return False
+        data = json.loads(_read_text(cache))
+        return chapter_num <= int(data.get("active_until", 0))
+    except Exception:
+        return False
+
+
 def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: int, paths: Paths) -> int:
     """Risk-adaptive candidate-plan count.
 
@@ -1334,6 +1466,14 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
     if base <= 1 or chapter_num <= 2:
         return base
 
+    # Recovery mode (mid-book degradation alert): force full candidate breadth
+    # for the recovery window — plan diversity is exactly what breaks a slide.
+    if _recovery_active(paths, chapter_num):
+        full = int(config["novel"]["candidate_plans"])
+        log(paths, f"Recovery upshift Ch{chapter_num}: degradation recovery mode "
+            f"active — keeping full candidate breadth ({full}).")
+        return full
+
     window = int(config["novel"].get("adaptive_downshift_window", 10))
     rows = recent_metrics(conn, window)
 
@@ -1353,6 +1493,17 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
         if pens and max(pens) >= pen_cut:
             risky = True
             reasons.append(f"max_style_penalty={max(pens):.1f}>={pen_cut}")
+    # Reader-panel retention proxy (Gap-7): a high recent simulated drop_rate is a
+    # collapse signal — restore full candidate breadth, plan diversity recovers it.
+    if bool(config["novel"].get("reader_panel_enabled", False)):
+        try:
+            from store import recent_panel_drop_rate
+            drop = recent_panel_drop_rate(conn, int(config["novel"].get("reader_panel_replan_window", 3)))
+            if drop is not None and drop >= float(config["novel"].get("reader_panel_upshift_drop", 0.5)):
+                risky = True
+                reasons.append(f"panel_drop_rate={drop:.2f}")
+        except Exception:
+            pass
     if risky:
         if base < int(config["novel"]["candidate_plans"]):
             base = int(config["novel"]["candidate_plans"])

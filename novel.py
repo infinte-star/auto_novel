@@ -32,6 +32,17 @@ import sys
 import time
 from pathlib import Path
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 PROJECT_DIR = Path(__file__).resolve().parent
 NOVELS_DIR = PROJECT_DIR / "novels"
 CONFIG_TEMPLATE = PROJECT_DIR / "config_template.yaml"
@@ -559,6 +570,7 @@ def cmd_run(name: str, foreground: bool) -> int:
         # The old table parser grabbed the first all-digit column (Handles),
         # writing a bogus small PID into run.pid; `stop` then trusted that PID,
         # killed the wrong/nonexistent process, and left the real worker alive.
+        os.environ["PYTHONIOENCODING"] = "utf-8"
         ps_command = (
             "(Start-Process "
             f"-FilePath '{python}' "
@@ -602,9 +614,11 @@ def cmd_run(name: str, foreground: bool) -> int:
         log_fp.write(
             f"\n\n========== novel run {name} @ {time.strftime('%Y-%m-%d %H:%M:%S')} ==========\n".encode()
         )
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
         proc = subprocess.Popen(
             [python, "-u", entry, "run", name, "--foreground"],
-            cwd=str(PROJECT_DIR),
+            cwd=str(PROJECT_DIR), env=env,
             stdin=subprocess.DEVNULL, stdout=log_fp, stderr=subprocess.STDOUT,
             start_new_session=True, close_fds=True,
         )
@@ -811,6 +825,106 @@ def kill_pids(pids: list[int]) -> None:
                 pass
             except Exception:
                 pass
+
+
+def cmd_import_style(name: str, sources: list[str], merge: bool = False) -> int:
+    _validate_name(name)
+    novel_dir = NOVELS_DIR / name
+    if not novel_dir.exists():
+        print(f"[novel] directory novels/{name}/ does not exist. Run 'create {name}' first.")
+        return 2
+    sample_paths = []
+    for src in sources:
+        p = Path(src).resolve()
+        if p.is_dir():
+            sample_paths.extend(sorted(p.glob("*.txt")) + sorted(p.glob("*.md")))
+        elif p.exists():
+            sample_paths.append(p)
+        else:
+            print(f"[novel] WARNING: source not found: {src}")
+    if not sample_paths:
+        print("[novel] no valid source files found.")
+        return 2
+    print(f"[novel] analyzing {len(sample_paths)} file(s): {', '.join(p.name for p in sample_paths[:5])}{'...' if len(sample_paths) > 5 else ''}")
+    config_path = novel_dir / "config.yaml"
+    os.environ["NOVEL_CONFIG"] = str(config_path)
+    os.environ["NOVEL_PROMPT"] = str(novel_dir / "prompt.md")
+    from config import load_config, get_paths
+    config = load_config()
+    paths = get_paths(config)
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError:
+        print("[novel] missing dependency: pip install openai")
+        return 2
+    from config import configured_api_endpoints
+    import httpx
+    api_endpoints, _ = configured_api_endpoints(config)
+    if not api_endpoints:
+        print("[novel] no API endpoints configured.")
+        return 2
+    base_url, api_key = api_endpoints[0]
+    client = OpenAI(base_url=base_url, api_key=api_key,
+                    timeout=httpx.Timeout(connect=15, read=180, write=15, pool=15))
+    from simulate import analyze_samples, save_style_profile, load_style_profile
+    profile = analyze_samples(client, paths, config, sample_paths)
+    if not profile:
+        print("[novel] style analysis returned empty result.")
+        return 1
+    if merge:
+        existing = load_style_profile(paths)
+        if existing:
+            for key in ("signature_devices", "anti_patterns", "hook_types"):
+                merged_list = list(existing.get(key, []))
+                for item in profile.get(key, []):
+                    if item not in merged_list:
+                        merged_list.append(item)
+                profile[key] = merged_list
+            for key in ("prose_structure", "dialogue_style", "sentence_rhythm",
+                        "pov_and_tense", "imagery", "pacing", "vocabulary_notes"):
+                if not profile.get(key) and existing.get(key):
+                    profile[key] = existing[key]
+            profile["source_files"] = list(set(existing.get("source_files", []) + profile.get("source_files", [])))
+    out = save_style_profile(paths, profile)
+    print(f"[novel] style profile saved to {out}")
+    print(f"[novel] enable with: style_simulation_enabled: true in config.yaml")
+    return 0
+
+
+def cmd_simulate(name: str, prompt: str = "写一段约500字的示范段落", tokens: int = 4000) -> int:
+    _validate_name(name)
+    novel_dir = NOVELS_DIR / name
+    if not novel_dir.exists():
+        print(f"[novel] directory novels/{name}/ does not exist.")
+        return 2
+    config_path = novel_dir / "config.yaml"
+    os.environ["NOVEL_CONFIG"] = str(config_path)
+    os.environ["NOVEL_PROMPT"] = str(novel_dir / "prompt.md")
+    from config import load_config, get_paths
+    config = load_config()
+    paths = get_paths(config)
+    from simulate import load_style_profile
+    if not load_style_profile(paths):
+        print("[novel] no style profile found. Run 'import-style' first.")
+        return 2
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError:
+        print("[novel] missing dependency: pip install openai")
+        return 2
+    from config import configured_api_endpoints
+    import httpx
+    api_endpoints, _ = configured_api_endpoints(config)
+    if not api_endpoints:
+        print("[novel] no API endpoints configured.")
+        return 2
+    base_url, api_key = api_endpoints[0]
+    client = OpenAI(base_url=base_url, api_key=api_key,
+                    timeout=httpx.Timeout(connect=15, read=180, write=15, pool=15))
+    from simulate import generate_sample_text
+    text = generate_sample_text(client, paths, config, prompt=prompt, max_tokens=tokens)
+    print("\n" + text)
+    return 0
 
 
 def cmd_stop(name: str) -> int:
@@ -1352,6 +1466,16 @@ def main() -> int:
     p_distill.add_argument("--genre", default=None, help="filter by genre (or '_all' for no filter)")
     p_distill.add_argument("--min-novels", type=int, default=3, dest="min_novels", help="min novels co-occurring for a rule (default 3)")
 
+    p_import_style = sub.add_parser("import-style", help="analyze reference texts to build a style profile")
+    p_import_style.add_argument("name")
+    p_import_style.add_argument("sources", nargs="+", help="paths to reference .txt/.md files")
+    p_import_style.add_argument("--merge", action="store_true", help="merge with existing profile instead of replacing")
+
+    p_simulate = sub.add_parser("simulate", help="generate a test passage using the style profile")
+    p_simulate.add_argument("name")
+    p_simulate.add_argument("--prompt", default="写一段约500字的示范段落，展示该风格特征")
+    p_simulate.add_argument("--tokens", type=int, default=4000)
+
     p_stop = sub.add_parser("stop", help="kill the running process for a novel")
     p_stop.add_argument("name")
 
@@ -1403,6 +1527,10 @@ def main() -> int:
             return cmd_telemetry_stats(genre=args.genre)
     if args.command == "distill":
         return cmd_distill(output=args.output, genre=args.genre, min_novels=args.min_novels)
+    if args.command == "import-style":
+        return cmd_import_style(args.name, args.sources, merge=args.merge)
+    if args.command == "simulate":
+        return cmd_simulate(args.name, prompt=args.prompt, tokens=args.tokens)
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from checkpoint import (
     CHAPTER_CURRENT_CHECKPOINT,
@@ -18,6 +30,7 @@ from config import (
     configured_api_endpoints,
     configured_api_endpoints_with_models,
     configured_review_endpoints,
+    configured_role_endpoints,
     count_chars,
     ensure_project,
     find_last_chapter,
@@ -31,6 +44,7 @@ from config import (
     rebuild_book,
     safe_score,
     tail_text,
+    write_text,
 )
 from llm import LLMClientPool
 from memory import bootstrap, cacheable_prefix, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
@@ -374,6 +388,14 @@ def write_chapter_with_candidates(
 
     if len(valid) == 1:
         idx, text = valid[0]
+        if bool(config["novel"].get("em_dash_reduce_enabled", True)):
+            try:
+                from quality import style_health as _sh1, reduce_em_dash_density as _red1
+                _m1 = _sh1(text, config)
+                if float(_m1.get("metrics", {}).get("em_dash_per_kchar", 0)) > float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0)):
+                    text = _red1(text, config)
+            except Exception:
+                pass
         log(paths, f"Only 1/{n} valid draft for Ch{chapter_num} idx={idx}; skipping comparative review")
         return text, None
 
@@ -390,6 +412,18 @@ def write_chapter_with_candidates(
 
     def review_one(item: tuple[int, str]) -> tuple[int, str, dict[str, Any]]:
         idx, text = item
+        # Pre-review em-dash reduction: clean the text before scoring so the
+        # style_health penalty reflects the final saved version, not the raw draft.
+        if bool(config["novel"].get("em_dash_reduce_enabled", True)):
+            try:
+                from quality import style_health as _sh_pre, reduce_em_dash_density as _red_pre
+                _sh_m = _sh_pre(text, config)
+                _em_d = float(_sh_m.get("metrics", {}).get("em_dash_per_kchar", 0))
+                _em_tgt = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
+                if _em_d > _em_tgt:
+                    text = _red_pre(text, config)
+            except Exception:
+                pass
         try:
             report = review_chapter(client, paths, conn, config, chapter_num, plan, text, tail, cached_memory=cached_memory, chapter_aux_cache=_aux)
         except Exception as exc:
@@ -512,9 +546,99 @@ def _build_replan_feedback(review: dict[str, Any]) -> str:
                 f"- 质量门作废（逐字复述上一章，clause_overlap={m.get('clause_overlap')}）："
                 "新稿必须从上一章结尾之后的【新】事件写起，上一章场景至多一句带过。"
             )
+        elif gate == "book_wide_fossils":
+            phrases = "、".join(str(p) for p in (g.get("phrases") or [])[:8])
+            lines.append(
+                f"- 质量门作废（全书微动作化石，{g.get('count')} 处）：以下片段已僵化为机械口癖、"
+                f"贯穿全书反复出现，新稿必须换用不同动作落点与句式，严禁复现：{phrases}"
+            )
         for d in (g.get("directives") or [])[:2]:
             lines.append(f"- 质量门指令：{str(d)[:160]}")
     return "\n".join(lines) if lines else ""
+
+
+def _detect_quality_degradation(
+    paths: Paths, conn: Any, config: dict[str, Any], chapter_num: int
+) -> dict[str, Any] | None:
+    """Mid-book quality-collapse early warning.
+
+    The circuit breaker only fires after 2 consecutive chapters are force-accepted
+    below 6.0 — by then the book is already broken (dushi_nuelian rode a -2.5 slide
+    from Ch11 to a Ch41 score of 1.0). This detector catches the DOWNWARD TREND
+    early and writes a recovery directive (consumed by the writer prompt and the
+    planning candidate-count upshift) so the engine RECOVERS instead of HALTS.
+
+    Returns the recovery directive dict when degradation is detected, else None.
+    """
+    cfg = config["novel"]
+    if not bool(cfg.get("degradation_alert_enabled", True)):
+        return None
+    window = int(cfg.get("degradation_window", 4))
+    # Warmup: never fire before there is a stable early baseline to fall from.
+    if chapter_num < window + int(cfg.get("degradation_warmup", 2)):
+        return None
+    from store import recent_metrics
+    rows = recent_metrics(conn, window)
+    if len(rows) < window:
+        return None
+    rows = sorted(rows, key=lambda r: int(r.get("chapter", 0)))  # oldest→newest
+    scores = [safe_score(r.get("score", 0)) for r in rows]
+    penalties = [float(r.get("style_penalty", 0) or 0) for r in rows]
+    avg = sum(scores) / len(scores)
+
+    triggers: list[str] = []
+    if avg < float(cfg.get("degradation_alert_score", 7.3)):
+        triggers.append(f"近{window}章均分{avg:.1f}")
+    if len(scores) >= 3 and scores[-1] < scores[-2] < scores[-3]:
+        drop = scores[-3] - scores[-1]
+        if drop >= float(cfg.get("degradation_alert_drop", 1.0)):
+            triggers.append(f"连续3章下滑累计{drop:.1f}")
+    if penalties and (sum(penalties) / len(penalties)) >= 1.0:
+        triggers.append(f"文体惩罚均值{sum(penalties) / len(penalties):.1f}")
+    if not triggers:
+        return None
+
+    return {
+        "chapter": chapter_num,
+        "active_until": chapter_num + int(cfg.get("degradation_recovery_chapters", 3)),
+        "reason": "；".join(triggers),
+        "avg_score": round(avg, 2),
+        "directive": (
+            "质量恢复模式：近几章质量持续下滑。本章起回到前期的叙事密度与文体节奏，"
+            "停止堆砌技术名词/伪科学概念/重复的身体代价描写；每一段都必须有新信息或冲突推进，"
+            "对白要承担推进作用，避免空转的内心独白与环境堆砌。"
+        ),
+    }
+
+
+def _recent_replan_ineffective(paths: Paths, chapter_num: int, config: dict[str, Any]) -> bool:
+    """True when the last `replan_max_attempts` structural replans (with a
+    measured before/after) all gained less than `replan_min_gain`.
+
+    gudai50_v2 burned $88.9 / 30 structural_diagnose calls largely on marginal
+    chapters where replan repeatedly 'did not improve'. When the book's recent
+    replans are not paying off, the ROI breaker stops throwing a full
+    diagnose+replan+N-draft cycle at a chapter that is only marginally short, and
+    accepts the best draft with quality debt instead.
+    """
+    n = int(config["novel"].get("replan_max_attempts", 2))
+    if n <= 0:
+        return False
+    min_gain = float(config["novel"].get("replan_min_gain", 0.3))
+    seen = 0
+    for ch in range(chapter_num - 1, 0, -1):
+        d = load_checkpoint(paths, ch, "quality_replan_done.json")
+        if not isinstance(d, dict):
+            continue
+        sb, sa = d.get("score_before"), d.get("score_after")
+        if sb is None or sa is None:
+            continue  # local-route / roi-stop entries carry no before/after
+        seen += 1
+        if (safe_score(sa) - safe_score(sb)) >= min_gain:
+            return False  # a recent replan DID work — keep trying
+        if seen >= n:
+            return True
+    return False
 
 
 def _apply_force_accept_patches(
@@ -652,6 +776,26 @@ def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> 
     cvs = review.get("contract_violations") or []
     if cvs and not has_patches:
         return "structural", "存在契约违约且无可定位补丁"
+
+    # Style collapse (em-dash / fragment / telegraphic shorts) is a PROSE-level
+    # habit, NOT a scene-design flaw — replanning the outline rewrites the same
+    # drifted voice and cannot fix it. The deterministic style_health gate catches
+    # the collapse even when the LLM reviewer (whose own voice has drifted with the
+    # prose) self-reports the style as fine and therefore emits NO patches. Without
+    # this branch such a chapter hits the "no patches → structural" fallback below
+    # and burns an expensive full replan that does not improve the style (observed:
+    # gudai50_v2 Ch20-24, em 6.6→8.8 for 5 chapters, every replan "did not improve").
+    # Route it to a LOCAL fix so revise_chapter's de-em-dash rewrite (REVISE_SYSTEM
+    # 文风塌缩禁令) actually runs on the working scene. Only when the content
+    # dimensions are otherwise healthy (no non-prose dimension is weak) — a genuine
+    # multi-dimension shortfall already returned structural above.
+    sh = review.get("style_health") if isinstance(review, dict) else None
+    sh_penalty = safe_score(sh.get("penalty", 0)) if isinstance(sh, dict) else 0.0
+    if sh_penalty > 0 and not weak_nonprose:
+        return "local", (
+            f"文体塌缩（style_penalty={sh_penalty:.1f}，破折号/碎句），内容各维度健康"
+            "—prose 级问题，走定向改写而非结构重做"
+        )
 
     # Otherwise: single weak dimension and/or style collapse with patches available.
     if has_patches:
@@ -1117,6 +1261,31 @@ def generate_one_chapter(
                     # the force-accept/debt block below (no full replan for local).
                     raise _LocalFixDone()
 
+                # ROI breaker: skip the expensive structural replan when (a) there
+                # is no hard deterministic gate-reject (those MUST be redone), (b)
+                # the shortfall is only marginal, and (c) the book's recent replans
+                # have not been improving. Accept the best draft with quality debt.
+                roi_margin = float(config["novel"].get("replan_roi_skip_margin", 0.7))
+                if (
+                    bool(config["novel"].get("replan_roi_breaker_enabled", True))
+                    and not review.get("gate_rejects")
+                    and safe_score(review.get("score", 0)) >= threshold - roi_margin
+                    and _recent_replan_ineffective(paths, chapter_num, config)
+                ):
+                    log(
+                        paths,
+                        f"Replan ROI stop Ch{chapter_num}: recent replans ineffective and "
+                        f"shortfall marginal (score={review.get('score')}/{threshold}); "
+                        f"accepting best draft with quality debt to save cost.",
+                    )
+                    db_event(conn, chapter_num, "replan_roi_stop", {
+                        "score": review.get("score"),
+                        "threshold": threshold,
+                    })
+                    save_checkpoint(paths, chapter_num, "quality_replan_done.json",
+                                    {"route": "roi_stop", "score_after": review.get("score")})
+                    raise _LocalFixDone()
+
                 log(
                     paths,
                     f"Quality replan Ch{chapter_num}: best score={review.get('score')}/10 below threshold={threshold}",
@@ -1545,6 +1714,25 @@ def generate_one_chapter(
                     save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
             except Exception as exc:
                 log(paths, f"Chapter title refine failed (non-fatal) Ch{chapter_num}: {exc}")
+        # Last-mile em-dash remediation: the revise_chapter path has its own
+        # em-dash layers, but structural-failure replans skip revise entirely.
+        # Apply programmatic reduction here so every chapter is cleaned before save.
+        if bool(config["novel"].get("em_dash_reduce_enabled", True)):
+            try:
+                from quality import style_health as _sh_final, reduce_em_dash_density as _reduce_em
+                _sh_f = _sh_final(chapter, config)
+                _em_f = float(_sh_f.get("metrics", {}).get("em_dash_per_kchar", 0))
+                _em_tgt = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
+                if _em_f > _em_tgt:
+                    _before = chapter.count("——")
+                    chapter = _reduce_em(chapter, config)
+                    _after = chapter.count("——")
+                    if _before != _after:
+                        log(paths, f"Pre-save em-dash reduction Ch{chapter_num}: {_before}->{_after} dashes, {_em_f:.1f}/k")
+                        save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
+            except Exception as exc:
+                log(paths, f"Pre-save em-dash reduction failed (non-fatal) Ch{chapter_num}: {exc}")
+
         if chapter_path(paths, chapter_num).exists():
             log(paths, f"Chapter file already exists Ch{chapter_num}; skipping duplicate save")
             # book.md is normally append-built by save_chapter, so it is already
@@ -1651,6 +1839,12 @@ def generate_one_chapter(
             if not load_checkpoint(paths, chapter_num, "chapter_completed.json"):
                 db_event(conn, chapter_num, "chapter_completed", {"review": review, "plan": plan, "decision": decision})
                 save_checkpoint(paths, chapter_num, "chapter_completed.json", {"done": True})
+    if bool(config["novel"].get("fingerprint_enabled", True)):
+        try:
+            from quality import store_chapter_fingerprint
+            store_chapter_fingerprint(conn, chapter_num, plan)
+        except Exception:
+            pass
     log(paths, f"Saved and indexed Ch{chapter_num}")
 
     # Log prompt-cache effectiveness per chapter for monitoring.
@@ -1752,6 +1946,15 @@ def generate_one_chapter(
             background.submit(f"memory_compress_ch{chapter_num}", _do_memory_compress)
         if run_replan:
             background.submit(f"adaptive_replan_ch{chapter_num}", _do_replan)
+        if bool(config["novel"].get("rolling_plan_enabled", False)):
+            def _do_rolling_plan() -> None:
+                try:
+                    from rolling_plan import maybe_roll_plan
+                    if maybe_roll_plan(client, paths, conn, config, chapter_num):
+                        log(paths, f"Rolling plan: arc rolled at Ch{chapter_num}")
+                except Exception as exc:
+                    log(paths, f"Rolling plan failed (non-fatal) Ch{chapter_num}: {exc}")
+            background.submit(f"rolling_plan_ch{chapter_num}", _do_rolling_plan)
 
         # Prefetch the next N chapters' plans so the main loop's planning
         # phase resumes from a cached validated_plan.json. Gate each prefetch
@@ -1822,6 +2025,13 @@ def generate_one_chapter(
             _do_memory_compress()
         if run_replan:
             _do_replan()
+        if bool(config["novel"].get("rolling_plan_enabled", False)):
+            try:
+                from rolling_plan import maybe_roll_plan
+                if maybe_roll_plan(client, paths, conn, config, chapter_num):
+                    log(paths, f"Rolling plan: arc rolled at Ch{chapter_num}")
+            except Exception as exc:
+                log(paths, f"Rolling plan failed (non-fatal) Ch{chapter_num}: {exc}")
 
 def main() -> None:
     config = load_config()
@@ -1868,29 +2078,30 @@ def main() -> None:
     )
     log(paths, f"LLM client pool initialized keys={len(clients)} primary={primary_endpoint_count}")
 
-    # Reviewer routing: when api.review_base_url is configured, build a separate
-    # client pool for the reviewer model (e.g. GPT) and attach it to the primary
-    # client. call_llm picks it up via getattr for tags in llm.REVIEW_TAGS, so
-    # scoring/review calls go to the reviewer while writing/planning/memory stay
-    # on the primary model. No review_* config => nothing attached => unchanged.
-    review_endpoints = configured_review_endpoints(config)
-    if review_endpoints:
-        review_clients = [
-            OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout, default_headers=default_headers or None)
-            for base_url, api_key in review_endpoints
-        ]
-        review_pool: Any = (
-            LLMClientPool(review_clients, endpoints=review_endpoints, log_fn=lambda msg: log(paths, msg))
-            if len(review_clients) > 1
-            else review_clients[0]
-        )
-        setattr(client, "review_pool", review_pool)
-        setattr(client, "review_api", config["api"])
-        log(
-            paths,
-            f"Reviewer pool initialized model={config['api'].get('review_model')} "
-            f"endpoints={len(review_clients)}",
-        )
+    # Per-role model routing: each role (review, planning, writing, extraction)
+    # can have its own model+endpoint. Build a separate client pool for each
+    # configured role and attach it to the primary client. call_llm picks them
+    # up via getattr for tags in the role's tag set. Unconfigured roles fall
+    # through to the primary model (backward compatible).
+    for _role in ("review", "planning", "writing", "extraction"):
+        _role_endpoints = configured_role_endpoints(config, _role)
+        if _role_endpoints:
+            _role_clients = [
+                OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout, default_headers=default_headers or None)
+                for base_url, api_key in _role_endpoints
+            ]
+            _role_pool: Any = (
+                LLMClientPool(_role_clients, endpoints=_role_endpoints, log_fn=lambda msg: log(paths, msg))
+                if len(_role_clients) > 1
+                else _role_clients[0]
+            )
+            setattr(client, f"{_role}_pool", _role_pool)
+            setattr(client, f"{_role}_api", config["api"])
+            log(
+                paths,
+                f"{_role.title()} pool initialized model={config['api'].get(f'{_role}_model')} "
+                f"endpoints={len(_role_clients)}",
+            )
 
     # Pre-flight: if a prior bootstrap run left partial artifacts (state.md
     # exists but is too short, contains the placeholder sentinel, or any
@@ -2100,6 +2311,21 @@ def main() -> None:
             last_written = find_last_chapter(paths)  # refresh once after write
             total = count_chars(paths.book)
             log(paths, f"Progress chars={total}/{target} pct={total / target * 100:.2f}%")
+            # Mid-book degradation early-warning: catch the downward slide BEFORE
+            # the circuit breaker has to halt the book. Persists a recovery
+            # directive read by the next chapter's writer prompt + planning upshift.
+            try:
+                import json as _json
+                deg = _detect_quality_degradation(paths, conn, config, last_written)
+                rec_path = paths.logs_dir / "recovery_directive.json"
+                if deg:
+                    write_text(rec_path, _json.dumps(deg, ensure_ascii=False, indent=2))
+                    log(paths, f"DEGRADATION ALERT Ch{last_written}: {deg['reason']} "
+                        f"(avg={deg['avg_score']}); recovery mode active until "
+                        f"Ch{deg['active_until']}.")
+                    db_event(conn, last_written, "degradation_alert", deg)
+            except Exception as exc:
+                log(paths, f"degradation detector failed (non-fatal): {exc}")
             # O3: consecutive-low-quality circuit breaker. suspense_v11 burned
             # 21 replans across 5 consecutive force-accepted chapters
             # (5.5/5.5/5.5/3.5/4.5) with nobody pulling the cord — every chapter

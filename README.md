@@ -71,8 +71,6 @@ pipeline.py  config.py  memory.py  planning.py  writing.py
 review.py    refine.py  store.py   checkpoint.py  llm.py
 quality.py   retrieval.py            # 质量护栏：规则文体检测 / 场景去重 / 检索式记忆
 
-# 旧版根目录长篇入口（向后兼容，操作根目录的 prompt.md/config.yaml）
-run.py  restart.py  start_pipeline.bat  restart.bat
 ```
 
 ---
@@ -198,12 +196,4 @@ run.py  restart.py  start_pipeline.bat  restart.bat
   （内含 `openai`）。可用 `NOVEL_PYTHON` 环境变量覆盖解释器路径。
 - **进程隔离靠的是独立进程**：引擎里有进程级全局状态（prompt 路径、prompt 缓存），
   所以多篇并行用「每篇一个进程」而非单进程多线程。
-- 旧版根目录长篇（`run.py`）和已迁移到 `novels/扶苏/` 的短篇互不影响。
-
----
-
-## 旧版兼容
-
-根目录的 `run.py` / `restart.py` 仍可运行那篇明末长篇（操作根目录的
-`prompt.md` / `config.yaml` / `chapters/` / `book.md`）。新小说推荐一律走
-`novel.py`，产物收纳在 `novels/<名字>/` 下，不污染根目录。
+- 所有小说一律通过 `novel.py` 管理，产物收纳在 `novels/<名字>/` 下，不污染根目录。
