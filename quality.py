@@ -338,6 +338,16 @@ _OPENING_ACTION_MARKERS = re.compile(
     r"最后通牒|滚出去|放开|别动|站住"
 )
 _OPENING_DIALOGUE_OPEN = ("“", "「", "『", '"')
+# 题材化"合格开场"标记：悬疑可用"线索/现场/异常"开场，言情可用"关系/情绪"开场——
+# 这些都不是景物铺垫，不应被危机模式的反模式检测误伤。
+_OPENING_CLUE_MARKERS = re.compile(
+    r"尸|血|死|失踪|消失|案|线索|现场|诡异|规则|不对劲|反常|不合理|证据|凶|报警|"
+    r"遗体|尖叫|惨叫|警察|命案|遇害|诅咒|怪|异常|消息|遗书|遗言|失联|藏|秘密"
+)
+_OPENING_RELATIONSHIP_MARKERS = re.compile(
+    r"爱|恨|吻|拥抱|分手|离婚|结婚|前任|未婚|心动|嫉妒|背叛|表白|暧昧|情敌|"
+    r"相亲|订婚|喜欢|讨厌|他和她|她和他|怀孕|追求|纠缠|旧情|重逢"
+)
 
 
 def opening_hook_gate(
@@ -374,27 +384,58 @@ def opening_hook_gate(
     has_action_head = bool(_OPENING_ACTION_MARKERS.search(head))
     bg_in_first = bool(_OPENING_BACKGROUND_MARKERS.search(first_sentence))
 
+    # Genre-aware notion of a valid opening (opening_gate_mode set by the genre
+    # detection profile): 爽文=crisis(动作/对话), 悬疑=clue(线索/现场/异常),
+    # 言情=relationship(关系/情绪), 历史/中性=balanced(更宽松，只罚最严重纯景物).
+    mode = str(cfg.get("opening_gate_mode", "crisis")).strip().lower()
+    valid_extra = False
+    if mode == "clue":
+        valid_extra = bool(_OPENING_CLUE_MARKERS.search(head))
+    elif mode == "relationship":
+        valid_extra = bool(_OPENING_RELATIONSHIP_MARKERS.search(head))
+    has_valid_open = has_dialogue_head or has_action_head or valid_extra
+
     signals: list[str] = []
     # Signal 1: first sentence is scenery/time/setting exposition.
-    if bg_in_first and not has_dialogue_head and not has_action_head:
+    if bg_in_first and not has_valid_open:
         signals.append("opening_first_sentence_background")
-    # Signal 2: a long, static, descriptive first sentence (no action / no dialogue).
-    if len(first_sentence) >= 50 and not has_dialogue_head and not has_action_head:
+    # Signal 2: a long, static, descriptive first sentence (no valid opening hook).
+    if len(first_sentence) >= 50 and not has_valid_open:
         signals.append("opening_first_sentence_long_static")
-    # Signal 3: the whole opening window has neither dialogue nor in-progress action.
-    if not has_dialogue_head and not has_action_head:
-        signals.append("opening_no_action_no_dialogue")
+    # Signal 3: the whole opening window has no genre-valid opening at all.
+    if not has_valid_open:
+        signals.append("opening_no_hook")
 
-    if len(signals) >= 2:
+    # balanced (历史/中性) only flags the most egregious case (all signals);
+    # crisis/clue/relationship flag at >=2 corroborating signals.
+    need = 3 if mode == "balanced" else 2
+    if len(signals) >= need:
         result["penalty"] = round(float(cfg.get("opening_golden_gate_penalty", 1.5)), 2)
         result["flags"].extend(signals)
-        result["directives"].append(
+        result["flags"].append(f"opening_mode:{mode}")
+        _open_directive = {
+            "clue": (
+                "开篇硬约束（悬疑·钩子开场）：本章开头是景物/天气铺垫，而非一个具体的"
+                "反常/线索/现场。请重写开头——第一句就把读者丢进一个不合理的具体细节、"
+                "一具尸体、一条诡异规则或一个待解的疑点，章末留未解信息钩。"
+            ),
+            "relationship": (
+                "开篇硬约束（言情·关系开场）：本章开头是景物/铺垫，缺少人物关系张力。"
+                "请重写开头——第一句就给出一段关系冲突/情绪对峙/暧昧张力（具体的人在当下"
+                "发生关系性的事），章末留情感悬念钩。"
+            ),
+            "balanced": (
+                "开篇问题：本章以大段纯景物/设定开场，读者抓不到本章要发生什么。"
+                "请把一个具体的人物动作、冲突或悬念前置到开头，景物服务于事件而非独立成段。"
+            ),
+        }.get(mode, (
             "开篇硬约束（黄金三句·番茄3秒定生死）：本章开头不是「正在发生的危机」，"
             "而是景物/天气/时段/设定铺垫。请重写开头——"
             "句1=直接抛出正在发生的冲突/动作/对话（具体、有人物在当下做事），禁止天气/景物/时间/世界观铺垫；"
             "句2=主角的核心反差（弱外表强承诺或反常行为）；"
             "句3=可截图金句钩子（情绪爆发/认知颠覆/后果预告，独立成段）。金手指/主角卖点在前 1/4 内亮相。"
-        )
+        ))
+        result["directives"].append(_open_directive)
         result["block"] = bool(cfg.get("opening_golden_gate_block", False))
 
     # NOTE: "人名≤5" stays as soft guidance in OPENING_RULES_BLOCK (writing.py).
@@ -1411,6 +1452,26 @@ _NARRATIVE_MOVES: tuple[tuple[str, tuple[str, ...]], ...] = (
         "反转", "翻转", "颠覆", "竟然", "原来", "真相", "其实", "并非",
         "另有", "嫁祸", "栽赃", "误导", "假象", "骗局",
     )),
+    # —— 爽文/通用 moves（之前缺失，导致爽文"羞辱→结算→打脸→围观"套路逃过检测）——
+    ("humiliation", (
+        "羞辱", "嘲讽", "嘲笑", "当众", "刁难", "诬陷", "诬蔑", "示众", "挑衅",
+        "打压", "逼迫", "奚落", "围攻", "退婚", "辱骂", "耳光", "扇", "踩",
+        "轻视", "看不起", "哄笑", "起哄", "下马威", "找茬", "针对", "压价", "克扣",
+    )),
+    ("system_payoff", (
+        "系统", "面板", "气运", "结算", "弹窗", "技能", "兑换", "到账", "数值",
+        "属性", "奖励", "签到", "解锁", "升级", "经验值", "积分", "宿主", "提示音",
+    )),
+    ("faceslap", (
+        "打脸", "反杀", "反将", "反咬", "拆穿", "揭穿", "当场", "碾压", "反击",
+        "哑口", "无言", "脸色骤变", "脸色大变", "甩在", "拍在", "装逼", "扮猪吃虎",
+        "真相大白", "下不来台", "措手不及", "完胜", "镇住", "震慑",
+    )),
+    ("crowd_react", (
+        "围观", "哗然", "震惊", "目瞪口呆", "死寂", "鸦雀", "众人", "骑手们",
+        "弹幕", "直播间", "看戏", "倒吸", "惊呼", "窃窃私语", "沸腾", "炸开",
+        "傻眼", "鸦雀无声", "面面相觑",
+    )),
 )
 
 
@@ -1501,62 +1562,90 @@ def narrative_pattern_repetition(
         return result
     cur = _narrative_pattern_sequence(plan)
     result["sequence"] = cur
-    # A sequence too short to be a recognisable "flow" carries no signal.
-    if len(cur) < int(cfg.get("narrative_pattern_min_moves", 3)):
-        return result
-    sims: list[float] = []
+    # Payoff-type monotony: an orthogonal formula axis, computed regardless of
+    # move-seq length (爽文: 每章都"打脸"; 悬疑: 每章都"reveal" is审美疲劳 even when the
+    # abstract flow varies). Counts the consecutive newest-first run of recent
+    # plans sharing this chapter's payoff_type.
+    cur_pt = str(plan.get("payoff_type", "")).strip()
+    pt_streak = 0
+    if cur_pt:
+        for rp in recent_plans:
+            if isinstance(rp, dict) and str(rp.get("payoff_type", "")).strip() == cur_pt:
+                pt_streak += 1
+            else:
+                break
+    # Run length INCLUDING the current chapter (current + matching recents).
+    pt_run = pt_streak + 1 if cur_pt else 0
+    pt_max = int(cfg.get("payoff_type_monotony_max", 3))
+
+    warn = float(cfg.get("narrative_pattern_sim_warn", 0.7))
+    block_streak = int(cfg.get("narrative_pattern_block_streak", 2))
+    block_sim = float(cfg.get("narrative_pattern_sim_block", 0.85))
+    # Genre-neutral variation directive: change shape AND/OR payoff AND/OR hook.
+    _vary = (
+        "必须打破套路：换一种叙事形状（改变推进的驱动力——人物关系/外部威胁/时间压力/"
+        "主角主动出击/信息揭示顺序），换一种爽点兑现方式（payoff_type 与近期不同），"
+        "并换一种章末钩子类型（悬念/反转/情绪炸弹/信息投放 轮换），不要再走同一套流程。"
+    )
+
     best = 0.0
     best_i: int | None = None
-    warn = float(cfg.get("narrative_pattern_sim_warn", 0.7))
-    for i, rp in enumerate(recent_plans):
-        if not isinstance(rp, dict):
-            sims.append(0.0)
-            continue
-        sim = _sequence_similarity(cur, _narrative_pattern_sequence(rp))
-        sims.append(sim)
-        if sim > best:
-            best = sim
-            best_i = i
-    # Consecutive run of recent chapters (newest-first ordering expected) that
-    # share this flow ≥ warn — a single dup is tolerable, a *streak* is the
-    # fatigue signal.
     consecutive = 0
-    for s in sims:
-        if s >= warn:
-            consecutive += 1
-        else:
-            break
+    # Move-seq similarity only when the flow is long enough to be recognisable.
+    if len(cur) >= int(cfg.get("narrative_pattern_min_moves", 3)):
+        sims: list[float] = []
+        for i, rp in enumerate(recent_plans):
+            if not isinstance(rp, dict):
+                sims.append(0.0)
+                continue
+            sim = _sequence_similarity(cur, _narrative_pattern_sequence(rp))
+            sims.append(sim)
+            if sim > best:
+                best = sim
+                best_i = i
+        for s in sims:  # consecutive run ≥ warn (a streak is the fatigue signal)
+            if s >= warn:
+                consecutive += 1
+            else:
+                break
+        seq_label = "→".join(cur)
+        if consecutive >= block_streak or best >= block_sim:
+            result["level"] = "block"
+            result["penalty"] = float(cfg.get("narrative_pattern_block_penalty", 1.5))
+            result["flags"].append(
+                f"narrative_pattern_repeat(streak={consecutive},max_sim={best:.2f})")
+            result["directives"].append(
+                f"本章叙事流程骨架（{seq_label}）与近 {consecutive or 1} 章高度雷同，"
+                f"属于'同一套流程换个道具'的审美疲劳模式。{_vary}")
+        elif best >= warn:
+            result["level"] = "warn"
+            result["penalty"] = float(cfg.get("narrative_pattern_warn_penalty", 0.6))
+            result["flags"].append(f"narrative_pattern_repeat(max_sim={best:.2f})")
+            result["directives"].append(
+                f"本章叙事流程（{seq_label}）与近期相似度偏高，有流程化倾向。{_vary}")
+
     result["metrics"] = {
         "max_sim": round(best, 3),
         "consecutive_similar": consecutive,
-        "compared": len(sims),
+        "compared": len(recent_plans),
+        "payoff_type_streak": pt_streak,
+        "payoff_type_run": pt_run,
     }
     result["max_sim"] = round(best, 3)
     result["most_similar_to"] = best_i
     result["consecutive"] = consecutive
 
-    block_streak = int(cfg.get("narrative_pattern_block_streak", 2))
-    block_sim = float(cfg.get("narrative_pattern_sim_block", 0.85))
-    seq_label = "→".join(cur)
-    if consecutive >= block_streak or best >= block_sim:
-        result["level"] = "block"
-        result["penalty"] = float(cfg.get("narrative_pattern_block_penalty", 1.5))
-        result["flags"].append(
-            f"narrative_pattern_repeat(streak={consecutive},max_sim={best:.2f})"
-        )
+    # Payoff-type monotony escalates an otherwise-OK chapter to at least warn.
+    if cur_pt and pt_run >= pt_max:
+        result["flags"].append(f"payoff_type_monotony({cur_pt}×{pt_run})")
+        if result["level"] == "ok":
+            result["level"] = "warn"
+            result["penalty"] = max(
+                result["penalty"], float(cfg.get("narrative_pattern_warn_penalty", 0.6)))
         result["directives"].append(
-            f"本章叙事流程骨架（{seq_label}）与近 {consecutive or 1} 章高度雷同，"
-            "属于'同一套流程换个取证对象'的审美疲劳模式。必须改变章节的叙事形状："
-            "例如把'静态取证→比对→推理'换成由人物对峙/外部威胁/时间压力驱动的场景，"
-            "或调整信息揭示顺序（先抛结论再倒查、让对手先行动），不得再走一遍线性取证流程。"
-        )
-    elif best >= warn:
-        result["level"] = "warn"
-        result["penalty"] = float(cfg.get("narrative_pattern_warn_penalty", 0.6))
-        result["flags"].append(f"narrative_pattern_repeat(max_sim={best:.2f})")
-        result["directives"].append(
-            f"本章叙事流程（{seq_label}）与近期相似度偏高，有流程化倾向。"
-            "请让本章的推进方式与上一章不同——换一种场景驱动力或信息揭示顺序，避免连续线性取证。"
+            f"已连续 {pt_run} 章 payoff_type 都是「{cur_pt}」——爽点形态单调。"
+            "本章必须换一种兑现类型（如打脸/暴富/实力跃升/身份反转/收服强者/金句怼人 之间切换），"
+            "避免读者对同一种爽点脱敏。"
         )
     return result
 

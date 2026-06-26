@@ -53,6 +53,119 @@ def parse_scalar(value: str) -> Any:
     except ValueError:
         return value
 
+def genre_detection_profile(preset: str) -> dict[str, Any]:
+    """Genre-specific defaults for the deterministic detection gates.
+
+    The recent 爽文-centric gates (opening/length/flat-streak/payoff-cadence/
+    下沉 register) would misfire on slow-burn / high-threshold genres (悬疑/历史)。
+    Rather than scattering `if preset == ...` across every gate, this returns the
+    detection-relevant config defaults for a genre, keyed by `style_preset`.
+    Applied in load_config with "fill only if the user did NOT set the key"
+    semantics (mirrors planning.py's `visual_payoff_blocks_plan` override pattern),
+    so explicit config.yaml values always win and existing novels are unaffected.
+
+    opening_gate_mode ∈ {crisis, clue, relationship, balanced} steers
+    quality.opening_hook_gate's notion of a valid opening per genre.
+    """
+    p = (preset or "").strip().lower()
+    # 爽文族基线：高频爽点 / 短章 / 低门槛 / 黄金三句危机开场 / 物证兑现仅建议。
+    shuang = {
+        "narrative_mode": "serial",
+        "opening_gate_mode": "crisis",
+        "payoff_density_min": 0.5,            # ≤2 章一个强爽点
+        "flat_streak_gate_enabled": True,
+        "flat_chapters_max_consecutive": 3,
+        "chapter_words": 2800,
+        "chapter_min_chars": 2200,
+        "chapter_max_chars": 3600,
+        "length_band_penalty_enabled": True,
+        "style_low_barrier_register": True,
+        "style_min_avg_sentence_chars": 12.0,
+        "visual_payoff_blocks_plan": False,
+        "emotional_cadence_max_same": 3,
+    }
+    profiles: dict[str, dict[str, Any]] = {
+        "xuanhuan_shuang": dict(shuang),
+        "system_stream": dict(shuang),
+        "urban_ability": dict(shuang),
+        # 万族/战力：略长的战斗章、爽点间隔略宽。
+        "wanzu_xuanhuan": {**shuang, "payoff_density_min": 0.4,
+                           "chapter_words": 3000, "chapter_min_chars": 2400,
+                           "chapter_max_chars": 4200},
+        # 悬疑：慢烧、线索开场、复杂容忍、高阅读门槛、物证兑现 block。
+        "suspense": {
+            "narrative_mode": "reasoning",
+            "opening_gate_mode": "clue",
+            "payoff_density_min": 0.25,        # ≤4 章
+            "flat_streak_gate_enabled": True,
+            "flat_chapters_max_consecutive": 5,
+            "chapter_words": 3500,
+            "chapter_min_chars": 2800,
+            "chapter_max_chars": 6000,
+            "length_band_penalty_enabled": True,
+            "style_low_barrier_register": False,
+            "style_min_avg_sentence_chars": 14.0,
+            "visual_payoff_blocks_plan": True,
+            "emotional_cadence_max_same": 4,
+        },
+        # 历史厚重：慢热、长章、关闭连续平路闸门、厚重长句。
+        "history": {
+            "narrative_mode": "balanced",
+            "opening_gate_mode": "balanced",
+            "payoff_density_min": 0.2,         # ≤5 章
+            "flat_streak_gate_enabled": False,
+            "flat_chapters_max_consecutive": 4,
+            "chapter_words": 3500,
+            "chapter_min_chars": 3000,
+            "chapter_max_chars": 6000,
+            "length_band_penalty_enabled": True,
+            "style_low_barrier_register": False,
+            "style_min_avg_sentence_chars": 16.0,
+            "visual_payoff_blocks_plan": False,
+            "emotional_cadence_max_same": 4,
+        },
+        # 女频言情：情绪弧主导、关系开场、情绪变奏最严。
+        "romance_female": {
+            "narrative_mode": "serial",
+            "opening_gate_mode": "relationship",
+            "payoff_density_min": 0.34,        # ≤3 章
+            "flat_streak_gate_enabled": True,
+            "flat_chapters_max_consecutive": 3,
+            "chapter_words": 2800,
+            "chapter_min_chars": 2200,
+            "chapter_max_chars": 4000,
+            "length_band_penalty_enabled": True,
+            "style_low_barrier_register": True,
+            "style_min_avg_sentence_chars": 12.0,
+            "visual_payoff_blocks_plan": False,
+            "emotional_cadence_max_same": 2,
+        },
+    }
+    # 未知/未设置题材 → 中性默认（不强加爽文短章/下沉）。
+    neutral = {**shuang, "narrative_mode": "balanced", "opening_gate_mode": "balanced",
+               "chapter_words": 3000, "chapter_min_chars": 2400, "chapter_max_chars": 4500,
+               "style_low_barrier_register": False, "style_min_avg_sentence_chars": 13.0}
+    return dict(profiles.get(p, neutral))
+
+
+def _apply_genre_detection_profile(config: dict[str, Any]) -> None:
+    """Fill genre-appropriate detection defaults into config['novel'].
+
+    Only fills keys the user did NOT explicitly set (so config.yaml always wins
+    and existing novels are unaffected). Driven by style_preset; runs BEFORE the
+    required-key check so it can supply chapter_words etc. for templates that omit
+    them and leave the genre to decide.
+    """
+    novel = config.get("novel")
+    if not isinstance(novel, dict):
+        return
+    preset = str(novel.get("style_preset", "") or "").strip().lower()
+    profile = genre_detection_profile(preset)
+    for key, value in profile.items():
+        if key not in novel:
+            novel[key] = value
+
+
 def load_config() -> dict[str, Any]:
     config: dict[str, Any] = {}
     section: str | None = None
@@ -67,6 +180,11 @@ def load_config() -> dict[str, Any]:
         if section and ":" in line:
             key, value = line.strip().split(":", 1)
             config[section][key.strip()] = parse_scalar(value)
+
+    # Genre-aware detection defaults (爽文/悬疑/言情/…), filled by style_preset
+    # BEFORE the required check so genre can supply chapter_words etc. Only fills
+    # keys the user did not set, so explicit config.yaml values always win.
+    _apply_genre_detection_profile(config)
 
     required = {
         "api": ["base_url", "api_key", "model", "max_tokens", "temperature"],

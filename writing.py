@@ -1230,6 +1230,37 @@ def reduce_em_dashes_targeted(
     return result
 
 
+def _chapter_write_max_tokens(config: dict[str, Any]) -> int | None:
+    """Generation-time length cap for chapter writing.
+
+    The write call otherwise inherits the global api.max_tokens (often 64k+), so
+    a chapter can balloon far past the target band. This bounds the writer's
+    output by chapter_max_chars (which the genre profile sets per题材), sized with
+    enough headroom that a complete in-band chapter is never truncated
+    mid-sentence — it kills runaway over-length without cutting normal chapters.
+    Returns None (no cap → global default) when disabled.
+
+    Tune with `write_token_char_ratio` (lower = tighter, but risks truncation)
+    and `write_token_margin`; or pin an absolute `write_max_tokens`.
+    """
+    nv = config.get("novel", {})
+    if not bool(nv.get("chapter_length_cap_enabled", True)):
+        return None
+    try:
+        explicit = int(nv.get("write_max_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    try:
+        cmax = int(nv.get("chapter_max_chars", 3600))
+    except (TypeError, ValueError):
+        cmax = 3600
+    ratio = float(nv.get("write_token_char_ratio", 1.15))
+    margin = int(nv.get("write_token_margin", 300))
+    return max(int(cmax * ratio) + margin, 1200)
+
+
 def write_chapter(
     client: OpenAI,
     paths: Paths,
@@ -1244,6 +1275,12 @@ def write_chapter(
     scene_breakdown: dict[str, Any] | None = None,
 ) -> str:
     title = str(plan.get("title") or f"Chapter {chapter_num}").strip()
+    # Strip any leading 第N章 prefix the planner put in the title — the write
+    # prompt formats the first line as "第{n}章 {title}", so a title that already
+    # starts with "第N章：" doubles it ("第2章 第2章：剪辑师的盲区").
+    title = re.sub(
+        r"^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章\s*[:：、\-—\s]*", "", title
+    ).strip() or f"Chapter {chapter_num}"
     preset = str(config["novel"].get("style_preset", "history"))
     write_system = WRITE_SYSTEM_PRESETS.get(preset, WRITE_SYSTEM_HISTORY)
     system = write_system.format(
@@ -1607,7 +1644,8 @@ def write_chapter(
     prefix = cacheable_prefix(paths, config)
     from config import log
     log(paths, f"write_chapter Ch{chapter_num} calling LLM with temp={temp:.2f} user_len={len(user)} system_len={len(system)}")
-    raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix, tag="write")
+    raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix,
+                   max_tokens=_chapter_write_max_tokens(config), tag="write")
     log(paths, f"write_chapter Ch{chapter_num} LLM returned {len(raw)} chars")
     return normalize_chapter(raw)
 
@@ -1690,7 +1728,8 @@ def repair_missing_beats(
     try:
         raw = call_llm(
             client, paths, config, BEAT_REPAIR_SYSTEM, user,
-            temperature=temp, cacheable_prefix=prefix, tag="beat_repair",
+            temperature=temp, cacheable_prefix=prefix,
+            max_tokens=_chapter_write_max_tokens(config), tag="beat_repair",
         )
     except Exception as exc:
         log(paths, f"beat repair LLM call failed Ch{chapter_num} (non-fatal): {exc}")
@@ -1835,7 +1874,8 @@ def revise_chapter(
 修订整章。"""
     raw = call_llm(
         client, paths, config, REVISE_SYSTEM, user,
-        temperature=0.45, cacheable_prefix=cacheable_prefix(paths, config), tag="revise",
+        temperature=0.45, cacheable_prefix=cacheable_prefix(paths, config),
+        max_tokens=_chapter_write_max_tokens(config), tag="revise",
     )
     revised = normalize_chapter(raw)
     # Layer 4: reject revisions that explode in size (observed: 4.3k→9.4k→15.6k in Ch43).

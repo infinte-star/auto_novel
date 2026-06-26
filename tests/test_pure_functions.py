@@ -21,10 +21,12 @@ from quality import _narrative_pattern_sequence, _sequence_similarity, narrative
 from quality import store_chapter_fingerprint, check_plan_against_fingerprints  # noqa: E402
 from quality import prose_texture, emotional_cadence  # noqa: E402
 from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
+from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from memory import _recency_aware_state  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
+from writing import _chapter_write_max_tokens  # noqa: E402
 
 
 def _make_paths(root):
@@ -1843,6 +1845,166 @@ class FlatChapterStreakTests(unittest.TestCase):
         cfg = {"novel": {"flat_streak_gate_enabled": False}}
         res = flat_chapter_streak(self._flat(5), cfg)
         self.assertEqual(res["penalty"], 0.0)
+
+
+class GenreDetectionProfileTests(unittest.TestCase):
+    def test_shuangwen_vs_suspense_differ(self):
+        s = genre_detection_profile("urban_ability")
+        m = genre_detection_profile("suspense")
+        self.assertEqual(s["opening_gate_mode"], "crisis")
+        self.assertEqual(m["opening_gate_mode"], "clue")
+        self.assertEqual(s["narrative_mode"], "serial")
+        self.assertEqual(m["narrative_mode"], "reasoning")
+        # suspense allows longer chapters, slower payoff, higher reading threshold
+        self.assertGreater(m["chapter_max_chars"], s["chapter_max_chars"])
+        self.assertLess(m["payoff_density_min"], s["payoff_density_min"])
+        self.assertTrue(s["style_low_barrier_register"])
+        self.assertFalse(m["style_low_barrier_register"])
+        # suspense blocks on visual/物证 payoff; 爽文 is advisory
+        self.assertTrue(m["visual_payoff_blocks_plan"])
+        self.assertFalse(s["visual_payoff_blocks_plan"])
+
+    def test_history_disables_flat_streak_and_romance_strict_cadence(self):
+        h = genre_detection_profile("history")
+        r = genre_detection_profile("romance_female")
+        self.assertFalse(h["flat_streak_gate_enabled"])
+        self.assertEqual(r["opening_gate_mode"], "relationship")
+        self.assertEqual(r["emotional_cadence_max_same"], 2)
+
+    def test_unknown_preset_is_neutral(self):
+        d = genre_detection_profile("totally_unknown")
+        self.assertEqual(d["narrative_mode"], "balanced")
+        self.assertEqual(d["opening_gate_mode"], "balanced")
+
+    def test_apply_fills_absent_but_never_overrides_explicit(self):
+        cfg = {"novel": {"style_preset": "suspense", "chapter_max_chars": 9999}}
+        _apply_genre_detection_profile(cfg)
+        # explicit value kept
+        self.assertEqual(cfg["novel"]["chapter_max_chars"], 9999)
+        # absent genre keys filled from the suspense profile
+        self.assertEqual(cfg["novel"]["opening_gate_mode"], "clue")
+        self.assertEqual(cfg["novel"]["narrative_mode"], "reasoning")
+        self.assertFalse(cfg["novel"]["style_low_barrier_register"])
+
+
+class OpeningGateModeTests(unittest.TestCase):
+    # scenery-shaped first sentence (夜色) + clue markers (规则/不对劲), no action/dialogue
+    _CLUE_SCENERY = (
+        "夜色像一块浸了水的黑布，沉沉压在这栋废弃疗养院的上空，连一丝风都没有。"
+        "走廊尽头的墙上贴着一张泛黄的纸，纸上用红笔写着第一条规则：午夜十二点之后，"
+        "无论听见谁敲门，都不要回应，也不要回头。第二条规则被人撕掉了一半，只剩下"
+        "几个模糊的字，越看越不对劲。登记簿上整层楼只住了他一个人，可昨晚的脚步声，"
+        "分明是从隔壁那间早就空置的病房传来的，一声接一声，踩得很慢，很有耐心。"
+        "他翻开值班记录，最后一页的笔迹戛然而止，停在一句没写完的话上：它们最怕的，"
+        "其实是有人记得第三条规则——而那一条，整本册子里哪里都找不到，像被谁刻意抹去。"
+    )
+    # pure scenery, short first sentence (<50), no clue/action/dialogue
+    _SCENERY_SHORT_FIRST = (
+        "清晨的阳光洒在地板上。空气里浮着淡淡的尘埃，窗外的天空泛着鱼肚白，"
+        "微风拂过院子里的老树，叶子轻轻摇动。这座小城安静得仿佛还在沉睡，"
+        "远处的山峦笼罩在一层薄雾里，看不真切。街道上空无一人，时间仿佛凝固，"
+        "整个世界都显得格外宁静而悠远，像一幅褪了色的旧画，挂在记忆深处的角落里，"
+        "檐角的风铃懒懒地响了一声，又归于沉寂，连早起的鸟雀都不知躲到了何处去。"
+        "巷口的老槐树下落了一地碎影，光斑随着叶隙缓缓移动，整条街都浸在这片"
+        "悠长而平淡的晨光里，像一段被反复擦拭、却始终没有人愿意翻开的旧时光。"
+    )
+
+    def test_clue_opening_rescued_in_clue_mode_but_flagged_in_crisis(self):
+        clue = opening_hook_gate(self._CLUE_SCENERY, 1, {"novel": {"opening_gate_mode": "clue"}})
+        crisis = opening_hook_gate(self._CLUE_SCENERY, 1, {"novel": {"opening_gate_mode": "crisis"}})
+        self.assertEqual(clue["penalty"], 0.0)       # 悬疑线索开场被认可
+        self.assertGreater(crisis["penalty"], 0.0)   # 爽文 gate 会误伤它
+
+    def test_pure_scenery_flagged_in_clue_and_crisis(self):
+        for mode in ("clue", "crisis"):
+            r = opening_hook_gate(self._SCENERY_SHORT_FIRST, 1, {"novel": {"opening_gate_mode": mode}})
+            self.assertGreater(r["penalty"], 0.0, f"pure scenery should be flagged in {mode}")
+
+    def test_balanced_mode_higher_threshold(self):
+        # short-first-sentence pure scenery = 2 signals: flagged at crisis(need2), not balanced(need3)
+        bal = opening_hook_gate(self._SCENERY_SHORT_FIRST, 1, {"novel": {"opening_gate_mode": "balanced"}})
+        self.assertEqual(bal["penalty"], 0.0)
+
+
+class ChapterWriteMaxTokensTests(unittest.TestCase):
+    def test_derives_from_chapter_max_chars(self):
+        small = _chapter_write_max_tokens({"novel": {"chapter_max_chars": 3600}})
+        big = _chapter_write_max_tokens({"novel": {"chapter_max_chars": 6000}})
+        self.assertIsNotNone(small)
+        self.assertGreater(big, small)  # 悬疑 longer band → bigger budget
+
+    def test_disabled_returns_none(self):
+        self.assertIsNone(
+            _chapter_write_max_tokens({"novel": {"chapter_max_chars": 3600, "chapter_length_cap_enabled": False}}))
+
+    def test_explicit_override_wins(self):
+        self.assertEqual(
+            _chapter_write_max_tokens({"novel": {"chapter_max_chars": 3600, "write_max_tokens": 5000}}), 5000)
+
+    def test_lower_ratio_is_tighter(self):
+        loose = _chapter_write_max_tokens({"novel": {"chapter_max_chars": 3600, "write_token_char_ratio": 1.5}})
+        tight = _chapter_write_max_tokens({"novel": {"chapter_max_chars": 3600, "write_token_char_ratio": 1.1}})
+        self.assertGreater(loose, tight)
+
+    def test_in_band_chapter_fits_within_budget(self):
+        # a complete chapter at the band ceiling (~1 token/char heuristic) should
+        # fit under the budget, so it is not truncated mid-sentence.
+        cfg = {"novel": {"chapter_max_chars": 3600}}
+        budget = _chapter_write_max_tokens(cfg)
+        self.assertGreaterEqual(budget, 3600)
+
+
+class ShuangwenFormulaGateTests(unittest.TestCase):
+    """The narrative-pattern gate must catch the 爽文 formula it previously missed."""
+    _P1 = {"beats": ["王崇当众羞辱陈砚", "系统结算气运到账", "陈砚当场拆穿打脸", "骑手们目瞪口呆围观"],
+           "payoff_type": "faceslap"}
+    _P3 = {"beats": ["李刚示众打压", "气运结算解锁技能", "陈砚反杀当场镇住", "众人哗然目瞪口呆"],
+           "payoff_type": "faceslap"}
+
+    def test_shuangwen_shape_detected(self):
+        seq = _narrative_pattern_sequence(self._P3)
+        self.assertIn("humiliation", seq)
+        self.assertIn("system_payoff", seq)
+        self.assertIn("faceslap", seq)
+        self.assertIn("crowd_react", seq)
+
+    def test_repeated_formula_blocks(self):
+        r = narrative_pattern_repetition(self._P3, [self._P1], {"novel": {}})
+        self.assertEqual(r["level"], "block")
+        self.assertGreaterEqual(r["max_sim"], 0.85)
+        self.assertTrue(r["directives"])
+
+    def test_different_shape_passes(self):
+        diff = {"beats": ["林晚约见谈判", "时间压力倒计时逼近", "两人对峙摊牌", "主动提出交换条件"],
+                "payoff_type": "reversal"}
+        r = narrative_pattern_repetition(diff, [self._P1], {"novel": {}})
+        self.assertNotEqual(r["level"], "block")
+
+    def test_payoff_type_monotony_warns(self):
+        # distinct-enough shapes but same payoff_type for 3 chapters → warn
+        a = {"beats": ["主角进入仓库勘查", "比对货物记录", "推断出账目造假"], "payoff_type": "reveal"}
+        b = {"beats": ["主角约见对手摊牌", "对方威胁恐吓", "主角逼问追问"], "payoff_type": "reveal"}
+        c = {"beats": ["主角跟踪尾随目标", "被对方发现险些出事", "主角逃脱"], "payoff_type": "reveal"}
+        r = narrative_pattern_repetition(c, [b, a], {"novel": {"payoff_type_monotony_max": 3}})
+        self.assertTrue(any("payoff_type_monotony" in f for f in r["flags"]))
+
+
+class ChapterTitleDedupeTests(unittest.TestCase):
+    @staticmethod
+    def _strip(title, n):
+        import re as _re
+        return _re.sub(r"^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章\s*[:：、\-—\s]*", "", title).strip() or f"Chapter {n}"
+
+    def test_strips_duplicate_chapter_prefix(self):
+        self.assertEqual(self._strip("第2章：剪辑师的盲区", 2), "剪辑师的盲区")
+        self.assertEqual(self._strip("第二章 微笑的标价", 2), "微笑的标价")
+        self.assertEqual(self._strip("第10章无声的受力分析", 10), "无声的受力分析")
+
+    def test_clean_title_unchanged(self):
+        self.assertEqual(self._strip("微笑的标价", 1), "微笑的标价")
+
+    def test_bare_prefix_falls_back(self):
+        self.assertEqual(self._strip("第4章", 4), "Chapter 4")
 
 
 if __name__ == "__main__":
