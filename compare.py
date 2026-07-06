@@ -48,6 +48,39 @@ def _load_chapter_metrics(nd: Path) -> list[dict[str, Any]]:
         return []
 
 
+def _load_panel_series(nd: Path) -> list[tuple[int, float, float]]:
+    """Read reader-panel reports (chapter, excitement, drop_rate) from the
+    novel's own store — the retention signal for P0. Prefers genre-weighted
+    values (weighted_excitement/weighted_drop_rate) when present, else raw.
+    Oldest-first; tolerant of missing db/rows."""
+    db = nd / "story_state.db"
+    if not db.exists():
+        return []
+    out: list[tuple[int, float, float]] = []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db))
+        rows = conn.execute(
+            "SELECT chapter, payload FROM events WHERE event_type='panel_report' ORDER BY chapter"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    for ch, payload in rows:
+        try:
+            p = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        ex = p.get("weighted_excitement", p.get("avg_excitement"))
+        dr = p.get("weighted_drop_rate", p.get("drop_rate"))
+        try:
+            out.append((int(p.get("chapter", ch)), float(ex if ex is not None else 5.0),
+                        float(dr if dr is not None else 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _load_events(nd: Path, types: tuple[str, ...]) -> dict[str, int]:
     """Count events of the given types from the novel's own store."""
     counts = {t: 0 for t in types}
@@ -183,8 +216,14 @@ def _fmt(v: Any, nd: int = 2) -> str:
     return str(v)
 
 
-def compare_novels(name_a: str, name_b: str) -> str:
-    """Build a markdown comparison report for two novels; returns the report."""
+def compare_novels(name_a: str, name_b: str, *, judge: bool = False,
+                   client: Any = None, paths: Any = None, config: Any = None) -> str:
+    """Build a markdown comparison report for two novels; returns the report.
+
+    When judge=True (and a client/paths/config are supplied), also runs a blind
+    pairwise LLM judge over matched chapters and appends its verdict. The default
+    (judge=False) path stays entirely deterministic / zero-LLM.
+    """
     nd_a, nd_b = NOVELS_DIR / name_a, NOVELS_DIR / name_b
     for nd in (nd_a, nd_b):
         if not nd.exists():
@@ -195,6 +234,13 @@ def compare_novels(name_a: str, name_b: str) -> str:
     llm_a, llm_b = _llm_totals(nd_a), _llm_totals(nd_b)
     ev_types = ("quality_debt", "gate_reject", "scene_dedupe_retry", "visual_payoff_retry")
     ev_a, ev_b = _load_events(nd_a, ev_types), _load_events(nd_b, ev_types)
+
+    # Retention (P0): the reader-panel-derived objective the per-chapter score is
+    # blind to. Summarized deterministically via the shared retention module.
+    from retention import summarize_retention, retention_by_block
+    ps_a, ps_b = _load_panel_series(nd_a), _load_panel_series(nd_b)
+    ret_a = summarize_retention([s[1] for s in ps_a], [s[2] for s in ps_a])
+    ret_b = summarize_retention([s[1] for s in ps_b], [s[2] for s in ps_b])
 
     def scores(ms: list[dict[str, Any]]) -> list[float]:
         return [float(r["score"]) for r in ms if r.get("score") is not None]
@@ -219,6 +265,10 @@ def compare_novels(name_a: str, name_b: str) -> str:
     lines.append(row("chapters < 7.0",
                      sum(1 for s in s_a if s < 7.0), sum(1 for s in s_b if s < 7.0)))
     lines.append(row("book chars", _book_chars(nd_a), _book_chars(nd_b)))
+    lines.append(row("retention index (0-10)", ret_a["retention_index"], ret_b["retention_index"]))
+    lines.append(row("panel mean excitement", ret_a["mean_excitement"], ret_b["mean_excitement"]))
+    lines.append(row("panel mean drop_rate", ret_a["mean_drop"], ret_b["mean_drop"]))
+    lines.append(row("excitement troughs (<4)", ret_a["trough_count"], ret_b["trough_count"]))
     lines.append(row("force-accepts (log)", log_a["force_accept"], log_b["force_accept"]))
     lines.append(row("quality_debt events", ev_a["quality_debt"], ev_b["quality_debt"]))
     lines.append(row("gate_reject events", ev_a["gate_reject"], ev_b["gate_reject"]))
@@ -252,6 +302,22 @@ def compare_novels(name_a: str, name_b: str) -> str:
         )
     lines.append("")
 
+    # --- retention curve (per-10-chapter block) ---
+    blk_a = {b["ch_from"]: b for b in retention_by_block(ps_a, 10)}
+    blk_b = {b["ch_from"]: b for b in retention_by_block(ps_b, 10)}
+    if blk_a or blk_b:
+        lines.append("## Retention curve (per 10 ch: index / excitement / drop)")
+        lines.append(f"| chapters | {name_a} | {name_b} |")
+        lines.append("|---|---|---|")
+        for cf in sorted(set(blk_a) | set(blk_b)):
+            ba, bb = blk_a.get(cf), blk_b.get(cf)
+            def cell(b: dict[str, Any] | None) -> str:
+                if not b:
+                    return "-"
+                return f"{_fmt(b['retention_index'],1)} / {_fmt(b['mean_excitement'],1)} / {_fmt(b['mean_drop'],2)}"
+            lines.append(f"| {cf}-{cf+9} | {cell(ba)} | {cell(bb)} |")
+        lines.append("")
+
     # --- config diff (non-secret, non-path keys) ---
     cfg_a, cfg_b = _read_config_lines(nd_a), _read_config_lines(nd_b)
     diffs = []
@@ -267,6 +333,33 @@ def compare_novels(name_a: str, name_b: str) -> str:
     else:
         lines.append("(identical apart from paths/keys)")
     lines.append("")
+
+    # --- optional blind pairwise LLM judge (only when --judge + client) ---
+    judge_result: dict[str, Any] | None = None
+    if judge and client is not None and paths is not None and config is not None:
+        try:
+            import judge as judge_mod
+            judge_result = judge_mod.judge_ablation(client, paths, config, name_a, name_b)
+            lines.append("## Pairwise judge (blind, order-swapped)")
+            if judge_result.get("error"):
+                lines.append(f"(judge skipped: {judge_result['error']})")
+            else:
+                jw, jl, jt = judge_result["a_wins"], judge_result["b_wins"], judge_result["ties"]
+                lines.append(f"Judged {judge_result['judged']} matched chapters (A={name_a}, B={name_b}).")
+                lines.append(f"| winner | {name_a} | {name_b} | tie |")
+                lines.append("|---|---|---|---|")
+                lines.append(f"| chapters | {jw} | {jl} | {jt} |")
+                lines.append("")
+                lines.append("| ch | winner | reason |")
+                lines.append("|---|---|---|")
+                for r in judge_result["per_chapter"]:
+                    who = {"a": name_a, "b": name_b, "tie": "tie"}.get(r["winner"], "tie")
+                    lines.append(f"| {r['chapter']} | {who} | {str(r.get('reason',''))[:70]} |")
+            lines.append("")
+        except Exception as exc:  # never let the judge crash the deterministic report
+            lines.append("## Pairwise judge (blind, order-swapped)")
+            lines.append(f"(judge failed: {exc}; see deterministic metrics above)")
+            lines.append("")
 
     # --- verdict heuristics ---
     lines.append("## Heuristic verdict")
@@ -285,6 +378,17 @@ def compare_novels(name_a: str, name_b: str) -> str:
     if log_a["force_accept"] != log_b["force_accept"]:
         better = name_a if log_a["force_accept"] < log_b["force_accept"] else name_b
         verdict.append(f"- fewer force-accepts: **{better}**")
+    ri_a, ri_b = ret_a["retention_index"], ret_b["retention_index"]
+    if ri_a is not None and ri_b is not None and abs(ri_a - ri_b) >= 0.5:
+        better = name_a if ri_a > ri_b else name_b
+        verdict.append(f"- higher retention index: **{better}** ({max(ri_a, ri_b):.1f} vs {min(ri_a, ri_b):.1f})")
+    if judge_result and not judge_result.get("error"):
+        jw, jl = judge_result["a_wins"], judge_result["b_wins"]
+        if jw != jl:
+            better = name_a if jw > jl else name_b
+            verdict.append(f"- blind pairwise judge favors **{better}** ({max(jw, jl)}-{min(jw, jl)}-{judge_result['ties']} W-L-T)")
+        else:
+            verdict.append(f"- blind pairwise judge: tie ({jw}-{jl}-{judge_result['ties']})")
     if s_a and s_b and llm_a["elapsed"] and llm_b["elapsed"]:
         eff_a = llm_a["elapsed"] / max(len(s_a), 1)
         eff_b = llm_b["elapsed"] / max(len(s_b), 1)
@@ -296,8 +400,9 @@ def compare_novels(name_a: str, name_b: str) -> str:
     return "\n".join(lines)
 
 
-def cmd_compare(name_a: str, name_b: str) -> int:
-    report = compare_novels(name_a, name_b)
+def cmd_compare(name_a: str, name_b: str, *, judge: bool = False,
+                client: Any = None, paths: Any = None, config: Any = None) -> int:
+    report = compare_novels(name_a, name_b, judge=judge, client=client, paths=paths, config=config)
     EXPERIMENTS_DIR.mkdir(exist_ok=True)
     out = EXPERIMENTS_DIR / f"{name_a}_vs_{name_b}.md"
     out.write_text(report, encoding="utf-8")

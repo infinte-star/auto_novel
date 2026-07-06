@@ -100,29 +100,48 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
             except sqlite3.OperationalError:
                 chapter_score = {}
 
-            # Scan agent_reports for gate_rejects and fixes
+            # Scan per-chapter final_review.json checkpoints for the actual
+            # review reports (problems + gate_rejects). NOTE: the review dict is
+            # NOT in agent_reports (that table only holds the 6 plan-review axes);
+            # it lives in logs/checkpoints/chNNNN/final_review.json, wrapped in a
+            # `payload` envelope. We categorize each failure via the canonical
+            # taxonomy (taxonomy.classify_problem / classify_gate), falling back
+            # to the legacy keyword inference when no code matches — so old books
+            # without inline `failure_codes` still get clean, structured buckets.
             try:
-                rows = conn.execute(
-                    "SELECT chapter, report_type, content FROM agent_reports WHERE report_type='review' ORDER BY chapter"
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []
+                import taxonomy
+            except Exception:
+                taxonomy = None
 
-            for row in rows:
-                chapter = row["chapter"]
-                content_str = row["content"]
+            ckpt_dir = novel_dir / "logs" / "checkpoints"
+            review_files = sorted(ckpt_dir.glob("ch*/final_review.json")) if ckpt_dir.exists() else []
+            for rf in review_files:
                 try:
-                    content = json.loads(content_str)
-                except json.JSONDecodeError:
+                    raw = json.loads(rf.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                content = raw.get("payload", raw) if isinstance(raw, dict) else {}
+                if not isinstance(content, dict):
                     continue
                 try:
-                    _ch_int = int(chapter)
+                    _ch_int = int(content.get("chapter") or rf.parent.name.replace("ch", ""))
                 except (TypeError, ValueError):
                     _ch_int = None
+                chapter = _ch_int
                 score_before = chapter_score.get(_ch_int) if _ch_int is not None else None
                 score_after = chapter_score.get(_ch_int + 1) if _ch_int is not None else None
 
                 total_chapters += 1
+
+                # A single actionable "fix" for this chapter: prefer the reviewer's
+                # explicit fixes, else the next-chapter writer directives.
+                fixes = content.get("fixes")
+                directives = content.get("writer_directives_for_next_chapter") or []
+                default_fix = ""
+                if isinstance(fixes, list) and fixes:
+                    default_fix = str(fixes[0])[:200]
+                elif directives:
+                    default_fix = str(directives[0])[:200]
 
                 # Extract gate_rejects
                 gate_rejects = content.get("gate_rejects", [])
@@ -131,60 +150,63 @@ def scan_novels(genre_filter: str | None = None, min_novels: int = 3) -> dict[st
                         if not isinstance(gr, dict):
                             continue
                         gate = gr.get("gate", "")
-                        directives = gr.get("directives", [])
+                        gr_directives = gr.get("directives", []) or [default_fix]
                         evidence_data = gr.get("evidence", {})
 
-                        # Map gate to category
-                        category = "other"
-                        if "repeat" in gate.lower() or "fossil" in gate.lower():
-                            category = "style"
-                        elif "beat" in gate.lower():
-                            category = "beat_execution"
-                        elif "adjacent" in gate.lower():
-                            category = "style"
+                        # Prefer taxonomy code as category; else legacy keyword map.
+                        category = (taxonomy.classify_gate(gate) if taxonomy else None) or "other"
+                        if category == "other":
+                            if "repeat" in gate.lower() or "fossil" in gate.lower() or "adjacent" in gate.lower():
+                                category = "style"
+                            elif "beat" in gate.lower():
+                                category = "beat_execution"
 
                         pattern = f"gate_reject: {gate}"
-                        for directive in directives[:2]:
+                        for directive in (gr_directives or [""])[:2]:
                             key = (category, pattern)
                             pattern_evidence[key].append({
                                 "novel": novel_dir.name,
                                 "chapter": chapter,
-                                "fix": str(directive),
+                                "fix": str(directive) or default_fix,
                                 "evidence": evidence_data,
                                 "score_before": score_before,
                                 "score_after": score_after,
                             })
 
-                # Extract problems with fixes
+                # Extract problems (prefixed gate messages + reviewer notes)
                 problems = content.get("problems", [])
-                fixes = content.get("fixes", [])
-                if isinstance(problems, list) and isinstance(fixes, list):
-                    for prob, fix in zip(problems[:3], fixes[:3]):
+                if isinstance(problems, list):
+                    for prob in problems[:5]:
                         prob_text = str(prob).strip()
-                        fix_text = str(fix).strip()
-                        if not prob_text or not fix_text:
+                        if not prob_text:
                             continue
 
-                        # Infer category from problem text
-                        category = "other"
-                        if any(kw in prob_text for kw in ["钩子", "hook", "章末"]):
-                            category = "hook_technique"
-                        elif any(kw in prob_text for kw in ["兑现", "payoff", "爽点"]):
-                            category = "payoff_setup"
-                        elif any(kw in prob_text for kw in ["人物", "角色", "character"]):
-                            category = "character_consistency"
-                        elif any(kw in prob_text for kw in ["世界观", "逻辑", "world"]):
-                            category = "world_logic"
-                        elif any(kw in prob_text for kw in ["beat", "节拍", "场景"]):
-                            category = "beat_execution"
-                        elif any(kw in prob_text for kw in ["文体", "style", "破折号", "句式"]):
-                            category = "style"
+                        # Prefer taxonomy code (from the prefix); else keyword infer.
+                        category = (taxonomy.classify_problem(prob_text) if taxonomy else None) or "other"
+                        if category == "other":
+                            if any(kw in prob_text for kw in ["钩子", "hook", "章末"]):
+                                category = "hook_technique"
+                            elif any(kw in prob_text for kw in ["兑现", "payoff", "爽点"]):
+                                category = "payoff_setup"
+                            elif any(kw in prob_text for kw in ["人物", "角色", "character"]):
+                                category = "character_consistency"
+                            elif any(kw in prob_text for kw in ["世界观", "逻辑", "world"]):
+                                category = "world_logic"
+                            elif any(kw in prob_text for kw in ["beat", "节拍", "场景"]):
+                                category = "beat_execution"
+                            elif any(kw in prob_text for kw in ["文体", "style", "破折号", "句式"]):
+                                category = "style"
+
+                        # Skip uncategorizable reviewer free-text (keeps the rule
+                        # set focused on recognized, actionable failure modes).
+                        if category == "other" and (taxonomy is None or taxonomy.classify_problem(prob_text) is None):
+                            continue
 
                         key = (category, prob_text[:100])
                         pattern_evidence[key].append({
                             "novel": novel_dir.name,
                             "chapter": chapter,
-                            "fix": fix_text[:200],
+                            "fix": default_fix,
                             "evidence": {},
                             "score_before": score_before,
                             "score_after": score_after,
@@ -265,7 +287,7 @@ def main():
     output_path = Path(args.output)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"\n✓ Distilled {len(result['rules'])} rules from {result['meta']['novels_scanned']} novels")
+    print(f"\n[distill] {len(result['rules'])} rules from {result['meta']['novels_scanned']} novels")
     print(f"  Total chapters scanned: {result['meta']['total_chapters']}")
     print(f"  Output written to: {output_path}")
 

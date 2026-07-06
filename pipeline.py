@@ -701,6 +701,21 @@ def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> 
     Returns (kind, reason) where kind is "local" or "structural".
     """
     cfg = config["novel"]
+    # Prefer the structured failure taxonomy when review.py tagged this report
+    # (additive `failure_codes`). It maps the chapter's named failure modes to a
+    # precise fix route; we collapse that to the pipeline's binary local/structural
+    # contract. Only short-circuits the heuristics below when it yields a decisive
+    # STRUCTURAL verdict — a "local" taxonomy read still falls through so the finer
+    # heuristics (intra-recap vs style-collapse vs patchable) pick the exact path.
+    if bool(cfg.get("failure_taxonomy_enabled", True)):
+        try:
+            import taxonomy
+            codes = review.get("failure_codes") or []
+            if codes and taxonomy.replan_kind(codes) == "structural":
+                route = taxonomy.dominant_route(codes)
+                return "structural", f"失败分类学判定结构性重做（codes={codes[:4]}, route={route}）"
+        except Exception:
+            pass
     # Deterministic gate rejects (cross-chapter fossil collapse, adjacent
     # re-narration) are ALWAYS structural: the draft itself is a write-off and
     # wording-level patches measurably cannot fix it. Checked first so no other

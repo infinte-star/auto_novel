@@ -385,6 +385,67 @@ def recent_panel_drop_rate(conn: Any, limit: int = 3) -> float | None:
     return sum(drops) / len(drops)
 
 
+def recent_panel_excitement(conn: Any, limit: int = 3) -> float | None:
+    """Mean panel excitement (1-10) over the most recent `limit` reader_panel
+    reports — the retention counterpart to recent_panel_drop_rate, used by the
+    P2 review gate. Prefers the genre-weighted `weighted_excitement` (P1) when
+    present, else the raw `avg_excitement`. Returns None when there is no panel
+    data so callers distinguish "no signal" from "low excitement". Never raises.
+    """
+    try:
+        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
+    except Exception:
+        return None
+    vals: list[float] = []
+    for r in rows:
+        payload = r.get("payload") if isinstance(r, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        v = payload.get("weighted_excitement", payload.get("avg_excitement"))
+        if v is not None:
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                continue
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def panel_series(
+    conn: Any, start_chapter: int = 0, end_chapter: int = 0, limit: int = 400
+) -> list[tuple[int, float, float]]:
+    """Return (chapter, excitement, drop_rate) for every reader_panel report,
+    optionally restricted to [start_chapter, end_chapter] (0 = unbounded).
+    Oldest-first. Feeds retention.retention_by_block (P0) and rolling_plan arc
+    retention (P3). Never raises."""
+    try:
+        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
+    except Exception:
+        return []
+    out: list[tuple[int, float, float]] = []
+    for r in rows:
+        payload = r.get("payload") if isinstance(r, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        try:
+            ch = int(payload.get("chapter", r.get("chapter", 0)))
+        except (TypeError, ValueError):
+            continue
+        if start_chapter and ch < start_chapter:
+            continue
+        if end_chapter and ch > end_chapter:
+            continue
+        ex = payload.get("weighted_excitement", payload.get("avg_excitement"))
+        dr = payload.get("weighted_drop_rate", payload.get("drop_rate"))
+        try:
+            out.append((ch, float(ex if ex is not None else 5.0), float(dr if dr is not None else 0.0)))
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
     try:
         with db_lock():

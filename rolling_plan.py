@@ -186,8 +186,45 @@ def expand_next_arc(
     revelations = get_pending_revelations(conn, chapter_num, limit=8)
     mem = memory_context(paths, conn, config)
 
-    user = f"""请为第 {next_arc_num} 弧（预计第 {next_start}-{next_end_est} 章）生成详细的章节级大纲。
+    # P3: retention-driven escalation. Read the just-completed arc's reader-panel
+    # retention; if the arc under-delivered (low excitement / high drop), the
+    # next arc's outline is FORCED to escalate structurally rather than continue
+    # the plateau — this is the arc-level lever the per-chapter directives lack,
+    # and directly targets the mid-book sag (excitement craters that逐章微调救不动).
+    escalation_block = ""
+    if bool(novel_cfg.get("rolling_plan_retention_escalate", True)):
+        try:
+            from retention import summarize_retention
+            from store import panel_series
+            series = panel_series(conn, arc_info["start_chapter"], chapter_num)
+            if series:
+                summ = summarize_retention(
+                    [s[1] for s in series], [s[2] for s in series]
+                )
+                exc_floor = float(novel_cfg.get("rolling_plan_escalate_excitement", 5.0))
+                drop_ceil = float(novel_cfg.get("rolling_plan_escalate_drop", 0.5))
+                me = summ.get("mean_excitement")
+                md = summ.get("mean_drop")
+                sagging = (me is not None and me < exc_floor) or (md is not None and md > drop_ceil)
+                if sagging:
+                    escalation_block = (
+                        f"\n## ⚠ 上弧留存告警（必须据此升级下弧）\n"
+                        f"上弧读者面板：兴奋度均值 {me}/10、弃书率 {md:.0%}、"
+                        f"低谷章 {summ.get('trough_count')} 个、留存指数 {summ.get('retention_index')}/10。"
+                        f"这说明上弧节奏塌陷、读者在流失。下弧大纲**必须**做出至少两项结构性升级，"
+                        f"不得延续上弧的调查/铺垫节奏：\n"
+                        f"1. 引入更高层级的对手或威胁（新反派/幕后升级/时间压力），把冲突拉到新台阶；\n"
+                        f"2. 制造一次不可逆的代价或损失（关系/能力/身份/资源的永久改变），提高赌注；\n"
+                        f"3. 前置一个强爽点/强反转到本弧前3章，立刻兑现留住读者；\n"
+                        f"4. 每3章至少一个当章兑现的高潮，避免连续铺垫。\n"
+                    )
+                    log(paths, f"Rolling plan: arc {arc_info['arc_number']} retention sag "
+                        f"(exc={me}, drop={md}); forcing escalation in next arc")
+        except Exception as exc:
+            log(paths, f"Rolling plan retention read failed (non-fatal): {exc}")
 
+    user = f"""请为第 {next_arc_num} 弧（预计第 {next_start}-{next_end_est} 章）生成详细的章节级大纲。
+{escalation_block}
 ## 全书导航罗盘
 {compass_text[:3000] if compass_text else "（首弧，无罗盘）"}
 

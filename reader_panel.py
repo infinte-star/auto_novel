@@ -29,6 +29,7 @@ import telemetry
 from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score
 from llm import call_llm, json_prompt, load_json_with_repair
+from retention import weighted_aggregate
 from store import db_event
 
 # Each persona is (key, system prompt). They are deliberately FIXED (not
@@ -63,6 +64,48 @@ PERSONAS: list[tuple[str, str]] = [
         "信息量稀薄、注水拉长、把一个场景切碎成好几章的行为会让你拒绝付费并弃书。",
     ),
 ]
+
+# P1 — genre/channel persona weighting. The 5 PERSONAS stay FIXED (telemetry
+# comparability), but the AGGREGATE drop_rate/excitement is weighted by how much
+# each persona represents the target channel's readers. A male-channel action
+# novel shouldn't let the 女频视角 persona's 80% drop dominate the retention
+# signal the gate acts on. Raw (unweighted) aggregates are still stored for
+# telemetry comparability; the weighted ones drive directives + the P2 gate.
+# Weights are relative (~0.3–1.5); a persona absent from a profile defaults 1.0.
+PERSONA_WEIGHTS: dict[str, dict[str, float]] = {
+    "_male_action": {"爽点党": 1.4, "弃书敏感型": 1.3, "付费意愿型": 1.2, "逻辑党": 0.8, "女频视角": 0.4},
+    "romance_female": {"女频视角": 1.5, "付费意愿型": 1.2, "弃书敏感型": 1.0, "爽点党": 0.7, "逻辑党": 0.7},
+    "suspense": {"逻辑党": 1.4, "弃书敏感型": 1.2, "付费意愿型": 1.0, "爽点党": 0.7, "女频视角": 0.7},
+    "history": {"逻辑党": 1.4, "弃书敏感型": 1.0, "女频视角": 0.9, "付费意愿型": 0.9, "爽点党": 0.6},
+}
+# style_preset → weight profile. Male-channel action/爽 presets share one profile.
+_PRESET_PROFILE = {
+    "xuanhuan_shuang": "_male_action",
+    "system_stream": "_male_action",
+    "urban_ability": "_male_action",
+    "wanzu_xuanhuan": "_male_action",
+    "romance_female": "romance_female",
+    "suspense": "suspense",
+    "history": "history",
+}
+
+
+def _persona_weights(config: dict[str, Any]) -> dict[str, float] | None:
+    """Resolve persona weights for the configured genre, or None for uniform.
+
+    Off (uniform) when reader_panel_persona_weighting is false. An explicit
+    reader_panel_persona_profile overrides the style_preset→profile mapping.
+    Returns None when no profile matches so aggregation stays plain-mean.
+    """
+    novel_cfg = config.get("novel", {})
+    if not bool(novel_cfg.get("reader_panel_persona_weighting", True)):
+        return None
+    profile = str(novel_cfg.get("reader_panel_persona_profile", "") or "").strip()
+    if not profile:
+        preset = str(novel_cfg.get("style_preset", "") or "").strip().lower()
+        profile = _PRESET_PROFILE.get(preset, "")
+    return PERSONA_WEIGHTS.get(profile)
+
 
 _PERSONA_USER_TEMPLATE = """## 这一章的全文（你对本书前文一无所知，只看这一章）
 {chapter_text}
@@ -151,11 +194,28 @@ def run_reader_panel(
         "worst_moments": [f"{r['persona']}：{r['worst_moment']}" for r in results if r["worst_moment"]][:5],
         "per_persona": results,
     }
+
+    # P1: genre-weighted aggregate. Stored alongside the raw values (raw kept for
+    # telemetry comparability across books); the weighted values drive the
+    # directive threshold below and the P2 review gate. Uniform weights → weighted
+    # == raw, so this is a safe no-op when weighting is disabled/unmatched.
+    weights = _persona_weights(config)
+    wagg = weighted_aggregate(results, weights)
+    report["weighted_drop_rate"] = wagg["drop_rate"]
+    report["weighted_pay_rate"] = wagg["pay_rate"]
+    report["weighted_excitement"] = wagg["avg_excitement"]
+    report["persona_weighted"] = bool(weights)
+
+    # Effective values the thresholds/gate act on: weighted when available.
+    eff_drop = report["weighted_drop_rate"] if report["weighted_drop_rate"] is not None else report["drop_rate"]
+    eff_exc = report["weighted_excitement"] if report["weighted_excitement"] is not None else report["avg_excitement"]
     log(
         paths,
         f"Reader panel Ch{chapter_num}: drop_rate={report['drop_rate']:.0%} "
-        f"pay_rate={report['pay_rate']:.0%} excitement={report['avg_excitement']}/10 "
-        f"({n}/{len(PERSONAS)} personas)",
+        f"pay_rate={report['pay_rate']:.0%} excitement={report['avg_excitement']}/10"
+        + (f" | weighted drop={eff_drop:.0%} exc={eff_exc}/10 [{('%s' % (weights and 'genre' or 'uniform'))}]"
+           if weights else "")
+        + f" ({n}/{len(PERSONAS)} personas)",
     )
 
     # Persist: book-local event + global telemetry (both non-fatal).
@@ -186,28 +246,28 @@ def run_reader_panel(
     else:
         threshold = float(novel_cfg.get("reader_panel_drop_threshold", 0.4))
         hard_threshold = float(novel_cfg.get("reader_panel_hard_drop", 0.6))
-    if report["drop_rate"] >= threshold:
+    if eff_drop >= threshold:
         try:
             existing = load_checkpoint(paths, chapter_num, "final_review.json")
             if isinstance(existing, dict):
                 wd = list(existing.get("writer_directives_for_next_chapter") or [])
                 reasons = "；".join(report["drop_reasons"][:3]) or "多名模拟读者弃书"
-                if report["drop_rate"] >= hard_threshold:
+                if eff_drop >= hard_threshold:
                     if _low_barrier:
                         msg = (
-                            f"【紧急·下沉留存】{report['drop_rate']:.0%} 的免费读者弃书（{reasons}）。"
+                            f"【紧急·下沉留存】{eff_drop:.0%} 的免费读者弃书（{reasons}）。"
                             f"下一章必须：①开头100字内有正在发生的冲突；②对话占比50%+、大白话；"
                             f"③给出具体可见的强爽点/情感冲击；④章末留强钩子。通勤5分钟内必须抓住读者。"
                         )
                     else:
                         msg = (
-                            f"【紧急】读者面板严重警告：{report['drop_rate']:.0%} 的模拟读者弃书"
+                            f"【紧急】读者面板严重警告：{eff_drop:.0%} 的模拟读者弃书"
                             f"（{reasons}）。下一章必须做出根本性调整：加入强爽点/情感冲击/"
                             f"关键揭示来挽回读者。不要延续本章的节奏和模式。"
                         )
                 else:
                     msg = (
-                        f"读者面板警示：{report['drop_rate']:.0%} 的模拟读者在本章弃书"
+                        f"读者面板警示：{eff_drop:.0%} 的模拟读者在本章弃书"
                         f"（{reasons}）。下一章必须针对性挽回追读"
                         + ("（下沉读者无耐心，开头即给冲突、对话优先、爽点前置）。" if _low_barrier else "。")
                     )
@@ -221,19 +281,20 @@ def run_reader_panel(
 
     # Hard drop alert: persist a panel_alert.json so next chapter's planning
     # can read it and force structural adjustments.
-    if report["drop_rate"] >= hard_threshold:
+    if eff_drop >= hard_threshold:
         try:
             alert = {
                 "chapter": chapter_num,
-                "drop_rate": report["drop_rate"],
+                "drop_rate": eff_drop,
+                "raw_drop_rate": report["drop_rate"],
                 "pay_rate": report["pay_rate"],
-                "avg_excitement": report["avg_excitement"],
+                "avg_excitement": eff_exc,
                 "drop_reasons": report["drop_reasons"][:5],
                 "worst_moments": report["worst_moments"][:5],
-                "severity": "critical" if report["drop_rate"] >= 0.8 else "high",
+                "severity": "critical" if eff_drop >= 0.8 else "high",
             }
             save_checkpoint(paths, chapter_num, "panel_alert.json", alert)
-            log(paths, f"Reader panel Ch{chapter_num}: HARD DROP ({report['drop_rate']:.0%}), "
+            log(paths, f"Reader panel Ch{chapter_num}: HARD DROP ({eff_drop:.0%}), "
                 f"panel_alert.json saved for next chapter planning")
         except Exception as exc:
             log(paths, f"Reader panel alert save failed (non-fatal) Ch{chapter_num}: {exc}")

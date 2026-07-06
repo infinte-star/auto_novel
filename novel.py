@@ -1448,6 +1448,7 @@ def main() -> int:
     p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
     p_compare.add_argument("name_a")
     p_compare.add_argument("name_b")
+    p_compare.add_argument("--judge", action="store_true", help="also run a blind pairwise LLM judge over matched chapters (requires API config; builds a client from name_a)")
 
     p_ablate = sub.add_parser("ablate", help="scaffold a chapter-capped copy of a novel with ONE config key flipped")
     p_ablate.add_argument("name")
@@ -1516,6 +1517,17 @@ def main() -> int:
         return cmd_package(args.name)
     if args.command == "compare":
         from compare import cmd_compare
+        if getattr(args, "judge", False):
+            # Build a client from name_a's config only when judging (keeps the
+            # default compare path zero-LLM). Same pattern as cmd_package.
+            _validate_name(args.name_a)
+            _set_novel_env(args.name_a)
+            from config import get_paths, load_config  # noqa: E402
+            from trial import _build_client  # noqa: E402
+            cfg = load_config()
+            pth = get_paths(cfg)
+            cli = _build_client(cfg, pth)
+            return cmd_compare(args.name_a, args.name_b, judge=True, client=cli, paths=pth, config=cfg)
         return cmd_compare(args.name_a, args.name_b)
     if args.command == "ablate":
         from compare import cmd_ablate

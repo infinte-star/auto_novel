@@ -701,6 +701,36 @@ def review_chapter(
                 f"本章缺少让读者产生真实情感反应的时刻。"
             )
 
+    # RETENTION GATE (P2): the reader-panel excitement is the pipeline's only
+    # signal that tracks real 追读/弃书, but historically it was advisory-only —
+    # so a stretch that bored readers (panel excitement 1.6-3.0) still shipped at
+    # 7.5-8.0. When the rolling panel excitement over recent chapters is below
+    # the floor, CAP the composite (same mechanism as the emotional/market
+    # floors) so the chapter drops under quality_threshold and is routed into the
+    # revise/replan loop instead of force-accepted. This is a CAP not a hard
+    # block: the panel lags (runs post-save, every N chapters), so blocking on it
+    # could reject a genuine recovery chapter; the cap applies pressure while the
+    # next-chapter directive + should_replan trigger + P3 arc-replan do the fix.
+    # Gated by reader_panel_gate_enabled (only meaningful when the panel runs).
+    if bool(config["novel"].get("reader_panel_enabled", False)) and \
+       bool(config["novel"].get("reader_panel_gate_enabled", True)):
+        try:
+            from store import recent_panel_excitement
+            gwin = int(config["novel"].get("reader_panel_gate_window", 3))
+            exc = recent_panel_excitement(conn, gwin)
+            floor = float(config["novel"].get("reader_panel_excitement_floor", 4.0))
+            if exc is not None and exc < floor:
+                cap = float(config["novel"].get("reader_panel_gate_cap", 7.5))
+                caps.append(cap)
+                report.setdefault("problems", []).append(
+                    f"RETENTION: 近{gwin}次读者面板兴奋度均值{exc:.1f}<地板{floor:.1f}——"
+                    f"读者正在流失，综合分封顶{cap:.1f}。本章须结构性拉升爽点/情绪/揭示，"
+                    f"而非延续前几章的节奏。"
+                )
+                log(paths, f"Retention gate Ch{chapter_num}: panel excitement {exc:.2f}<{floor:.1f} → cap {cap:.1f}")
+        except Exception:
+            pass
+
     # KEY-DIMENSION HARD FLOOR: novelty/payoff are the two dimensions self-review
     # systematically over-passes — across suspense_v4 every chapter scored
     # novelty 7.0–8.0 (3 of 6 stuck at exactly 7.0) yet the composite still read
@@ -1352,6 +1382,20 @@ def review_chapter(
             report.setdefault("problems", []).append(
                 f"FACTCHECK: {len(hard)} hard contradiction(s) with established facts must be fixed."
             )
+
+    # Fiction failure taxonomy (additive): derive canonical `failure_codes` from
+    # the existing problems prefixes + gate_rejects gates so replan-routing
+    # (pipeline._classify_replan_failure) and cross-book distillation read a
+    # structured vocabulary instead of free text. Purely additive — no score,
+    # message, or accept decision changes. Inert if disabled or import fails.
+    if bool(config["novel"].get("failure_taxonomy_enabled", True)):
+        try:
+            import taxonomy
+            codes = taxonomy.codes_from_review(report)
+            if codes:
+                report["failure_codes"] = codes
+        except Exception:
+            pass
     return report
 
 def stage_review(
