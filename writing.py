@@ -123,6 +123,14 @@ LOW_BARRIER_REGISTER_BLOCK = """## 下沉语体（大白话，硬性执行，叠
 - 动词精准、少形容词堆砌："很/非常/极其/十分"等程度虚词最少化，靠具体动作和画面让读者自己感受。
 - 场景快进：一个场景不拖沓，画面感优先，快速给到冲突与爽点，不为凑字数重复铺陈。"""
 
+SENSITIVE_WORD_AVOIDANCE_BLOCK = """## 内容分级与呈现方式（平台合规·硬性执行，最高优先级之一）
+本作发布渠道带内容审核，正文过于露骨会被拦截而无法过审。写作时用**克制、含蓄、侧写、留白**的笔法处理黑暗内容——**只改呈现方式，绝不删弱情节、冲突、悬念与压迫感**。
+- 暴力与伤亡：不做血腥的身体损伤特写，改写旁观者的反应、环境的变化、声音与温度的骤变、事后的痕迹与静默；用"倒下／不再动弹／再没起来／满地狼藉"这类结果性、暗示性的表达带过。
+- 死亡与恐怖：不铺陈遗骸、腐坏、解剖的直观细节，改用气氛、光影、空气的凝滞、人物的战栗与心理惊惧来营造恐怖；场所与状态用偏侧写的说法（如"冷藏区／后室／失去体温的人"）。
+- "吞噬/变强"设定：把核心能力写成对**能量、气息、本源、光**的汲取与消化，聚焦力量流动、身体的变化感与代价，而不是进食血肉脏器的生理过程。
+- 涉性/低俗：点到为止，以情绪与张力替代露骨描写。涉政/违禁：不涉及真实政治人物、敏感时政、违禁品制法。
+- 核心原则：黑暗、压迫、恐怖靠**氛围、心理、后果与感官暗示**营造，而非露骨的生理名词堆砌。宁可更克制、更留白，也不要触发审核。"""
+
 CLOSING_RULES_BLOCK = """## 终章特化（这是全书最后一章，必须写成真正的结局，严格执行；与上面通用的"结尾钩/制造下章悬念"规则冲突时，以本块为准）
 - 兑现主线：本章必须正面解决全书/本卷的核心矛盾，把前文铺设的人、信息、伏笔在页面上兑现，不得回避或拖延。
 - 谜底必须明确（悬疑/推理硬性）：凶手是谁、真相是什么、核心谜题如何解开，必须在本章给出确定答案；不得含糊、不得"留给读者判断"、不得以模糊暗示替代揭晓。
@@ -698,6 +706,22 @@ def carried_over_partial_beats(paths: Paths, chapter_num: int, limit: int = 6) -
         if partial:
             return partial
     return []
+
+
+def sensitive_word_avoidance_block(config: dict[str, Any]) -> str:
+    """Content-register directive steering the model to render dark content (violence,
+    death, horror, the 吞噬 power) obliquely — aftermath, sensory/psychological
+    suggestion, energy-absorption framing — so a content-moderation gateway does not
+    reject the chapter (sensitive_words_detected). Gated by novel.sensitive_word_avoidance.
+
+    NOTE: deliberately category-based and positive-framed. It does NOT list explicit
+    trigger nouns: echoing raw banned words into the prompt primes the model to emit
+    them (observed: adding a word-list made generations fail FASTER), so we name
+    categories and prescribe the oblique technique instead. Returns "" when off.
+    """
+    if not bool(config["novel"].get("sensitive_word_avoidance", False)):
+        return ""
+    return SENSITIVE_WORD_AVOIDANCE_BLOCK
 
 
 def writer_directives_for_chapter(paths: Paths, chapter_num: int, limit: int = 6) -> list[str]:
@@ -1290,6 +1314,16 @@ def write_chapter(
         anti_fragment_ban=ANTI_FRAGMENT_BAN,
         aesthetic_taste=AESTHETIC_PRESETS.get(preset, AESTHETIC_HISTORY),
     )
+    # Sensitive-word avoidance goes into the SYSTEM prompt (highest attention) so it
+    # is not diluted inside the large user prompt. Content-moderation gateways scan
+    # the streamed OUTPUT; a single flagged token in a full chapter → 500. Keeping
+    # this front-and-center in the system role is the strongest steering position.
+    try:
+        _swa_sys = sensitive_word_avoidance_block(config)
+        if _swa_sys:
+            system = system + "\n\n" + _swa_sys
+    except Exception:
+        pass
     mem = cached_memory or writing_memory_context(paths, conn, config)
     partial_beats = carried_over_partial_beats(paths, chapter_num)
     directives = writer_directives_for_chapter(paths, chapter_num)
@@ -1305,6 +1339,14 @@ def write_chapter(
             f"番茄是短章高频钩子（每章一个钩子、情绪高峰间隔≤2章），不要写成长章文学体——"
             f"超出上限 {_cmax} 字会被判超长扣分，请精简技术性/描写性堆砌、聚焦推进剧情与爽点。\n"
         )
+    except Exception:
+        pass
+    # 敏感词规避（平台合规）：正文避免触发内容审核网关的 sensitive_words_detected。
+    # 高优先级，动笔前置。仅在 novel.sensitive_word_avoidance=true 时注入。
+    try:
+        _swa = sensitive_word_avoidance_block(config)
+        if _swa:
+            carryover_block += "\n" + _swa + "\n"
     except Exception:
         pass
     # 下沉/大白话语体（正交开关，叠加任意题材）：免费流 platform_preset 或显式
@@ -1853,9 +1895,14 @@ def revise_chapter(
             _log(paths, f"Revise patches too few hit ({applied}/{total} < {threshold_hit}); falling back to LLM rewrite")
 
     mem = cached_memory or writing_memory_context(paths, conn, config)
+    _swa_revise = ""
+    try:
+        _swa_revise = sensitive_word_avoidance_block(config)
+    except Exception:
+        _swa_revise = ""
     user = f"""## 记忆
 {mem}
-
+{(_swa_revise + chr(10)) if _swa_revise else ""}
 ## 上章结尾
 {tail[-1500:]}
 

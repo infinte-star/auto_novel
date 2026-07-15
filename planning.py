@@ -252,9 +252,22 @@ def _strategy_history(conn: Any, lookback: int = 60) -> dict[str, dict[str, floa
         plans = payload.get("plans") or []
         if not plans:
             continue
-        sel_idx = int(decision.get("selected_index", 0))
+        # selected_index / scores[].index come from LLM-produced arbitration JSON that
+        # is persisted verbatim; a malformed record (e.g. a critique note landing in the
+        # index field) must NOT crash the bandit and take down all future planning.
+        try:
+            sel_idx = int(decision.get("selected_index", 0))
+        except (ValueError, TypeError):
+            sel_idx = 0
         scores = decision.get("scores") or []
-        score_map = {int(s.get("index", -1)): safe_score(s.get("score", 0)) for s in scores}
+        score_map = {}
+        for s in scores:
+            if not isinstance(s, dict):
+                continue
+            try:
+                score_map[int(s.get("index", -1))] = safe_score(s.get("score", 0))
+            except (ValueError, TypeError):
+                continue
 
         # Get terminal quality for this chapter (if available)
         terminal_score = terminal_scores.get(int(chapter), None) if chapter else None
@@ -413,7 +426,10 @@ def _recent_selected_plans(
         if isinstance(merged, dict) and merged:
             plans.append(merged)
         elif cand:
-            sel = int(decision.get("selected_index", 0))
+            try:
+                sel = int(decision.get("selected_index", 0))
+            except (ValueError, TypeError):
+                sel = 0
             if 0 <= sel < len(cand) and isinstance(cand[sel], dict):
                 plans.append(cand[sel])
         if len(plans) >= lookback:
@@ -907,6 +923,23 @@ def generate_candidate_plans(
             ch = craft_planner_hints(config)
             if ch:
                 base_user += "\n\n" + ch
+        except Exception:
+            pass
+    # Content register (platform moderation compliance): steer the plan away from
+    # mandating graphic gore/death/body-horror scenes so the WRITTEN chapter can pass
+    # a content-moderation gateway. Same gate as the writer-side block.
+    if bool(config["novel"].get("sensitive_word_avoidance", False)):
+        try:
+            from writing import SENSITIVE_WORD_AVOIDANCE_BLOCK
+            base_user += (
+                "\n\n## 内容分级约束（规划层·硬性）\n"
+                "本作发布渠道带内容审核。规划 goal/conflict/payoff/beats/scenes 时，"
+                "不要设计依赖血腥身体损伤、遗骸解剖、进食血肉脏器等露骨生理细节才能成立的场景；"
+                "把黑暗、恐怖、伤亡、"
+                "「吞噬变强」都设计成可用氛围、心理、后果、能量/本源汲取来实演的形态——"
+                "冲突与爽点强度不减，但呈现方式必须可被克制、含蓄地写出来。\n"
+                + SENSITIVE_WORD_AVOIDANCE_BLOCK
+            )
         except Exception:
             pass
     # Platform golden-finger constraints (免费流偏好简单/有代价的金手指；Gap-5).
