@@ -129,6 +129,9 @@ def init_db(paths: Paths) -> Any:
             accepted INTEGER,
             em_dash_per_kchar REAL,
             style_penalty REAL,
+            avg_sentence_chars REAL,
+            dialogue_char_ratio REAL,
+            tech_per_kchar REAL,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS entities (
@@ -216,6 +219,9 @@ def init_db(paths: Paths) -> Any:
         "em_dash_per_kchar REAL",
         "style_penalty REAL",
         "emotional_impact REAL",
+        "avg_sentence_chars REAL",
+        "dialogue_char_ratio REAL",
+        "tech_per_kchar REAL",
     ):
         try:
             conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
@@ -487,6 +493,12 @@ def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]])
         return
     with db_lock():
         for link in links:
+            # causal_links comes from LLM extraction JSON; a malformed element
+            # (e.g. a bare string instead of a dict) must not crash finalize —
+            # that leaves chapter_completed.json unwritten and wedges resume in
+            # an endless "Resuming partially indexed Ch{n}" loop.
+            if not isinstance(link, dict):
+                continue
             conn.execute(
                 """INSERT INTO causal_links(source_event_id, target_event_id, source_chapter, target_chapter,
                    link_type, description, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",

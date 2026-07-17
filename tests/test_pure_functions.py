@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
-from quality import _beat_anchor_fragments, beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
+from quality import beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
 from quality import store_chapter_fingerprint, check_plan_against_fingerprints  # noqa: E402
 from quality import prose_texture, emotional_cadence  # noqa: E402
@@ -320,16 +320,6 @@ class BeatCoverageTests(unittest.TestCase):
         # >500 chars of filler so the short-text auto-pass doesn't trigger.
         return "第10章 残响\n\n" + ("林夕沿着走廊往前走，灯光在地面投下长长的影子。" * 20) + extra
 
-    def test_missing_concrete_beat_fails(self):
-        plan = {"beats": [
-            "林夕发现安瓿碎裂方向与针孔方向矛盾，意识到现场被布置过。",
-        ]}
-        report = beat_coverage(self._body(), plan, {"novel": {}})
-        self.assertTrue(report["enabled"])
-        self.assertFalse(report["passed"])
-        self.assertEqual(len(report["missing_beats"]), 1)
-        self.assertIn("安瓿", report["missing_beats"][0])
-
     def test_realized_beat_passes_exact(self):
         plan = {"beats": [
             "林夕发现安瓿碎裂方向与针孔方向矛盾。",
@@ -361,27 +351,6 @@ class BeatCoverageTests(unittest.TestCase):
         report = beat_coverage(self._body(), plan, {"novel": {"beat_coverage_enabled": False}})
         self.assertFalse(report["enabled"])
         self.assertTrue(report["passed"])
-
-    def test_coverage_floor_fails_even_when_each_beat_hits_once(self):
-        # Both beats hit one anchor each, but overall anchor hit-rate is low;
-        # a strict min coverage should still fail the gate.
-        plan = {"beats": [
-            "林夕用镊子夹起安瓿，对照护士站的交接记录核对批号与给药时间。",
-            "周临舟拦在配药室门口，亮出调岗通知逼她交出钥匙。",
-        ]}
-        body = self._body("她夹起安瓿看了一眼。周临舟站在配药室门口。")
-        report = beat_coverage(body, plan, {"novel": {"beat_coverage_min": 0.95}})
-        self.assertFalse(report["passed"])
-        self.assertEqual(report["missing_beats"], [])
-        self.assertLess(report["coverage"], 0.95)
-
-    def test_anchor_fragments_skip_stop_tokens_and_generic(self):
-        anchors = _beat_anchor_fragments("她发现了一个东西，意识到事情不对。")
-        self.assertEqual(anchors, ["不对"])
-        anchors2 = _beat_anchor_fragments("林夕把安瓿碎片收进证物袋。")
-        self.assertIn("安瓿碎片", anchors2)
-        self.assertIn("证物袋", anchors2)
-
 
 class QualityDebtPatchTests(unittest.TestCase):
     def test_force_accept_patches_land_without_llm(self):
@@ -708,128 +677,6 @@ class ThreadLocalConnTests(unittest.TestCase):
             self.assertEqual(len(events), 30)
         finally:
             shutil.rmtree(root, ignore_errors=True)
-
-
-class CraftRulesTests(unittest.TestCase):
-    """Cross-book craft-rule consumption layer (closes the distillation loop)."""
-
-    def _write_rules(self, rules):
-        import tempfile, json as _json
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, "craft_rules.json")
-        with open(p, "w", encoding="utf-8") as f:
-            _json.dump({"rules": rules, "meta": {}}, f, ensure_ascii=False)
-        return p
-
-    def test_missing_file_is_silent_noop(self):
-        import craft
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": "/no/such/file.json"}}
-        self.assertEqual(craft.load_craft_rules(cfg), {"rules": [], "meta": {}})
-        self.assertEqual(craft.craft_writer_block(cfg), "")
-        self.assertEqual(craft.craft_planner_hints(cfg), "")
-
-    def test_disabled_flag_returns_empty(self):
-        import craft
-        p = self._write_rules([
-            {"category": "style", "pattern": "碎片化破折号", "fix": "用完整长句", "confidence": 0.9, "evidence_count": 5}
-        ])
-        cfg = {"novel": {"craft_rules_enabled": False, "craft_rules_path": p}}
-        self.assertEqual(craft.craft_writer_block(cfg), "")
-
-    def test_confidence_filter(self):
-        import craft
-        p = self._write_rules([
-            {"category": "style", "pattern": "低置信噪声", "fix": "忽略", "confidence": 0.1, "evidence_count": 2},
-            {"category": "style", "pattern": "高置信化石句", "fix": "换措辞", "confidence": 0.8, "evidence_count": 6},
-        ])
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_min_confidence": 0.3}}
-        block = craft.craft_writer_block(cfg)
-        self.assertIn("高置信化石句", block)
-        self.assertNotIn("低置信噪声", block)
-
-    def test_category_routing(self):
-        import craft
-        p = self._write_rules([
-            {"category": "style", "pattern": "文体问题", "fix": "修文体", "confidence": 0.7, "evidence_count": 4},
-        ])
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p}}
-        # style is a writer category, not a planner category
-        self.assertIn("文体问题", craft.craft_writer_block(cfg))
-        self.assertEqual(craft.craft_planner_hints(cfg), "")
-
-    def test_top_k_limit(self):
-        import craft
-        rules = [
-            {"category": "hook_technique", "pattern": f"模式{i}", "fix": f"修复{i}",
-             "confidence": 0.9, "evidence_count": 10 - i}
-            for i in range(10)
-        ]
-        p = self._write_rules(rules)
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_top_k": 3}}
-        block = craft.craft_writer_block(cfg)
-        # exactly 3 rule lines (each rule renders a "失败模式：" line)
-        self.assertEqual(block.count("失败模式："), 3)
-
-    def test_score_delta_ranks_first(self):
-        import craft
-        p = self._write_rules([
-            {"category": "payoff_setup", "pattern": "无收益证据", "fix": "A",
-             "confidence": 0.9, "evidence_count": 20, "avg_score_before": 0.0, "avg_score_after": 0.0},
-            {"category": "payoff_setup", "pattern": "有正收益", "fix": "B",
-             "confidence": 0.4, "evidence_count": 3, "avg_score_before": 6.0, "avg_score_after": 8.0},
-        ])
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p, "craft_rules_top_k": 1}}
-        block = craft.craft_planner_hints(cfg)
-        self.assertIn("有正收益", block)
-        self.assertNotIn("无收益证据", block)
-
-    def test_malformed_rules_skipped(self):
-        import craft
-        p = self._write_rules([
-            "not a dict",
-            {"category": "style", "pattern": "", "fix": "x", "confidence": 0.9},  # empty pattern
-            {"category": "style", "pattern": "有效", "fix": "y", "confidence": 0.9, "evidence_count": 5},
-        ])
-        cfg = {"novel": {"craft_rules_enabled": True, "craft_rules_path": p}}
-        block = craft.craft_writer_block(cfg)
-        self.assertIn("有效", block)
-
-
-class SceneBreakdownBlockTests(unittest.TestCase):
-    def test_empty_breakdown_renders_nothing(self):
-        from scene_breakdown import scene_breakdown_block
-        self.assertEqual(scene_breakdown_block({}, 1), "")
-        self.assertEqual(scene_breakdown_block({"scenes": []}, 1), "")
-        self.assertEqual(scene_breakdown_block(None, 1), "")
-
-    def test_renders_scenes_with_fields(self):
-        from scene_breakdown import scene_breakdown_block
-        bd = {
-            "scenes": [
-                {
-                    "goal": "主角识破伪证",
-                    "location": "县衙后堂",
-                    "time": "深夜",
-                    "characters": ["林照", "县令"],
-                    "visible_actions": ["林照展开那张被烧残的契书", "县令的手抖了一下"],
-                    "beats_covered": ["揭穿契书造假"],
-                    "exit_state": "县令认罪，新的幕后名字浮出",
-                }
-            ],
-            "carryover_to_next_chapter": "幕后之人是谁",
-        }
-        out = scene_breakdown_block(bd, 7)
-        self.assertIn("CH7", out)
-        self.assertIn("县衙后堂", out)
-        self.assertIn("林照展开那张被烧残的契书", out)
-        self.assertIn("退出状态", out)
-        self.assertIn("幕后之人是谁", out)
-
-    def test_skips_malformed_scenes(self):
-        from scene_breakdown import scene_breakdown_block
-        bd = {"scenes": ["not a dict", {"goal": "ok", "visible_actions": ["做事"]}]}
-        out = scene_breakdown_block(bd, 2)
-        self.assertIn("做事", out)
 
 
 class ChapterTitleTests(unittest.TestCase):

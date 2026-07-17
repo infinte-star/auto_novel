@@ -314,11 +314,6 @@ def _select_strategies_bandit(
     strategy has a wide posterior and still wins some draws. A small floor of
     forced exploration (`strategy_bandit_explore_frac`, default 0.1) guards
     against posterior lock-in over a long book.
-
-    Cross-book prior (gated by `cross_book_prior_enabled`): global telemetry
-    wins/trials are blended in as pseudo-counts, so a brand-new book starts
-    from the library's accumulated win-rates. Any telemetry failure silently
-    degrades to local-only.
     """
     import random as _random
 
@@ -329,32 +324,12 @@ def _select_strategies_bandit(
     lookback = int(config["novel"].get("strategy_bandit_lookback", 60))
     stats = _strategy_history(conn, lookback=lookback)
 
-    global_stats: dict[str, dict[str, float]] = {}
-    if bool(config["novel"].get("cross_book_prior_enabled", False)):
-        try:
-            import telemetry as _telemetry
-            genre = str(config["novel"].get("genre", "_default") or "_default")
-            novel_name = paths.logs_dir.parent.name
-            global_stats = _telemetry.global_strategy_history(genre, exclude_novel=novel_name)
-        except Exception:
-            global_stats = {}
-    prior_weight = float(config["novel"].get("cross_book_prior_weight", 0.3))
-
-    used_prior = False
     sampled: list[tuple[float, int, tuple[str, str]]] = []
     for idx, strat in enumerate(strategies):
         name = strat[0]
         s = stats.get(name)
-        g = global_stats.get(name)
         wins = float(s["wins"]) if s else 0.0
         trials = float(s["trials"]) if s else 0.0
-        # Global prior enters as capped pseudo-counts; local evidence dominates as it accumulates.
-        if g and float(g.get("trials", 0)) >= 3 and prior_weight > 0:
-            k = prior_weight * min(float(g["trials"]), 20.0)
-            g_win_rate = float(g["wins"]) / float(g["trials"])
-            wins += k * g_win_rate
-            trials += k
-            used_prior = True
         losses = max(0.0, trials - wins)
         sampled.append((_random.betavariate(wins + 1.0, losses + 1.0), idx, strat))
     sampled.sort(key=lambda x: (-x[0], x[1]))
@@ -368,8 +343,7 @@ def _select_strategies_bandit(
         if leftovers:
             picked[_random.randrange(len(picked))] = _random.choice(leftovers)
     try:
-        suffix = " (thompson, with cross-book prior)" if used_prior else " (thompson)"
-        log(paths, f"Strategy bandit picked: {[p[0] for p in picked]}{suffix}")
+        log(paths, f"Strategy bandit picked: {[p[0] for p in picked]} (thompson)")
     except Exception:
         pass
     return picked
@@ -601,23 +575,10 @@ def generate_candidate_plans(
             emotional_cadence_block = "\n".join(ec["directives"])
     except Exception:
         pass
-    panel_alert_block = ""
-    try:
-        from checkpoint import load_checkpoint as _lc
-        if chapter_num > 1:
-            alert = _lc(paths, chapter_num - 1, "panel_alert.json")
-            if isinstance(alert, dict) and alert.get("drop_rate", 0) > 0:
-                reasons = "；".join(alert.get("drop_reasons", [])[:3])
-                panel_alert_block = (
-                    f"## 读者面板紧急警报（上一章 Ch{chapter_num - 1}）\n"
-                    f"弃读率：{alert['drop_rate']:.0%}，严重等级：{alert.get('severity', 'high')}\n"
-                    f"弃书原因：{reasons}\n"
-                    f"本章必须做出根本性调整以挽回读者——不要延续上章的节奏/模式/情感基调。\n"
-                    f"必须包含：强爽点 或 情感冲击 或 关键揭示 或 关系突破。\n"
-                )
-    except Exception:
-        pass
-    mem = cached_memory or memory_context(paths, conn, config)
+    mem = cached_memory or memory_context(
+        paths, conn, config,
+        max_chars=int(config["novel"].get("plan_memory_chars", 60000) or 0),
+    )
     # Whole-book beat scheduler: locate this chapter against the volume_plan
     # milestones so the planner is told which payoff/高潮 should land around now.
     # Pure parse+inject, no LLM call; degrades to "" on any parse failure.
@@ -816,7 +777,7 @@ def generate_candidate_plans(
 ## 逾期未揭示的信息（硬性：这些谜团/秘密已过了计划揭示时间，本章必须至少推进或揭示其中一条）
 {overdue_rev_block}
 
-{panel_alert_block}{f"## 情感节奏警告{chr(10)}{emotional_cadence_block}{chr(10)}" if emotional_cadence_block else ""}
+{f"## 情感节奏警告{chr(10)}{emotional_cadence_block}{chr(10)}" if emotional_cadence_block else ""}
 {beat_block}
 
 ## 上章结尾
@@ -913,18 +874,6 @@ def generate_candidate_plans(
 - 不要只换措辞或换场景名；要针对上面的每条缺陷，在 goal/conflict/payoff/beats 里给出可见的修复动作。
 - 若上一版因文体碎片化/破折号堆砌失分，本章 beats 必须明确要求用完整主谓宾长句叙事、控制破折号。
 - 若上一版因能力越界/视角越界失分，本章必须在 risk 字段写明如何严守能力模态与限制视角。"""
-    # Cross-book craft hints (distillation loop): inject library-wide structural
-    # lessons so a new book inherits accumulated planning experience from Ch1.
-    # Silent no-op when craft_rules.json is absent or yields no qualifying rules.
-    if bool(config["novel"].get("craft_rules_enabled", True)):
-        try:
-            from craft import craft_planner_hints
-
-            ch = craft_planner_hints(config)
-            if ch:
-                base_user += "\n\n" + ch
-        except Exception:
-            pass
     # Content register (platform moderation compliance): steer the plan away from
     # mandating graphic gore/death/body-horror scenes so the WRITTEN chapter can pass
     # a content-moderation gateway. Same gate as the writer-side block.
@@ -1393,7 +1342,19 @@ def arbitrate_plan(
     reports_by_plan: list[list[dict[str, Any]]],
     cached_memory: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    mem = cached_memory or memory_context(paths, conn, config)
+    # P2 降本：仲裁是"选择"任务——候选大纲 + agent 报告 + 节奏诊断已经在 prompt 里，
+    # 完整 4-tier memory（实测 ~150K 字/次）冗余。改用 lite 上下文（含开篇路线/伏线/
+    # 近期指标，专用预算 plan_arbitrate_memory_chars）。cached_memory 仅作 lite
+    # 构建失败时的兜底。
+    try:
+        mem = lite_memory_context(
+            paths, conn, config,
+            max_chars=int(config["novel"].get("plan_arbitrate_memory_chars", 20000) or 0),
+        )
+    except Exception:
+        mem = ""
+    if not mem:
+        mem = cached_memory or memory_context(paths, conn, config)
     calib = plan_calibration_hint(conn, config)
     calib_block = f"\n{calib}\n" if calib else ""
     # Used-element ledger so the arbiter can PENALISE a candidate whose ability
@@ -1437,7 +1398,10 @@ def arbitrate_plan(
         tag="plan_arbitrate",
     )
     decision = load_json_with_repair(client, paths, config, raw)
-    plan = decision.get("merged_plan") or plans[int(decision.get("selected_index", 0))]
+    _sel = _coerce_index(decision.get("selected_index", 0))
+    if not (0 <= _sel < len(plans)):
+        _sel = 0
+    plan = decision.get("merged_plan") or plans[_sel]
     db_event(conn, chapter_num, "plan_arbitration", {"decision": decision, "plans": plans})
     # Cross-book telemetry double-write (observer; silently degrades). Done at
     # the source because this is the only point where the full candidate list
@@ -1454,16 +1418,38 @@ def arbitrate_plan(
             pass
     return plan, decision
 
+def _coerce_index(val: Any, default: int = 0) -> int:
+    """Robustly parse an arbiter-supplied index that may be malformed.
+    Arbitration JSON is LLM-produced and untrusted: selected_index / scores[].index
+    have shown up as '^1', ' 1 ', 1.0, None. A bad value must never crash planning
+    (that wedges the whole run). Extract the first signed integer run, else default."""
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        import re as _re
+        m = _re.search(r"-?\d+", str(val or ""))
+        return int(m.group()) if m else default
+
+
 def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> float:
     scores = decision.get("scores") or []
     if not scores:
         return 0.0
     if selected_index is None:
-        selected_index = int(decision.get("selected_index", 0))
+        selected_index = _coerce_index(decision.get("selected_index", 0))
     for score in scores:
-        if int(score.get("index", -1)) == selected_index:
+        if not isinstance(score, dict):
+            continue
+        if _coerce_index(score.get("index", -1), -1) == selected_index:
             return safe_score(score.get("score", 0))
-    return safe_score(scores[0].get("score", 0))
+    first = scores[0] if isinstance(scores[0], dict) else {}
+    return safe_score(first.get("score", 0))
 
 def _recovery_active(paths: Paths, chapter_num: int) -> bool:
     """True when a mid-book degradation recovery directive (written by
@@ -1482,30 +1468,29 @@ def _recovery_active(paths: Paths, chapter_num: int) -> bool:
 def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: int, paths: Paths) -> int:
     """Risk-adaptive candidate-plan count.
 
-    Two forces, applied in order:
+    Inverted cost model (MVP): the DEFAULT is the cheap path (candidate_plans,
+    typically 1) and breadth is spent only when deterministic signals say the
+    book is in trouble:
       1. RISK UPSHIFT — recent chapters show trouble (style/repeat penalties,
-         gate rejects, falling scores, force-accepts): restore full breadth even
-         if a downshift would otherwise apply. Recovering from a collapse is
-         exactly when plan diversity pays for itself.
-      2. STABLE DOWNSHIFT — quality stably high after a warm-up: drop one
-         candidate to save the (plan_candidate + fused_review + arbitrate)
-         overhead, which measures ~55% of total LLM seconds per chapter.
+         falling scores) or recovery mode is active: WIDEN to
+         `risk_upshift_candidates` (default 3), even above candidate_plans.
+         Recovering from a collapse is exactly when plan diversity pays.
+      2. STABLE DOWNSHIFT — for configs still running multi-candidate by
+         default: drop one candidate once quality is stably high.
 
-    Never returns below 1; chapter 1-2 always keep full breadth.
+    Never returns below 1.
     """
     base = int(config["novel"]["candidate_plans"])
-    if not bool(config["novel"].get("adaptive_downshift_enabled", True)):
+    if chapter_num <= 2:
         return base
-    if base <= 1 or chapter_num <= 2:
-        return base
+    upshift_n = max(base, int(config["novel"].get("risk_upshift_candidates", 3)))
 
     # Recovery mode (mid-book degradation alert): force full candidate breadth
     # for the recovery window — plan diversity is exactly what breaks a slide.
     if _recovery_active(paths, chapter_num):
-        full = int(config["novel"]["candidate_plans"])
         log(paths, f"Recovery upshift Ch{chapter_num}: degradation recovery mode "
-            f"active — keeping full candidate breadth ({full}).")
-        return full
+            f"active — widening candidate breadth to {upshift_n}.")
+        return upshift_n
 
     window = int(config["novel"].get("adaptive_downshift_window", 10))
     rows = recent_metrics(conn, window)
@@ -1526,27 +1511,16 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
         if pens and max(pens) >= pen_cut:
             risky = True
             reasons.append(f"max_style_penalty={max(pens):.1f}>={pen_cut}")
-    # Reader-panel retention proxy (Gap-7): a high recent simulated drop_rate is a
-    # collapse signal — restore full candidate breadth, plan diversity recovers it.
-    if bool(config["novel"].get("reader_panel_enabled", False)):
-        try:
-            from store import recent_panel_drop_rate
-            drop = recent_panel_drop_rate(conn, int(config["novel"].get("reader_panel_replan_window", 3)))
-            if drop is not None and drop >= float(config["novel"].get("reader_panel_upshift_drop", 0.5)):
-                risky = True
-                reasons.append(f"panel_drop_rate={drop:.2f}")
-        except Exception:
-            pass
     if risky:
-        if base < int(config["novel"]["candidate_plans"]):
-            base = int(config["novel"]["candidate_plans"])
         log(
             paths,
-            f"Risk upshift Ch{chapter_num}: keeping full candidate breadth ({base}) — {', '.join(reasons)}",
+            f"Risk upshift Ch{chapter_num}: widening candidate breadth to {upshift_n} — {', '.join(reasons)}",
         )
-        return base
+        return upshift_n
 
     # --- 2. Stable downshift (original behaviour, warmup-gated) ---
+    if base <= 1 or not bool(config["novel"].get("adaptive_downshift_enabled", True)):
+        return base
     warmup = int(config["novel"].get("adaptive_downshift_warmup", 60))
     if chapter_num < warmup:
         return base
@@ -1589,7 +1563,10 @@ def create_plan(
         log(paths, f"Resuming cached {checkpoint_label} plan Ch{chapter_num}")
         return cached["plan"], cached["decision"]
 
-    mem = cached_memory or memory_context(paths, conn, config)
+    mem = cached_memory or memory_context(
+        paths, conn, config,
+        max_chars=int(config["novel"].get("plan_memory_chars", 60000) or 0),
+    )
     best_plan: dict[str, Any] | None = None
     best_decision: dict[str, Any] | None = None
     best_score = -1.0

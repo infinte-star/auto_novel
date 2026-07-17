@@ -43,7 +43,6 @@ PLAN_TAGS = frozenset({
     "plan_screen",
     "plan_arbitrate",
     "structural_diagnose",
-    "scene_breakdown",
     "bootstrap",
     "bootstrap_bible",
     "bootstrap_characters",
@@ -54,6 +53,8 @@ PLAN_TAGS = frozenset({
     "replan",
     "creative_boost",
     "contract",
+    "hook_package",
+    "hook_package_score",
 })
 
 WRITE_TAGS = frozenset({
@@ -61,13 +62,14 @@ WRITE_TAGS = frozenset({
     "beat_repair",
     "revise",
     "em_dash_fix",
+    "revise_hook",
+    "refine_rewrite",
 })
 
 EXTRACT_TAGS = frozenset({
     "extract",
-    "state_update",
-    "state_sections",
     "memory_compress",
+    "json_repair",
 })
 
 REVIEW_TAGS = frozenset({
@@ -78,6 +80,7 @@ REVIEW_TAGS = frozenset({
     "macro_progress",
     "plan_review_fused",
     "plan_review_axis",
+    "refine_diagnose",
 })
 
 # Ordered list of (pool_attr, api_attr, tag_set, model_key) for role routing.
@@ -684,8 +687,6 @@ def _enhance_system_prompt(system: str, config: dict[str, Any], *, tag: str, wan
         "creative_boost",
         "memory_compress",
         "extract",
-        "state_update",
-        "state_sections",
         "voice_anchor",
         "voices_table",
     }:

@@ -702,35 +702,6 @@ def review_chapter(
             )
 
     # RETENTION GATE (P2): the reader-panel excitement is the pipeline's only
-    # signal that tracks real 追读/弃书, but historically it was advisory-only —
-    # so a stretch that bored readers (panel excitement 1.6-3.0) still shipped at
-    # 7.5-8.0. When the rolling panel excitement over recent chapters is below
-    # the floor, CAP the composite (same mechanism as the emotional/market
-    # floors) so the chapter drops under quality_threshold and is routed into the
-    # revise/replan loop instead of force-accepted. This is a CAP not a hard
-    # block: the panel lags (runs post-save, every N chapters), so blocking on it
-    # could reject a genuine recovery chapter; the cap applies pressure while the
-    # next-chapter directive + should_replan trigger + P3 arc-replan do the fix.
-    # Gated by reader_panel_gate_enabled (only meaningful when the panel runs).
-    if bool(config["novel"].get("reader_panel_enabled", False)) and \
-       bool(config["novel"].get("reader_panel_gate_enabled", True)):
-        try:
-            from store import recent_panel_excitement
-            gwin = int(config["novel"].get("reader_panel_gate_window", 3))
-            exc = recent_panel_excitement(conn, gwin)
-            floor = float(config["novel"].get("reader_panel_excitement_floor", 4.0))
-            if exc is not None and exc < floor:
-                cap = float(config["novel"].get("reader_panel_gate_cap", 7.5))
-                caps.append(cap)
-                report.setdefault("problems", []).append(
-                    f"RETENTION: 近{gwin}次读者面板兴奋度均值{exc:.1f}<地板{floor:.1f}——"
-                    f"读者正在流失，综合分封顶{cap:.1f}。本章须结构性拉升爽点/情绪/揭示，"
-                    f"而非延续前几章的节奏。"
-                )
-                log(paths, f"Retention gate Ch{chapter_num}: panel excitement {exc:.2f}<{floor:.1f} → cap {cap:.1f}")
-        except Exception:
-            pass
-
     # KEY-DIMENSION HARD FLOOR: novelty/payoff are the two dimensions self-review
     # systematically over-passes — across suspense_v4 every chapter scored
     # novelty 7.0–8.0 (3 of 6 stuck at exactly 7.0) yet the composite still read
@@ -769,6 +740,7 @@ def review_chapter(
             # newest) so a slow upward drift is penalized even below the
             # absolute warn threshold (the 0.94→4.15 monotonic-creep miss).
             em_history: list[float] = []
+            tech_history: list[float] = []
             try:
                 from store import recent_metrics
 
@@ -787,15 +759,23 @@ def review_chapter(
                     if v is None:
                         continue
                     try:
-                        seq.append((int(r.get("chapter", 0)), float(v)))
+                        tv = r.get("tech_per_kchar")
+                        seq.append((int(r.get("chapter", 0)), float(v),
+                                    float(tv) if tv is not None else None))
                     except (TypeError, ValueError):
                         continue
                 seq.sort(key=lambda x: x[0])
-                em_history = [v for _, v in seq[-trend_window:]]
+                em_history = [v for _, v, _ in seq[-trend_window:]]
+                tech_history = [t for _, _, t in seq[-trend_window:] if t is not None]
             except Exception:
                 em_history = []
+                tech_history = []
 
-            sh = style_health(chapter, config, em_history=em_history or None)
+            sh = style_health(
+                chapter, config,
+                em_history=em_history or None,
+                tech_history=tech_history or None,
+            )
             report["style_health"] = sh
             penalty = float(sh.get("penalty", 0.0))
             if penalty > 0:
@@ -819,7 +799,8 @@ def review_chapter(
                 if penalty >= float(config["novel"].get("style_penalty_block", 2.0)):
                     report["accepted"] = False
                     report.setdefault("problems", []).append(
-                        "STYLE: prose-health collapse detected (em-dash fragments / telegraphic lines)."
+                        "STYLE: prose-health collapse detected "
+                        "(em-dash fragments / telegraphic lines / overwriting-instrument-report register)."
                     )
 
             if bool(config["novel"].get("prose_calibration_enabled", True)):
@@ -1787,7 +1768,9 @@ def refresh_glossary(
 COLD_READER_SYSTEM = """你是一名**没有读过本书前文**、第一次拿到这一章的挑剔读者兼资深编辑。
 你不知道作者的任何设定、声音锚或写作意图——你只看这一章的文字本身。
 请用"陌生人视角"诚实判断这一章作为小说是否好读，重点抓两类毛病：
-1. 文体是否畸形：是否大量用破折号（——）把句子切成碎片、通篇单词短句、像电报或舞台提示而不像小说？是否几乎没有正常的完整句子和对话？
+1. 文体是否畸形——两种病都要抓：
+   (a) 碎句化：大量破折号（——）把句子切成碎片、通篇单词短句、像电报或舞台提示而不像小说；
+   (b) 过度书写：超长句一逗到底、堆砌技术名词与伪精确测量值（如"零点三毫米""每分钟七十二次""频率/脉冲/共振"），整章几乎没有人物对话，读起来像仪器报告或实验记录而不像小说。
 2. 剧情是否原地打转：这一章是否在反复咀嚼同一个微观场景/同一件事，几乎没有实质推进？读完后你是否觉得"什么都没真正发生"？
 
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
@@ -2156,17 +2139,6 @@ def should_replan(conn: Any, config: dict[str, Any]) -> bool:
     # replan trigger — readers disengage when intensity never varies or only sags.
     if structural.get("tension_shape") in {"flat", "monotone_fall"}:
         triggers += 1
-    # Reader-panel retention proxy (Gap-7): a sustained high simulated drop_rate
-    # is the closest signal we have to番茄的追读率掉点，纳入重规划触发条件。
-    if bool(config["novel"].get("reader_panel_enabled", False)):
-        try:
-            from store import recent_panel_drop_rate
-            window = int(config["novel"].get("reader_panel_replan_window", 3))
-            drop = recent_panel_drop_rate(conn, window)
-            if drop is not None and drop >= float(config["novel"].get("reader_panel_replan_drop", 0.5)):
-                triggers += 1
-        except Exception:
-            pass
     return triggers >= 2
 
 def adaptive_replan(

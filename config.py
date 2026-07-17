@@ -81,6 +81,13 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "length_band_penalty_enabled": True,
         "style_low_barrier_register": True,
         "style_min_avg_sentence_chars": 12.0,
+        # 反过度书写锚点（碎句塌缩的镜像）：句长上限 / 对话占比下限 / 伪技术腔。
+        # 阈值由离线回放校准（experiments/replay_style_health.py）：健康对话书
+        # 跑 8-18% 对话占比；塌缩章 0.5-3% + 黑话 ≥12/k。
+        "style_max_avg_sentence_chars": 38.0,
+        "style_dialogue_ratio_min": 0.05,
+        "style_tech_jargon_per_kchar_warn": 8.0,
+        "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
         "emotional_cadence_max_same": 3,
     }
@@ -91,7 +98,9 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         # 万族/战力：略长的战斗章、爽点间隔略宽。
         "wanzu_xuanhuan": {**shuang, "payoff_density_min": 0.4,
                            "chapter_words": 3000, "chapter_min_chars": 2400,
-                           "chapter_max_chars": 4200},
+                           "chapter_max_chars": 4200,
+                           "style_max_avg_sentence_chars": 40.0,
+                           "style_dialogue_ratio_min": 0.04},
         # 悬疑：慢烧、线索开场、复杂容忍、高阅读门槛、物证兑现 block。
         "suspense": {
             "narrative_mode": "reasoning",
@@ -105,6 +114,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": False,
             "style_min_avg_sentence_chars": 14.0,
+            "style_max_avg_sentence_chars": 48.0,
+            "style_dialogue_ratio_min": 0.03,
+            "style_tech_jargon_per_kchar_warn": 10.0,
+            "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,
             "emotional_cadence_max_same": 4,
         },
@@ -121,6 +134,9 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": False,
             "style_min_avg_sentence_chars": 16.0,
+            "style_max_avg_sentence_chars": 52.0,
+            "style_dialogue_ratio_min": 0.02,
+            "style_tech_jargon_per_kchar_warn": 8.0,
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 4,
         },
@@ -137,6 +153,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": True,
             "style_min_avg_sentence_chars": 12.0,
+            "style_max_avg_sentence_chars": 38.0,
+            "style_dialogue_ratio_min": 0.08,
+            "style_tech_jargon_per_kchar_warn": 6.0,
+            "style_tech_jargon_per_kchar_bad": 10.0,
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 2,
         },
@@ -144,7 +164,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
     # 未知/未设置题材 → 中性默认（不强加爽文短章/下沉）。
     neutral = {**shuang, "narrative_mode": "balanced", "opening_gate_mode": "balanced",
                "chapter_words": 3000, "chapter_min_chars": 2400, "chapter_max_chars": 4500,
-               "style_low_barrier_register": False, "style_min_avg_sentence_chars": 13.0}
+               "style_low_barrier_register": False, "style_min_avg_sentence_chars": 13.0,
+               "style_max_avg_sentence_chars": 42.0, "style_dialogue_ratio_min": 0.04,
+               "style_tech_jargon_per_kchar_warn": 8.0,
+               "style_tech_jargon_per_kchar_bad": 12.0}
     return dict(profiles.get(p, neutral))
 
 

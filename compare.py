@@ -216,13 +216,10 @@ def _fmt(v: Any, nd: int = 2) -> str:
     return str(v)
 
 
-def compare_novels(name_a: str, name_b: str, *, judge: bool = False,
-                   client: Any = None, paths: Any = None, config: Any = None) -> str:
+def compare_novels(name_a: str, name_b: str) -> str:
     """Build a markdown comparison report for two novels; returns the report.
 
-    When judge=True (and a client/paths/config are supplied), also runs a blind
-    pairwise LLM judge over matched chapters and appends its verdict. The default
-    (judge=False) path stays entirely deterministic / zero-LLM.
+    Entirely deterministic / zero-LLM.
     """
     nd_a, nd_b = NOVELS_DIR / name_a, NOVELS_DIR / name_b
     for nd in (nd_a, nd_b):
@@ -334,33 +331,6 @@ def compare_novels(name_a: str, name_b: str, *, judge: bool = False,
         lines.append("(identical apart from paths/keys)")
     lines.append("")
 
-    # --- optional blind pairwise LLM judge (only when --judge + client) ---
-    judge_result: dict[str, Any] | None = None
-    if judge and client is not None and paths is not None and config is not None:
-        try:
-            import judge as judge_mod
-            judge_result = judge_mod.judge_ablation(client, paths, config, name_a, name_b)
-            lines.append("## Pairwise judge (blind, order-swapped)")
-            if judge_result.get("error"):
-                lines.append(f"(judge skipped: {judge_result['error']})")
-            else:
-                jw, jl, jt = judge_result["a_wins"], judge_result["b_wins"], judge_result["ties"]
-                lines.append(f"Judged {judge_result['judged']} matched chapters (A={name_a}, B={name_b}).")
-                lines.append(f"| winner | {name_a} | {name_b} | tie |")
-                lines.append("|---|---|---|---|")
-                lines.append(f"| chapters | {jw} | {jl} | {jt} |")
-                lines.append("")
-                lines.append("| ch | winner | reason |")
-                lines.append("|---|---|---|")
-                for r in judge_result["per_chapter"]:
-                    who = {"a": name_a, "b": name_b, "tie": "tie"}.get(r["winner"], "tie")
-                    lines.append(f"| {r['chapter']} | {who} | {str(r.get('reason',''))[:70]} |")
-            lines.append("")
-        except Exception as exc:  # never let the judge crash the deterministic report
-            lines.append("## Pairwise judge (blind, order-swapped)")
-            lines.append(f"(judge failed: {exc}; see deterministic metrics above)")
-            lines.append("")
-
     # --- verdict heuristics ---
     lines.append("## Heuristic verdict")
     verdict: list[str] = []
@@ -382,27 +352,19 @@ def compare_novels(name_a: str, name_b: str, *, judge: bool = False,
     if ri_a is not None and ri_b is not None and abs(ri_a - ri_b) >= 0.5:
         better = name_a if ri_a > ri_b else name_b
         verdict.append(f"- higher retention index: **{better}** ({max(ri_a, ri_b):.1f} vs {min(ri_a, ri_b):.1f})")
-    if judge_result and not judge_result.get("error"):
-        jw, jl = judge_result["a_wins"], judge_result["b_wins"]
-        if jw != jl:
-            better = name_a if jw > jl else name_b
-            verdict.append(f"- blind pairwise judge favors **{better}** ({max(jw, jl)}-{min(jw, jl)}-{judge_result['ties']} W-L-T)")
-        else:
-            verdict.append(f"- blind pairwise judge: tie ({jw}-{jl}-{judge_result['ties']})")
     if s_a and s_b and llm_a["elapsed"] and llm_b["elapsed"]:
         eff_a = llm_a["elapsed"] / max(len(s_a), 1)
         eff_b = llm_b["elapsed"] / max(len(s_b), 1)
         if abs(eff_a - eff_b) / max(eff_a, eff_b) > 0.15:
             better = name_a if eff_a < eff_b else name_b
             verdict.append(f"- cheaper per chapter: **{better}** ({min(eff_a, eff_b)/60:.0f}m vs {max(eff_a, eff_b)/60:.0f}m)")
-    lines.extend(verdict if verdict else ["- no decisive deterministic difference; consider a blind pairwise judge run"])
+    lines.extend(verdict if verdict else ["- no decisive deterministic difference"])
     lines.append("")
     return "\n".join(lines)
 
 
-def cmd_compare(name_a: str, name_b: str, *, judge: bool = False,
-                client: Any = None, paths: Any = None, config: Any = None) -> int:
-    report = compare_novels(name_a, name_b, judge=judge, client=client, paths=paths, config=config)
+def cmd_compare(name_a: str, name_b: str) -> int:
+    report = compare_novels(name_a, name_b)
     EXPERIMENTS_DIR.mkdir(exist_ok=True)
     out = EXPERIMENTS_DIR / f"{name_a}_vs_{name_b}.md"
     out.write_text(report, encoding="utf-8")

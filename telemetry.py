@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS chapter_metrics (
     accepted INTEGER,
     em_dash_per_kchar REAL,
     style_penalty REAL,
+    avg_sentence_chars REAL,
+    dialogue_char_ratio REAL,
+    tech_per_kchar REAL,
     created_at TEXT,
     PRIMARY KEY (novel_name, chapter)
 );
@@ -108,6 +111,14 @@ _METRIC_COLUMNS = (
     "title", "score", "readthrough_score", "hook_score", "payoff_score",
     "novelty_score", "prose_score", "continuity_score", "plan_score",
     "hook_strength", "accepted", "em_dash_per_kchar", "style_penalty",
+    "avg_sentence_chars", "dialogue_char_ratio", "tech_per_kchar",
+)
+
+# 幂等迁移：老 global.db 缺反过度书写锚点三列（CREATE IF NOT EXISTS 不迁移旧表）。
+_MIGRATE_COLUMNS = (
+    "avg_sentence_chars REAL",
+    "dialogue_char_ratio REAL",
+    "tech_per_kchar REAL",
 )
 
 
@@ -130,6 +141,12 @@ def _connect() -> Any:
         conn = sqlite3.connect(TELEMETRY_DB, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        for column in _MIGRATE_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
+                conn.commit()
+            except Exception:
+                pass
         return conn
     except Exception:
         return None
@@ -246,58 +263,6 @@ def record_revise_pair(
         )
     except Exception:
         return False
-
-
-# ----------------------------------------------------------------------------
-# cross-book prior (read path for the planning bandit)
-# ----------------------------------------------------------------------------
-def global_strategy_history(genre: str, exclude_novel: str | None = None) -> dict[str, dict[str, float]]:
-    """Aggregate per-strategy stats across all books of the same genre.
-
-    Returns the same shape as planning._strategy_history:
-    {strategy: {"trials": N, "score_sum": X, "wins": K}}. When the genre
-    bucket has no data the whole library is used as fallback so a brand-new
-    genre still benefits from generic narrative priors. Any failure returns
-    {} (the bandit then behaves exactly as before this feature existed).
-    """
-    conn = _connect()
-    if conn is None:
-        return {}
-    try:
-        def _query(where_genre: bool) -> dict[str, dict[str, float]]:
-            sql = (
-                "SELECT strategy, COUNT(*) AS trials, SUM(score) AS score_sum,"
-                " SUM(selected) AS wins FROM strategy_outcomes WHERE 1=1"
-            )
-            params: list[Any] = []
-            if where_genre:
-                sql += " AND genre = ?"
-                params.append(genre or "_default")
-            if exclude_novel:
-                sql += " AND novel_name != ?"
-                params.append(exclude_novel)
-            sql += " GROUP BY strategy"
-            rows = conn.execute(sql, params).fetchall()
-            return {
-                str(r["strategy"]): {
-                    "trials": float(r["trials"] or 0),
-                    "score_sum": float(r["score_sum"] or 0.0),
-                    "wins": float(r["wins"] or 0),
-                }
-                for r in rows
-            }
-
-        stats = _query(where_genre=True)
-        if not stats:
-            stats = _query(where_genre=False)
-        return stats
-    except Exception:
-        return {}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 # ----------------------------------------------------------------------------

@@ -62,6 +62,7 @@ def style_health(
     text: str,
     config: dict[str, Any] | None = None,
     em_history: list[float] | None = None,
+    tech_history: list[float] | None = None,
 ) -> dict[str, Any]:
     """Compute deterministic prose-health metrics + a penalty + directives.
 
@@ -82,6 +83,12 @@ def style_health(
     below the absolute warn threshold — it is penalized and a directive is
     emitted. This is the cure for slow style collapse (em creeping 0.94→4.15
     monotonically with the static threshold never tripping).
+
+    `tech_history` is the tech-jargon-per-kchar sequence of prior chapters
+    (oldest→newest), reserved for a trend term on the OPPOSITE collapse mode
+    (overwriting / instrument-report register). Accepted from day one so call
+    sites plumb it once; the static conjunction check below is the active
+    detector.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     body = _strip_title_line(text)
@@ -234,6 +241,30 @@ def style_health(
                     + "避免把一句话拆成多个单词短句。"
                 )
 
+        # --- 2b. 句长上限带（过度书写塌缩 = 碎句塌缩的镜像） -----------------
+        # v12 huangliang Ch60-100：正文塌缩为"伪技术过度书写体"——超长句一逗到底、
+        # 通篇说明书腔，而 LLM 自评反而打到 9.7。上面的下限只防碎句化；这里补上限。
+        # 阈值题材分档（历史/悬疑容忍更长的书面句），见 config._genre_profile。
+        max_avg = float(cfg.get("style_max_avg_sentence_chars", 42.0))
+        bad_mult = float(cfg.get("style_max_avg_sentence_bad_mult", 1.3))
+        if avg_seg > max_avg * bad_mult:
+            penalty += 2.0
+            flags.append(
+                f"sentences_overlong_severe(avg={avg_seg:.1f}>{max_avg * bad_mult:.0f})"
+            )
+            directives.append(
+                f"严重文体问题：上一章平均句长高达 {avg_seg:.0f} 字，超长句一逗到底，"
+                "读起来像说明书。本章把复合长句拆成主谓宾清晰的短句，"
+                "恢复正常句号节奏，长短句交替，让读者能喘气。"
+            )
+        elif avg_seg > max_avg:
+            penalty += 1.0
+            flags.append(f"sentences_too_long(avg={avg_seg:.1f}>{max_avg})")
+            directives.append(
+                f"上一章平均句长 {avg_seg:.0f} 字、偏向过度书写。本章拆分冗长复合句，"
+                "多用句号收束，长短句交替，避免一逗到底。"
+            )
+
     # --- 3. Fragment-line ratio (lines that are tiny standalone clauses) ---
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     if lines:
@@ -273,11 +304,66 @@ def style_health(
     else:
         quote_pairs = body.count('"') // 2
     metrics["dialogue_markers"] = quote_pairs
+
+    # --- 4b. 对话字符占比下限（过度书写塌缩的第二症状：整章没人说话） --------
+    # 存在性检查（<3 对引号）抓不住"有零星引号但通篇是叙述/说明"的章。
+    # 这里量化：引号内字符 ÷ 正文字符。阈值题材分档（悬疑/历史容忍低对话）。
+    dlg_chars = sum(len(m) for m in re.findall(r"“[^“”]{1,300}”", body))
+    dlg_chars += sum(len(m) for m in re.findall(r"「[^「」]{1,300}」", body))
+    dialogue_ratio = dlg_chars / n
+    metrics["dialogue_char_ratio"] = round(dialogue_ratio, 3)
+    ratio_min = float(cfg.get("style_dialogue_ratio_min", 0.04))
     # Only flag if the chapter is long enough that some dialogue is expected.
-    if n > 2000 and quote_pairs < 3:
+    if n > 2000 and ratio_min > 0 and dialogue_ratio < ratio_min:
+        penalty += 1.0
+        flags.append(f"dialogue_starved({dialogue_ratio:.1%}<{ratio_min:.0%})")
+        directives.append(
+            f"上一章对话占比仅 {dialogue_ratio:.0%}，几乎全是叙述。本章至少 {ratio_min:.0%} 的篇幅"
+            "用有潜台词的人物对白推进情节，让信息从人物嘴里说出来而不是叙述灌输。"
+        )
+    elif n > 2000 and quote_pairs < 3:
+        # 存在性检查是占比检查的真子集，仅在占比检查未触发/被禁用时兜底，不叠加。
         penalty += 0.5
         flags.append("almost_no_dialogue")
         directives.append("上一章几乎没有对话，本章请加入有潜台词的人物对白。")
+
+    # --- 6. 伪技术腔（过度书写塌缩的标志性症状：像仪器报告，没人说话） --------
+    # v12 huangliang Ch50-100 实测：塌缩章 = 技术黑话密度(频率/脉冲/共振/毫米…)
+    # ≥12/k 且对话占比 <2%；而黑话高但对话充足的书（数据面板类爽文）读感正常。
+    # 离线校准结论：单看数字密度不可分（健康悬疑 8-16/k > 塌缩章 2-5/k），
+    # 必须用 [黑话高 × 对话枯竭] 的合取才是"仪器报告体"的确定性指纹。
+    if bool(cfg.get("style_pseudo_precision_enabled", True)) and n >= 500:
+        kchars = n / 1000.0
+        tech_per_kchar = len(_PSEUDO_TECH_TERMS.findall(body)) / max(kchars, 0.1)
+        metrics["tech_per_kchar"] = round(tech_per_kchar, 2)
+        pp_warn = float(cfg.get("style_tech_jargon_per_kchar_warn", 8.0))
+        pp_bad = float(cfg.get("style_tech_jargon_per_kchar_bad", 12.0))
+        pp_dlg_max = float(cfg.get("style_tech_jargon_dialogue_max", 0.06))
+        _pp_directive = (
+            "严重文体问题：上一章堆砌技术名词与伪精确测量值（频率/脉冲/共振/零点X毫米），"
+            "且几乎没有人物对话，读起来像仪器报告而不是小说。本章停止一切技术腔描写，"
+            "把信息放进动作、对白和情绪里，让人物开口说话。"
+        )
+        if tech_per_kchar >= pp_bad and dialogue_ratio < pp_dlg_max:
+            penalty += 2.0
+            flags.append(
+                f"pseudo_tech_collapse({tech_per_kchar:.1f}/k≥{pp_bad},dlg={dialogue_ratio:.1%})"
+            )
+            directives.append(_pp_directive)
+        elif tech_per_kchar >= pp_warn and dialogue_ratio < pp_dlg_max:
+            penalty += 1.0
+            flags.append(
+                f"pseudo_tech_high({tech_per_kchar:.1f}/k≥{pp_warn},dlg={dialogue_ratio:.1%})"
+            )
+            directives.append(_pp_directive)
+        elif tech_per_kchar >= pp_bad:
+            # 黑话高但对话充足：不罚分（数据面板类爽文的合法形态），只提醒收敛。
+            directives.append(
+                f"上一章技术名词密度偏高（{tech_per_kchar:.1f}/千字）。对话充足所以暂不扣分，"
+                "但请注意用感官与比喻替代部分技术描述，防止滑向仪器报告腔。"
+            )
+        # tech_history 趋势项预留：静态合取已在校准回放中抓住塌缩段，趋势逻辑缓做。
+        _ = tech_history
 
     # --- 5. 下沉语体校准（仅 low_barrier 模式）：罚书面腔，奖大白话 ----------
     # 番茄下沉读者要低阅读门槛口语体。这里在免费流/显式下沉模式下：
@@ -1768,6 +1854,17 @@ _NUMBER_PATTERN = re.compile(
     r"(?:百分之[一二三四五六七八九十零〇两\d]+|"
     r"\d+(?:\.\d+)?(?:%|‰|°|℃|赫兹|毫米|厘米|分钟|秒|小时|公斤|千克|米|层|级|阶)?|"
     r"零点[一二三四五六七八九十零〇两\d]+)"
+)
+# 伪技术腔词表（style_health 检查 6 用）：LLM 过度书写塌缩的黑话指纹。
+# v12 huangliang 塌缩章实测 ≥12/k；健康书（gudai/fanqie 系）≤3/k。
+# 注意不收 “系统/面板/数据” 等系统流爽文的合法金手指词——只收"仪器报告腔"词。
+_PSEUDO_TECH_TERMS = re.compile(
+    r"频率|脉冲|共振|振动|振幅|波形|载波|声波|信号|编码|解码|传导|衰减|"
+    r"激活|残留物?|辐射|磁场|力场|模块|装置|参数|数值|读数|精确|坐标|直径|半径|"
+    r"密度|浓度|阈值|频段|晶格|离子|分子|细胞|神经束|皮层|骨膜|血清|电流|电压|"
+    r"回路|接口|协议|算法|数据流|扫描|检测|监测|校准|同步率?|周期|"
+    r"孔隙|微粒|粒子|介质|载体|样本|组织液|角质层|肉芽|毛细|凝固|"
+    r"接收|发射|反射|折射|绕射|成像|定位"
 )
 
 

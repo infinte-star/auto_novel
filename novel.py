@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -827,106 +828,6 @@ def kill_pids(pids: list[int]) -> None:
                 pass
 
 
-def cmd_import_style(name: str, sources: list[str], merge: bool = False) -> int:
-    _validate_name(name)
-    novel_dir = NOVELS_DIR / name
-    if not novel_dir.exists():
-        print(f"[novel] directory novels/{name}/ does not exist. Run 'create {name}' first.")
-        return 2
-    sample_paths = []
-    for src in sources:
-        p = Path(src).resolve()
-        if p.is_dir():
-            sample_paths.extend(sorted(p.glob("*.txt")) + sorted(p.glob("*.md")))
-        elif p.exists():
-            sample_paths.append(p)
-        else:
-            print(f"[novel] WARNING: source not found: {src}")
-    if not sample_paths:
-        print("[novel] no valid source files found.")
-        return 2
-    print(f"[novel] analyzing {len(sample_paths)} file(s): {', '.join(p.name for p in sample_paths[:5])}{'...' if len(sample_paths) > 5 else ''}")
-    config_path = novel_dir / "config.yaml"
-    os.environ["NOVEL_CONFIG"] = str(config_path)
-    os.environ["NOVEL_PROMPT"] = str(novel_dir / "prompt.md")
-    from config import load_config, get_paths
-    config = load_config()
-    paths = get_paths(config)
-    try:
-        from openai import OpenAI
-    except ModuleNotFoundError:
-        print("[novel] missing dependency: pip install openai")
-        return 2
-    from config import configured_api_endpoints
-    import httpx
-    api_endpoints, _ = configured_api_endpoints(config)
-    if not api_endpoints:
-        print("[novel] no API endpoints configured.")
-        return 2
-    base_url, api_key = api_endpoints[0]
-    client = OpenAI(base_url=base_url, api_key=api_key,
-                    timeout=httpx.Timeout(connect=15, read=180, write=15, pool=15))
-    from simulate import analyze_samples, save_style_profile, load_style_profile
-    profile = analyze_samples(client, paths, config, sample_paths)
-    if not profile:
-        print("[novel] style analysis returned empty result.")
-        return 1
-    if merge:
-        existing = load_style_profile(paths)
-        if existing:
-            for key in ("signature_devices", "anti_patterns", "hook_types"):
-                merged_list = list(existing.get(key, []))
-                for item in profile.get(key, []):
-                    if item not in merged_list:
-                        merged_list.append(item)
-                profile[key] = merged_list
-            for key in ("prose_structure", "dialogue_style", "sentence_rhythm",
-                        "pov_and_tense", "imagery", "pacing", "vocabulary_notes"):
-                if not profile.get(key) and existing.get(key):
-                    profile[key] = existing[key]
-            profile["source_files"] = list(set(existing.get("source_files", []) + profile.get("source_files", [])))
-    out = save_style_profile(paths, profile)
-    print(f"[novel] style profile saved to {out}")
-    print(f"[novel] enable with: style_simulation_enabled: true in config.yaml")
-    return 0
-
-
-def cmd_simulate(name: str, prompt: str = "写一段约500字的示范段落", tokens: int = 4000) -> int:
-    _validate_name(name)
-    novel_dir = NOVELS_DIR / name
-    if not novel_dir.exists():
-        print(f"[novel] directory novels/{name}/ does not exist.")
-        return 2
-    config_path = novel_dir / "config.yaml"
-    os.environ["NOVEL_CONFIG"] = str(config_path)
-    os.environ["NOVEL_PROMPT"] = str(novel_dir / "prompt.md")
-    from config import load_config, get_paths
-    config = load_config()
-    paths = get_paths(config)
-    from simulate import load_style_profile
-    if not load_style_profile(paths):
-        print("[novel] no style profile found. Run 'import-style' first.")
-        return 2
-    try:
-        from openai import OpenAI
-    except ModuleNotFoundError:
-        print("[novel] missing dependency: pip install openai")
-        return 2
-    from config import configured_api_endpoints
-    import httpx
-    api_endpoints, _ = configured_api_endpoints(config)
-    if not api_endpoints:
-        print("[novel] no API endpoints configured.")
-        return 2
-    base_url, api_key = api_endpoints[0]
-    client = OpenAI(base_url=base_url, api_key=api_key,
-                    timeout=httpx.Timeout(connect=15, read=180, write=15, pool=15))
-    from simulate import generate_sample_text
-    text = generate_sample_text(client, paths, config, prompt=prompt, max_tokens=tokens)
-    print("\n" + text)
-    return 0
-
-
 def cmd_stop(name: str) -> int:
     _validate_name(name)
     pids = find_novel_pids(name)
@@ -994,18 +895,75 @@ def _read_title(nd: Path, max_len: int = 20) -> str:
     return ""
 
 
+def _parse_price_table(spec: str) -> list[tuple[str, float, float]]:
+    """Parse an `api: price_table` value into (model_prefix, in_$/Mtok, out_$/Mtok).
+
+    Format (YAML-subset-safe single string):
+      price_table: "deepseek:3.0:15.0, minimax:0.5:2.0"
+    Prefix match against each llm_calls.jsonl row's `model` (case-insensitive).
+    Malformed entries are skipped; unmatched models fall back to $3/$15.
+    """
+    table: list[tuple[str, float, float]] = []
+    for entry in re.split(r"[,;]", spec or ""):
+        parts = entry.strip().split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            table.append((parts[0].strip().lower(), float(parts[1]), float(parts[2])))
+        except ValueError:
+            continue
+    return table
+
+
+def _read_price_table(nd: Path) -> list[tuple[str, float, float]]:
+    """Read `price_table` from the novel config's `api:` section (light parser,
+    mirrors _parse_config_novel_section so we never import config.py here)."""
+    config_path = nd / "config.yaml"
+    section = ""
+    try:
+        lines = config_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for raw in lines:
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t")) and line.rstrip().endswith(":"):
+            section = line.strip()[:-1]
+            continue
+        if section == "api" and ":" in line:
+            key, _, val = line.strip().partition(":")
+            if key.strip() == "price_table":
+                return _parse_price_table(val.strip().strip('"').strip("'"))
+    return []
+
+
 def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
     """Read novels/<name>/logs/llm_calls.jsonl and return (ok_calls, prompt_chars, output_chars, cost).
 
     Returns None if the file does not exist.
-    Cost formula: (prompt_chars/4)*$0.000003 + (output_chars/4)*$0.000015
+    Cost formula: chars/4 ≈ tokens; per-model prices from `api: price_table`
+    (prefix match) when configured, else flat $3/$15 per Mtok. Prompt-cache
+    discounts are NOT modeled — treat the figure as an upper-bound estimate.
     """
     metrics_path = nd / "logs" / "llm_calls.jsonl"
     if not metrics_path.exists():
         return None
+    price_table = _read_price_table(nd)
+
+    def _row_cost(model: str, prompt_chars: int, output_chars: int) -> float:
+        in_price, out_price = 3.0, 15.0  # $/Mtok fallback (legacy flat formula)
+        m = (model or "").lower()
+        for prefix, pin, pout in price_table:
+            if m.startswith(prefix):
+                in_price, out_price = pin, pout
+                break
+        return (prompt_chars / 4) * in_price / 1e6 + (output_chars / 4) * out_price / 1e6
+
     ok_calls = 0
     total_prompt = 0
     total_output = 0
+    cost = 0.0
     try:
         with metrics_path.open(encoding="utf-8", errors="replace") as fh:
             for raw in fh:
@@ -1018,11 +976,13 @@ def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
                     continue
                 if row.get("ok") is True:
                     ok_calls += 1
-                total_prompt += int(row.get("prompt_chars") or 0)
-                total_output += int(row.get("output_chars") or 0)
+                p = int(row.get("prompt_chars") or 0)
+                o = int(row.get("output_chars") or 0)
+                total_prompt += p
+                total_output += o
+                cost += _row_cost(str(row.get("model") or ""), p, o)
     except OSError:
         return None
-    cost = (total_prompt / 4) * 0.000003 + (total_output / 4) * 0.000015
     return ok_calls, total_prompt, total_output, cost
 
 
@@ -1309,6 +1269,30 @@ def cmd_package(name: str) -> int:
     return 0
 
 
+def cmd_refine(name: str) -> int:
+    """Run the post-completion refine pass for a finished novel (explicit manual
+    step; refine_after_complete is off by default). Writes chapters_refined/ +
+    book_refined.md, never touches chapters/ or book.md. Resumable via
+    logs/refine/ checkpoints."""
+    _validate_name(name)
+    _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
+    from config import get_paths, load_config, read_text  # noqa: E402
+    from package import _build_client  # noqa: E402
+    from store import init_db  # noqa: E402
+    from refine import refine_book  # noqa: E402
+
+    config = load_config()
+    paths = get_paths(config)
+    if not paths.book.exists() or not read_text(paths.book).strip():
+        print(f"[novel] ERROR: no book.md content for '{name}'. Run/finish the novel first.")
+        return 2
+    conn = init_db(paths)
+    client = _build_client(config, paths)
+    refine_book(client, paths, conn, config)
+    print(f"[novel] refine pass finished; see novels/{name}/book_refined.md")
+    return 0
+
+
 def cmd_telemetry_backfill() -> int:
     """Import every novel's historical metrics/arbitrations/revise pairs into
     telemetry/global.db. Idempotent: INSERT OR REPLACE on composite keys, so
@@ -1342,33 +1326,6 @@ def cmd_telemetry_backfill() -> int:
     print(f"{'TOTAL':<24} {grand['chapter_metrics']:>8} {grand['events']:>8}"
           f" {grand['strategy_outcomes']:>9} {grand['revise_pairs']:>7}")
     print(f"[novel] global DB: {telemetry.TELEMETRY_DB}")
-    return 0
-
-
-def cmd_distill(output: str, genre: str | None, min_novels: int) -> int:
-    """Distill cross-book craft rules into craft_rules.json so the runtime
-    writer/planner can consume them (closes the distillation feedback loop).
-    Wraps distill.scan_novels; pure DB scan, no LLM calls."""
-    try:
-        import distill
-    except Exception as exc:
-        print(f"[novel] distill module unavailable: {exc}")
-        return 1
-    result = distill.scan_novels(genre_filter=genre, min_novels=min_novels)
-    out_path = (PROJECT_DIR / output) if not Path(output).is_absolute() else Path(output)
-    try:
-        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        print(f"[novel] failed to write {out_path}: {exc}")
-        return 1
-    meta = result.get("meta", {})
-    rules = result.get("rules", [])
-    print(f"[novel] distilled {len(rules)} rules from {meta.get('novels_scanned', 0)} novels "
-          f"({meta.get('total_chapters', 0)} chapters) -> {out_path}")
-    for r in rules[:5]:
-        print(f"  [{r.get('category')}] {str(r.get('pattern',''))[:54]} "
-              f"(conf={r.get('confidence')}, n={r.get('evidence_count')}, "
-              f"Δ={r.get('avg_score_after',0)-r.get('avg_score_before',0):+.2f})")
     return 0
 
 
@@ -1445,10 +1402,12 @@ def main() -> int:
     p_package = sub.add_parser("package", help="generate book packaging (titles/intros/tags/synopsis) for a finished novel")
     p_package.add_argument("name")
 
+    p_refine = sub.add_parser("refine", help="run the post-completion refine pass (chapters_refined/ + book_refined.md; resumable)")
+    p_refine.add_argument("name")
+
     p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
     p_compare.add_argument("name_a")
     p_compare.add_argument("name_b")
-    p_compare.add_argument("--judge", action="store_true", help="also run a blind pairwise LLM judge over matched chapters (requires API config; builds a client from name_a)")
 
     p_ablate = sub.add_parser("ablate", help="scaffold a chapter-capped copy of a novel with ONE config key flipped")
     p_ablate.add_argument("name")
@@ -1461,21 +1420,6 @@ def main() -> int:
     telemetry_sub.add_parser("backfill", help="import all novels' historical data into telemetry/global.db (idempotent)")
     p_tel_stats = telemetry_sub.add_parser("stats", help="show cross-book strategy win-rates and totals")
     p_tel_stats.add_argument("--genre", default=None, help="filter by genre bucket")
-
-    p_distill = sub.add_parser("distill", help="distill cross-book craft rules -> craft_rules.json (consumed by writer/planner)")
-    p_distill.add_argument("--output", default="craft_rules.json", help="output JSON path (default craft_rules.json)")
-    p_distill.add_argument("--genre", default=None, help="filter by genre (or '_all' for no filter)")
-    p_distill.add_argument("--min-novels", type=int, default=3, dest="min_novels", help="min novels co-occurring for a rule (default 3)")
-
-    p_import_style = sub.add_parser("import-style", help="analyze reference texts to build a style profile")
-    p_import_style.add_argument("name")
-    p_import_style.add_argument("sources", nargs="+", help="paths to reference .txt/.md files")
-    p_import_style.add_argument("--merge", action="store_true", help="merge with existing profile instead of replacing")
-
-    p_simulate = sub.add_parser("simulate", help="generate a test passage using the style profile")
-    p_simulate.add_argument("name")
-    p_simulate.add_argument("--prompt", default="写一段约500字的示范段落，展示该风格特征")
-    p_simulate.add_argument("--tokens", type=int, default=4000)
 
     p_stop = sub.add_parser("stop", help="kill the running process for a novel")
     p_stop.add_argument("name")
@@ -1515,19 +1459,10 @@ def main() -> int:
         return cmd_stats(args.name)
     if args.command == "package":
         return cmd_package(args.name)
+    if args.command == "refine":
+        return cmd_refine(args.name)
     if args.command == "compare":
         from compare import cmd_compare
-        if getattr(args, "judge", False):
-            # Build a client from name_a's config only when judging (keeps the
-            # default compare path zero-LLM). Same pattern as cmd_package.
-            _validate_name(args.name_a)
-            _set_novel_env(args.name_a)
-            from config import get_paths, load_config  # noqa: E402
-            from trial import _build_client  # noqa: E402
-            cfg = load_config()
-            pth = get_paths(cfg)
-            cli = _build_client(cfg, pth)
-            return cmd_compare(args.name_a, args.name_b, judge=True, client=cli, paths=pth, config=cfg)
         return cmd_compare(args.name_a, args.name_b)
     if args.command == "ablate":
         from compare import cmd_ablate
@@ -1537,12 +1472,6 @@ def main() -> int:
             return cmd_telemetry_backfill()
         if args.telemetry_command == "stats":
             return cmd_telemetry_stats(genre=args.genre)
-    if args.command == "distill":
-        return cmd_distill(output=args.output, genre=args.genre, min_novels=args.min_novels)
-    if args.command == "import-style":
-        return cmd_import_style(args.name, args.sources, merge=args.merge)
-    if args.command == "simulate":
-        return cmd_simulate(args.name, prompt=args.prompt, tokens=args.tokens)
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

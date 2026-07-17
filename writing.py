@@ -111,6 +111,36 @@ OPENING_RULES_BLOCK = """## 开篇特化（黄金三章→黄金三句，3秒定
 - 信息密度高但不堆设定：边演边给信息，把世界观融进动作与冲突，禁止整段解释性设定倾倒。
 - 章末必须留强钩子（悬念/反转/危机/承诺），制造追读冲动。"""
 
+def _hook_directives_block(pkg: dict) -> str:
+    """Render the 吸量包's hook_directives as an opening-writer prompt block.
+
+    build_hook_package (package.py) 早在 bootstrap 就产出"书名/简介向读者承诺了
+    哪些爽点、开篇必须兑现哪个"的落地指令，但历史上只写进 hook_package.md 从未
+    注入写手 prompt（P3 断链修复）。上限 5 条 / ~600 字；缺失/畸形返回 ""。
+    """
+    if not isinstance(pkg, dict):
+        return ""
+    directives = pkg.get("hook_directives")
+    if not isinstance(directives, list):
+        return ""
+    lines: list[str] = []
+    used = 0
+    for d in directives[:5]:
+        d = str(d).strip()
+        if not d:
+            continue
+        if used + len(d) > 600:
+            break
+        lines.append(f"- {d}")
+        used += len(d)
+    if not lines:
+        return ""
+    return (
+        "## 开篇吸量指令（书名/简介已向读者承诺的爽点，前三章必须兑现）\n"
+        + "\n".join(lines)
+    )
+
+
 # 下沉/大白话语体（正交开关，可叠加任意题材）。番茄 58.6% 用户来自三线及以下、
 # 通勤/夜间解压、低耐心，要的是低阅读门槛、对话优先、短句驱动的口语体，而不是
 # 文学性长句。本块由 style_low_barrier_register 或免费流 platform_preset 触发，
@@ -645,7 +675,9 @@ EXTRACT_SYSTEM = """你是长篇小说引擎中的事件溯源抽取器。
     "characters": [],
     "timeline": [],
     "threads": []
-  }
+  },
+  "protagonist_state": "<=600 个中文字符 markdown：主角当前的目标、资源、恐惧、秘密、持续的压力，以及尚未决断的关键决定。须反映本章带来的变化，须自足（新读者可据此接续），避免含糊措辞。",
+  "next_12_directions": ["10-12 条针对后续章节的具体指令；每条一句中文，明确指出具体必须发生什么，而非抽象主题"]
 }
 
 关系阶段说明：potential(尚无互动)→contact(初次接触)→tension(紧张/试探)→trust(建立信任)→conflict(产生冲突)→resolution(冲突化解)→deepened(关系深化)→broken(关系破裂)。intensity_delta 为正数表示关系拉近，负数表示疏远。
@@ -665,14 +697,6 @@ EXTRACT_SYSTEM = """你是长篇小说引擎中的事件溯源抽取器。
 - 已经兑现/收束的线索，输出该线索并把 status 设为 "recovered"（已回收）或 "dropped"（已放弃），让它从台账移除。
 - 只有当出现清单里完全没有的全新伏笔时，才创建一个新的、稳定的 id。
 - 不要把同一条线索拆成多个措辞略有差异的新条目。"""
-
-STATE_UPDATE_SYSTEM = """你负责维护一部 200 万字以上小说的简短工作状态。
-只输出 markdown，不要任何解释。
-要求：
-- <=5000 个中文字符。
-- 包含当前进度、卷/阶段目标、主角状态、关键冲突、接下来 12 章的方向。
-- 近期章节摘要保持紧凑。
-- 保留硬性连续性约束。"""
 
 def carried_over_partial_beats(paths: Paths, chapter_num: int, limit: int = 6) -> list[dict[str, Any]]:
     """Return the previous chapter's partial/absent beats so the next writer can repair them.
@@ -1137,6 +1161,7 @@ def revise_hook_only(
         client, paths, config, HOOK_REVISE_SYSTEM, user,
         max_tokens=8000, temperature=0.55,
         cacheable_prefix=cacheable_prefix(paths, config),
+        tag="revise_hook",
     )
     new_chapter = normalize_chapter(raw)
     # Safety: if the model failed to preserve the head (e.g., truncated or
@@ -1296,7 +1321,6 @@ def write_chapter(
     tail: str,
     cached_memory: str | None = None,
     temperature: float | None = None,
-    scene_breakdown: dict[str, Any] | None = None,
 ) -> str:
     title = str(plan.get("title") or f"Chapter {chapter_num}").strip()
     # Strip any leading 第N章 prefix the planner put in the title — the write
@@ -1379,18 +1403,6 @@ def write_chapter(
             "黑名单与禁止套路同样不得触碰。\n"
             f"{contract_text}\n"
         )
-    # Cross-book craft rules (closes the distillation loop): distilled lessons
-    # from the whole library, valuable precisely when the in-book preflight list
-    # is still empty (early chapters). Silent no-op when craft_rules.json absent.
-    if bool(config["novel"].get("craft_rules_enabled", True)):
-        try:
-            from craft import craft_writer_block
-
-            cb = craft_writer_block(config)
-            if cb:
-                carryover_block += "\n" + cb
-        except Exception:
-            pass
     if preflight_neg and (preflight_neg["items"] or preflight_neg["fossils"] or preflight_neg["style_warnings"]):
         carryover_block += "\n## 本章绝对禁止（前置负面清单·来自近期质量门禁）\n"
         carryover_block += "以下失败模式已在前几章触发质量门禁拒收。本章动笔前必须规避：\n"
@@ -1517,18 +1529,6 @@ def write_chapter(
         except Exception as exc:
             from config import log as _log
             _log(paths, f"used_element_ledger (writer) failed (non-fatal) Ch{chapter_num}: {exc}")
-    # Scene breakdown (分场细纲中间层): an ordered shot list for THIS chapter,
-    # built between plan selection and writing. Rides in the variable carryover
-    # (never the cacheable_prefix). No-op when absent/disabled.
-    if scene_breakdown:
-        try:
-            from scene_breakdown import scene_breakdown_block
-            sb_block = scene_breakdown_block(scene_breakdown, chapter_num)
-            if sb_block:
-                carryover_block += "\n" + sb_block
-        except Exception as exc:
-            from config import log as _log
-            _log(paths, f"Scene-breakdown block render failed (non-fatal) Ch{chapter_num}: {exc}")
     # Glossary / proper-noun consistency layer: surface the canonical names &
     # terms so the writer keeps surface forms stable across chapters. Variable
     # section only — never folded into cacheable_prefix sources.
@@ -1576,15 +1576,6 @@ def write_chapter(
         except Exception as exc:
             from config import log as _log
             _log(paths, f"Structured recall failed (non-fatal) Ch{chapter_num}: {exc}")
-    if bool(config["novel"].get("style_simulation_enabled", False)):
-        try:
-            from simulate import style_profile_block
-            sp_block = style_profile_block(paths, config)
-            if sp_block:
-                carryover_block += "\n" + sp_block + "\n"
-        except Exception as exc:
-            from config import log as _log
-            _log(paths, f"Style profile block failed (non-fatal) Ch{chapter_num}: {exc}")
     try:
         from benchmark import benchmark_context, platform_guidance
 
@@ -1606,6 +1597,19 @@ def write_chapter(
                 carryover_block += "\n" + po + "\n"
         except Exception:
             pass
+        # 吸量包落地（P3 断链修复）：把 hook_directives（书名/简介承诺的爽点）
+        # 注入开篇写手 prompt。缺失/畸形静默跳过（镜像 craft_rules 的 no-op 模式）；
+        # per-chapter 块，不影响 cacheable_prefix。
+        if bool(config["novel"].get("hook_directives_inject_enabled", True)):
+            try:
+                hp_path = paths.logs_dir / "hook_package.json"
+                if hp_path.exists():
+                    hp = json.loads(hp_path.read_text(encoding="utf-8"))
+                    hd_block = _hook_directives_block(hp)
+                    if hd_block:
+                        carryover_block += "\n" + hd_block + "\n"
+            except Exception:
+                pass
     # Character signature traits: nudge the writer to surface at least one
     # character's 人设记忆点 (already shipped via the cacheable character profile)
     # so characters stay distinctive across chapters. One sentence, no content
@@ -1981,13 +1985,25 @@ def extract_events(
             )
     except Exception:
         open_threads_block = ""
+    # Include the chapter ending explicitly: protagonist_state/next_12_directions
+    # (merged into this single extraction call) depend on where the chapter LANDS,
+    # and a >8000-char chapter would otherwise have its tail truncated away.
+    chapter_block = chapter[:8000]
+    if len(chapter) > 8000:
+        chapter_block += "\n……（中段省略）……\n" + chapter[-2500:]
+    prev_state = read_text(paths.state)
+    if len(prev_state) > 2000:
+        prev_state = prev_state[:2000] + "\n...[truncated]"
     user = f"""## 章节前记忆
 {mem}
 {open_threads_block}
-## 第 {chapter_num} 章
-{chapter[:8000]}
+## 上一版主角状态（用于 protagonist_state 的连贯）
+{prev_state}
 
-抽取持久的状态变化。"""
+## 第 {chapter_num} 章
+{chapter_block}
+
+抽取持久的状态变化，并给出更新后的 protagonist_state 与 next_12_directions。"""
     raw = call_llm(client, paths, config, EXTRACT_SYSTEM, max_tokens=12000, user=json_prompt(user), temperature=0.2, tag="extract")
     return load_json_with_repair(client, paths, config, raw)
 
@@ -2005,6 +2021,8 @@ def update_structured_state(
         db_event(conn, chapter_num, "story_event", event)
 
     for entity in extraction.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
         entity_type = str(entity.get("entity_type", "unknown"))
         name = str(entity.get("name", "unknown"))
         with db_lock():
@@ -2029,13 +2047,27 @@ def update_structured_state(
                 (entity_type, name, json.dumps(state, ensure_ascii=False), chapter_num),
             )
 
+    def _as_chnum(v: Any) -> int | None:
+        # chapter-number columns must bind as int/None; LLM may emit a dict/list/str.
+        if isinstance(v, bool) or v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            return None
+
     for thread in extraction.get("threads", []):
+        if not isinstance(thread, dict):
+            continue
         thread_id = str(thread.get("id") or f"ch{chapter_num}-{abs(hash(json.dumps(thread, ensure_ascii=False))) % 100000}")
         if str(thread.get("thread_type", "plot")) == "reader_promise":
             promise = dict(thread)
             promise["id"] = thread_id
             promise.setdefault("opened_chapter", thread.get("introduced_chapter", chapter_num))
             upsert_reader_promise(conn, chapter_num, promise)
+        _payload = thread.get("payload")
         with db_lock():
             conn.execute(
                     """
@@ -2052,10 +2084,10 @@ def update_structured_state(
                         str(thread.get("description", "")),
                         str(thread.get("status", "open")),
                         str(thread.get("thread_type", "plot")),
-                        thread.get("introduced_chapter"),
-                        thread.get("due_chapter"),
+                        _as_chnum(thread.get("introduced_chapter")),
+                        _as_chnum(thread.get("due_chapter")),
                         chapter_num,
-                        json.dumps(thread.get("payload", {}), ensure_ascii=False),
+                        json.dumps(_payload if isinstance(_payload, (dict, list)) else {}, ensure_ascii=False),
                     ),
                 )
 
@@ -2083,6 +2115,10 @@ def update_structured_state(
         "em_dash_per_kchar": _sh_metrics.get("em_dash_per_kchar"),
         "style_penalty": _sh.get("penalty"),
         "emotional_impact": safe_score(review.get("emotional_impact", 0)),
+        # 反过度书写锚点指标（趋势项/回放/退化诊断读取）。
+        "avg_sentence_chars": _sh_metrics.get("avg_sentence_chars"),
+        "dialogue_char_ratio": _sh_metrics.get("dialogue_char_ratio"),
+        "tech_per_kchar": _sh_metrics.get("tech_per_kchar"),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     with db_lock():
@@ -2092,11 +2128,12 @@ def update_structured_state(
                 chapter, title, score, readthrough_score, hook_score, payoff_score,
                 novelty_score, prose_score, continuity_score, plan_score, payoff_type, conflict_type, tension,
                 novelty, hook_strength, emotional_tone, accepted, em_dash_per_kchar, style_penalty,
-                emotional_impact, created_at
+                emotional_impact, avg_sentence_chars, dialogue_char_ratio, tech_per_kchar, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chapter) DO UPDATE SET
-                title=excluded.title, score=excluded.score,
+                title=excluded.title,
+                score=COALESCE(NULLIF(excluded.score, 0), score),
                 readthrough_score=excluded.readthrough_score, hook_score=excluded.hook_score,
                 payoff_score=excluded.payoff_score, novelty_score=excluded.novelty_score,
                 prose_score=excluded.prose_score, continuity_score=excluded.continuity_score,
@@ -2105,7 +2142,10 @@ def update_structured_state(
                 tension=excluded.tension, novelty=excluded.novelty, hook_strength=excluded.hook_strength,
                 emotional_tone=excluded.emotional_tone, accepted=excluded.accepted,
                 em_dash_per_kchar=excluded.em_dash_per_kchar, style_penalty=excluded.style_penalty,
-                emotional_impact=excluded.emotional_impact
+                emotional_impact=excluded.emotional_impact,
+                avg_sentence_chars=excluded.avg_sentence_chars,
+                dialogue_char_ratio=excluded.dialogue_char_ratio,
+                tech_per_kchar=excluded.tech_per_kchar
             """,
             (
                 metrics_row["chapter"],
@@ -2128,18 +2168,30 @@ def update_structured_state(
                 metrics_row["em_dash_per_kchar"],
                 metrics_row["style_penalty"],
                 metrics_row["emotional_impact"],
+                metrics_row["avg_sentence_chars"],
+                metrics_row["dialogue_char_ratio"],
+                metrics_row["tech_per_kchar"],
                 metrics_row["created_at"],
             ),
         )
         conn.commit()
 
     updates = extraction.get("memory_updates") or {}
-    append_memory(paths.bible, chapter_num, updates.get("bible") or [])
-    append_memory(paths.characters, chapter_num, updates.get("characters") or [])
-    append_memory(paths.timeline, chapter_num, updates.get("timeline") or [])
-    append_memory(paths.threads, chapter_num, updates.get("threads") or [])
+    # LLM extraction JSON: memory_updates may come back malformed (a bare string
+    # instead of a dict, or a per-key value that isn't a list). Guard so finalize
+    # can't crash here — a crash leaves chapter_completed.json unwritten and wedges
+    # resume in an endless "Resuming partially indexed Ch{n}" loop.
+    if not isinstance(updates, dict):
+        updates = {}
+    def _as_list(v: Any) -> list[Any]:
+        return v if isinstance(v, list) else []
+    append_memory(paths.bible, chapter_num, _as_list(updates.get("bible")))
+    append_memory(paths.characters, chapter_num, _as_list(updates.get("characters")))
+    append_memory(paths.timeline, chapter_num, _as_list(updates.get("timeline")))
+    append_memory(paths.threads, chapter_num, _as_list(updates.get("threads")))
 
-    store_causal_links(conn, chapter_num, extraction.get("causal_links") or [])
+    _cl = extraction.get("causal_links")
+    store_causal_links(conn, chapter_num, _cl if isinstance(_cl, list) else [])
 
     # Relationship changes extracted from this chapter
     try:
@@ -2192,17 +2244,6 @@ def append_memory(path: Path, chapter_num: int, items: list[Any]) -> None:
     if not fresh:
         return
     append_text(path, f"\n\n{section_header}\n" + "\n".join(f"- {t}" for t in fresh) + "\n")
-
-STATE_DYNAMIC_SECTIONS_SYSTEM = """你只生成一部长篇小说工作状态中的两个动态小节。
-只返回恰好一个合法的 JSON 对象，不要输出其它任何内容：
-{
-  "protagonist_state": "<=600 个中文字符 markdown：主角当前的目标、资源、恐惧、秘密、持续的压力，以及尚未决断的关键决定。须反映本章带来的变化。>",
-  "next_12_directions": ["10-12 条针对后续章节的具体指令；每条一句中文，明确指出具体必须发生什么，而非抽象主题"]
-}
-约束：
-- protagonist_state 须自足（新读者可据此接续）。避免含糊措辞。
-- next_12_directions 必须是具体可执行的指令，而非情节主题。"""
-
 
 def _render_state_md_template(
     paths: Paths,
@@ -2264,64 +2305,18 @@ def update_state_file(
     chapter: str,
     extraction: dict[str, Any],
 ) -> None:
+    """Render state.md deterministically from the extraction.
+
+    The two dynamic sections (protagonist_state / next_12_directions) ride in the
+    extraction JSON itself — extract_events is the single per-chapter state LLM
+    call. No LLM here.
+    """
     if paths.state.exists():
         shutil.copy2(paths.state, paths.state.with_suffix(".md.bak"))
 
-    template_mode = bool(config["novel"].get("state_template_mode", True))
-    if not template_mode:
-        # Legacy path: full LLM regeneration (kept as fallback).
-        user = f"""## 当前状态
-{read_text(paths.state)}
-
-## 记忆上下文
-{memory_context(paths, conn, config)}
-
-## 抽取JSON
-{json.dumps(extraction, ensure_ascii=False, indent=2)}
-
-## 当前总字数
-{count_chars(paths.book)}
-
-## 近期章节正文
-{chapter[:5000]}
-
-在第 {chapter_num} 章之后更新 state.md。"""
-        new_state = call_llm(client, paths, config, STATE_UPDATE_SYSTEM, user, max_tokens=12000, temperature=0.25, tag="state_update")
-        write_text(paths.state, normalize_text(new_state) + "\n")
-        return
-
-    # Template mode: only ask LLM for the 2 dynamic sections, then deterministically
-    # render the full state.md. This drops LLM output from ~12K tokens to ~2-3K.
-    current_state_excerpt = read_text(paths.state)
-    if len(current_state_excerpt) > 3000:
-        current_state_excerpt = current_state_excerpt[:3000] + "\n...[truncated]"
-    user = f"""## 上一版主角状态（用于连贯）
-{current_state_excerpt}
-
-## 来自第 {chapter_num} 章的抽取
-{json.dumps(extraction, ensure_ascii=False, indent=2)}
-
-## 最新章节结尾（最后 2500 字，提供新鲜细节）
-{chapter[-2500:]}
-
-只输出含 protagonist_state 与 next_12_directions 的 JSON。"""
-    try:
-        raw = call_llm(
-            client, paths, config, STATE_DYNAMIC_SECTIONS_SYSTEM, json_prompt(user),
-            max_tokens=4000, temperature=0.25,
-            cacheable_prefix=cacheable_prefix(paths, config), tag="state_sections",
-        )
-        data = load_json_with_repair(
-            client, paths, config, raw,
-            fallback={"protagonist_state": "", "next_12_directions": []},
-        )
-    except Exception as exc:
-        from config import log as _log
-        _log(paths, f"State dynamic sections LLM failed (non-fatal); using empty fallback: {exc}")
-        data = {"protagonist_state": "", "next_12_directions": []}
-
-    protagonist_state = str(data.get("protagonist_state", "")).strip()
-    next_directions = [str(d).strip() for d in (data.get("next_12_directions") or []) if str(d).strip()]
+    protagonist_state = str(extraction.get("protagonist_state", "")).strip()
+    raw_dirs = extraction.get("next_12_directions") or []
+    next_directions = [str(d).strip() for d in raw_dirs if str(d).strip()] if isinstance(raw_dirs, list) else []
     new_state = _render_state_md_template(
         paths, conn, chapter_num, extraction, protagonist_state, next_directions
     )

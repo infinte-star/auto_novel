@@ -7,8 +7,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Universal multi-novel AI writing framework. The core engine is an automated
 long-form Chinese web novel generation pipeline that targets a configurable
 character count (`novel.target_words`) by repeatedly running plan → write →
-review → revise → extract loops until done. Optional post-completion `refine`
-pass rewrites in 5-chapter groups under intensities chosen by a diagnose LLM call.
+review → revise → extract loops until done. An optional post-completion `refine`
+pass (explicit manual step: `python novel.py refine <name>`) rewrites in
+5-chapter groups under intensities chosen by a diagnose LLM call.
+
+The architecture follows a "Less is More" MVP model (2026-07 refactor): a
+single-candidate plan→write→review pipeline guarded by DETERMINISTIC quality
+gates, with multi-candidate breadth spent only when risk signals fire. Modules
+that were premature for the current scale (reader_panel, rolling_plan,
+scene_breakdown, craft/distill cross-book learning consumption, simulate style
+profiles, pairwise judge) were deleted; recover them from git history if the
+library ever reaches the scale (≥5 finished books) where they pay for
+themselves.
 
 The pipeline itself is **content-agnostic** — it only consumes a creative brief
 (`prompt.md`) and a config (`config.yaml`). Each novel lives in its own
@@ -38,9 +48,10 @@ python novel.py script --input PATH      # convert ANY novel text file -> 短剧
 python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/<name>/
 python novel.py compare <a> <b>          # deterministic side-by-side report (scores/penalties/fossils/cost/config diff) -> experiments/
 python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped
+python novel.py refine <name>            # explicit post-completion refine pass (chapters_refined/ + book_refined.md; resumable)
+python novel.py package <name>           # book packaging (titles/intros/tags/synopsis) for a finished novel
 python novel.py telemetry backfill       # import every novel's history into telemetry/global.db (idempotent)
 python novel.py telemetry stats [--genre G]  # cross-book strategy win-rates + totals
-python novel.py distill [--output craft_rules.json] [--genre G] [--min-novels 3]  # mine cross-book failure->fix rules
 ```
 
 `novel.py` is the **only** entry point — there is no longer any root-level
@@ -109,7 +120,7 @@ secondary endpoints when all primaries are dead.
 1. `bootstrap()` once — generates `state.md`, `memory/{bible,characters,timeline,threads,volume_plan}.md` from `prompt.md`
 2. Loop: `find_last_chapter()` → `generate_one_chapter()` until `count_chars(book.md) >= target_words`
 3. `BackgroundTasks` thread pool runs finalization (extract + structured-state + state.md), stage reviews, memory compression, adaptive replans, and next-chapter plan prefetches off the critical path
-4. After completion, optional `refine.refine_book()` if `novel.refine_after_complete: true`
+4. After completion, optional `refine.refine_book()` if `novel.refine_after_complete: true` (default **false** — run `python novel.py refine <name>` manually instead)
 
 ### One chapter (`pipeline.py:generate_one_chapter`)
 Strict ordering with a barrier on the previous chapter's `chapter_finalize_ch{n-1}` background label so memory/threads/metrics are fresh before planning:
@@ -124,10 +135,10 @@ create_plan → validate_plan_continuity → write_chapter_with_candidates
 Critical invariant in `pipeline.py:413-422`: `chapter_completed.json` must be written **synchronously** before submitting the finalize background task. If left for the bg task, the main loop's resume check would re-enter `Resuming partially indexed Ch{n}` and resubmit on every iteration, leaking threads and memory.
 
 ### Planning (`planning.py:create_plan`)
-1. `generate_candidate_plans` — N parallel candidates, each forced into a different strategy (`scene-driven`, `character-driven`, `thread-driven`, `institutional`, `reversal`, `pressure-payoff`) selected by a bandit over historical `plan_arbitration` events. Default `strategy_bandit_mode: thompson` (Beta-posterior sampling on arbiter win-rates, with `strategy_bandit_explore_frac` forced exploration); `epsilon` keeps the legacy epsilon-greedy for ablation. Candidates whose scene skeleton is ≥ `scene_dedupe_candidate_block` (0.85) similar to a recently selected plan are dropped pre-review (unless all would be dropped)
-2. Optional `screen_candidates` (skipped when `plan_skip_screen: true`)
-3. `review_candidate_plans` — fused 6-axis review (world/character/rhythm/payoff/foreshadowing/reader) per candidate, one LLM call expanded into 6 legacy reports via `_explode_fused_axes`. Toggle with `fused_plan_review` (true) — the legacy 6-parallel-calls path is still in the codebase
-4. `arbitrate_plan` — picks `selected_index` and emits a `merged_plan` plus `required_constraints`
+1. `generate_candidate_plans` — N candidates (default N=1; see adaptive cost control), each forced into a different strategy (`scene-driven`, `character-driven`, `thread-driven`, `institutional`, `reversal`, `pressure-payoff`) selected by a Thompson-sampling bandit (Beta posterior on arbiter win-rates, `strategy_bandit_explore_frac` forced exploration) over historical `plan_arbitration` events. Candidates whose scene skeleton is ≥ `scene_dedupe_candidate_block` (0.85) similar to a recently selected plan are dropped pre-review (unless all would be dropped)
+2. Optional `screen_candidates` (skipped when `plan_skip_screen: true`, or automatically at ≤3 candidates)
+3. `review_candidate_plans` — fused 6-axis review (world/character/rhythm/payoff/foreshadowing/reader) per candidate, one LLM call expanded into 6 legacy reports via `_explode_fused_axes` (the only review path — the legacy 6-parallel-calls variant was removed)
+4. `arbitrate_plan` — picks `selected_index` and emits a `merged_plan` plus `required_constraints`. Still runs with a single candidate: it merges rhythm diagnostics / recent quality feedback / used-element ledger into the plan
 
 ### Writing & revision (`writing.py`)
 - `write_chapter_with_candidates` generates `candidate_chapters` parallel drafts at spread temperatures (`base ± 0.08·offset`), reviews each, keeps the highest-scoring
@@ -190,13 +201,16 @@ to catch its own degeneration.
   degraded prose became "the book's voice."
 
 ### Adaptive cost control (`planning.py`)
-- `_effective_candidate_count` is bidirectional: RISK UPSHIFT (checked first, from
-  Ch3, no warmup) restores full candidate breadth when the last
-  `risk_upshift_window` chapters show a score below `risk_upshift_score_floor` or a
-  style penalty ≥ `risk_upshift_style_penalty` — collapse recovery is when plan
-  diversity pays. STABLE DOWNSHIFT then drops one candidate once quality is stably
-  ≥ `adaptive_downshift_score` over `adaptive_downshift_window` chapters after
-  `adaptive_downshift_warmup`. Gated by `adaptive_downshift_enabled`.
+- Inverted cost model: the DEFAULT is cheap (`candidate_plans: 1`, `candidate_chapters: 1`)
+  and breadth is spent only on trouble. `_effective_candidate_count` RISK UPSHIFT
+  (always on, from Ch3, no warmup) WIDENS the candidate count to
+  `risk_upshift_candidates` (default 3) when the last `risk_upshift_window` chapters
+  show a score below `risk_upshift_score_floor` or a style penalty ≥
+  `risk_upshift_style_penalty`, or when a degradation-recovery directive is active —
+  collapse recovery is when plan diversity pays. STABLE DOWNSHIFT (gated by
+  `adaptive_downshift_enabled`, only meaningful for multi-candidate bases) drops one
+  candidate once quality is stably ≥ `adaptive_downshift_score`. The structural
+  replan path independently forces multi-draft sampling (`structural_replan_candidates`).
 
 ### Experiment harness (`compare.py`)
 - `novel.py compare <a> <b>` — deterministic, zero-LLM side-by-side report
@@ -211,39 +225,20 @@ to catch its own degeneration.
   engine change should carry an ablation report instead of a hand-compared full
   rerun.
 
-### Cross-book learning (`telemetry.py`, `distill.py`, `craft.py`, `reader_panel.py`)
-Each novel runs as an isolated process with its own `story_state.db`. These four
-modules are how the engine learns **across** books instead of cold-starting every
-new novel. All four are strict observers / safe no-ops: any failure (db missing,
-locked, malformed) returns an empty value and never stalls a chapter.
+### Cross-book telemetry (`telemetry.py`)
+Each novel runs as an isolated process with its own `story_state.db`.
+`telemetry.py` is the ONE shared sink: `telemetry/global.db` (WAL, one fresh
+connection per write so N novel processes write concurrently). It is a strict
+observer / safe no-op: any failure (db missing, locked, malformed) returns an
+empty value and never stalls a chapter. Live double-writes from the pipeline
+(`record_chapter_metrics`/`record_event`/`record_arbitration`/`record_revise_pair`)
+plus idempotent `backfill_novel` (`novel.py telemetry backfill`).
 
-- **`telemetry.py`** — the ONE shared sink: `telemetry/global.db` (WAL, one fresh
-  connection per write so N novel processes write concurrently). Live double-writes
-  from the pipeline (`record_chapter_metrics`/`record_event`/`record_arbitration`/
-  `record_revise_pair`) plus idempotent `backfill_novel` (`novel.py telemetry
-  backfill`). `record_arbitration` flattens each plan into `strategy_outcomes`
-  (one row per candidate strategy) so the planning bandit reads a cross-book prior
-  via a single indexed GROUP BY. `global_strategy_history(genre)` is that read path
-  — falls back to the whole library when a genre bucket is empty.
-- **`distill.py`** — `python -m distill` (or `novel.py distill`) scans every
-  `novels/*/story_state.db`'s `agent_reports`/`gate_rejects`/problems→fixes for
-  recurring failure→fix patterns appearing in ≥ `--min-novels` books, and writes
-  `craft_rules.json` (rules with category/pattern/fix/evidence_count/confidence and
-  a real before/after score delta computed as score(C) vs score(C+1)).
-- **`craft.py`** — the consumption last-mile that closes the distillation loop
-  (historically `craft_rules.json` was written but never read). `craft_writer_block`
-  / `craft_planner_hints` load and rank the rules (positive measured delta ranks
-  first, else confidence×evidence) and render prompt blocks injected into the writer
-  and planner so a brand-new book inherits the library's lessons from chapter 1.
-  Gated by `novel.craft_rules_enabled` (inert when the file is absent — the common
-  fresh-install case).
-- **`reader_panel.py`** — a PANEL of fixed reader personas (vs `cold_reader`'s single
-  stranger) each deciding "would I keep reading?", aggregated into drop_rate/pay_rate
-  persisted to both the book's store and global telemetry, and injected as a
-  corrective writer directive when drop_rate crosses the threshold. Like
-  `cold_reader`, it **must NOT pass the cacheable_prefix**. Gated by
-  `reader_panel_enabled` (default false), `reader_panel_every`,
-  `reader_panel_drop_threshold`.
+Telemetry is currently **write-only** (pure logging + `telemetry stats`). The
+consumption layers that read it back into generation (distill → craft rules,
+cross-book bandit prior, reader_panel) were deleted in the MVP refactor because
+the library lacks the ≥5-book sample size where they beat noise; recover them
+from git history (commit `9dd1ec0` and earlier) when that scale is reached.
 
 ### Memory layers (`memory.py`)
 Two distinct context builders feed different LLM calls:
@@ -251,6 +246,11 @@ Two distinct context builders feed different LLM calls:
 - `writing_memory_context` — small variable portion (state + threads + recent metrics + volume plan head) for write/revise/review hot path
 - `memory_context` — full layered context (4 tiers, char-budgeted) for plan generation and event extraction
 - `lite_memory_context` — heavily abbreviated for plan-review/screening
+
+Per-chapter state persistence is a SINGLE LLM call: `extract_events` returns the
+extraction JSON **including** `protagonist_state` + `next_12_directions`;
+`update_structured_state` (pure DB writes) and `update_state_file` (deterministic
+markdown render of those fields) consume it with zero further LLM calls.
 
 `compress_all_memory` consolidates per-chapter `## ChN` sections in bible/characters/timeline/threads when files exceed `memory_max_kb` or every `memory_compress_every` chapters; archives the old sections under `logs/memory_archive/`.
 
@@ -293,7 +293,8 @@ Resume detection lives in `should_resume_existing_chapter`: chapter file exists 
 When the JSON contract matters, prompts are wrapped in `json_prompt(user)` which appends the mandatory output contract block. `call_llm` infers JSON mode from the presence of that string and sets `response_format={"type": "json_object"}`, automatically retrying without it when a provider returns a 400/404/422 mentioning `response_format`.
 
 ### Refine pass (`refine.py`)
-Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond 3× original.
+Explicit manual step: `python novel.py refine <name>` (`refine_after_complete`
+defaults to false). Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond 3× original.
 
 ### Screenplay conversion (`screenplay.py`)
 Standalone novel-text → 短剧 (vertical-drama) script converter, decoupled from the

@@ -588,6 +588,7 @@ Ch{last_chapter} 是全书最后一章，应作为结局：必须收束主线、
         json_prompt(user),
         max_tokens=int(config["novel"].get("refine_diagnose_max_tokens", DEFAULT_DIAGNOSE_MAX_TOKENS)),
         temperature=0.3,
+        tag="refine_diagnose",
     )
     data = load_json_with_repair(client, paths, config, raw, fallback={
         "group_summary": "",
@@ -780,6 +781,7 @@ def refine_one_chapter(
         user,
         max_tokens=int(config["novel"].get("refine_chapter_max_tokens", DEFAULT_REFINE_MAX_TOKENS)),
         temperature=float(config["novel"].get("refine_temperature", 0.5)),
+        tag="refine_rewrite",
     )
     refined = normalize_chapter(refined)
     return refined

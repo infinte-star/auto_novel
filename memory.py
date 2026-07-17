@@ -586,21 +586,6 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     write_text(paths.timeline, _section("timeline", "时间线", data) + "\n")
     write_text(paths.threads, _section("threads", "伏笔与线索", data) + "\n")
     write_text(paths.volume_plan, _section("volume_plan", "卷纲", data) + "\n")
-    if bool(config["novel"].get("rolling_plan_enabled", False)):
-        try:
-            from rolling_plan import seed_first_arc
-            seed_first_arc(conn, config)
-            compass_text = (
-                "# 全书导航罗盘\n\n"
-                "## 终极目标\n（待首弧完成后由弧总结更新）\n\n"
-                "## 活跃长线\n（待首弧完成后由弧总结更新）\n\n"
-                "## 已完成弧概要\n（无）\n\n"
-                "## 下弧方向\n见 volume_plan.md 第1弧规划\n"
-            )
-            write_text(paths.compass, compass_text)
-            log(paths, "Rolling plan: seeded arc_history + compass.md")
-        except Exception as exc:
-            log(paths, f"Rolling plan bootstrap failed (non-fatal): {exc}")
     # Narrative-voice charter: this is the strongest anti-style-collapse anchor and
     # must exist from chapter 1. Only write it when the model produced one; an empty
     # value falls back to the placeholder created by ensure_project().
@@ -710,8 +695,13 @@ def opening_route_text(paths: Paths, cap: int = 6000) -> str:
     path = paths.volume_plan.parent / "opening_route.md"
     return _read_memory_file(path, cap) if path.exists() else ""
 
-def memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+def memory_context(paths: Paths, conn: Any, config: dict[str, Any],
+                   max_chars: int | None = None) -> str:
     budget = estimate_chars_budget(config)
+    # 调用方预算上限（P2 降本）：规划候选/仲裁等消费点可以传一个远小于
+    # context_window 推算值的预算，tier1/2 总能装下，tier3/4 自动截断。
+    if max_chars is not None and int(max_chars) > 0:
+        budget = min(budget, int(max_chars))
     fatigue_window = int(config["novel"]["fatigue_window"])
 
     creative_brief = read_text(PROMPT_FILE).strip()
@@ -932,14 +922,21 @@ def _legacy_writing_memory_context(paths: Paths, conn: Any, config: dict[str, An
     return ""
 
 
-def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
+def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
+                        max_chars: int | None = None) -> str:
     """Slim memory context for plan-review and screening calls.
 
     Drops timeline, full events list, voices table, and recent_events from the
     full memory_context. Keeps the creative brief, current state, voice anchor,
     bible (capped), characters (capped), threads (capped), recent metrics 5 rows.
+
+    `max_chars` overrides the plan_review_memory_chars budget (P2: the plan
+    arbiter uses this with plan_arbitrate_memory_chars instead of the full
+    4-tier memory_context).
     """
     char_budget = int(config["novel"].get("plan_review_memory_chars", 10000))
+    if max_chars is not None and int(max_chars) > 0:
+        char_budget = int(max_chars)
     creative_brief = _read_memory_file(PROMPT_FILE, 3000)
     current_state = _read_memory_file(paths.state, 3500)
     voice_anchor = _read_memory_file(paths.voice, 2000)
@@ -976,14 +973,36 @@ def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any]) -> str:
         used += len(block) + 2
     return "\n\n".join(parts)
 
+def _compressible_sections(content: str, keep_recent: int) -> int:
+    """How many `## ChN` sections would actually be consolidated right now.
+
+    Mirrors compress_memory_file's early-return logic so the trigger and the
+    worker agree — the v12 ratchet bug was the size trigger re-firing every
+    chapter while the worker had only 1 newly-aged-out section to consolidate
+    (231 near-no-op LLM calls per book)."""
+    sections = re.split(r"(?=^## Ch\d+)", content, flags=re.MULTILINE)
+    if len(sections) <= 2:
+        return 0
+    return max(len(sections) - 1 - keep_recent, 0)
+
+
 def should_compress_memory(paths: Paths, config: dict[str, Any], chapter_num: int) -> bool:
     compress_every = int(config["novel"].get("memory_compress_every", 30))
     max_kb = int(config["novel"].get("memory_max_kb", 15))
+    keep_recent = int(config["novel"].get("memory_keep_recent_sections", 30))
+    min_batch = int(config["novel"].get("memory_compress_min_batch", 5))
     if chapter_num > 0 and chapter_num % compress_every == 0:
         return True
+    # 尺寸触发加批量下限：压缩结果（Consolidated + keep_recent 节）常驻 >max_kb，
+    # 若无批量下限则每章重发 4 个近似空转的 LLM 调用（v12 实测 231 次/$0.60）。
+    # 只有当至少 min_batch 个节真正可归并时才因尺寸触发。
     for p in [paths.bible, paths.characters, paths.timeline, paths.threads]:
         if p.exists() and p.stat().st_size > max_kb * 1024:
-            return True
+            try:
+                if _compressible_sections(read_text(p), keep_recent) >= min_batch:
+                    return True
+            except Exception:
+                return True
     return False
 
 def compress_memory_file(
@@ -1030,9 +1049,11 @@ def compress_all_memory(client: OpenAI, paths: Paths, config: dict[str, Any]) ->
         return
     max_workers = int(config["novel"].get("max_parallel_workers", 8))
 
+    keep_recent = int(config["novel"].get("memory_keep_recent_sections", 30))
+
     def run_one(file_path: Path) -> tuple[Path, Exception | None]:
         try:
-            compress_memory_file(client, paths, config, file_path)
+            compress_memory_file(client, paths, config, file_path, keep_recent=keep_recent)
             return file_path, None
         except Exception as exc:
             return file_path, exc

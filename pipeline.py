@@ -205,7 +205,6 @@ def write_chapter_with_candidates(
     num_candidates_override: int | None = None,
     base_temp_override: float | None = None,
     chapter_aux_cache: dict | None = None,
-    scene_breakdown: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate N candidate chapter drafts in parallel, review each, keep the best.
 
@@ -226,7 +225,6 @@ def write_chapter_with_candidates(
             client, paths, conn, config, chapter_num, plan, decision, tail,
             cached_memory=cached_memory,
             temperature=base_temp if base_temp_override is not None else None,
-            scene_breakdown=scene_breakdown,
         )
         text, cov = _beat_gate_one(client, paths, config, chapter_num, plan, text)
         if cov is not None:
@@ -243,7 +241,6 @@ def write_chapter_with_candidates(
             text = write_chapter(
                 client, paths, conn, config, chapter_num, plan, decision, tail,
                 cached_memory=cached_memory, temperature=temp,
-                scene_breakdown=scene_breakdown,
             )
             return text
         except Exception as exc:
@@ -317,15 +314,20 @@ def write_chapter_with_candidates(
                 # Style health
                 try:
                     em_history = []
+                    tech_history = []
                     recent = recent_metrics(conn, limit=int(config["novel"].get("style_em_dash_trend_window", 5)))
                     for row in recent:
                         em = row.get("em_dash_per_kchar")
                         if em is not None:
                             em_history.append(float(em))
+                        tv = row.get("tech_per_kchar")
+                        if tv is not None:
+                            tech_history.append(float(tv))
                 except Exception:
                     em_history = []
+                    tech_history = []
 
-                sh = style_health(text, config, em_history)
+                sh = style_health(text, config, em_history, tech_history or None)
                 sh_penalty = sh.get("penalty", 0.0)
                 sh_flags = sh.get("flags", [])
 
@@ -912,7 +914,13 @@ def generate_one_chapter(
             # flushed before create_plan tries to resume from it.
             background.wait_label(f"prefetch_plan_ch{chapter_num}")
     tail = _build_writer_tail(paths, config, chapter_num)
-    cached_memory = memory_context(paths, conn, config)
+    # P2 降本：cached_memory 只被规划侧消费（create_plan/validate），
+    # 用 plan_memory_chars 封顶（tier1/2 完整，tier3/4 截断）。写作/评审用
+    # writing_memory_context，评审自建，均不受影响；不动 cacheable_prefix。
+    cached_memory = memory_context(
+        paths, conn, config,
+        max_chars=int(config["novel"].get("plan_memory_chars", 60000) or 0),
+    )
     # Smaller context for write/revise/review hot path to reduce prefill time.
     writing_memory = writing_memory_context(paths, conn, config)
     # Build review auxiliary context once per chapter so all review_chapter
@@ -953,29 +961,6 @@ def generate_one_chapter(
         else:
             decision.setdefault("required_constraints", []).extend(violations)
 
-    # Scene-breakdown middle layer: decompose the validated plan into an ordered
-    # shot list (goal/location/visible_actions/beats_covered/exit_state) and feed
-    # it to the writer. Built once per chapter, checkpointed for resume, threaded
-    # into every write_chapter_with_candidates call below. Disabled / failed =>
-    # {} and the writer falls back to the plan-only prompt (current behaviour).
-    scene_breakdown: dict[str, Any] = {}
-    if bool(config["novel"].get("scene_breakdown_enabled", True)):
-        cached_sb = load_checkpoint(paths, chapter_num, "scene_breakdown.json")
-        if isinstance(cached_sb, dict) and cached_sb.get("scenes"):
-            scene_breakdown = cached_sb
-            log(paths, f"Resuming scene breakdown Ch{chapter_num} ({len(cached_sb.get('scenes') or [])} scenes)")
-        else:
-            try:
-                from scene_breakdown import build_scene_breakdown
-                scene_breakdown = build_scene_breakdown(
-                    client, paths, config, chapter_num, plan, decision, cached_memory=cached_memory
-                )
-                if scene_breakdown:
-                    save_checkpoint(paths, chapter_num, "scene_breakdown.json", scene_breakdown)
-            except Exception as exc:
-                log(paths, f"Scene breakdown failed (non-fatal) Ch{chapter_num}: {exc}")
-                scene_breakdown = {}
-
     existing_chapter = read_text(chapter_path(paths, chapter_num))
     chapter = load_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT) or existing_chapter
     if chapter:
@@ -986,7 +971,6 @@ def generate_one_chapter(
         chapter, candidate_review = write_chapter_with_candidates(
             client, paths, conn, config, chapter_num, plan, decision, tail, cached_memory=writing_memory,
             chapter_aux_cache=_chapter_aux,
-            scene_breakdown=scene_breakdown,
         )
 
         # Handle catastrophic pre-screen failure (all candidates have high fossils)
@@ -1058,7 +1042,6 @@ def generate_one_chapter(
                         client, paths, conn, config, chapter_num, plan, retry_decision, tail,
                         cached_memory=writing_memory,
                         chapter_aux_cache=_chapter_aux,
-                        scene_breakdown=scene_breakdown,
                     )
                     ar2 = adjacent_repetition(retry_chapter, prev_text, config)
                     if ar2.get("level") != "block":
@@ -1384,20 +1367,6 @@ def generate_one_chapter(
                 # keep the best-reviewed one instead of betting on one roll.
                 sr_candidates = int(config["novel"].get("structural_replan_candidates", 3))
                 sr_temp = float(config["novel"].get("structural_replan_temperature", 0.65))
-                # The replan regenerated the whole plan, so the old scene
-                # breakdown no longer matches. Rebuild it for the new plan (best
-                # effort; {} falls back to the plan-only writer prompt).
-                replan_breakdown: dict[str, Any] = {}
-                if bool(config["novel"].get("scene_breakdown_enabled", True)):
-                    try:
-                        from scene_breakdown import build_scene_breakdown
-                        replan_breakdown = build_scene_breakdown(
-                            client, paths, config, chapter_num, replan_plan, replan_decision,
-                            cached_memory=replan_memory,
-                        )
-                    except Exception as exc:
-                        log(paths, f"Replan scene breakdown failed (non-fatal) Ch{chapter_num}: {exc}")
-                        replan_breakdown = {}
                 replan_chapter, replan_review = write_chapter_with_candidates(
                     client,
                     paths,
@@ -1411,7 +1380,6 @@ def generate_one_chapter(
                     num_candidates_override=max(1, sr_candidates),
                     base_temp_override=sr_temp,
                     chapter_aux_cache=_chapter_aux,
-                    scene_breakdown=replan_breakdown,
                 )
                 if replan_review is None:
                     # n<=1 path returned no review (or only 1 valid draft); review now.
@@ -1446,8 +1414,6 @@ def generate_one_chapter(
                     best_review = dict(review)
                     save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
                     save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
-                    if replan_breakdown:
-                        save_checkpoint(paths, chapter_num, "scene_breakdown.json", replan_breakdown)
                     save_checkpoint(paths, chapter_num, "final_review.json", review)
                     log(paths, f"Quality replan Ch{chapter_num} improved score to {review.get('score')}/10")
                 else:
@@ -1575,6 +1541,20 @@ def generate_one_chapter(
                     f"(best score={review.get('score')}/10). Accepting anyway to avoid pipeline halt.",
                 )
                 review["accepted"] = True
+            # v12 Ch4/Ch6 数据缺陷：极少数路径下走到这里的 review 是 score=0 的空壳
+            # （无 style_health/problems），force_accepted 后污染 stats/退化诊断。
+            # 兜底：score<=0 时从本章最后一轮真实评审 checkpoint 恢复。
+            if safe_score(review.get("score", 0)) <= 0:
+                for _ck in ("review_round1.json", "review_round0.json"):
+                    _prev = load_checkpoint(paths, chapter_num, _ck)
+                    if isinstance(_prev, dict) and safe_score(_prev.get("score", 0)) > 0:
+                        log(
+                            paths,
+                            f"Force-accept Ch{chapter_num}: review carried score=0, "
+                            f"recovered from {_ck} (score={_prev.get('score')})",
+                        )
+                        review = {**_prev, "accepted": True}
+                        break
             # Mark this as a force-accept and persist the chosen best as the
             # authoritative final_review + current chapter text. On resume, the
             # final_is_authoritative check honours force_accepted reviews, so the
@@ -1785,7 +1765,17 @@ def generate_one_chapter(
         else:
             extraction_local = load_checkpoint(paths, chapter_num, "extraction.json") or {}
         if not structured_done:
-            update_structured_state(paths, conn, chapter_num, extraction_local, review, decision)
+            # Structured-state writes consume LLM-extracted JSON that is frequently
+            # malformed (non-scalar DB binds, dicts-as-strings). A failure here must
+            # NOT abort finalize: the caller writes chapter_completed.json only after
+            # this returns, so a raised exception leaves the chapter un-completed and
+            # wedges resume in an endless "Resuming partially indexed Ch{n}" loop.
+            # Degrade gracefully — the chapter content is already saved; structured
+            # tracking (threads/entities/metrics) is best-effort.
+            try:
+                update_structured_state(paths, conn, chapter_num, extraction_local, review, decision)
+            except Exception as exc:
+                log(paths, f"Structured-state update failed Ch{chapter_num} (non-fatal, continuing): {exc}")
             save_checkpoint(paths, chapter_num, "structured_state_done.json", {"done": True})
         return extraction_local
 
@@ -1917,6 +1907,9 @@ def generate_one_chapter(
                 "accepted": 1 if review.get("accepted") else 0,
                 "em_dash_per_kchar": sh_metrics.get("em_dash_per_kchar"),
                 "style_penalty": sh.get("penalty"),
+                "avg_sentence_chars": sh_metrics.get("avg_sentence_chars"),
+                "dialogue_char_ratio": sh_metrics.get("dialogue_char_ratio"),
+                "tech_per_kchar": sh_metrics.get("tech_per_kchar"),
             }
             telemetry.record_chapter_metrics(_telemetry_novel, _telemetry_genre, chapter_num, metrics_row)
             # NOTE: plan_arbitration / strategy_outcomes are double-written at
@@ -1932,26 +1925,11 @@ def generate_one_chapter(
         except Exception as exc:
             log(paths, f"Telemetry record failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    def _do_reader_panel() -> None:
-        try:
-            from reader_panel import run_reader_panel
-            run_reader_panel(client, paths, conn, config, chapter_num, chapter)
-        except Exception as exc:
-            log(paths, f"Reader panel failed (non-fatal) Ch{chapter_num}: {exc}")
-
     telemetry_on = bool(config["novel"].get("telemetry_enabled", True))
-    panel_every = int(config["novel"].get("reader_panel_every", 5) or 5)
-    run_reader_panel_now = (
-        bool(config["novel"].get("reader_panel_enabled", False))
-        and panel_every > 0
-        and chapter_num % panel_every == 0
-    )
 
     if background is not None:
         if telemetry_on:
             background.submit(f"telemetry_ch{chapter_num}", _do_telemetry)
-        if run_reader_panel_now:
-            background.submit(f"reader_panel_ch{chapter_num}", _do_reader_panel)
         if run_stage_review:
             background.submit(f"stage_review_ch{chapter_num}", _do_stage_review)
         cold_every = int(config["novel"].get("cold_reader_every", 10))
@@ -1961,15 +1939,6 @@ def generate_one_chapter(
             background.submit(f"memory_compress_ch{chapter_num}", _do_memory_compress)
         if run_replan:
             background.submit(f"adaptive_replan_ch{chapter_num}", _do_replan)
-        if bool(config["novel"].get("rolling_plan_enabled", False)):
-            def _do_rolling_plan() -> None:
-                try:
-                    from rolling_plan import maybe_roll_plan
-                    if maybe_roll_plan(client, paths, conn, config, chapter_num):
-                        log(paths, f"Rolling plan: arc rolled at Ch{chapter_num}")
-                except Exception as exc:
-                    log(paths, f"Rolling plan failed (non-fatal) Ch{chapter_num}: {exc}")
-            background.submit(f"rolling_plan_ch{chapter_num}", _do_rolling_plan)
 
         # Prefetch the next N chapters' plans so the main loop's planning
         # phase resumes from a cached validated_plan.json. Gate each prefetch
@@ -2004,7 +1973,10 @@ def generate_one_chapter(
                         continue
                     try:
                         next_tail = tail_text(paths.book, int(config["novel"]["recent_tail_chars"]))
-                        next_memory = memory_context(paths, conn, config)
+                        next_memory = memory_context(
+                            paths, conn, config,
+                            max_chars=int(config["novel"].get("plan_memory_chars", 60000) or 0),
+                        )
                         next_plan, next_decision = create_plan(
                             client, paths, conn, config, target_num, next_tail, cached_memory=next_memory
                         )
@@ -2029,8 +2001,6 @@ def generate_one_chapter(
     else:
         if telemetry_on:
             _do_telemetry()
-        if run_reader_panel_now:
-            _do_reader_panel()
         if run_stage_review:
             _do_stage_review()
         cold_every = int(config["novel"].get("cold_reader_every", 10))
@@ -2040,13 +2010,6 @@ def generate_one_chapter(
             _do_memory_compress()
         if run_replan:
             _do_replan()
-        if bool(config["novel"].get("rolling_plan_enabled", False)):
-            try:
-                from rolling_plan import maybe_roll_plan
-                if maybe_roll_plan(client, paths, conn, config, chapter_num):
-                    log(paths, f"Rolling plan: arc rolled at Ch{chapter_num}")
-            except Exception as exc:
-                log(paths, f"Rolling plan failed (non-fatal) Ch{chapter_num}: {exc}")
 
 def main() -> None:
     config = load_config()
@@ -2444,3 +2407,5 @@ def main() -> None:
             refine_book(client, paths, conn, config)
         except Exception as exc:
             log(paths, f"Refine pass failed (non-fatal): {exc}")
+
+    log(paths, "Book complete")
