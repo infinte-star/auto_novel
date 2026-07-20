@@ -938,8 +938,147 @@ def review_chapter(
                             "count": len(bf["phrases"]),
                             "phrases": bf["phrases"][:8],
                         })
+                    # A SINGLE phrase recurring in >= hard_ratio of the book (e.g.
+                    # tangshuting「老市场街七号」65/199≈33%) is a structural fossil in
+                    # its own right even when the DISTINCT-phrase count stays below
+                    # struct_count. Route it to STRUCTURAL replan via the same gate.
+                    hard = bf.get("hard_fossils") or []
+                    if hard:
+                        report.setdefault("gate_rejects", []).append({
+                            "gate": "book_wide_fossils_ratio",
+                            "ratio_threshold": float(config["novel"].get("book_fossil_hard_ratio", 0.20)),
+                            "phrases": [f["phrase"] for f in hard[:8]],
+                            "fracs": [f["frac"] for f in hard[:8]],
+                        })
         except Exception as exc:
             log(paths, f"book_wide_fossils check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Descriptor-frequency gate: catch short (3-6 char) overused descriptors
+    # that evade the clause min_len and ngram window. Runs on the same schedule
+    # as book_wide_fossils to share the chapter-loading cost.
+    if bool(config["novel"].get("descriptor_freq_enabled", True)):
+        try:
+            d_every = max(1, int(config["novel"].get("descriptor_freq_every", 5)))
+            if chapter_num >= int(config["novel"].get("descriptor_freq_min_spread", 15)) \
+                    and chapter_num % d_every == 0:
+                from quality import descriptor_frequency
+                import json as _json
+                texts: dict[int, str] = {}
+                for num in range(1, chapter_num + 1):
+                    p = chapter_path(paths, num)
+                    if p.exists():
+                        texts[num] = read_text(p)
+                df = descriptor_frequency(texts, config)
+                report["descriptor_frequency"] = df
+                if df.get("flagged"):
+                    try:
+                        write_text(
+                            paths.logs_dir / "descriptor_freq.json",
+                            _json.dumps(df, ensure_ascii=False, indent=2),
+                        )
+                    except Exception:
+                        pass
+                    log(paths, f"Descriptor freq Ch{chapter_num}: "
+                        f"{df['metrics'].get('descriptor_flagged_count')} flagged "
+                        f"examples={[f['phrase'] for f in df['flagged'][:5]]}")
+                    if df.get("directives"):
+                        wd = report.setdefault("writer_directives_for_next_chapter", [])
+                        for d in df["directives"]:
+                            if d not in wd:
+                                wd.append(d)
+                    df_penalty = float(df.get("penalty", 0.0))
+                    if df_penalty > 0:
+                        penalties += df_penalty
+                    if str(df.get("level", "")) == "reject":
+                        report.setdefault("gate_rejects", []).append({
+                            "gate": "descriptor_frequency",
+                            "phrases": [f["phrase"] for f in df["flagged"][:8]],
+                        })
+        except Exception as exc:
+            log(paths, f"descriptor_frequency check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Genre-adherence gate: deterministic keyword check that chapter content
+    # matches the declared style_preset.
+    if bool(config["novel"].get("genre_adherence_enabled", True)):
+        try:
+            from quality import genre_adherence
+            recent_genre_scores: list[float] = []
+            try:
+                import store as _store
+                conn = _store.get_connection(str(paths.db))
+                if conn and not isinstance(conn, _store.JsonStoryStore):
+                    cursor = conn.execute(
+                        "SELECT genre_score FROM chapter_metrics "
+                        "WHERE chapter < ? AND genre_score IS NOT NULL "
+                        "ORDER BY chapter DESC LIMIT ?",
+                        (chapter_num, int(config["novel"].get("genre_adherence_window", 5))),
+                    )
+                    recent_genre_scores = [row[0] for row in cursor.fetchall()][::-1]
+            except Exception:
+                pass
+            ga = genre_adherence(chapter, recent_genre_scores, config)
+            report["genre_adherence"] = ga
+            ga_penalty = float(ga.get("penalty", 0.0))
+            if ga_penalty > 0:
+                penalties += ga_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in ga.get("flags", []):
+                    tag = f"genre:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in ga.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(paths, f"Genre adherence Ch{chapter_num} "
+                    f"score={ga['genre_score']} penalty={ga_penalty} "
+                    f"flags={ga.get('flags')}")
+            if str(ga.get("level", "")) == "reject":
+                report["accepted"] = False
+                report.setdefault("gate_rejects", []).append({
+                    "gate": "genre_adherence",
+                    "genre_score": ga["genre_score"],
+                    "streak": ga["metrics"].get("low_streak", 0),
+                    "directives": ga.get("directives", []),
+                })
+                report.setdefault("problems", []).append(
+                    "GATE: 体裁严重偏移（确定性检测），"
+                    "章节内容与声明体裁不符，必须重新规划。"
+                )
+        except Exception as exc:
+            log(paths, f"genre_adherence check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Multi-lead character-service scan: in multi-男主/multi-lead books a secondary
+    # lead can go silent for dozens of chapters while the contract's "非官配需完整
+    # 成长线" rule has no executable metric. Every character_service_every chapters,
+    # measure each principal-cast name's appearance rate over the recent window and
+    # persist an under-served alert; planning.create_plan reads the latest alert and
+    # injects a soft high-light directive (WARN only — never blocks/replans).
+    if bool(config["novel"].get("character_service_enabled", True)):
+        try:
+            every = max(1, int(config["novel"].get("character_service_every", 5)))
+            window = int(config["novel"].get("character_service_window", 15))
+            if chapter_num >= every and chapter_num % every == 0:
+                from quality import character_names_from_md, character_appearance_rate
+                names = character_names_from_md(read_text(paths.characters)) if paths.characters.exists() else []
+                if names:
+                    lo = max(1, chapter_num - window + 1)
+                    texts_cs: dict[int, str] = {}
+                    for num in range(lo, chapter_num + 1):
+                        p = chapter_path(paths, num)
+                        if p.exists():
+                            texts_cs[num] = read_text(p)
+                    car = character_appearance_rate(
+                        names, texts_cs, window=window,
+                        floor=float(config["novel"].get("character_service_rate_floor", 0.15)),
+                    )
+                    report["character_service"] = car
+                    if car.get("under_served"):
+                        log(paths, f"Character service Ch{chapter_num}: under-served="
+                            f"{[u['name'] for u in car['under_served']]}")
+                        db_event(conn, chapter_num, "character_service_alert", car)
+        except Exception as exc:
+            log(paths, f"character_service check failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Chapter length band: a guard beyond save_chapter's 500-char hard floor.
     # 番茄短章高频钩子 = 2.5-3k 字/章；超长章把"每章一钩子"稀释成"每5章一钩子"。
@@ -1138,12 +1277,17 @@ def review_chapter(
             from quality import cross_chapter_repetition
 
             lookback = int(config["novel"].get("style_cross_repeat_lookback", 6))
-            prior_texts: list[str] = []
-            for num in range(max(1, chapter_num - lookback), chapter_num):
+            lookback_long = int(config["novel"].get("style_cross_repeat_lookback_long", 20))
+            effective_lookback = max(lookback, lookback_long)
+            all_prior: list[str] = []
+            for num in range(max(1, chapter_num - effective_lookback), chapter_num):
                 p = chapter_path(paths, num)
                 if p.exists():
-                    prior_texts.append(read_text(p))
-            cr = cross_chapter_repetition(chapter, prior_texts, config)
+                    all_prior.append(read_text(p))
+            prior_texts: list[str] = all_prior[-lookback:] if len(all_prior) > lookback else all_prior
+            prior_texts_long: list[str] = all_prior
+            cr = cross_chapter_repetition(chapter, prior_texts, config,
+                                          prior_texts_long=prior_texts_long)
             report["cross_chapter_repetition"] = cr
             cr_penalty = float(cr.get("penalty", 0.0))
             if cr_penalty > 0:
@@ -1355,6 +1499,17 @@ def review_chapter(
         report.setdefault("problems", []).append(
             f"CONTRACT: {len(contract_hard)} 条硬违约（能力越界/模态漂移/黑名单/禁止套路/破坏必守设定）必须修复。"
         )
+        # A hard contract breach is a PLAN-level contradiction (the chapter is doing
+        # something the ability/setting forbids), not a wording tic. Surface it as a
+        # gate-reject so pipeline._classify_replan_failure routes to STRUCTURAL
+        # replan (regenerate the plan) instead of burning revision rounds on futile
+        # wording patches and then force-accepting the breach (tangshuting Ch21/23).
+        report.setdefault("gate_rejects", []).append({
+            "gate": "contract_hard",
+            "count": len(contract_hard),
+            "rules": [str(c.get("rule", "")) for c in contract_hard[:8]],
+            "evidence": [str(c.get("prose", "")) for c in contract_hard[:8]],
+        })
     # Optionally block acceptance when a HARD contradiction is detected, so the
     if bool(config["novel"].get("factcheck_hard_blocks_accept", True)):
         hard = [c for c in report.get("contradictions", []) if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]

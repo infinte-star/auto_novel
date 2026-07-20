@@ -9,10 +9,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from checkpoint import load_checkpoint, save_checkpoint
-from config import Paths, log, safe_score
+from config import Paths, log, safe_score, cost_savings_disabled
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import beat_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_metrics, recent_quality_feedback
+from store import db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_events, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -517,6 +517,34 @@ def _serial_milestone_block(config: dict[str, Any], chapter_num: int) -> str:
     )
 
 
+def _genre_constraint_block(config: dict[str, Any]) -> str:
+    """Return a genre-enforcement block for plan prompts when GENRE_KEYWORDS exist."""
+    try:
+        from quality import GENRE_KEYWORDS
+    except ImportError:
+        return ""
+    preset = str(config.get("novel", {}).get("style_preset", "")).strip().lower()
+    kw = GENRE_KEYWORDS.get(preset)
+    if not kw:
+        return ""
+    preset_names = {
+        "romance_female": "女频甜宠言情",
+        "suspense": "悬疑推理",
+        "xuanhuan_shuang": "玄幻爽文",
+        "system_stream": "系统流",
+    }
+    name = preset_names.get(preset, preset)
+    pos = "、".join(kw["positive"][:15])
+    neg = "、".join(kw["negative"][:15])
+    return (
+        f"## 体裁守恒约束（硬性）\n"
+        f"本书声明体裁：【{name}】\n"
+        f"- 核心场景关键词（每章计划必须覆盖至少1个）：{pos}\n"
+        f"- 禁止场景关键词（计划中不得以此为主要场景）：{neg}\n"
+        f"- 每5章中至少3章以本体裁核心场景为主要内容。\n\n"
+    )
+
+
 def generate_candidate_plans(
     client: OpenAI,
     paths: Paths,
@@ -735,7 +763,7 @@ def generate_candidate_plans(
 - 若本章使用主角的核心能力（如临终视像读取），该次使用的流程/条件/代价/解读路径必须与最近各章的能力使用方式有可见区别，禁止原样复用同一套"读取→看画面→报结论"的流程；info_source 即便相同，beats 里的能力使用方式也必须翻新。
 - 锁定关键嫌疑/真凶时，beats 不得让单一物证一步定罪；必须把画面物证与此前已在前文铺垫的行为模式/逻辑缺口结合成推理闭环。
 
-## 当前生效的阶段约束（必须遵守）
+{_genre_constraint_block(config)}## 当前生效的阶段约束（必须遵守）
 {json.dumps(constraints, ensure_ascii=False, indent=2) if constraints else "None"}
 
 ## 沉默伏线（硬性要求：若叙事上可行，至少在页面上推进其中之一）
@@ -1786,6 +1814,23 @@ def create_plan(
                     )
             except Exception as exc:
                 log(paths, f"narrative_pattern check failed (non-fatal) Ch{chapter_num}: {exc}")
+        # Multi-lead character service (WARN-only, never blocks): if a recent review
+        # flagged under-served principal-cast names, ask this plan to give one of
+        # them a meaningful beat so secondary男主/lead lines don't starve.
+        if bool(config["novel"].get("character_service_enabled", True)):
+            try:
+                alerts = recent_events(conn, limit=1, event_types={"character_service_alert"})
+                under = (alerts[0].get("payload", {}).get("under_served") if alerts else None) or []
+                names = "、".join(u.get("name", "") for u in under[:4] if u.get("name"))
+                if names:
+                    directive = (
+                        f"多线角色服务：配角/男主线【{names}】近期长期缺席。本章若情节允许，"
+                        "安排其中至少一人获得有推进意义的出场或高光（非背景一笔带过），维持其成长线不断供。"
+                    )
+                    if directive not in decision.setdefault("required_constraints", []):
+                        decision["required_constraints"].append(directive)
+            except Exception as exc:
+                log(paths, f"character_service directive failed (non-fatal) Ch{chapter_num}: {exc}")
         if duplicate_blocked and attempt < max_attempts - 1:
             db_event(
                 conn,
@@ -1880,13 +1925,18 @@ def create_plan(
             best_plan, best_decision, best_score = plan, decision, score
         if score >= min_score:
             break
-        if score >= retry_score:
+        if score >= retry_score and not cost_savings_disabled(config, chapter_num):
             log(
                 paths,
                 f"Ch{chapter_num} plan score={score} below min={min_score} but above retry_threshold={retry_score}; "
                 f"accepting without retry to save tokens.",
             )
             break
+        if score >= retry_score:
+            log(
+                paths,
+                f"Ch{chapter_num} plan score={score} below min={min_score}; 收尾区禁用省token接受，强制重试。",
+            )
         db_event(conn, chapter_num, "low_plan_score_retry", {"score": score, "decision": decision})
     assert best_plan is not None and best_decision is not None
     save_checkpoint(

@@ -222,6 +222,7 @@ def init_db(paths: Paths) -> Any:
         "avg_sentence_chars REAL",
         "dialogue_char_ratio REAL",
         "tech_per_kchar REAL",
+        "genre_score REAL",
     ):
         try:
             conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")

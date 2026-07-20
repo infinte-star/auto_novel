@@ -608,6 +608,21 @@ def ending_zone_distance(config: dict[str, Any], chapter_num: int) -> int | None
         return remaining
     return None
 
+
+def cost_savings_disabled(config: dict[str, Any], chapter_num: int) -> bool:
+    """True when token-saving accept shortcuts must be suppressed for this chapter.
+
+    In the收尾 zone (the final chapter and the `ending_zone_chapters` leading up to
+    it) quality's marginal value is highest — a mediocre finale poisons the whole
+    book — so the "accept a below-threshold plan/chapter to save cost" branches
+    (planning.py plan-score shortcut, pipeline.py ROI breaker) should NOT fire.
+    Gated by `ending_zone_disables_cost_savings` (default True); returns False in
+    pure char-target mode where there is no deterministic finale.
+    """
+    if not bool(config["novel"].get("ending_zone_disables_cost_savings", True)):
+        return False
+    return is_final_chapter(config, chapter_num) or ending_zone_distance(config, chapter_num) is not None
+
 # Valid narrative-mode identifiers. `reasoning` = single-room / precise物证 mode
 # (strengthens closure, fair clues, concrete physical anchors); `serial` =
 # strong-hook / emotional / serializable mode (relaxes per-chapter closure,

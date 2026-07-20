@@ -294,7 +294,7 @@ When the JSON contract matters, prompts are wrapped in `json_prompt(user)` which
 
 ### Refine pass (`refine.py`)
 Explicit manual step: `python novel.py refine <name>` (`refine_after_complete`
-defaults to false). Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond 3× original.
+defaults to false). Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond an intensity-tiered ceiling (`polish` 1.5× via `refine_max_grow_ratio`, `restructure` 2.0×, `rewrite` 2.5×).
 
 ### Screenplay conversion (`screenplay.py`)
 Standalone novel-text → 短剧 (vertical-drama) script converter, decoupled from the

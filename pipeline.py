@@ -37,6 +37,7 @@ from config import (
     book_is_consistent,
     get_paths,
     is_final_chapter,
+    cost_savings_disabled,
     load_config,
     log,
     normalize_chapter,
@@ -1268,6 +1269,7 @@ def generate_one_chapter(
                     bool(config["novel"].get("replan_roi_breaker_enabled", True))
                     and not review.get("gate_rejects")
                     and safe_score(review.get("score", 0)) >= threshold - roi_margin
+                    and not cost_savings_disabled(config, chapter_num)
                     and _recent_replan_ineffective(paths, chapter_num, config)
                 ):
                     log(

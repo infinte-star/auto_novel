@@ -50,6 +50,27 @@ def _get_cached_clause_set(text: str) -> frozenset[str]:
     return _CLAUSE_SET_CACHE[key]
 
 
+_PREFIX_SET_CACHE: dict[str, frozenset[str]] = {}
+
+
+def _get_cached_prefix_set(text: str, prefix_len: int = 8) -> frozenset[str]:
+    """Return normalized clause-prefix set for template-fossil detection."""
+    key = hashlib.md5(
+        (text[:200] + text[-100:] + str(prefix_len)).encode("utf-8", errors="replace")
+    ).hexdigest()
+    if key not in _PREFIX_SET_CACHE:
+        if len(_PREFIX_SET_CACHE) >= _CLAUSE_CACHE_MAX:
+            evict = list(_PREFIX_SET_CACHE.keys())[: _CLAUSE_CACHE_MAX // 2]
+            for k in evict:
+                del _PREFIX_SET_CACHE[k]
+        prefixes: set[str] = set()
+        for c in _clause_segments(text, min_len=prefix_len + 2):
+            nc = _normalize_clause(c)
+            prefixes.add(nc[:prefix_len])
+        _PREFIX_SET_CACHE[key] = frozenset(prefixes)
+    return _PREFIX_SET_CACHE[key]
+
+
 def _strip_title_line(text: str) -> str:
     """Drop the leading `第N章 标题` line so it doesn't skew line stats."""
     lines = text.lstrip().splitlines()
@@ -939,12 +960,12 @@ def cross_chapter_repetition(
     text: str,
     prior_texts: list[str] | None,
     config: dict[str, Any] | None = None,
+    prior_texts_long: list[str] | None = None,
 ) -> dict[str, Any]:
     """Detect signature clauses in `text` that recur in earlier chapters.
 
-    Returns {"metrics", "penalty", "flags", "directives", "repeats"}. `repeats`
-    lists the offending clauses (with prior occurrence counts) for logging and
-    for folding into the writer's avoid-list directive.
+    `prior_texts_long`: extended lookback (default 20ch) for template-prefix
+    matching only. Exact clause matching still uses the short `prior_texts`.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     enabled = bool(cfg.get("style_cross_repeat_enabled", True))
@@ -973,34 +994,67 @@ def cross_chapter_repetition(
         if prior >= 1 and len(c) >= int(cfg.get("style_cross_repeat_min_len", 7)):
             repeats.append((c, prior))
 
+    # --- Template-prefix fossil detection ---
+    prefix_len = int(cfg.get("template_fossil_prefix_len", 8))
+    prefix_threshold = int(cfg.get("template_fossil_prefix_chapters", 3))
+    long_texts = prior_texts_long if prior_texts_long else prior_texts
+    template_fossils: list[tuple[str, int]] = []
+    if prefix_len > 0 and prefix_threshold > 0 and long_texts:
+        prior_prefix_counts: dict[str, int] = {}
+        for pt in long_texts:
+            for pfx in _get_cached_prefix_set(pt, prefix_len):
+                prior_prefix_counts[pfx] = prior_prefix_counts.get(pfx, 0) + 1
+
+        cur_prefix_seen: set[str] = set()
+        for c in cur_clauses:
+            nc = _normalize_clause(c)
+            if len(nc) < prefix_len + 2:
+                continue
+            pfx = nc[:prefix_len]
+            if pfx in cur_prefix_seen:
+                continue
+            cur_prefix_seen.add(pfx)
+            prior_pfx = prior_prefix_counts.get(pfx, 0)
+            if prior_pfx >= prefix_threshold:
+                already_exact = any(
+                    _normalize_clause(r[0])[:prefix_len] == pfx for r in repeats
+                )
+                if not already_exact:
+                    template_fossils.append((c, prior_pfx))
+
+    result["metrics"]["template_fossils"] = len(template_fossils)
+
     # Penalize by how many earlier chapters already used the clause.
     fossil_threshold = int(cfg.get("style_cross_repeat_chapters", 2))
     fossils = [(c, p) for c, p in repeats if p >= fossil_threshold]
+    all_fossils = fossils + template_fossils
     repeats.sort(key=lambda x: -x[1])
     result["repeats"] = [{"clause": c, "prior_chapters": p} for c, p in repeats[:12]]
+    if template_fossils:
+        result["template_fossils"] = [
+            {"clause": c, "prior_chapters": p} for c, p in template_fossils[:6]
+        ]
     result["metrics"]["cross_repeat_count"] = len(repeats)
     result["metrics"]["cross_repeat_fossils"] = len(fossils)
 
-    if fossils:
-        # Each entrenched fossil adds penalty, capped.
-        pen = min(2.0, 0.5 * len(fossils))
+    if all_fossils:
+        pen = min(2.0, 0.5 * len(all_fossils))
         result["penalty"] = round(pen, 2)
         result["flags"].append(f"cross_chapter_fossils({len(fossils)})")
-        examples = "、".join(f"“{c}”(已出现{p}章)" for c, p in fossils[:4])
+        if template_fossils:
+            result["flags"].append(f"template_fossils({len(template_fossils)})")
+        examples = "、".join(
+            f"“{c}”(已出现{p}章)" for c, p in all_fossils[:4]
+        )
         result["directives"].append(
             "文体复读预警：以下标志性句子/比喻在前面多章反复出现，已成为口癖，"
             f"本章必须改写或避免：{examples}。同一意象请换新的具体写法。"
         )
         result["level"] = "advise"
-        # Escalation: a chapter carrying MANY entrenched fossils is not a tic to
-        # warn about — it is style collapse already in motion (suspense_v11 ran
-        # 6 consecutive chapters at fossils 9-25 with only advisory directives,
-        # and the prose never recovered). Past this count the verdict becomes
-        # "reject": the pipeline must regenerate, not annotate.
         reject_count = int(cfg.get("style_cross_repeat_reject_count", 8))
-        if len(fossils) >= reject_count:
+        if len(all_fossils) >= reject_count:
             result["level"] = "reject"
-            result["flags"].append(f"cross_chapter_fossil_collapse({len(fossils)})")
+            result["flags"].append(f"cross_chapter_fossil_collapse({len(all_fossils)})")
     elif len(repeats) >= int(cfg.get("style_cross_repeat_warn_count", 4)):
         result["penalty"] = 0.5
         result["flags"].append(f"cross_chapter_repeats({len(repeats)})")
@@ -1088,10 +1142,21 @@ def book_wide_fossils(
         if len(fossils) >= cap:
             break
 
+    # Hard fossils: a SINGLE phrase saturating a large fraction of the whole book
+    # (default >= 20% of chapters, e.g. tangshuting「老市场街七号」65/199≈33%) is a
+    # structural fossil on its own, even when the DISTINCT-phrase count stays under
+    # the reject threshold. review.py routes any hard fossil to STRUCTURAL replan.
+    hard_ratio = float(cfg.get("book_fossil_hard_ratio", 0.20))
+    hard_fossils = [
+        {**f, "hard": True} for f in fossils if f["frac"] >= hard_ratio
+    ]
+
     result["fossils"] = fossils
+    result["hard_fossils"] = hard_fossils
     result["phrases"] = kept_phrases
     result["metrics"] = {
         "book_fossil_count": len(fossils),
+        "hard_fossil_count": len(hard_fossils),
         "chapters_scanned": total,
         "threshold_chapters": threshold,
     }
@@ -1103,6 +1168,360 @@ def book_wide_fossils(
             "全书高频僵化短语预警：以下微动作/描写片段已在全书大量章节反复出现，"
             f"成为机械口癖，本章起必须主动规避并换用不同的动作落点与句式：{examples}。"
         )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Multi-lead character service: measure how often each principal-cast member
+# actually appears, so a secondary lead can't silently go missing for dozens of
+# chapters while the creative contract's "非官配需完整成长线" rule has no metric.
+# ---------------------------------------------------------------------------
+
+def character_names_from_md(md: str) -> list[str]:
+    """Extract principal-cast names from a `characters.md` state-machine file.
+
+    Parses `## …：名字（备注）` section headers: takes the text after the last
+    fullwidth/half-width colon and strips any trailing （…）/(…) parenthetical.
+    Headers without a colon (e.g. `## Consolidated`, `## Ch5`) are skipped, so
+    only real character sections are returned. Order-preserving, de-duplicated.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in (md or "").splitlines():
+        s = line.strip()
+        if not s.startswith("## "):
+            continue
+        header = s[3:].strip()
+        # Only headers of the form "role：name" name a character.
+        idx = max(header.rfind("："), header.rfind(":"))
+        if idx < 0:
+            continue
+        name = header[idx + 1:].strip()
+        # Drop a trailing parenthetical annotation.
+        for lp, rp in (("（", "）"), ("(", ")")):
+            p = name.find(lp)
+            if p >= 0:
+                name = name[:p].strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def character_appearance_rate(
+    names: list[str],
+    texts_by_chapter: dict[int, str],
+    window: int = 15,
+    floor: float = 0.15,
+) -> dict[str, Any]:
+    """Fraction of the recent `window` chapters in which each name appears.
+
+    Returns {"rates": {name: frac}, "under_served": [{"name","rate"}], "window"}.
+    The first name (protagonist) is measured but never reported as under-served —
+    only secondary leads starving out is the failure mode this guards. Safe no-op
+    on empty inputs.
+    """
+    result: dict[str, Any] = {"rates": {}, "under_served": [], "window": 0}
+    if not names or not texts_by_chapter:
+        return result
+
+    ordered = sorted(texts_by_chapter.keys())
+    windowed = ordered[-window:] if window > 0 else ordered
+    denom = len(windowed)
+    result["window"] = denom
+    if denom <= 0:
+        return result
+
+    rates: dict[str, float] = {}
+    for name in names:
+        hits = sum(1 for ch in windowed if name and name in (texts_by_chapter.get(ch) or ""))
+        rates[name] = round(hits / denom, 2)
+    result["rates"] = rates
+
+    under: list[dict[str, Any]] = []
+    for name in names[1:]:  # skip protagonist
+        if rates.get(name, 0.0) < floor:
+            under.append({"name": name, "rate": rates.get(name, 0.0)})
+    result["under_served"] = under
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Descriptor-frequency gate: catch short (3-6 char) phrases that evade both
+# the clause min_len (7) and the ngram window (6).
+# ---------------------------------------------------------------------------
+
+_STOPWORD_BIGRAMS = frozenset({
+    "的时", "时候", "的人", "一个", "他的", "她的", "自己", "已经", "没有",
+    "不是", "可以", "因为", "但是", "所以", "如果", "就是", "这个", "那个",
+    "什么", "怎么", "一下", "出来", "起来", "进去", "过来", "回来", "上去",
+    "下来", "下去", "不了", "不到", "得到", "之后", "之前", "的话", "一样",
+    "还是", "虽然", "然后", "或者",
+})
+
+_STOPWORD_TRIGRAMS = frozenset({
+    "了一下", "的声音", "最后一", "屏幕上", "把手机", "的时候", "看了一",
+    "说了一", "了一声", "了一口", "了一眼", "的眼睛", "的手指", "在桌上",
+    "的肩膀", "了过来", "了出来", "了起来", "了过去", "在地上", "在手里",
+    "一句话", "在嘴里", "了出去", "一个人", "的头发", "了下来", "了进去",
+    "在身边", "在身后", "在手上", "在脸上", "在门口", "在旁边",
+    "手机屏", "机屏幕", "个字都", "老市场", "市场街",
+})
+
+
+def descriptor_frequency(
+    texts_by_chapter: dict[int, str],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect short descriptive phrases (3-6 CJK chars) overused across the book."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "flagged": [], "directives": [], "metrics": {}, "level": "pass",
+    }
+    if not texts_by_chapter or not bool(cfg.get("descriptor_freq_enabled", True)):
+        return result
+
+    min_spread = int(cfg.get("descriptor_freq_min_spread", 15))
+    max_density = float(cfg.get("descriptor_freq_max_density", 0.5))
+    reject_density = float(cfg.get("descriptor_freq_reject_density", 2.0))
+    total = len(texts_by_chapter)
+    if total < min_spread:
+        return result
+
+    gram_info: dict[str, dict] = {}
+    for ch, text in texts_by_chapter.items():
+        body = _strip_title_line(text or "")
+        cjk = "".join(c for c in body if "一" <= c <= "鿿")
+        seen_in_chapter: set[str] = set()
+        for n in (3, 4, 5, 6):
+            for i in range(len(cjk) - n + 1):
+                g = cjk[i:i + n]
+                if n == 3 and (g[:2] in _STOPWORD_BIGRAMS or g in _STOPWORD_TRIGRAMS):
+                    continue
+                if g[-1] in "把在的了着过给让被从向往对跟比":
+                    continue
+                if n <= 4 and g[0] in "了一每三把出":
+                    continue
+                if g not in gram_info:
+                    gram_info[g] = {"chapters": set(), "count": 0}
+                gram_info[g]["count"] += 1
+                if g not in seen_in_chapter:
+                    gram_info[g]["chapters"].add(ch)
+                    seen_in_chapter.add(g)
+
+    flagged: list[dict[str, Any]] = []
+    has_reject = False
+    name_density_ceiling = float(cfg.get("descriptor_freq_name_ceiling", 1.0))
+    for phrase, info in gram_info.items():
+        spread = len(info["chapters"])
+        density = info["count"] / max(total, 1)
+        if density > name_density_ceiling:
+            continue
+        if spread >= min_spread and density >= max_density:
+            entry = {
+                "phrase": phrase,
+                "chapter_spread": spread,
+                "total_count": info["count"],
+                "density": round(density, 2),
+            }
+            flagged.append(entry)
+            if density >= reject_density:
+                has_reject = True
+
+    flagged.sort(key=lambda x: (-x["density"], -x["chapter_spread"]))
+    kept: list[dict[str, Any]] = []
+    for f in flagged:
+        if any(f["phrase"] in k["phrase"] or k["phrase"] in f["phrase"] for k in kept):
+            continue
+        kept.append(f)
+        if len(kept) >= 12:
+            break
+    flagged = kept
+
+    result["flagged"] = flagged
+    result["metrics"] = {
+        "descriptor_flagged_count": len(flagged),
+        "chapters_scanned": total,
+    }
+
+    if flagged:
+        penalty = min(1.5, 0.3 * len(flagged))
+        result["penalty"] = round(penalty, 2)
+        examples = "、".join(
+            f"“{f['phrase']}”({f['total_count']}次/{f['chapter_spread']}章)"
+            for f in flagged[:6]
+        )
+        result["directives"].append(
+            "描写标签过度使用预警："
+            "以下短语在全书中反复"
+            "出现频率过高，"
+            "已退化为机械标签，"
+            "本章起必须控制使用或"
+            "替换为其他描写："
+            + examples + "。"
+        )
+        result["level"] = "reject" if has_reject else "advise"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Genre-adherence gate: deterministic keyword check that chapter content
+# matches the declared style_preset.  Zero LLM cost.
+# ---------------------------------------------------------------------------
+
+GENRE_KEYWORDS: dict[str, dict[str, list[str]]] = {
+    "romance_female": {
+        "positive": [
+            "心跳", "脸红", "甜", "吻",
+            "暧昧", "告白", "约会", "牵手",
+            "做饭", "探店", "试吃", "菜谱",
+            "食材", "香味", "厨房", "味道",
+            "食欲", "小吃", "夜市", "烘焙",
+            "餐厅", "饭菜", "炒菜", "煮",
+            "撒娇", "心动", "喜欢", "恋",
+            "甜蜜", "温柔", "宠",
+            "拥抱", "耳朵红", "小鹿乱撞",
+            "笑容", "陪伴", "关心", "照顾",
+            "早餐", "晚餐", "火锅", "奶茶",
+            "逛街", "散步", "日常", "温馨",
+        ],
+        "negative": [
+            "尸体", "枪", "排爆", "液氮",
+            "冷库", "绑架", "劫持", "失明",
+            "截肢", "瘫痪", "盲杖", "轮椅",
+            "械斗", "刺伤", "弹孔", "弹壳",
+            "手铐", "枪口", "作战靴",
+            "爆炸", "炸弹", "毒气",
+            "证物", "血迹", "凶器", "弹道",
+            "解剖", "法医", "尸检", "验尸",
+            "逮捕", "拘留", "审讯", "口供",
+            "监控", "蹲守", "跟踪", "盯梢",
+            "对讲机", "警用", "防弹",
+            "伤口", "缝合", "手术台", "抢救",
+        ],
+    },
+    "suspense": {
+        "positive": [
+            "线索", "证据", "嫌疑", "案件",
+            "推理", "真相", "密码", "指纹",
+            "尸检", "现场", "凶器", "作案",
+            "目击", "审讯", "档案",
+        ],
+        "negative": [
+            "修炼", "灵气", "法宝", "妖兽",
+            "仙界", "丹药", "飞升",
+            "金手指", "系统提示",
+            "任务完成",
+        ],
+    },
+    "xuanhuan_shuang": {
+        "positive": [
+            "修炼", "突破", "灵气", "丹药",
+            "法宝", "妖兽", "境界",
+            "金手指", "系统", "升级",
+            "战力", "秘境",
+        ],
+        "negative": [
+            "办公室", "电话", "汽车",
+            "地铁", "公司", "股票",
+        ],
+    },
+    "system_stream": {
+        "positive": [
+            "系统", "任务", "奖励", "升级",
+            "积分", "抽奖", "属性",
+            "面板", "技能", "经验值",
+        ],
+        "negative": [
+            "修炼", "飞升", "仙界",
+        ],
+    },
+}
+
+
+def genre_adherence(
+    text: str,
+    recent_scores: list[float] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Check whether a chapter's content matches its declared genre."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "genre_score": 0.0, "penalty": 0.0, "flags": [], "directives": [],
+        "level": "pass", "metrics": {},
+    }
+    if not bool(cfg.get("genre_adherence_enabled", True)):
+        return result
+
+    preset = str(cfg.get("style_preset", "")).strip().lower()
+    keywords = GENRE_KEYWORDS.get(preset)
+    if not keywords:
+        return result
+
+    body = _strip_title_line(text)
+    kchars = max(len(body) / 1000.0, 0.1)
+
+    pos_count = sum(body.count(kw) for kw in keywords["positive"])
+    neg_count = sum(body.count(kw) for kw in keywords["negative"])
+    pos_density = pos_count / kchars
+    neg_density = neg_count / kchars
+    neg_weight = float(cfg.get("genre_negative_weight", 2.0))
+    score = pos_density - neg_density * neg_weight
+
+    result["genre_score"] = round(score, 3)
+    result["metrics"] = {
+        "positive_count": pos_count,
+        "negative_count": neg_count,
+        "positive_density": round(pos_density, 3),
+        "negative_density": round(neg_density, 3),
+    }
+
+    threshold = float(cfg.get("genre_drift_threshold", 0.0))
+    consec_warn = int(cfg.get("genre_drift_consecutive", 3))
+    consec_reject = int(cfg.get("genre_drift_reject_consecutive", 5))
+
+    scores = list(recent_scores or []) + [score]
+    low_streak = 0
+    for s in reversed(scores):
+        if s < threshold:
+            low_streak += 1
+        else:
+            break
+
+    result["metrics"]["low_streak"] = low_streak
+
+    preset_names = {
+        "romance_female": "女频甜宠言情",
+        "suspense": "悬疑推理",
+        "xuanhuan_shuang": "玄幻爽文",
+        "system_stream": "系统流",
+    }
+    genre_name = preset_names.get(preset, preset)
+
+    if low_streak >= consec_reject:
+        result["penalty"] = 1.0
+        result["flags"].append(f"genre_drift_reject(streak={low_streak})")
+        result["directives"].append(
+            f"体裁严重偏移："
+            f"本书声明体裁为【{genre_name}】，"
+            f"但最近{low_streak}章内容"
+            "持续偏离该体裁核心场景。"
+            "本章必须回归体裁核心。"
+        )
+        result["level"] = "reject"
+    elif low_streak >= consec_warn:
+        result["penalty"] = 0.5
+        result["flags"].append(f"genre_drift_warn(streak={low_streak})")
+        result["directives"].append(
+            f"体裁漂移预警："
+            f"最近{low_streak}章内容偏离"
+            f"声明体裁【{genre_name}】，"
+            "请在本章及后续章节中"
+            "增加体裁核心场景元素。"
+        )
+        result["level"] = "advise"
+
     return result
 
 

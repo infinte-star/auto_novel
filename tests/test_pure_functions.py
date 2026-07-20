@@ -27,6 +27,7 @@ from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 from writing import _chapter_write_max_tokens  # noqa: E402
+from quality import cross_chapter_repetition, descriptor_frequency, genre_adherence, GENRE_KEYWORDS  # noqa: E402
 
 
 def _make_paths(root):
@@ -1429,6 +1430,18 @@ class BookWideFossilTests(unittest.TestCase):
         off = book_wide_fossils(texts, {"novel": {"book_fossil_enabled": False}})
         self.assertEqual(off["fossils"], [])
 
+    def test_hard_fossil_by_ratio(self):
+        from quality import book_wide_fossils
+        # fossil in 8/10 chapters = 0.8 frac, well above default hard_ratio 0.20
+        texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
+        res = book_wide_fossils(texts, {"novel": {}})
+        self.assertTrue(res.get("hard_fossils"), "0.8-frac fossil must be marked hard")
+        self.assertTrue(all(f["hard"] for f in res["hard_fossils"]))
+        # raise the ratio above the fossil's frac -> no hard fossils, soft still there
+        res2 = book_wide_fossils(texts, {"novel": {"book_fossil_hard_ratio": 0.95}})
+        self.assertFalse(res2.get("hard_fossils"))
+        self.assertTrue(res2["fossils"])  # still detected, just not hard
+
 
 class EndingZoneTests(unittest.TestCase):
     """Tests for config.ending_zone_distance gradual收束 gating."""
@@ -1459,6 +1472,100 @@ class EndingZoneTests(unittest.TestCase):
     def test_ending_aware_off(self):
         from config import ending_zone_distance
         self.assertIsNone(ending_zone_distance(self._cfg(ending_aware=False), 47))
+
+    def test_cost_savings_disabled_in_zone_and_finale(self):
+        from config import cost_savings_disabled
+        self.assertTrue(cost_savings_disabled(self._cfg(), 50))   # finale
+        self.assertTrue(cost_savings_disabled(self._cfg(), 47))   # inside zone
+        self.assertFalse(cost_savings_disabled(self._cfg(), 30))  # outside zone
+        self.assertFalse(cost_savings_disabled(self._cfg(), 45))  # remaining==zone, not < zone
+
+    def test_cost_savings_disabled_gates(self):
+        from config import cost_savings_disabled
+        # explicit opt-out
+        self.assertFalse(
+            cost_savings_disabled(self._cfg(ending_zone_disables_cost_savings=False), 50)
+        )
+        # pure char-target mode (no max_chapters) never disables
+        self.assertFalse(cost_savings_disabled(self._cfg(max_chapters=0), 47))
+
+
+class RefinedTextAcceptableTests(unittest.TestCase):
+    """Tests for refine._refined_text_acceptable intensity-tiered grow ceiling."""
+
+    def _cfg(self, **kw):
+        base = {"refine_min_keep_ratio": 0.6, "refine_max_grow_ratio": 1.5}
+        base.update(kw)
+        return {"novel": base}
+
+    def test_rewrite_allows_more_growth_than_polish(self):
+        from refine import _refined_text_acceptable
+        original = "字" * 1000
+        refined = "字" * 2200  # 2.2x
+        ok_polish, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="polish")
+        ok_rewrite, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="rewrite")
+        self.assertFalse(ok_polish, "polish must reject 2.2x growth")
+        self.assertTrue(ok_rewrite, "rewrite ceiling (2.5x) must accept 2.2x growth")
+
+    def test_restructure_tier(self):
+        from refine import _refined_text_acceptable
+        original = "字" * 1000
+        refined = "字" * 1900  # 1.9x -> under restructure 2.0x, over polish 1.5x
+        ok_restr, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="restructure")
+        ok_polish, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="polish")
+        self.assertTrue(ok_restr)
+        self.assertFalse(ok_polish)
+
+    def test_rewrite_still_rejects_extreme_growth(self):
+        from refine import _refined_text_acceptable
+        original = "字" * 1000
+        refined = "字" * 3000  # 3.0x, above rewrite 2.5x
+        ok, reason = _refined_text_acceptable(original, refined, self._cfg(), intensity="rewrite")
+        self.assertFalse(ok)
+        self.assertIn("grew beyond", reason)
+
+
+class CharacterAppearanceRateTests(unittest.TestCase):
+    """Tests for quality.character_appearance_rate + character_names_from_md."""
+
+    def test_names_from_md(self):
+        from quality import character_names_from_md
+        md = (
+            "# 人物状态机档案\n"
+            "## 主角：汤舒婷\n### 状态\n文本\n"
+            "## 核心配角①：陆时砚（唯一官配）\n文本\n"
+            "## 核心反派①：高子昂（前男友）\n文本\n"
+            "## Consolidated\n压缩内容\n"
+        )
+        names = character_names_from_md(md)
+        self.assertEqual(names, ["汤舒婷", "陆时砚", "高子昂"])
+
+    def test_appearance_rate_and_under_served(self):
+        from quality import character_appearance_rate
+        texts = {
+            1: "汤舒婷和陆时砚在店里", 2: "汤舒婷一个人",
+            3: "汤舒婷想起高子昂", 4: "汤舒婷继续", 5: "汤舒婷收尾陆时砚也在",
+        }
+        res = character_appearance_rate(["汤舒婷", "陆时砚", "高子昂"], texts, window=5, floor=0.15)
+        self.assertEqual(res["rates"]["汤舒婷"], 1.0)
+        self.assertEqual(res["rates"]["陆时砚"], 0.4)
+        self.assertEqual(res["rates"]["高子昂"], 0.2)
+        # nobody under 0.15 here
+        self.assertFalse(res["under_served"])
+
+    def test_under_served_flagged(self):
+        from quality import character_appearance_rate
+        texts = {i: "汤舒婷独角戏" for i in range(1, 21)}
+        texts[20] = "汤舒婷独角戏还是没有别人"  # 陆时砚 never appears
+        res = character_appearance_rate(["汤舒婷", "陆时砚"], texts, window=15, floor=0.15)
+        under = {u["name"] for u in res["under_served"]}
+        self.assertIn("陆时砚", under)
+        self.assertNotIn("汤舒婷", under)
+
+    def test_empty_inputs(self):
+        from quality import character_appearance_rate
+        self.assertEqual(character_appearance_rate([], {1: "x"})["rates"], {})
+        self.assertEqual(character_appearance_rate(["甲"], {})["rates"], {})
 
 
 class PayoffDensityTests(unittest.TestCase):
@@ -1852,6 +1959,146 @@ class ChapterTitleDedupeTests(unittest.TestCase):
 
     def test_bare_prefix_falls_back(self):
         self.assertEqual(self._strip("第4章", 4), "Chapter 4")
+
+
+class TemplateFossilDetectionTests(unittest.TestCase):
+    """0A: Template-prefix matching catches variable-suffix fossil clauses."""
+
+    def test_variable_suffix_detected(self):
+        base = "每个字都像从牙缝里往外"
+        cur = base + "挤，疼得他直冒冷汗。"
+        priors = [
+            f"一些前文。{base}崩，声音沙哑。一些后文。",
+            f"他说不出口，{base}吐，断断续续。",
+            f"嗓子像卡了铁丝，{base}蹦，每一声都带血。",
+        ]
+        cfg = {"novel": {
+            "template_fossil_prefix_len": 8,
+            "template_fossil_prefix_chapters": 3,
+        }}
+        r = cross_chapter_repetition(cur, priors, config=cfg, prior_texts_long=priors)
+        has_template = any("template_fossil" in f for f in r["flags"])
+        self.assertTrue(has_template, f"Expected template_fossil flag, got flags={r['flags']}")
+
+    def test_short_prefix_no_false_positive(self):
+        cur = "他笑了笑说，没什么大不了的。"
+        priors = ["她笑了笑说，你这人真有趣。"]
+        cfg = {"novel": {"template_fossil_prefix_len": 8, "template_fossil_prefix_chapters": 3}}
+        r = cross_chapter_repetition(cur, priors, config=cfg, prior_texts_long=priors)
+        self.assertEqual(r["level"], "pass")
+
+    def test_below_threshold_no_flag(self):
+        base = "每个字都像从牙缝里往外"
+        cur = base + "挤。"
+        priors = [base + "崩。", "完全不相关的文本内容。"]
+        cfg = {"novel": {"template_fossil_prefix_len": 8, "template_fossil_prefix_chapters": 3}}
+        r = cross_chapter_repetition(cur, priors, config=cfg, prior_texts_long=priors)
+        has_template = any("template_fossil" in f for f in r["flags"])
+        self.assertFalse(has_template)
+
+
+class DescriptorFrequencyTests(unittest.TestCase):
+    """0B: Short-phrase (3-6 char) overuse detection across the full book."""
+
+    def test_high_spread_high_density_flagged(self):
+        texts = {}
+        for i in range(1, 21):
+            start = 0x4E00 + i * 80
+            unique = "".join(chr(start + j) for j in range(80))
+            texts[i] = f"第{i}章\n{unique}虎口旧疤{unique}"
+        cfg = {"novel": {
+            "descriptor_freq_enabled": True,
+            "descriptor_freq_min_spread": 15,
+            "descriptor_freq_max_density": 0.5,
+            "descriptor_freq_reject_density": 1.0,
+        }}
+        r = descriptor_frequency(texts, config=cfg)
+        phrases = [f["phrase"] for f in r["flagged"]]
+        has_target = any("虎口" in p or "旧疤" in p for p in phrases)
+        self.assertTrue(
+            has_target,
+            f"Expected a phrase related to '虎口旧疤' in flagged, got {phrases}",
+        )
+        self.assertIn(r["level"], ("advise", "reject"))
+
+    def test_below_min_spread_not_flagged(self):
+        texts = {}
+        for i in range(1, 21):
+            body = "正常的文字内容，没有重复的描述。" * 3
+            if i <= 10:
+                body += "虎口旧疤泛白。"
+            texts[i] = f"第{i}章 测试\n{body}"
+        cfg = {"novel": {
+            "descriptor_freq_enabled": True,
+            "descriptor_freq_min_spread": 15,
+            "descriptor_freq_max_density": 0.5,
+        }}
+        r = descriptor_frequency(texts, config=cfg)
+        phrases = [f["phrase"] for f in r["flagged"]]
+        self.assertFalse(any("虎口旧疤" in p for p in phrases))
+
+    def test_disabled_returns_pass(self):
+        texts = {i: "虎口旧疤虎口旧疤" for i in range(1, 30)}
+        cfg = {"novel": {"descriptor_freq_enabled": False}}
+        r = descriptor_frequency(texts, config=cfg)
+        self.assertEqual(r["level"], "pass")
+        self.assertEqual(r["flagged"], [])
+
+
+class GenreAdherenceTests(unittest.TestCase):
+    """0C: Genre drift detection via deterministic keyword scoring."""
+
+    def test_pure_negative_triggers_reject(self):
+        text = "枪口对准了她。排爆小组赶到冷库。劫持人质的嫌犯持刀械斗。尸体横陈。" * 5
+        scores = [-2.0, -1.5, -1.8, -2.1]
+        cfg = {"novel": {
+            "genre_adherence_enabled": True,
+            "style_preset": "romance_female",
+            "genre_negative_weight": 2.0,
+            "genre_drift_threshold": 0.0,
+            "genre_drift_consecutive": 3,
+            "genre_drift_reject_consecutive": 5,
+        }}
+        r = genre_adherence(text, recent_scores=scores, config=cfg)
+        self.assertEqual(r["level"], "reject")
+        self.assertGreater(r["penalty"], 0)
+
+    def test_positive_text_passes(self):
+        text = "她脸红心跳，甜蜜的吻让她整个人都软了。厨房里香味扑鼻，他温柔地说喜欢她做的饭菜。" * 3
+        cfg = {"novel": {
+            "genre_adherence_enabled": True,
+            "style_preset": "romance_female",
+            "genre_negative_weight": 2.0,
+            "genre_drift_threshold": 0.0,
+            "genre_drift_consecutive": 3,
+            "genre_drift_reject_consecutive": 5,
+        }}
+        r = genre_adherence(text, recent_scores=[1.0, 2.0], config=cfg)
+        self.assertEqual(r["level"], "pass")
+        self.assertGreater(r["genre_score"], 0)
+
+    def test_unknown_preset_passes(self):
+        text = "枪口排爆失明截肢" * 10
+        cfg = {"novel": {
+            "genre_adherence_enabled": True,
+            "style_preset": "unknown_genre",
+        }}
+        r = genre_adherence(text, config=cfg)
+        self.assertEqual(r["level"], "pass")
+
+    def test_advise_at_3_consecutive(self):
+        text = "尸体横在冷库里。劫持绑架械斗排爆弹孔。" * 3
+        scores = [-1.0, -1.5]
+        cfg = {"novel": {
+            "genre_adherence_enabled": True,
+            "style_preset": "romance_female",
+            "genre_negative_weight": 2.0,
+            "genre_drift_threshold": 0.0,
+            "genre_drift_consecutive": 3,
+            "genre_drift_reject_consecutive": 5,
+        }}
+        r = genre_adherence(text, recent_scores=scores, config=cfg)
+        self.assertEqual(r["level"], "advise")
 
 
 if __name__ == "__main__":

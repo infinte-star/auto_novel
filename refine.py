@@ -792,11 +792,11 @@ def _refined_text_acceptable(
 ) -> tuple[bool, str]:
     """Sanity-check the refined output. Returns (ok, reason_if_not).
 
-    The keep-ratio floor is intensity-aware: a "polish" pass must not drop more
-    than ~10% (matching its prompt contract), while "rewrite" may restructure
-    more aggressively but still cannot shrink below the global floor. The upper
-    bound matches the prompt's "<=1.5x original" instruction so the gate and the
-    prompt no longer disagree.
+    Both bounds are intensity-aware: a "polish" pass must not drop more than ~10%
+    (matching its prompt contract) and stays near 1x on the upper side, while
+    "restructure"/"rewrite" may both shrink and expand more aggressively (a thin
+    chapter diagnosed for rewrite legitimately needs room to grow). Floors and
+    ceilings both fall back to the global config keys when the intensity is unknown.
     """
     if len(refined.strip()) < 500:
         return False, f"too short: {len(refined.strip())} chars"
@@ -809,9 +809,18 @@ def _refined_text_acceptable(
     min_keep = floor_by_intensity.get(intensity, global_floor)
     if len(refined) < len(original) * min_keep:
         return False, f"shrank below {int(min_keep * 100)}% of original ({len(refined)}/{len(original)}) at intensity={intensity}"
-    max_grow = float(config["novel"].get("refine_max_grow_ratio", 1.5))
+    # Grow ceiling is intensity-aware too: a "polish" pass must stay near 1x, but a
+    # "rewrite" legitimately needs room to expand (thin原章 diagnosed for rewrite
+    # were being silently dropped by a flat 1.5x ceiling — see tangshuting Ch23).
+    global_ceil = float(config["novel"].get("refine_max_grow_ratio", 1.5))
+    ceil_by_intensity = {
+        "polish": global_ceil,
+        "restructure": max(global_ceil, float(config["novel"].get("refine_max_grow_ratio_restructure", 2.0))),
+        "rewrite": max(global_ceil, float(config["novel"].get("refine_max_grow_ratio_rewrite", 2.5))),
+    }
+    max_grow = ceil_by_intensity.get(intensity, global_ceil)
     if len(refined) > len(original) * max_grow:
-        return False, f"grew beyond {max_grow:g}x of original ({len(refined)}/{len(original)})"
+        return False, f"grew beyond {max_grow:g}x of original ({len(refined)}/{len(original)}) at intensity={intensity}"
     return True, ""
 
 

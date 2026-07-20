@@ -392,7 +392,16 @@ class LLMClientPool:
     def _should_try_next_client(exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None)
         if status_code is not None:
-            return int(status_code) in {401, 403, 408, 409, 429, 500, 502, 503, 504}
+            # Standard retryable/failover codes plus the Cloudflare origin-error
+            # family (520-527, 530). Reseller gateways sit behind Cloudflare and
+            # emit 524 (origin read timeout) etc. when their upstream stalls;
+            # treating these as failover-able lets the pool fall through to a
+            # healthy fallback endpoint instead of exhausting retries on the dead
+            # primary (which never marks dead, so retries would loop forever).
+            return int(status_code) in {
+                401, 403, 408, 409, 429, 500, 502, 503, 504,
+                520, 521, 522, 523, 524, 525, 526, 527, 530,
+            }
         return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
 
 def _resolve_thinking_param(

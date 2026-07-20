@@ -2119,6 +2119,7 @@ def update_structured_state(
         "avg_sentence_chars": _sh_metrics.get("avg_sentence_chars"),
         "dialogue_char_ratio": _sh_metrics.get("dialogue_char_ratio"),
         "tech_per_kchar": _sh_metrics.get("tech_per_kchar"),
+        "genre_score": (review.get("genre_adherence") or {}).get("genre_score"),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     with db_lock():
@@ -2128,9 +2129,9 @@ def update_structured_state(
                 chapter, title, score, readthrough_score, hook_score, payoff_score,
                 novelty_score, prose_score, continuity_score, plan_score, payoff_type, conflict_type, tension,
                 novelty, hook_strength, emotional_tone, accepted, em_dash_per_kchar, style_penalty,
-                emotional_impact, avg_sentence_chars, dialogue_char_ratio, tech_per_kchar, created_at
+                emotional_impact, avg_sentence_chars, dialogue_char_ratio, tech_per_kchar, genre_score, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chapter) DO UPDATE SET
                 title=excluded.title,
                 score=COALESCE(NULLIF(excluded.score, 0), score),
@@ -2145,7 +2146,8 @@ def update_structured_state(
                 emotional_impact=excluded.emotional_impact,
                 avg_sentence_chars=excluded.avg_sentence_chars,
                 dialogue_char_ratio=excluded.dialogue_char_ratio,
-                tech_per_kchar=excluded.tech_per_kchar
+                tech_per_kchar=excluded.tech_per_kchar,
+                genre_score=excluded.genre_score
             """,
             (
                 metrics_row["chapter"],
@@ -2171,6 +2173,7 @@ def update_structured_state(
                 metrics_row["avg_sentence_chars"],
                 metrics_row["dialogue_char_ratio"],
                 metrics_row["tech_per_kchar"],
+                metrics_row["genre_score"],
                 metrics_row["created_at"],
             ),
         )
