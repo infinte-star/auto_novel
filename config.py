@@ -160,7 +160,30 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 2,
         },
+        # 规则怪谈/民俗无限流：悬疑推理内核 + 抖音快节奏。线索开场、物证兑现门（规则/破法
+        # 必须落到可见后果），节奏比纯悬疑快，保留怪谈冷叙事（不下沉）。
+        "rule_horror": {
+            "narrative_mode": "reasoning",
+            "opening_gate_mode": "clue",
+            "payoff_density_min": 0.4,          # ≤2.5 章（比纯悬疑 0.25 快，贴抖音爽感）
+            "flat_streak_gate_enabled": True,
+            "flat_chapters_max_consecutive": 4,
+            "chapter_words": 3000,
+            "chapter_min_chars": 2400,
+            "chapter_max_chars": 5000,
+            "length_band_penalty_enabled": True,
+            "style_low_barrier_register": False,   # 保留怪谈冷叙事，不强加下沉
+            "style_min_avg_sentence_chars": 13.0,
+            "style_max_avg_sentence_chars": 44.0,
+            "style_dialogue_ratio_min": 0.04,
+            "style_tech_jargon_per_kchar_warn": 10.0,
+            "style_tech_jargon_per_kchar_bad": 14.0,
+            "visual_payoff_blocks_plan": True,     # 规则怪谈命脉：规则真伪/破法要落到物证与可见后果
+            "emotional_cadence_max_same": 4,
+        },
     }
+    # 别名：规则流 / 无限流 指向同一 profile。
+    profiles["guize"] = profiles["infinite_flow"] = profiles["rule_horror"]
     # 未知/未设置题材 → 中性默认（不强加爽文短章/下沉）。
     neutral = {**shuang, "narrative_mode": "balanced", "opening_gate_mode": "balanced",
                "chapter_words": 3000, "chapter_min_chars": 2400, "chapter_max_chars": 4500,

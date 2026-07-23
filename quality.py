@@ -183,9 +183,20 @@ def style_health(
             and delta >= rise_abs
             and em_per_kchar >= base * rise_mult
         ):
-            penalty += 1.0
+            # Graduated penalty: scale by how far above the baseline the
+            # chapter sits, instead of a flat +1.0 that blocks marginal cases.
+            ratio = em_per_kchar / base if base > 0 else 3.0
+            if ratio >= 3.0:
+                trend_penalty = 1.0
+            elif ratio >= 2.5:
+                trend_penalty = 0.8
+            elif ratio >= 2.0:
+                trend_penalty = 0.5
+            else:
+                trend_penalty = 0.3
+            penalty += trend_penalty
             flags.append(
-                f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k)"
+                f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k, ratio={ratio:.1f}x, pen={trend_penalty:.1f})"
             )
             # Avoid a near-duplicate directive when the static tier already told
             # the writer to cut em-dashes; the trend flag still surfaces for logs.
@@ -1080,6 +1091,7 @@ def _overlaps_kept(phrase: str, kept: list[str], min_shared: int = 4) -> bool:
 def book_wide_fossils(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
+    whitelist: set[str] | None = None,
 ) -> dict[str, Any]:
     """Detect micro-phrase tics recurring across a large fraction of the WHOLE
     book — the slow habit-stiffening that `cross_chapter_repetition` (6-chapter
@@ -1130,7 +1142,10 @@ def book_wide_fossils(
     kept_phrases: list[str] = []
     fossils: list[dict[str, Any]] = []
     cap = int(cfg.get("book_fossil_report_cap", 12))
+    _wl = whitelist or set()
     for g, count in candidates:
+        if _wl and any(w in g or g in w for w in _wl):
+            continue
         if _overlaps_kept(g, kept_phrases):
             continue
         kept_phrases.append(g)
@@ -1169,6 +1184,88 @@ def book_wide_fossils(
             f"成为机械口癖，本章起必须主动规避并换用不同的动作落点与句式：{examples}。"
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Dialogue health: measure dialogue-to-prose ratio.  Pure-narration chapters
+# feel "flat" in the web-novel register; conversely, wall-to-wall dialogue
+# starves the reader of interiority.  This check targets the more common
+# failure mode — too little dialogue — because the model's default drift is
+# toward narration/internal-monologue when unconstrained.
+# ---------------------------------------------------------------------------
+
+def dialogue_health(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute dialogue-ratio metrics + a penalty + directives.
+
+    Returns the same shape as ``style_health``::
+
+      {
+        "metrics": {"dialogue_char_ratio": float,
+                     "dialogue_chars": int,
+                     "total_chars": int},
+        "penalty": float,        # >=0, to SUBTRACT from the LLM review score
+        "flags":  [str],         # human-readable problem tags
+        "directives": [str],     # imperative fixes injected into the writer prompt
+      }
+
+    Thresholds are configurable under config["novel"] with sane defaults; the
+    function is safe to call with config=None.  Pure function — no DB, no I/O.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+
+    # --- gate ---------------------------------------------------------------
+    if not cfg.get("dialogue_health_enabled", True):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    total_chars = len(text)
+    if total_chars < 200:
+        return {
+            "metrics": {"dialogue_char_ratio": 0.0,
+                        "dialogue_chars": 0,
+                        "total_chars": total_chars},
+            "penalty": 0.0,
+            "flags": [],
+            "directives": [],
+        }
+
+    # --- measure dialogue chars inside “…” pairs --------------------------
+    dialogue_spans = re.findall(r'“([^”]*?)”', text)
+    dialogue_chars = sum(len(s) for s in dialogue_spans)
+    ratio = dialogue_chars / total_chars
+
+    # --- config thresholds --------------------------------------------------
+    ratio_min = float(cfg.get("dialogue_char_ratio_min", 0.10))
+    ratio_target = float(cfg.get("dialogue_char_ratio_target", 0.20))
+    cap = float(cfg.get("dialogue_penalty_cap", 1.5))
+
+    # --- penalty ------------------------------------------------------------
+    penalty = 0.0
+    flags: list[str] = []
+    directives: list[str] = []
+
+    if ratio < ratio_min:
+        penalty = min((ratio_min - ratio) / 0.05, cap)
+        flags.append(f"low_dialogue({ratio:.0%}<{ratio_min:.0%})")
+        pct = f"{ratio:.0%}"
+        tgt = f"{ratio_target:.0%}"
+        directives.append(
+            f"本章对话占比仅{pct}，远低于目标{tgt}。"
+            "下一章必须增加角色间的对话交锋，将叙述性心理独白转化为对话呈现。"
+        )
+
+    return {
+        "metrics": {
+            "dialogue_char_ratio": round(ratio, 4),
+            "dialogue_chars": dialogue_chars,
+            "total_chars": total_chars,
+        },
+        "penalty": round(penalty, 2),
+        "flags": flags,
+        "directives": directives,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2332,9 +2429,23 @@ def prose_texture(
         balance = "over_poetic"
         flags.append("诗意过度缺少具体锚定")
         directives.append(
-            "本章比喻/感官密度高但缺少具体数据锚定。"
-            "下一章请在关键动作/状态处加入 2-3 个具体数字/量级/时限来增加可信度。"
+            "本章比喻/感官密度过高（poetic_density={:.1f}/千字），偏向散文诗而非叙事推进。"
+            "下一章大幅削减比喻与华丽形容：每段最多保留 1 个比喻，改用白描的具体动作、对话，"
+            "并在关键处加 2-3 个数字/量级/时限锚定，优先把情节往前推。".format(poetic_density)
         )
+
+    # Over-poetic（紫色文体）安全网：仅对 EGREGIOUS 离群（poetic_density 远超正常语体）扣分。
+    # 注意：这里的 poetic_density 用单字比喻/感官正则（如/似/若…）粗测，中文里这些字常作
+    # 非比喻功能词（如果/似乎/一如既往），会系统性高估——健康中文网文正文普遍就跑 ~25-35。
+    # 因此阈值必须设在正常语体之上（默认 40），否则会惩罚正常文本（Ch1-11 好章也 ~30）。
+    # 真正的"风格飘逸"防线是相对尖峰门：style_health 的 em_dash_trend_rise（vs 近章均值）与
+    # 跨章化石检测——它们按"相对基线的突变"判定漂移，比这个绝对阈值可靠。此惩罚只兜底极端塌缩。
+    penalty = 0.0
+    if balance == "over_poetic":
+        pen_thresh = float(cfg.get("texture_poetic_penalty_threshold", 40.0))
+        pen_cap = float(cfg.get("texture_poetic_penalty_cap", 1.5))
+        if poetic_density > pen_thresh:
+            penalty = min(pen_cap, round((poetic_density - pen_thresh) * 0.1, 2))
 
     return {
         "metrics": {
@@ -2346,6 +2457,7 @@ def prose_texture(
         "balance": balance,
         "flags": flags,
         "directives": directives,
+        "penalty": penalty,
     }
 
 

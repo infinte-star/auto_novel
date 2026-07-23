@@ -890,8 +890,66 @@ def review_chapter(
                         wd.append(d)
                 log(paths, f"Prose-texture Ch{chapter_num}: balance={pt['balance']} "
                     f"metrics={pt['metrics']}")
+            # Over-poetic (紫色文体) now bites the score, not just advises the next
+            # chapter — advisory-only steering let purple-prose drift accumulate until
+            # it cratered (Ch15: poetic_density 38, force-accepted at 1.0).
+            pt_penalty = float(pt.get("penalty", 0.0))
+            if pt_penalty > 0:
+                penalties += pt_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in pt.get("flags", []):
+                    tag = f"texture:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                log(paths, f"Prose-texture Ch{chapter_num} penalty={pt_penalty} "
+                    f"(over_poetic, poetic_density={pt['metrics'].get('poetic_density')})")
         except Exception as exc:
             log(paths, f"prose_texture check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Dialogue ratio gate: deterministic check that chapters contain enough
+    # character dialogue (vs pure narration/internal monologue). Low dialogue
+    # kills pacing and reader engagement in 都市/言情/悬疑 genres.
+    if bool(config["novel"].get("dialogue_health_enabled", True)):
+        try:
+            from quality import dialogue_health
+            dh = dialogue_health(chapter, config)
+            report["dialogue_health"] = dh
+            dh_penalty = float(dh.get("penalty", 0.0))
+            if dh_penalty > 0:
+                penalties += dh_penalty
+                rr = report.setdefault("rhythm_risks", [])
+                for f in dh.get("flags", []):
+                    tag = f"dialogue:{f}"
+                    if tag not in rr:
+                        rr.append(tag)
+                wd = report.setdefault("writer_directives_for_next_chapter", [])
+                for d in dh.get("directives", []):
+                    if d not in wd:
+                        wd.append(d)
+                log(
+                    paths,
+                    f"Dialogue-health Ch{chapter_num} penalty={dh_penalty} "
+                    f"ratio={dh.get('metrics', {}).get('dialogue_char_ratio', 0):.2%}",
+                )
+        except Exception as exc:
+            log(paths, f"dialogue_health check failed (non-fatal) Ch{chapter_num}: {exc}")
+
+    # Chapter length penalty: deterministic check for mid-book shrinkage.
+    try:
+        _ch_min = int(config["novel"].get("chapter_min_chars", 2800))
+        if _ch_min > 0:
+            _ch_len = len(chapter or "")
+            if _ch_len < _ch_min:
+                _len_pen = min(float(config["novel"].get("chapter_length_penalty_cap", 1.0)),
+                               (_ch_min - _ch_len) / 500.0)
+                if _len_pen > 0:
+                    penalties += _len_pen
+                    report.setdefault("rhythm_risks", []).append("short_chapter")
+                    report.setdefault("writer_directives_for_next_chapter", []).append(
+                        "本章仅%d字，低于下限%d字。下章必须充分展开场景细节和对话。" % (_ch_len, _ch_min))
+                    log(paths, f"Chapter length Ch{chapter_num}: {_ch_len}<{_ch_min} penalty={_len_pen:.1f}")
+    except Exception:
+        pass
 
     # Book-wide micro-fossil scan: the sliding-window cross_chapter_repetition
     # misses 4-6 char action stubs that recur across the WHOLE book (e.g.
@@ -910,7 +968,20 @@ def review_chapter(
                     p = chapter_path(paths, num)
                     if p.exists():
                         texts[num] = read_text(p)
-                bf = book_wide_fossils(texts, config)
+                _wl: set[str] = set()
+                _wl_str = str(config["novel"].get("book_fossil_whitelist", "")).strip()
+                for _w in _wl_str.split(","):
+                    _w = _w.strip()
+                    if len(_w) >= 2:
+                        _wl.add(_w)
+                try:
+                    import re as _re
+                    _prompt_text = read_text(paths.prompt_file)
+                    for _m in _re.findall(r'[《「]([^》」]{2,10})[》」]', _prompt_text):
+                        _wl.add(_m)
+                except Exception:
+                    pass
+                bf = book_wide_fossils(texts, config, whitelist=_wl)
                 report["book_fossils"] = bf
                 if bf.get("phrases"):
                     try:
@@ -1446,7 +1517,7 @@ def review_chapter(
                     "rule": "能力白名单/模态（由 problems 文本回填）",
                     "prose": ptxt[:60],
                     "type": "ability_modality_drift",
-                    "severity": "hard",
+                    "severity": "soft",
                 })
                 log(paths, f"Contract backstop Ch{chapter_num}: lifted problem -> hard violation")
         report["contract_violations"] = cv

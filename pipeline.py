@@ -1407,7 +1407,14 @@ def generate_one_chapter(
                         "accepted_after": replan_review.get("accepted"),
                     },
                 )
-                if safe_score(replan_review.get("score", 0)) > safe_score(review.get("score", 0)):
+                # INVARIANT: best_chapter/best_review must never regress. Promote the
+                # replan result ONLY when it beats the BEST seen so far (not merely the
+                # last round). Structural replan can iterate, so a weaker later replan
+                # must not overwrite a stronger earlier draft — otherwise force-accept
+                # (which ships best_*) ships the worse one. Observed regression: an 8.38
+                # draft was overwritten by a 6.63 replan and shipped as 6.63.
+                replan_score = safe_score(replan_review.get("score", 0))
+                if replan_score > safe_score(best_review.get("score", 0)):
                     chapter = normalize_chapter(replan_chapter)
                     review = replan_review
                     plan = replan_plan
@@ -1417,12 +1424,12 @@ def generate_one_chapter(
                     save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
                     save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
                     save_checkpoint(paths, chapter_num, "final_review.json", review)
-                    log(paths, f"Quality replan Ch{chapter_num} improved score to {review.get('score')}/10")
+                    log(paths, f"Quality replan Ch{chapter_num} improved best score to {review.get('score')}/10")
                 else:
                     log(
                         paths,
-                        f"Quality replan Ch{chapter_num} did not improve "
-                        f"(new score={replan_review.get('score')}/10); keeping previous best.",
+                        f"Quality replan Ch{chapter_num} did not beat best "
+                        f"(new score={replan_score}/10, best={safe_score(best_review.get('score', 0))}/10); keeping best.",
                     )
             except _LocalFixDone:
                 pass
@@ -1474,7 +1481,10 @@ def generate_one_chapter(
                             client, paths, conn, config, chapter_num, replan_plan, replan_chapter, replan_tail,
                             cached_memory=writing_memory, chapter_aux_cache=_chapter_aux
                         )
-                    # Accept replan result unconditionally (even if still low) to avoid infinite loop
+                    # Accept replan result unconditionally (even if still low) to avoid infinite loop.
+                    # INTENTIONAL EXCEPTION to the best-never-regress invariant above: this fires
+                    # only when the current best is a catastrophic collapse (score<=3.0 + gate_rejects),
+                    # so taking the fresh replan as the new best is the emergency exit, not a regression.
                     chapter = normalize_chapter(replan_chapter)
                     review = replan_review
                     plan = replan_plan

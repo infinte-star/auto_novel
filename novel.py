@@ -1405,6 +1405,12 @@ def main() -> int:
     p_refine = sub.add_parser("refine", help="run the post-completion refine pass (chapters_refined/ + book_refined.md; resumable)")
     p_refine.add_argument("name")
 
+    p_fossil = sub.add_parser("fix-fossils", help="deterministic fossil phrase replacement (chapters_fixed/ + book_fixed.md)")
+    p_fossil.add_argument("name")
+    p_fossil.add_argument("--dry-run", action="store_true", help="report fossils without writing files")
+    p_fossil.add_argument("--max-keep", type=int, default=1, help="max occurrences to keep per chapter (0 = replace all)")
+    p_fossil.add_argument("--custom-replacements", default=None, help="path to JSON file with {phrase: [alternatives]} mappings")
+
     p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
     p_compare.add_argument("name_a")
     p_compare.add_argument("name_b")
@@ -1472,6 +1478,13 @@ def main() -> int:
             return cmd_telemetry_backfill()
         if args.telemetry_command == "stats":
             return cmd_telemetry_stats(genre=args.genre)
+    if args.command == "fix-fossils":
+        from fossil_fix import cmd_fix_fossils
+        return cmd_fix_fossils(
+            args.name, dry_run=args.dry_run,
+            max_keep=args.max_keep,
+            custom_replacements_path=args.custom_replacements,
+        )
     if args.command == "stop":
         return cmd_stop(args.name)
     if args.command == "restart":

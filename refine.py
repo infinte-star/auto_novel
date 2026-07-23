@@ -696,6 +696,26 @@ def refine_one_chapter(
     for num, text in extra_anchors:
         anchor_blocks.append(f"### Ch{num} (远端锚点, 摘要)\n{_summarize_chapter(text)}")
 
+    fossil_block = ""
+    try:
+        _fc = paths.logs_dir / "book_fossils.json"
+        if _fc.exists():
+            _bf = json.loads(read_text(_fc))
+            _fl = []
+            for _f in (_bf.get("fossils") or [])[:10]:
+                _ph = _f.get("phrase", "")
+                if _ph:
+                    _fl.append("- 「%s」%d章 (%.0f%%)" % (_ph, _f.get("chapter_count", 0), _f.get("frac", 0) * 100))
+            if _fl:
+                fossil_block = (
+                    "## 全书高频化石短语（精修时必须替换）\n"
+                    "以下短语在全书中过度重复，已成为机械口癖。\n"
+                    "精修本章时，若原文包含这些短语，必须用不同的动作/感官/句式替换：\n"
+                    + "\n".join(_fl)
+                )
+    except Exception:
+        pass
+
     intensity_instr = INTENSITY_INSTRUCTIONS.get(intensity, INTENSITY_INSTRUCTIONS["polish"])
     issues_text = "\n".join(f"- {i}" for i in diagnosis.get("issues", [])[:10]) or "（无）"
     group_summary = diagnosis.get("group_summary", "")
@@ -762,6 +782,8 @@ def refine_one_chapter(
 {chr(10).join(neighbour_blocks)}
 
 {chr(10).join(anchor_blocks)}
+
+{fossil_block}
 
 ## 待精调的原章节 Ch{chapter_num}
 {original.strip()}

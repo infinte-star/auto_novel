@@ -49,6 +49,7 @@ python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/
 python novel.py compare <a> <b>          # deterministic side-by-side report (scores/penalties/fossils/cost/config diff) -> experiments/
 python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped
 python novel.py refine <name>            # explicit post-completion refine pass (chapters_refined/ + book_refined.md; resumable)
+python novel.py fix-fossils <name>       # deterministic fossil replacement (chapters_fixed/ + book_fixed.md)
 python novel.py package <name>           # book packaging (titles/intros/tags/synopsis) for a finished novel
 python novel.py telemetry backfill       # import every novel's history into telemetry/global.db (idempotent)
 python novel.py telemetry stats [--genre G]  # cross-book strategy win-rates + totals
@@ -199,6 +200,28 @@ to catch its own degeneration.
   and **skips the refresh entirely** when recent prose shows collapse
   (`voice_refresh_skip_penalty`). This closes the voice.md self-feeding loop where
   degraded prose became "the book's voice."
+- **`quality.py:dialogue_health`** — deterministic dialogue-ratio gate. Measures
+  text inside `"…"` Chinese curly quotes as a fraction of total chars. Penalty
+  when ratio < `dialogue_char_ratio_min` (default 0.10), target is
+  `dialogue_char_ratio_target` (0.20). Wired into `review.py` like `style_health`.
+  The writer prompt also gets a dialogue-ratio warning when recent chapters run low.
+  Gated by `dialogue_health_enabled`.
+- **Chapter length penalty** — deterministic check in `review.py`: chapters shorter
+  than `chapter_min_chars` (default 2800) get a proportional penalty (up to
+  `chapter_length_penalty_cap`). The writer prompt injects the floor as a directive.
+- **Opening diversity** — `writing.py:_prewrite_quality_contract` reads the first
+  line of the last 5 chapters and injects them into the writer prompt with a
+  diversity requirement, preventing consecutive same-type openings. Gated by
+  `opening_diversity_enabled`.
+
+### Fossil fix (`fossil_fix.py`)
+Post-processing tool: `python novel.py fix-fossils <name>` scans finished
+chapters for CJK n-gram fossils (phrases recurring in ≥15% of chapters) and
+replaces excess occurrences with rotated synonym variants from
+`FOSSIL_REPLACEMENTS`. Keeps `--max-keep` (default 1) per chapter; uses
+`--custom-replacements <json>` for user-defined mappings. Reads from
+`chapters_refined/` if available, writes to `chapters_fixed/` + `book_fixed.md`.
+Zero LLM calls — purely deterministic.
 
 ### Adaptive cost control (`planning.py`)
 - Inverted cost model: the DEFAULT is cheap (`candidate_plans: 1`, `candidate_chapters: 1`)

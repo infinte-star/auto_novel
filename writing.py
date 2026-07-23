@@ -1073,12 +1073,42 @@ def _prewrite_quality_contract(
         "- 章末钩子笼统或近期已用过（hook<7）：结尾必须抛出一个具体的、未解决的新问题。",
         "- 廉价顿悟（'他突然意识到'）、连续心理独白>150字、用解释性叙述代替戏剧化呈现：均扣分。",
     ])
-    if payoff_intent or hook_intent:
-        lines.append("\n### 本章大纲自己承诺的兑现与钩子（首稿必须在页面上真正落地，而非换个说法）")
-        if payoff_intent:
-            lines.append(f"- 必须兑现的 payoff：{payoff_intent[:200]}")
-        if hook_intent:
-            lines.append(f"- 章末必须落地的 hook：{hook_intent[:200]}")
+    if payoff_intent:
+        lines.append("\n### Payoff 兑现验收（53%% 的首稿失败源于 payoff 空转）")
+        lines.append(
+            "大纲承诺的 payoff：%s" % payoff_intent[:250]
+        )
+        lines.extend([
+            "验收标准——正文必须同时满足以下三条，否则 payoff 维度直接低分：",
+            "1. 用 ≥150 字的连续场景动作（对话+动作+环境反应）实演 payoff，禁止用叙述句『他终于做到了』一笔带过。",
+            "2. payoff 必须由主角的主动选择或行动触发，不得凭空降临、对手突然降智、或旁人代劳。",
+            "3. payoff 的结果必须在页面上产生可见后果（信息变化/关系变化/资源得失），而非停留在内心感悟。",
+        ])
+    if hook_intent:
+        lines.append("\n### 章末钩子落地要求")
+        lines.append(
+            "大纲承诺的 hook：%s" % hook_intent[:250]
+        )
+
+    # --- Hook dedup: inject recent chapter endings so the writer avoids
+    # repeating the same hook pattern in consecutive chapters.
+    try:
+        from config import chapter_path as _ch_path
+        recent_hooks: list[str] = []
+        for prev in range(max(1, chapter_num - 3), chapter_num):
+            cp = _ch_path(paths, prev)
+            if cp.exists():
+                tail = cp.read_text(encoding="utf-8", errors="replace")[-300:]
+                last_para = tail.rsplit("\n\n", 1)[-1].strip()
+                if last_para:
+                    recent_hooks.append("Ch%d 结尾：%s" % (prev, last_para[:120]))
+        if recent_hooks:
+            lines.append("\n### 近期章末钩子（本章结尾必须与以下模式不同构）")
+            lines.append("27%% 的首稿失败源于 hook 与前章同构。以下是最近章节的结尾：")
+            lines.extend("- %s" % h for h in recent_hooks)
+            lines.append("本章结尾必须在【手法/信息类型/悬念载体】上至少换一种，禁止复用上述模式。")
+    except Exception:
+        pass
     if plan_risk:
         lines.append(f"\n### 大纲已点名的首要风险（本章主动规避，不要踩中）\n- {plan_risk[:240]}")
     if beat_list:
@@ -1097,6 +1127,133 @@ def _prewrite_quality_contract(
     if recent_problem_lines:
         lines.append("\n### 近期低分/扣分点（本章必须规避）")
         lines.extend(recent_problem_lines)
+
+    # --- Style budget: inject concrete style-health thresholds so the writer
+    # pre-empts the deterministic penalties instead of discovering them at review.
+    try:
+        import sqlite3
+        from store import ThreadLocalDB, recent_metrics as _rqm
+        db = ThreadLocalDB(paths.database)
+        rows = _rqm(db, 6)
+        em_vals = [float(r["em_dash_per_kchar"]) for r in rows
+                   if r.get("em_dash_per_kchar") is not None]
+        if em_vals:
+            em_mean = sum(em_vals) / len(em_vals)
+            em_warn = float(config["novel"].get("style_em_dash_per_kchar_warn", 6.0))
+            em_target = min(em_mean * 1.3, em_warn * 0.7)
+            _emdash = "——"
+            lines.append("\n### 风格预算（确定性扣分项，LLM评分无法覆盖）")
+            lines.append(
+                "• 破折号（%s）密度：近期均值 %.1f/千字，"
+                "本章目标 ≤%.1f/千字。超过 %.0f/千字 "
+                "将被确定性扣1分。用完整句叙事，"
+                "避免“A%sB%sC”碎句。"
+                % (_emdash, em_mean, em_target, em_warn, _emdash, _emdash)
+            )
+            sp_vals = [float(r["style_penalty"]) for r in rows
+                       if r.get("style_penalty") is not None]
+            if sp_vals and max(sp_vals) > 0:
+                sp_str = ", ".join("%.1f" % v for v in reversed(sp_vals))
+                lines.append(
+                    "• 近 %d 章风格扣分：%s。"
+                    "扣分>0意味着首稿文体不合格。"
+                    % (len(sp_vals), sp_str)
+                )
+    except Exception:
+        pass
+
+    # --- Dialogue ratio: inject target when recent chapters run low on dialogue.
+    try:
+        import sqlite3
+        from store import ThreadLocalDB, recent_metrics as _rqm_dlg
+        _db_dlg = ThreadLocalDB(paths.database)
+        _rows_dlg = _rqm_dlg(_db_dlg, 5)
+        _dlg_vals = [float(r["dialogue_char_ratio"]) for r in _rows_dlg
+                     if r.get("dialogue_char_ratio") is not None]
+        if _dlg_vals:
+            _dlg_mean = sum(_dlg_vals) / len(_dlg_vals)
+            _dlg_target = float(config["novel"].get("dialogue_char_ratio_target", 0.20))
+            if _dlg_mean < _dlg_target:
+                lines.append("\n### 对话占比预警")
+                lines.append(
+                    "近 %d 章对话占比均值仅 %.0f%%，目标 ≥%.0f%%。"
+                    "本章必须增加角色间的对话交锋：将心理独白/叙述总结改为对话呈现，"
+                    "关键信息通过对话传递而非旁白叙述。每个场景至少包含一组有效对话（≥3轮交锋）。"
+                    % (len(_dlg_vals), _dlg_mean * 100, _dlg_target * 100)
+                )
+    except Exception:
+        pass
+
+    # --- Chapter length floor: prevent mid-book chapter shrinkage.
+    try:
+        _cmin = int(config["novel"].get("chapter_min_chars", 2800))
+        if _cmin > 0:
+            lines.append("\n### 章节字数下限")
+            lines.append(
+                "本章正文不得少于 %d 字。若发现内容不足以支撑该字数，"
+                "应展开场景细节、补充环境互动、深化对话交锋，而非压缩跳过。"
+                % _cmin
+            )
+    except Exception:
+        pass
+
+    # --- Opening diversity: prevent consecutive same-type chapter openings.
+    if bool(config["novel"].get("opening_diversity_enabled", True)):
+        try:
+            from config import chapter_path as _ch_path_open
+            _recent_openings: list[str] = []
+            for _prev_ch in range(max(1, chapter_num - 5), chapter_num):
+                _cp_open = _ch_path_open(paths, _prev_ch)
+                if _cp_open.exists():
+                    _body = _cp_open.read_text(encoding="utf-8", errors="replace")
+                    for _line in _body.split("\n"):
+                        _ls = _line.strip()
+                        if _ls and not _ls.startswith("#") and not _ls.startswith("第") and len(_ls) > 5:
+                            _recent_openings.append("Ch%d：%s" % (_prev_ch, _ls[:60]))
+                            break
+            if len(_recent_openings) >= 3:
+                lines.append("\n### 开场多样性（近期章节开头）")
+                lines.extend("- %s" % o for o in _recent_openings[-5:])
+                lines.append(
+                    "本章开头必须与上述模式不同构。可选手法：对话直入、环境/天气切入、"
+                    "配角视角、时间跳跃、物件特写、回忆闪回。禁止连续3章以上用同一类型开场。"
+                )
+        except Exception:
+            pass
+
+    # --- Book-wide fossil injection: tell writer exactly which phrases
+    # are overused and how severely, so it pre-empts gate-reject.
+    try:
+        _fossil_cache = paths.logs_dir / "book_fossils.json"
+        if _fossil_cache.exists():
+            _bf = json.loads(read_text(_fossil_cache))
+            _hard = [f for f in (_bf.get("fossils") or []) if f.get("frac", 0) >= 0.20]
+            _soft = [f for f in (_bf.get("fossils") or []) if 0 < f.get("frac", 0) < 0.20]
+            if _hard:
+                lines.append("\n### 全书硬化石（本章出现即触发 gate-reject 重写）")
+                for f in _hard[:6]:
+                    lines.append(
+                        "- 『%s』已出现在 %d 章 (%.0f%%)——本章正文禁止出现。"
+                        % (f["phrase"], f["chapter_count"], f["frac"] * 100)
+                    )
+            if _soft:
+                lines.append("\n### 全书高频口癖（本章每个最多1次，优先替换）")
+                for f in _soft[:8]:
+                    lines.append(
+                        "- 『%s』(%d 章 %.0f%%)——换用不同动作/感官/句式。"
+                        % (f["phrase"], f["chapter_count"], f["frac"] * 100)
+                    )
+    except Exception:
+        pass
+
+    banned = str(config["novel"].get("banned_descriptors", "")).strip()
+    if banned:
+        lines.append("\n### 描写禁用标签（本章不得出现）")
+        for item in banned.split(","):
+            item = item.strip()
+            if item:
+                lines.append("- 禁止使用『%s』及其变体描写任何角色。" % item)
+
     return "\n".join(lines) + "\n"
 
 

@@ -23,6 +23,7 @@ from quality import prose_texture, emotional_cadence  # noqa: E402
 from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
 from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from memory import _recency_aware_state  # noqa: E402
+from memory import _contract_to_markdown  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
@@ -1146,6 +1147,15 @@ class ProseTextureTests(unittest.TestCase):
         result = prose_texture(text)
         self.assertEqual(result["balance"], "over_poetic")
         self.assertTrue(len(result["directives"]) > 0)
+        # egregious purple prose (poetic_density well above 12) now carries a score
+        # penalty, capped at texture_poetic_penalty_cap (default 1.5)
+        self.assertGreater(result["penalty"], 0.0)
+        self.assertLessEqual(result["penalty"], 1.5)
+
+    def test_balanced_prose_has_no_texture_penalty(self):
+        text = "他推开门，走进屋里，看了看四周，把手册放在桌上。" * 30
+        result = prose_texture(text)
+        self.assertEqual(result.get("penalty", 0.0), 0.0)
 
     def test_metrics_present(self):
         text = "正常的叙事文字。" * 50
@@ -1830,6 +1840,20 @@ class GenreDetectionProfileTests(unittest.TestCase):
         self.assertEqual(d["narrative_mode"], "balanced")
         self.assertEqual(d["opening_gate_mode"], "balanced")
 
+    def test_rule_horror_profile_and_aliases(self):
+        rh = genre_detection_profile("rule_horror")
+        # reasoning core + clue opening + 物证兑现 block (规则怪谈命脉)
+        self.assertEqual(rh["narrative_mode"], "reasoning")
+        self.assertEqual(rh["opening_gate_mode"], "clue")
+        self.assertTrue(rh["visual_payoff_blocks_plan"])
+        # faster payoff than pure suspense (抖音爽感), cold 叙事 (no 下沉)
+        susp = genre_detection_profile("suspense")
+        self.assertGreater(rh["payoff_density_min"], susp["payoff_density_min"])
+        self.assertFalse(rh["style_low_barrier_register"])
+        # aliases resolve to the same profile
+        self.assertEqual(genre_detection_profile("guize"), rh)
+        self.assertEqual(genre_detection_profile("infinite_flow"), rh)
+
     def test_apply_fills_absent_but_never_overrides_explicit(self):
         cfg = {"novel": {"style_preset": "suspense", "chapter_max_chars": 9999}}
         _apply_genre_detection_profile(cfg)
@@ -1839,6 +1863,29 @@ class GenreDetectionProfileTests(unittest.TestCase):
         self.assertEqual(cfg["novel"]["opening_gate_mode"], "clue")
         self.assertEqual(cfg["novel"]["narrative_mode"], "reasoning")
         self.assertFalse(cfg["novel"]["style_low_barrier_register"])
+
+
+class ContractIronRulesTests(unittest.TestCase):
+    def test_iron_rules_rendered_at_top_before_whitelist(self):
+        md = _contract_to_markdown({
+            "protagonist": "陈九",
+            "iron_rules": ["本副本规则必须以编号清单逐条明示", "主角零战力不得亲自打斗"],
+            "ability_whitelist": [{"name": "残卷", "modality": "cognitive", "scope": "被动提示", "cost": "命痕"}],
+            "ability_blacklist": ["不能主动查阅残卷"],
+            "banned_tropes": ["反派降智"],
+            "must_hold": ["每章一个强钩子"],
+        })
+        self.assertIn("## 开写铁律", md)
+        self.assertIn("本副本规则必须以编号清单逐条明示", md)
+        # iron rules sit at the top: before the ability whitelist heading
+        self.assertLess(md.index("## 开写铁律"), md.index("## 能力白名单"))
+
+    def test_absent_iron_rules_omits_section(self):
+        md = _contract_to_markdown({
+            "protagonist": "某人",
+            "ability_blacklist": ["不能飞"],
+        })
+        self.assertNotIn("## 开写铁律", md)
 
 
 class OpeningGateModeTests(unittest.TestCase):
