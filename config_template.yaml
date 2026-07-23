@@ -1,0 +1,748 @@
+# 通用 AI 写小说框架 —— 单篇小说配置模板
+#
+# 本文件由 `python novel.py create <name>` 复制到 novels/<name>/config.yaml，
+# 并把所有 __NOVEL__ 占位符替换成小说名。生成后可自行修改下列参数。
+#
+# 重要：paths 段的所有路径都相对仓库根目录（config.py 的 ROOT），
+# 指向 novels/<name>/ 内部，确保每篇小说的产物互不干扰。
+
+api:
+  base_url: "https://api.example.com/v1"
+  api_key: "sk-YOUR-API-KEY-HERE"
+  api_keys: ""
+  user_agent: ""
+  # 注意：多篇小说并行运行时共享同一批 API key 的 RPM/TPM 配额，
+  # 如需隔离请给不同小说分配不同的 api_key / api_key_groups。
+  # 端点优先级：api_key_groups 里的端点全部是 primary（轮询顺序即列出顺序），
+  # base_url/api_key 仅作所有 primary 都失效后的最终回退（与上面首个端点相同）。
+  # 格式 base_url|key1,key2|model：第三段可选，指定该端点使用的模型名；
+  # 省略则用全局 api.model。mimo 端点不认 claude-opus-4-8，故显式标注 mimo-v2.5-pro。
+  # 100xlabs 放最前 = 主端点（opus-4-8）；mimo 各端点排后，作 429 配额恢复后的回退。
+  # primary_base_url：把该 base_url 设为唯一 primary（其余端点全降级为 fallback，
+  # 仅 primary 全挂时才用）。设为 100xlabs，使 mimo 真正只作备用。
+  primary_base_url: ""
+  api_key_groups: ""
+  model: "deepseek-v4-pro"
+  group: ""
+  # 思考模式控制。thinking_mode 优先于 thinking_disabled。
+  #   disabled — 发送 thinking:{type:disabled}，关闭思维链（非思维链模型无害）
+  #   auto     — 不发送 thinking 参数，由模型/提供方自行决定
+  #   enabled  — 发送 thinking:{type:enabled}，主动启用思维链；
+  #              可配合 thinking_budget_tokens 限制推理token上限
+  # deepseek-v4-pro 非思维链模型，disabled 对其无害；
+  # 保持 disabled 确保 mimo 等思维链模型在回退时不挂死。
+  thinking_mode: disabled
+  thinking_budget_tokens: 0
+  max_tokens: 65536
+  max_output_tokens_cap: 0
+  temperature: 0.8
+  top_p: 1
+  frequency_penalty: 0
+  presence_penalty: 0
+  stream: true
+  context_window: 1000000
+  # 模型感知成本报表（novel.py stats/list 用，非必填）：`模型前缀:输入$/Mtok:输出$/Mtok`，
+  # 逗号分隔，前缀大小写不敏感；未命中回退 $3/$15。示例：
+  # price_table: "deepseek:3.0:15.0, minimax:0.5:2.0"
+  # grok 流式偶发"开流后长时间不吐 content"的挂起。stream_idle_steady（内容已开始
+  # 流出后的空闲上限）是抓 mid-stream 卡死的关键闸；stream_timeout 是单次调用总上限。
+  # 原 1800/360 太宽，一条挂死的候选流会拖垮整章 6-30 分钟。收紧到下列值后，挂起的
+  # 流会快速 salvage/重试而非阻塞整章。
+  stream_timeout: 600
+  stream_idle_timeout: 90
+  stream_idle_startup: 120
+  stream_idle_steady: 30
+  stream_startup_grace_secs: 60
+  stream_salvage_min_chars: 600
+  client_read_timeout: 180
+  client_connect_timeout: 15
+  # 部分网关需要浏览器 UA 通过防爬
+  user_agent: ""
+  max_attempts: 6
+  min_request_interval_secs: 0
+  max_rpm: 20
+  # Per-call LLM metrics are appended to logs/llm_calls.jsonl (one JSON line per
+  # finished call) for `python novel.py stats <name>`. Set false to disable.
+  metrics_enabled: true
+  prompt_enhancement_enabled: true
+  # —— 三端点分工：deepseek-v4-pro→ldapi / deepseek-v4-flash→littlesheep / doubao→xkool(仅refine) ——
+  # 写作/规划/记忆 → deepseek-v4-pro @ ldapi（强执行、密集情节稳）
+  # 评审/冷读/阶段审 → deepseek-v4-pro @ ldapi
+  # 提取/状态/记忆压缩 → deepseek-v4-flash @ littlesheep（便宜结构化）
+  # 精修 refine → doubao-seed-2-1-turbo @ xkool（生成用deepseek保结构，refine用doubao补网文味）
+  # 注：ldapi 的 deepseek-v4-pro 是 OpenRouter 式网关，先吐 reasoning 再吐 content，
+  #     需较大 max_tokens 才不被推理吃光（写作/规划默认 max_tokens 足够；tiny 调用会空）。
+  # 留空 *_base_url 即关闭该角色路由、走主力模型。
+  review_base_url:
+  review_api_key:
+  review_keys:
+  review_model:
+  review_thinking_mode: auto
+  review_thinking_budget_tokens: 0
+  # —— 按角色路由（可选，留空 *_base_url 即关闭该角色路由，走主力模型）——
+  # 规划（bootstrap/plan/replan/contract）→ 强推理模型
+  planning_base_url:
+  planning_api_key:
+  planning_keys:
+  planning_model:
+  planning_thinking_mode: auto
+  planning_thinking_budget_tokens: 0
+  # 写作（write/revise/beat_repair）→ deepseek-v4-pro @ ldapi（强执行/密集情节稳；网文味由 refine 补）
+  # 注：与主力 model 同模型同端点，留空亦等效；显式写出便于按需改成 doubao。
+  writing_base_url:
+  writing_api_key:
+  writing_keys:
+  writing_model:
+  writing_thinking_mode: disabled
+  writing_thinking_budget_tokens: 0
+  # 提取（extract/state_update/memory_compress）→ deepseek-v4-flash @ littlesheep（便宜结构化）
+  extraction_base_url:
+  extraction_api_key:
+  extraction_keys:
+  extraction_model:
+  extraction_thinking_mode: disabled
+  extraction_thinking_budget_tokens: 0
+  # 精修（python novel.py refine <name>，完本后手动步骤）→ doubao-seed-2-1-turbo @ xkool
+  # 生成用 deepseek 保结构，refine 用 doubao 补"网文味/爽感"。留空 refine_model 则 refine 走主力模型。
+  # cmd_refine 读到 refine_model 即用下列端点跑整个精修 pass。
+  refine_base_url:
+  refine_api_key:
+  refine_model:
+  refine_thinking_mode: disabled
+
+novel:
+  # ── 题材检测 profile（config.py:genre_detection_profile）───────────────────
+  # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
+  # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
+  # 选题材只需改 style_preset（见下方）。
+  # 番茄短章高频钩子：单章 2.5-3k 字（不是长章文学体）。章长硬约束见 chapter_min/max_chars +
+  # length_band_penalty_enabled；超长会被判超长扣分。
+  # chapter_words: 2800            # 题材profile自动设定;取消注释可手动覆盖
+  target_words: 2000000
+  quality_threshold: 8.0
+  # MVP cost model: single plan candidate / single draft by default. Breadth is
+  # spent only when deterministic risk signals fire (see risk_upshift_* below,
+  # which widens candidate_plans to risk_upshift_candidates), and the structural
+  # replan path still forces multi-draft sampling on its own.
+  max_revision_rounds: 1
+  candidate_plans: 1
+  # Inject a beat-to-page execution ledger into the first-draft writer prompt.
+  # This forces each selected outline beat to land as cause -> goal -> obstacle
+  # -> visible action/dialogue -> consequence, reducing "good plan, flat draft"
+  # failures. Set false only if the write prompt becomes too long.
+  first_draft_execution_ledger: true
+  min_plan_score: 8.0
+  plan_retry_score: 6.5
+  plan_max_attempts: 2
+  plan_skip_screen: true
+  # Temperature spread for parallel candidate-plan generation. Candidate i uses
+  # temp_base + i*temp_step (clamped to 1.1). A wider spread is the cheapest
+  # defense against the candidates converging into near-identical drafts: low-temp
+  # candidates anchor a safe plan, high-temp ones explore. Defaults give
+  # 0.60 / 0.72 / 0.84 for 3 candidates.
+  plan_candidate_temp_base: 0.6
+  plan_candidate_temp_step: 0.12
+  # First N chapters get an opening-specific craft block (sell-point up front,
+  # no info-dump, strong hook) because the bandit / dedupe / quality-feedback
+  # steering loops are still empty this early. Only fires while history is thin.
+  cold_start_chapters: 3
+  revise_use_patches: true
+  recent_tail_chars: 5000
+  stage_review_every: 20
+  repeat_window: 24
+  fatigue_window: 12
+  memory_compress_every: 30
+  memory_max_kb: 15
+  # 压缩棘轮修复（P2 降本）：尺寸触发时，只有 ≥min_batch 个 ## ChN 节真正可归并才发
+  # LLM 调用；否则每章重发 4 个近似空转的压缩调用（v12 实测 231 次/本）。
+  memory_keep_recent_sections: 30
+  memory_compress_min_batch: 5
+  context_budget_reserve_chars: 40000
+  replan_score_threshold: 6.5
+  replan_novelty_threshold: 5.5
+  # Bounds the ThreadPoolExecutor used for parallel candidate-plan generation,
+  # fused plan review, and multi-candidate chapter writing. These are all
+  # I/O-bound (waiting on streaming LLM responses), so >1 cuts per-chapter wall
+  # time roughly linearly with the candidate count. Keep this <= the number of
+  # distinct API keys you have (see api_key_groups / api_keys) so concurrent
+  # calls don't fight over a single key's RPM/TPM. llm.py already rate-limits
+  # and backs off, so this won't blow past provider limits. Set to 1 to force
+  # fully serial behaviour (e.g. when running many novels in parallel on shared
+  # keys).
+  max_parallel_workers: 5
+  max_no_improvement_revision_rounds: 1
+  candidate_chapters: 1
+  # Deterministic beat-coverage gate (quality.beat_coverage): non-LLM check that
+  # every plan beat's concrete anchor fragments actually appear in the draft.
+  # Failing drafts get ONE surgical low-temp repair call (beat_coverage_retry)
+  # that weaves the missing beats in before review. v13 shipped chapters whose
+  # core payoff beat was entirely absent (-1.0 each at final review); catching
+  # this pre-review is the cheapest point.
+  beat_coverage_enabled: true
+  beat_coverage_min: 0.6
+  beat_coverage_retry: 1
+  prewrite_quality_contract: true
+  prewrite_dimension_floor: 7.7
+  state_file_in_background: true
+  extract_in_background: true
+  prefetch_next_plan: false   # disabled: prefetched plan can be built off pre-revise state (staleness); re-enable only when proven safe
+  prefetch_plan_horizon: 2
+  plan_review_memory_chars: 10000
+  # P2 降本：规划侧上下文预算。plan_memory_chars 封顶候选生成/场景分解用的 4-tier
+  # memory_context（v12 实测每次候选 prompt ~168K 字、占全书成本 49%；tier1/2 总能装下，
+  # tier3/4 截断）。plan_arbitrate_memory_chars 是仲裁改用 lite 上下文后的专用预算
+  # （仲裁只做"选择"，候选大纲+agent 报告已在 prompt 里）。设 0 恢复旧行为（不封顶）。
+  plan_memory_chars: 60000
+  plan_arbitrate_memory_chars: 20000
+  writing_memory_chars: 50000
+  cacheable_prefix_chars: 30000
+  revise_patch_min_frac: 0.5
+  # 低于阈值但最终必须强制接受时，先自动落地评审给出的可定位 patches，
+  # 再登记 quality_debt，避免 7.8 分章节把已知小问题原样入库。
+  quality_debt_apply_patches: true
+  strategy_bandit: true
+  strategy_bandit_lookback: 60
+  hook_revise_enabled: true
+  hook_strength_min: 6.0
+  hook_revise_tail_chars: 400
+  # refine 是显式的完本后手动步骤（python novel.py refine <name>），不再默认自动烧钱。
+  refine_after_complete: false
+  refine_diagnose_max_tokens: 4000
+  refine_chapter_max_tokens: 16000
+  refine_temperature: 0.5
+  refine_min_keep_ratio: 0.6
+  refine_max_grow_ratio: 1.5
+  # 增长上限按强度分级：polish 沿用上面的 refine_max_grow_ratio；restructure/rewrite 放宽，
+  # 否则已正确诊断为需扩写的薄章会被一刀切 1.5x 静默丢弃（tangshuting Ch23）。
+  refine_max_grow_ratio_restructure: 2.0
+  refine_max_grow_ratio_rewrite: 2.5
+  refine_max_extra_anchors: 4
+  # refine 相邻章重复生成防护：精调后若与上一章相似度过高则强制重写/回退原文
+  refine_adjacent_dedupe_enabled: true
+  refine_adjacent_sim_max: 0.7
+  refine_adjacent_dedupe_retries: 1
+  plan_validate_deep: true
+  factcheck_enabled: true
+  factcheck_facts_chars: 3000
+  factcheck_hard_blocks_accept: true   # block accept on HARD contradiction with established facts (was advisory-only)
+  reader_promise_overdue_grace: 15
+  payoff_max_gap: 99
+  character_voice_check: false
+  # 文体健康度（非 LLM 规则检测，防止破折号/碎句文体塌缩）
+  style_health_enabled: true
+  style_em_dash_per_kchar_warn: 6.0
+  style_em_dash_per_kchar_bad: 9.0
+  # style_min_avg_sentence_chars: 12.0   # 题材profile自动设定;取消注释可手动覆盖
+  # 反过度书写锚点（碎句塌缩的镜像，v12 huangliang "仪器报告体"教训）：
+  # ①平均句长上限带（超 1.3 倍升级 severe）②对话字符占比下限（引号内字符÷正文）
+  # ③伪技术黑话密度×对话枯竭 合取检查（黑话高但对话充足的数据面板爽文不罚）。
+  # 三键均由题材profile自动设定（爽文38/0.05/8-12,悬疑48/0.03/10-14,历史52/0.02/8-12），取消注释可手动覆盖。
+  # style_max_avg_sentence_chars: 42.0
+  # style_dialogue_ratio_min: 0.04
+  # style_tech_jargon_per_kchar_warn: 8.0
+  # style_tech_jargon_per_kchar_bad: 12.0
+  style_max_avg_sentence_bad_mult: 1.3
+  style_tech_jargon_dialogue_max: 0.06
+  style_pseudo_precision_enabled: true
+  # 下沉/口语语体（番茄/七猫免费流）专用的平均句长下限：免费流要短句、低阅读门槛，
+  # 用更宽的阈值避免把"健康的下沉短句文"误判为碎句塌缩（Gap-3 冲突修正）。
+  # 仅当 platform_preset 属免费流或 style_low_barrier_register=true 时生效；反碎句的破折号/断行/对话检查不变。
+  style_min_avg_sentence_chars_free: 9.0
+  # 下沉/大白话语体（正交开关，可叠加任意 style_preset）。true 或 platform_preset∈免费流 时：
+  # ①写手注入大白话短句对话体指令块 ②style_health 放宽短句下限、并对书面腔连接词
+  # （然而/虽然/尽管/诸如…）密度超标扣分、对健康大白话发正向 directive ③reader_panel 用下沉阈值。
+  # style_low_barrier_register: false    # 题材profile自动设定(爽文/言情=true,悬疑/历史=false);取消注释可手动覆盖
+  style_bookish_per_kchar_warn: 2.0
+  style_bookish_penalty: 0.5
+  style_fragment_line_ratio_max: 0.35
+  style_penalty_cap: 4.0
+  style_penalty_block: 2.0
+  # 对话占比质量门：确定性检测章节对话字符占比，低于 min 即扣分。
+  dialogue_health_enabled: true
+  dialogue_char_ratio_min: 0.10
+  dialogue_char_ratio_target: 0.20
+  dialogue_penalty_cap: 1.5
+  # AI味确定性检测：套话/比喻堆砌/情感贴标签/程度副词/总结叙述/段落单一。
+  # 读者一眼能辨的AI生成痕迹，LLM自评完全失效，必须确定性检测+前移惩罚。
+  ai_flavor_enabled: true
+  ai_cliche_per_kchar_warn: 4.0
+  ai_cliche_per_kchar_bad: 8.0
+  metaphor_per_kchar_warn: 5.0
+  tell_not_show_per_kchar_warn: 3.0
+  adverb_inflation_per_kchar_warn: 4.0
+  ai_flavor_penalty_cap: 3.0
+  # 章节字数下限：低于此值在评审中扣分，并在 writer prompt 中注入扩写要求。
+  chapter_min_chars: 2800
+  chapter_length_penalty_cap: 1.0
+  # 开场多样性：读取近5章开头，注入多样性指令，防止连续同类型开场。
+  opening_diversity_enabled: true
+  # 文体趋势感知：破折号密度相对近 N 章均值显著上升（即使绝对值未达 warn 阈值）也扣分，
+  # 治"em 从 0.94 单调爬到 4.15 全程 penalty=0"的钝感漏报。趋势项现在【不再只在低于 warn 时
+  # 评估】——超过 warn 后仍在爬升（如 6.6→7.8→8.8）也叠加趋势罚分，使持续滑坡升级为 block，
+  # 而非永远停在 +1.0（实证 gudai50_v2 Ch20-24）。
+  style_em_dash_trend_window: 5
+  style_em_dash_trend_rise: 1.0
+  style_em_dash_trend_mult: 1.8
+  style_em_dash_trend_floor: 1.5
+  # 持续塌缩升级：当本章与近期均值【双双】高于 warn 阈值时，趋势的乘法判定会失灵
+  # （每步都 < mult×已抬高的基线，温水煮青蛙），此时额外 +1.0 把"已成新常态的塌缩"
+  # 升级为 block。关闭则只靠静态档+趋势档。
+  style_em_dash_sustained_block: true
+  # 破折号修复管线（Layer 2+3）：当 style_health 检测到破折号塌缩后，对 revise 输出
+  # 进行两级修复：先用 LLM 逐句改写含"——"的句子（scope 小不会膨胀），再用确定性规则
+  # 把剩余破折号替换为逗号（跳过对话中的打断用法）。
+  em_dash_targeted_rewrite_enabled: true
+  em_dash_targeted_rewrite_max_sentences: 30
+  em_dash_reduce_enabled: true
+  em_dash_reduce_target_per_kchar: 3.0
+  # revise 尺寸护栏：LLM 改写后章节不得超过原文 N 倍（防止 Ch43 式膨胀 4k→15k）。
+  revise_max_grow_ratio: 1.5
+  # 跨章句式/比喻复读检测（防止"像一颗心脏在缓慢地跳动""不是暂时的，是永久的"等口癖句反复出现）
+  style_cross_repeat_enabled: true
+  style_cross_repeat_lookback: 6
+  style_cross_repeat_min_len: 7
+  style_cross_repeat_chapters: 2
+  style_cross_repeat_warn_count: 4
+  # O1: 相邻章正文复读硬闸（确定性、非 LLM）。实测复读废稿 clause_overlap 0.33-0.81，
+  # 健康章 0.00-0.07。block 级：出稿后先重写一次 + review 强制 reject 并封顶分数；
+  # warn 级：扣分 + 注入避免清单。LLM 评审孤立打分看不见跨章雷同（曾给逐字复读章打 hook 9 分），
+  # 这是它的确定性兜底。
+  adjacent_repeat_enabled: true
+  adjacent_repeat_clause_warn: 0.10
+  # P0(v13 崩盘复盘)：原 0.30 太宽容——Ch11 clause_overlap=0.117 仅触发 warn 后
+  # 仍 force-accept，复读持续累积至熔断。收紧到 0.20，让"复述上一章"更早 block 重写。
+  adjacent_repeat_clause_block: 0.20
+  adjacent_repeat_bigram_block: 0.50
+  adjacent_repeat_warn_penalty: 1.0
+  adjacent_repeat_block_penalty: 3.0
+  adjacent_repeat_score_cap: 5.0
+  # 候选草稿预筛（pre-screen）：写完多候选后、评分前，先跑确定性化石句检测，
+  # 直接丢弃 level=reject 的废稿，避免浪费 review LLM call。当【所有】候选化石数
+  # 都 >= prescreen_fossil_catastrophe_threshold 时，判定为"plan 本身在生成垃圾"，
+  # 触发 plan-level STRUCTURAL replan（比事后 quality-replan 更早、更彻底）。
+  prescreen_fossil_catastrophe_threshold: 5
+  # 连续 force-accept 熔断：连续 N 章低于阈值被 force-accept，停跑（质量死亡螺旋）。
+  # 设 0 关闭。旧 quality_breaker_consecutive 仍保留（作用于连续低分，不限 force-accept）。
+  consecutive_force_accept_limit: 2
+  # 章内自我复述门（O1b）：章末"总结段"复述正文已给出的推理/结论（零增量），
+  # 拖累 readthrough。tail 的 clause 有多少比例已在 head 出现：warn 扣分+指令，
+  # block 封顶分数驱动改写章末。observed: suspense_10ch Ch7（mimo 章末复读正文推理）。
+  intra_repeat_enabled: true
+  intra_repeat_tail_chars: 600
+  intra_repeat_min_chars: 1500
+  intra_repeat_warn: 0.25
+  intra_repeat_block: 0.45
+  intra_repeat_warn_penalty: 0.8
+  intra_repeat_block_penalty: 2.0
+  intra_repeat_score_cap: 6.0
+  # 已用元素账本（P0 防后期重复坍缩）：扫最近 scene_dedupe_window 章已选大纲，抽出
+  # 已反复使用的金手指用法/物证/兑现类型，作为明文避免清单前置注入「候选生成 + 仲裁评分 +
+  # 写手」三处，把差异化从事后扣分前移到生成时预防。零额外 LLM 调用、不影响 cacheable_prefix。
+  used_element_ledger_enabled: true
+  # O1: 章末钩子回收检测：本章结尾与近几章结尾的句子集合重合即判"回收旧钩子"，
+  # 即使 hook_strength 打分很高也强制 hook-only 重写（治"章末钩子与上章完全相同"复发债）
+  hook_repeat_tail_chars: 300
+  hook_repeat_lookback: 3
+  hook_repeat_min_clauses: 2
+  hook_repeat_min_ratio: 0.25
+  # O3: 毒章 tail 消毒。上一章若被 force-accept 且分数低于 floor，写作 prompt 的
+  # "上章结尾"改用最后一个达标章的结尾 + 中间低分章的事实梗概，切断复读自增强回路。
+  tail_sanitize_enabled: true
+  tail_sanitize_score_floor: 6.0
+  # O3: 连续低分熔断。连续 N 章 force-accept 且分数低于 floor 时停跑（resume 照常），
+  # 防止 premise 枯竭/上下文污染时全速烧 token（v11 曾连烧 5 章 21 次 replan）。设 0 关闭。
+  quality_breaker_consecutive: 2
+  quality_breaker_score_floor: 6.0
+  # 熔断器在短篇模式（设了 max_chapters）下的行为：true=优雅提前收束（把下一章变终章、
+  # 触发 CLOSING_RULES 干净收尾，治 premise 枯竭烂尾），仅触发一次（第二次再熔断仍 HALT）；
+  # false=保持旧行为，直接 HALT 等人工介入。纯字数长篇（无 max_chapters）此项无效，始终 HALT。
+  quality_breaker_graceful_close: true
+  voice_refresh_skip_penalty: 1.0
+  # 冷读者独立终审（不共享 cacheable_prefix，专挑文体异常/原地打转）；按 cold_reader_every 调度
+  cold_reader_every: 15
+  # 跨书学习层（全局 telemetry 仓库 telemetry/global.db）
+  # genre：题材标签，全局库按 genre 分桶
+  genre: _default
+  # telemetry_enabled：每章把 metrics/仲裁/修订对/冷读结果异步双写进全局库（失败静默，不影响生成）
+  telemetry_enabled: true
+  # 失败分类学（taxonomy.py）：在 review 报告上附加结构化 failure_codes（纯增量，不改分/不改
+  # 消息），使重规划路由（pipeline._classify_replan_failure）精准化。
+  # 关掉则回退旧的自由文本启发式路由（行为不变）。
+  failure_taxonomy_enabled: true
+  # 宏观推进度量（对照 volume_plan 大事件锚点检测剧情停滞）
+  macro_progress_enabled: false   # disabled: only fires from Ch20; defer to long-novel phase
+  macro_progress_every: 10
+  macro_progress_stall_threshold: 12
+  # 自适应流程降档（仅对多候选基数有意义；单候选默认下无效）
+  adaptive_downshift_enabled: false   # disabled: warmup 60 never reached at current scale; pointless complexity
+  adaptive_downshift_score: 8.5
+  adaptive_downshift_window: 10
+  adaptive_downshift_warmup: 60
+  # 风险升档（MVP 反转成本模型的唯一扩宽来源）：近 N 章出现低分/高文体罚分时，
+  # 把候选数从默认 1 扩宽到 risk_upshift_candidates。崩盘恢复期正是规划多样性
+  # 最值钱的时候（v11 教训：连续 6 章 5.5 分仍在省候选）。
+  risk_upshift_window: 3
+  risk_upshift_score_floor: 7.0
+  risk_upshift_style_penalty: 1.0
+  risk_upshift_candidates: 3
+  strategy_bandit_explore_frac: 0.1
+  # 章节级语义去重（阻止无限切片同一场景）
+  scene_dedupe_enabled: true
+  scene_dedupe_window: 8
+  scene_dedupe_sim_warn: 0.6
+  scene_dedupe_sim_block: 0.82
+  scene_dedupe_force_retry: true
+  # 候选预过滤：生成的候选大纲若与近期已选大纲骨架相似度 >= 该值，直接淘汰（除非全灭），
+  # 不再浪费评审/仲裁调用，也防止仲裁者把"与全书一致"的复读候选选中。
+  scene_dedupe_candidate_block: 0.85
+  # 绝对天花板：与近期大纲近乎逐字相同（>=该值）在任何模式下都硬性重规划，
+  # 包括短篇模式（v11 Ch8 曾以 max_sim=1.0 通过——同场地可复用，同骨架不行）。
+  scene_dedupe_sim_identical: 0.97
+  # 短篇/限章模式（max_chapters <= 下列章数）天然复用同一场地与人物，
+  # 自动放宽 BLOCK 阈值（但不再整体关闭强制重规划）。
+  scene_dedupe_short_novel_chapters: 8
+  scene_dedupe_short_novel_block: 0.92
+  # 叙事流程骨架去重（防"同一套流程换个取证对象"的审美疲劳——字面去重 scene_dedupe
+  # 抓不到，因为换了取证对象后用词几乎不重叠，但抽象流程 enter→collect→compare→deduce
+  # 仍然逐章雷同。这是 suspense_10ch Ch3→Ch8 分数单调下滑的实证元凶）。
+  narrative_pattern_enabled: true
+  narrative_pattern_window: 3          # 只比最近 N 章（连续雷同才是疲劳信号）
+  narrative_pattern_min_moves: 3       # 流程少于该 move 数不算可识别的"流程形状"
+  narrative_pattern_sim_warn: 0.7      # >= 该相似度：WARN，注入换叙事形状的约束
+  narrative_pattern_sim_block: 0.85    # 单章 >= 该相似度：BLOCK，强制重规划
+  narrative_pattern_block_streak: 2    # 连续 >= 该章数都 >= warn：BLOCK（连续才算疲劳）
+  narrative_pattern_warn_penalty: 0.6
+  narrative_pattern_block_penalty: 1.5
+  # 爽点形态单调：连续 N 章 payoff_type 相同（每章都"打脸"/每章都"reveal"）即 warn+指令换爽点类型。
+  # 与流程骨架去重正交——治"换道具不换套路"的审美疲劳。
+  payoff_type_monotony_max: 3
+  # 跨章化石句坍塌级阈值：单章命中 >= 该数量的多章复读化石句时，评审直接作废本稿
+  # （gate_reject），强制走结构性重规划，而非仅扣分+下章提醒（v11 实证提醒无效）。
+  style_cross_repeat_reject_count: 5
+  # 模板化石前缀匹配：变体后缀化石（如"每个字都像从牙缝里往外X"）的前缀长度和阈值。
+  template_fossil_prefix_len: 8
+  template_fossil_prefix_chapters: 3
+  # 前缀匹配用的扩展回看窗口（精确匹配仍用 style_cross_repeat_lookback）。
+  style_cross_repeat_lookback_long: 20
+  # P0-1 前置负面清单：写稿前从近期 gate_rejects + 风格塌缩标记 + 化石句中提取
+  # 禁用模式列表，前置注入本章动笔前（而非事后才在 review 里发现）。
+  preflight_constraints_enabled: true
+  preflight_constraints_lookback: 5
+  # P0-2 候选草稿确定性预筛：多候选模式下，用 style_health + cross_chapter_repetition
+  # 在 LLM review 前筛掉必触发 gate_reject 或罚分过高的草稿，省评审成本、防低质稿以分胜出。
+  candidate_prescreen_enabled: true
+  candidate_prescreen_penalty_block: 3.0
+  # P0-3 黄金范例 RAG：从本书高分章节（≥8.8/10）中检索与当前 plan 类型匹配的片段，
+  # 作为正例注入写手 prompt（变量段，不影响 cacheable_prefix），学习节奏与执行手法。
+  exemplar_rag_enabled: false   # disabled: un-IDF'd second ranker + per-write full-chapter disk I/O, redundant with rag retrieval_block
+  exemplar_rag_min_chapter: 8
+  exemplar_rag_score_min: 8.8
+  exemplar_rag_top_k: 3
+  # P0-4 required_constraints 契约结构化：仲裁层输出结构化约束（id/type/check_method/target），
+  # 评审层机械验证每条约束是否兑现，未通过则扣分 + 反馈给下章写手。
+  constraint_verification_enabled: true
+  constraint_violation_penalty_each: 0.5
+  constraint_violation_penalty_cap: 2.0
+  constraint_violation_block_count: 3
+  # 悬疑/推理视觉爽点检查：防止核心 payoff 只停留在阴影角度/光源方向
+  # 等抽象推理上，要求大纲给出读者可见的画面A vs 现实B物证对照。
+  visual_payoff_check_enabled: true
+  visual_payoff_min_score: 7.0
+  # visual_payoff_blocks_plan: true      # 题材profile自动设定(悬疑=block,其余=建议);取消注释可手动覆盖
+  # 章节低于阈值时，先重做大纲并重写一次，而不是只做补丁修补后勉强接受
+  replan_on_low_quality: true
+  # 重规划局部/结构分流：局部失败（单维短板/可定位违约/文体塌缩且有补丁）先走定向 revise 多轮，
+  # 不做高方差整章重写；只有结构性失败（多维低分/场景雷同/payoff缺失）才整章重规划。
+  local_fix_before_replan: true
+  local_fix_max_rounds: 2
+  # 宏观维度（novelty/payoff/hook）短板时 revise patch 实测 ~0 收益，直接跳过 revise
+  # 轮、进入 structural replan；revise 仅保留给 prose/continuity 等局部可修问题。
+  skip_revise_on_macro_fail: true
+  # structural replan 方差对冲：用多候选 + 降温采样，取 review 最高，防单稿写崩
+  # （曾把 8.5 计划写成 5.5）。重写稿仍须 > 原 best 才采纳。
+  structural_replan_candidates: 3
+  structural_replan_temperature: 0.65
+  # 开篇试写模式（python novel.py trial <name>），不污染 chapters/book
+  opening_trial_variants: 3
+  opening_trial_chapters: 3
+  # 小说转剧本（python novel.py script ...）每次 LLM 调用最多送入的小说字符数、
+  # 输出上限、温度。短剧改编要忠于原文事件，温度偏低更稳。
+  script_seg_chars: 6000
+  script_max_tokens: 16000
+  script_temperature: 0.6
+  # 三段式改编：先抽 source_packet JSON，再做 episode_plan，再按计划生成剧本。
+  # 关闭后回退到旧的一步式小说->剧本提示。
+  script_structured_pipeline: true
+  # 注入短剧格式 few-shot 范例，对齐分集分场颗粒度/△原子化/身份字幕/钩子节奏
+  script_fewshot: true
+  # 转换后自检重写：以短剧制片人视角打分并按修改指令重写一遍（提升可拍性与节奏）
+  script_review_enabled: true
+  script_review_max_rounds: 1
+  script_review_min_score: 8.0
+  # 10章包追读审校：检查承诺账本、爽点兑现、重复疲劳和下一包指令
+  # 【未使用 / dead】代码只读取 pack_review_every / pack_review_barrier，从不读取此开关——当前无法用它关闭包审校。
+  pack_review_enabled: true
+  pack_review_every: 10
+  pack_review_barrier: true
+  stage_review_barrier: true
+  # 分层记忆读取上限：防止 memory/*.md 膨胀后把上下文塞满；早期具体事实由 RAG 召回
+  memory_state_chars: 12000
+  memory_opening_route_chars: 6000
+  memory_volume_plan_chars: 16000
+  memory_threads_chars: 12000
+  memory_characters_chars: 16000
+  memory_bible_chars: 16000
+  memory_timeline_chars: 10000
+  memory_voice_chars: 8000
+  memory_voices_chars: 12000
+  # memory_context（规划/抽取用的全量分层上下文）组装后的硬上限。context_window 常被
+  # 设成理想值（如 1000000），但真实模型在远低于此的 prompt 上就会拒答/返回空，故用这个
+  # 独立现实上限兜底，与 context_window 解耦。上面各 memory_*_chars 已把每层限得更小，
+  # 正常情况下不会触达此上限，仅防止异常膨胀（如事件 JSON 累积）撑爆模型真实容量。0 关闭。
+  memory_context_max_chars: 150000
+  # 创作契约（从 prompt.md 抽取作者钉死的硬规则：能力白/黑名单+模态、禁止套路、必守设定），
+  # 逐章在 write 回灌、在 review 硬校验。违约即 block 并驱动重写。
+  contract_enabled: true
+  memory_contract_chars: 6000
+  # review 命中能力越界/违约时是否阻止 accept（驱动重写）。关闭则仅记录不拦截。
+  contract_blocks_accept: true
+  # V2-#5: 在 writer prompt 末尾（recency 最强位）再注入一份精简的能力边界胶囊
+  # （白名单+模态/黑名单/禁止套路），治长上下文稀释导致的能力越界（v4 5/6 章违约）。
+  contract_capsule_enabled: true
+  # V2-#3: 关键维度硬地板。novelty/payoff 低于地板时综合分封顶（而非微调），
+  # 驱动重写而非修辞修补；并在重规划分流里判为 structural（revise 对场景设计无效）。
+  key_dimension_floor_enabled: true
+  novelty_floor: 7.5
+  payoff_floor: 7.5
+  key_dimension_floor_cap: 7.5
+  # V3-#1: plan→成稿 gap 校准。仲裁层长期把大纲打到 ~8.5（天花板），但成稿实测只有 ~7.5，
+  # 开环。把最近若干章 (plan_score, 实测综合分) 的系统性正差注入仲裁 prompt，命令其按
+  # 可执行性而非意图雄心打分、并扣掉 mean_gap 作校准基线。差值 < min_gap 时不注入（已校准）。
+  plan_calibration_min_gap: 0.6
+  # V3-#2: 锚点完成门。短篇/限章模式下，循环仅按 字数/章数 上限收尾，可能在卷纲的
+  # 高潮锚点（真相揭露/主线对峙/核心代价兑现）尚未在正文落地时就草草停笔。到达上限时
+  # LLM 审计 volume_plan 必达锚点 vs 实际章节梗概，若有未兑现锚点则带着"落地该锚点"
+  # 指令多写 1 章（最多 anchor_gate_max_extra 章），让结局被真正写出来而非被梗概掉。
+  # 纯字数长篇（无 max_chapters）无确定性结局，gate 不触发。
+  anchor_gate_enabled: true
+  anchor_gate_max_extra: 3
+  # V3-#3: structural replan 前的定向诊断。结构性失败时整章重规划历史上常"did not improve"，
+  # 因为新计划用不同措辞重犯同一开环错误（抽象意图/页面外兑现）。先做一次轻量诊断，定位
+  # 没落地的 beat + 最弱维度 + 场景必须如何改，把结论注入重写计划的 required_constraints 与
+  # replan_feedback，让重写有靶子而非又生成一份"看起来不一样实则同样落不了地"的大纲。
+  structural_diagnose_enabled: true
+  # 检索式记忆（轻量本地 TF-IDF，召回被摘要压缩掉的早期具体事实）
+  rag_enabled: true
+  rag_top_k: 4
+  rag_exclude_recent: 6
+  rag_min_score: 0.04   # absolute cosine floor: drop weakly-related passages rather than anchor the writer to noise
+  # ── Audit fixes (2026-06): foundation + verification levers ──
+  bootstrap_chain_enabled: true    # generate foundation as dependency chain (bible→characters→voice→volume_plan) vs one JSON
+  bootstrap_verify_enabled: true   # run style_health on the voice charter (repair once) + anchor/entity grounding audit
+  plan_executability_gate_enabled: true   # deterministic regex gate: block plans whose payoff is abstract realization with no shootable action
+  review_use_frozen_voice: true    # reviewer judges against frozen voice_baseline.md, not the drift-mutated voice.md
+  hook_revise_rereview: true       # re-review after hook-only revise instead of fabricating hook_strength
+  # 终章意识：写最后一章时改为收束（兑现主线、给完成感），不再强行留下章悬念。
+  # 仅在设定了 max_chapters（短篇/限章模式）时生效；纯字数长篇不触发。
+  ending_aware: true
+  # 题材预设（驱动写作/评审/精调的题材化提示词）：
+  # history / xuanhuan_shuang / system_stream / urban_ability / romance_female / wanzu_xuanhuan
+  #   / suspense（悬疑慢烧）/ rule_horror（规则怪谈·民俗无限流，别名 guize/infinite_flow）
+  style_preset: history
+  # 敏感词规避（正交开关，默认 false）：怪谈/悬疑/黑暗等题材正文多 尸/鬼/血/献祭 等词，
+  # 部分中转网关会返回 sensitive_words_detected(500)；开启后在写作/规划层引导意象化表达绕过
+  # 内容审核，不改暗黑基调。这类题材建议 true。
+  # sensitive_word_avoidance: true
+  # 叙事模式（与题材预设叠加的可选写法风向）：
+  #   balanced  - 默认，沿用既有行为
+  #   reasoning - 单密室·精密推理：收敛场景、物证驱动、视觉矛盾、强收束（视觉爽点门槛保持阻断）
+  #   serial    - 强钩子·情绪外放·可连载：强开场钩、情绪外放、章末强钩；视觉爽点门槛默认降为建议
+  # narrative_mode: serial               # 题材profile自动设定(爽文=serial,悬疑=reasoning,历史=balanced);取消注释可手动覆盖
+  # 平台/读者预设：general / qidian_male / fanqie_free / jinjiang_female / qimao_free
+  platform_preset: fanqie_free
+  # 全书爽点节拍器：把卷纲的阶段高潮/大事件锚点按章号定位后注入单章规划，催更准时的兑现
+  beat_scheduler_enabled: true
+  beat_climax_tighten: 2
+  # 人设记忆点：bootstrap 让每个主要人物带 1-3 个标志记忆点(口头禅/标志动作/外号/反差)，写作时提醒自然复现
+  # （仅对新 bootstrap 的书生效；老书不自动补）
+  signature_trait_surface: true
+  # 爆款样本库：把 markdown/txt/json 放到 benchmarks/<platform>/<style>/ 下，生成时会召回结构参照
+  benchmark_enabled: true
+  benchmark_dir: "benchmarks"
+  benchmark_top_k: 3
+  benchmark_context_chars: 5000
+  # bootstrap 阶段一次性 AI 创意增强（跨题材联想注入新颖金手指/人设梗/开篇钩子）
+  creative_boost_enabled: true
+  # 开篇三章特化（黄金三章，决定弃书率）
+  opening_chapters: 3
+  opening_hook_strength_min: 7.0
+  opening_review_strict: true
+  # 黄金三句开篇确定性闸门：前 opening_chapters 章，确定性拦截"景物/时段/设定铺垫"开场
+  # （第一句须是正在发生的危机/动作/对话）。命中扣分 opening_golden_gate_penalty + 注入重写开头指令；
+  # opening_golden_gate_block=true 时直接 reject 强制重写（默认 false，避免开篇章空烧 token）。
+  opening_golden_gate_enabled: true
+  opening_golden_gate_penalty: 1.5
+  opening_golden_gate_block: false
+  # 书名/简介/标签/概要产出：全书完成后(精修前)生成包装素材到 package.md / logs/package.json
+  package_after_complete: false
+  # Gap-4 吸量包：bootstrap 阶段(开写前)用番茄书名/三段式简介公式生成候选 -> hook_package.md。
+  # 纯顾问产物，不进 cacheable_prefix；多一次 bootstrap LLM 调用，关掉即跳过。
+  hook_package_enabled: true
+  hook_package_max_tokens: 4000
+  # 吸量评分：bootstrap 生成吸量包后，用独立"吸量评判"调用（不带 cacheable_prefix）按点击率
+  # 给书名/简介打分排序 + 赛道(红海/蓝海)评估 -> logs/hook_package_scored.json；并把最优书名
+  # 采纳进 title.txt（不在 cacheable_prefix，零缓存影响）。
+  hook_package_scoring_enabled: true
+  hook_package_adopt_title: true
+  hook_package_score_max_tokens: 3000
+  # 吸量包落地（P3 断链修复）：把 hook_directives（书名/简介向读者承诺的爽点）注入
+  # 开篇 1-3 章的写手 prompt（历史上只写进 .md 从未被消费）。per-chapter 块，零缓存影响。
+  hook_directives_inject_enabled: true
+  # 章节起名优化：用钩子化、不剧透的短标题替换正文首行标题(只动首行，正文不变)；默认关，便于消融
+  chapter_title_refine_enabled: false
+  # 词条/名词表一致性层：阶段审校时刷新 memory/glossary.md，写作时作为变量段注入，评审复用 contradictions 核对
+  glossary_enabled: true
+  glossary_max_tokens: 4000
+  glossary_inject_chars: 1800
+  # ── 爆款质量层（P0-P2 + 量化/诗意变奏）──
+  # 连载节奏感知：里程碑章节（每 N 章 + 付费墙章）提高钩子要求
+  serial_milestone_every: 10
+  serial_milestone_hook_boost: 1.0
+  serial_free_to_paid_chapter: 0
+  # 情感冲击评分地板：emotional_impact 低于阈值时综合分封顶 8.5
+  emotional_impact_floor_enabled: true
+  emotional_impact_floor: 5.0
+  # 文体纹理（量化密度 vs 诗意密度）变奏检测与指令注入
+  prose_texture_enabled: true
+  texture_num_high_per_kchar: 8.0
+  texture_poetic_low_per_kchar: 1.0
+  # 过度诗化（紫色文体）安全网惩罚：poetic_density 用单字比喻/感官正则（如/似/若…）粗测，
+  # 中文里这些字常作非比喻功能词，会系统性高估——健康中文网文正文普遍就跑 ~25-35。所以阈值
+  # 必须设在正常语体之上（默认 40），只抓真正失控的极端离群，否则会误伤正常文本。真正的抗漂移
+  # 防线是相对尖峰门（style_health 的 em_dash_trend_rise 按 vs 近章均值判定、跨章化石检测）。
+  texture_poetic_penalty_threshold: 40.0
+  texture_poetic_penalty_cap: 1.5
+  # 情绪节律：连续 N 章同一情绪基调时注入变调指令
+  # emotional_cadence_max_same: 3        # 题材profile自动设定(言情=2情绪变奏更严);取消注释可手动覆盖
+  # 记忆压缩保护：LLM 压缩后字符数低于阈值则保留原文
+  memory_compress_min_chars: 500
+  # 评分校准三层（Layer A 确定性地板 / Layer B prose 维度锚定 / Layer C 自评失真惩罚）
+  deterministic_score_floor: 5.0
+  prose_calibration_enabled: true
+  style_audit_mismatch_penalty: 0.5
+  # ── 质量框架修复优化（9 项）──
+  # P0-1 全书级微动作化石检测：跨全书的 4-6 字僵化口癖，注入写手避免清单
+  book_fossil_enabled: true
+  book_fossil_ngram: 6
+  book_fossil_chapter_frac: 0.30
+  book_fossil_min_chapters: 6
+  book_fossil_every: 5
+  book_fossil_report_cap: 12
+  book_fossil_struct_count: 10
+  # 单个短语命中率 >= 此比例（出现在 >=20% 的章节）即视为结构性化石，单独触发结构化重规划，
+  # 不必等到"不同化石短语数"累积到 struct_count（tangshuting「老市场街七号」65/199≈33% 逃逸了旧阈值）。
+  book_fossil_hard_ratio: 0.20
+  # 白名单：逗号分隔的地名/设定词汇，不被视为化石（自动追加 prompt.md 中《》「」内的词）
+  book_fossil_whitelist: ""
+  # P0-1b 短描述符频率检测：3-6字短语（低于ngram=6和clause min_len=7的双重下限）过度使用追踪
+  descriptor_freq_enabled: true
+  descriptor_freq_min_spread: 15
+  descriptor_freq_max_density: 0.5
+  descriptor_freq_reject_density: 2.0
+  descriptor_freq_every: 15
+  # 禁用描写标签（逗号分隔），每章 writer prompt 直注禁令。留空不注入。
+  banned_descriptors: ""
+  # P0-1c 体裁漂移检测：确定性关键词检测，章节内容是否符合声明体裁
+  genre_adherence_enabled: true
+  genre_adherence_window: 5
+  genre_negative_weight: 2.0
+  genre_drift_threshold: 0.3
+  genre_drift_consecutive: 3
+  genre_drift_reject_consecutive: 5
+  # 多线角色服务度量：多男主/多线小说里次要线易长期断供。每 every 章扫描 characters.md 里的
+  # 主要人物（## 小节名），统计其在最近 window 章正文的出场率，低于 floor 的角色经 planning
+  # 软提示要求补高光（仅 WARN，不硬拦截/重规划）。
+  character_service_enabled: true
+  character_service_every: 5
+  character_service_window: 15
+  character_service_rate_floor: 0.15
+  # P0-2 中期质量塌方预警与主动恢复
+  degradation_alert_enabled: true
+  degradation_window: 4
+  degradation_warmup: 2
+  degradation_alert_score: 7.3
+  degradation_alert_drop: 1.0
+  degradation_recovery_chapters: 3
+  # P0-3 结尾渐进收束区（距结局 N 章起渐进收束）
+  ending_zone_chapters: 5
+  # 收尾区（终章 + 上面 N 章）禁用"低分省token接受"分支（plan 低分不重试 / ROI 熔断接受质量债）。
+  # 收尾质量边际价值最高，宁可多花 token 也不放行烂尾。纯字数长篇无确定性结局，此项无效。
+  ending_zone_disables_cost_savings: true
+  # P1-4 评分维度去通胀（hook/readthrough 长期满分时恢复区分度）
+  dimension_inflation_enabled: true
+  dim_inflation_window: 8
+  dim_inflation_saturate: 9.3
+  dim_inflation_discount: 0.5
+  # P1-5 章节长度带（番茄短章高频钩子：2.5-3k 字/章）。length_band_penalty_enabled=true 时
+  # 出带不只给指令、还扣分（超长按超出比例扣，封顶 2.0）；length_band_block=true 时超长 1.5x 以上硬 block。
+  # 旧小说未设 length_band_penalty_enabled 时默认仅给指令（行为不变）。
+  # chapter_min_chars: 2200              # 题材profile自动设定(爽文短/悬疑历史长);取消注释可手动覆盖
+  # chapter_max_chars: 3600              # 题材profile自动设定;取消注释可手动覆盖
+  # length_band_penalty_enabled: true    # 题材profile自动设定;取消注释可手动覆盖
+  length_band_block: false
+  # ── 生成时长度上限（硬约束写手 max_tokens，治"写到收不住"）──
+  # 写手 LLM 调用默认继承全局 api.max_tokens（常 64k+），章节会写飞。这里按 chapter_max_chars
+  # （题材 profile 已按题材设好）给写手/修订/补 beat 调用一个 max_tokens 预算，物理上限制章长，
+  # 同时留足余量保证带内章节不会被中途截断。chapter_length_cap_enabled=false 关闭（回退全局上限）。
+  # write_token_char_ratio 越小越紧（但过紧会截断未写完的章节）；write_max_tokens>0 则直接定死预算。
+  chapter_length_cap_enabled: true
+  write_token_char_ratio: 1.15
+  write_token_margin: 300
+  write_max_tokens: 12000
+  # 连续平路闸门：连续 N 章无强爽点且 emotional_impact 低于 flat_impact_floor → 扣分 + 强制本章给中爽点。
+  # 番茄追读率要求情绪高峰间隔 ≤2 章，故默认 3 章平路即触发。
+  # flat_streak_gate_enabled: true       # 题材profile自动设定(历史=false允许慢热);取消注释可手动覆盖
+  # flat_chapters_max_consecutive: 3     # 题材profile自动设定(悬疑=5);取消注释可手动覆盖
+  flat_impact_floor: 5.0
+  flat_streak_penalty: 1.0
+  # P1-6 修复 ROI 断路器（近期 replan 无效且短缺轻微时停手）
+  replan_roi_breaker_enabled: true
+  replan_max_attempts: 2
+  replan_min_gain: 0.3
+  replan_roi_skip_margin: 0.7
+  # P2-7 爽点密度检测（近 N 章无强爽点则注入指令）
+  # 0.5 ⇒ max_gap=2：番茄追读率要求情绪高峰间隔 ≤2 章（Gap-2 节拍收紧）。
+  payoff_density_enabled: true
+  # payoff_density_min: 0.5              # 题材profile自动设定(爽文≤2章,悬疑≤4,历史≤5);取消注释可手动覆盖
+  # P2-8 信息密度/过渡章检测
+  info_density_enabled: true
+  info_density_min_signals: 3
+  # Gap-9 可截图金句/传播性信号：本章无金句钩子时给下一章注入"埋金句"建议（advisory，不扣分）
+  shareable_line_enabled: true
+  shareable_min_score: 2.0
+  shareable_tail_chars: 500
+  # P2-9 设定/力量体系铁律交叉校验
+  setting_rules_check_enabled: true
+  setting_rules_chars: 1500
+  # ── 结构化上下文回忆：从数据库追踪的实体/伏线/关系/悬念中提取与本章相关的状态快照注入写手 ──
+  structured_recall_enabled: true
+  structured_recall_max_chars: 3000
+  structured_recall_thread_horizon: 5
+
+paths:
+  book: "novels/__NOVEL__/book.md"
+  state: "novels/__NOVEL__/state.md"
+  title: "novels/__NOVEL__/title.txt"
+  bible: "novels/__NOVEL__/memory/bible.md"
+  characters: "novels/__NOVEL__/memory/characters.md"
+  timeline: "novels/__NOVEL__/memory/timeline.md"
+  threads: "novels/__NOVEL__/memory/threads.md"
+  volume_plan: "novels/__NOVEL__/memory/volume_plan.md"
+  compass: "novels/__NOVEL__/memory/compass.md"
+  voices: "novels/__NOVEL__/memory/voices.md"
+  voice: "novels/__NOVEL__/memory/voice.md"
+  contract: "novels/__NOVEL__/memory/contract.md"
+  glossary: "novels/__NOVEL__/memory/glossary.md"
+  chapters_dir: "novels/__NOVEL__/chapters"
+  logs_dir: "novels/__NOVEL__/logs"
+  database: "novels/__NOVEL__/story_state.db"

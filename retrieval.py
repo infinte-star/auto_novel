@@ -509,45 +509,32 @@ def exemplar_block(
             if ch is None:
                 continue
 
-            # Read chapter text
-            from config import chapter_path
-            ch_text = ""
-            try:
-                ch_path = chapter_path(paths, ch)
-                if ch_path.exists():
-                    ch_text = ch_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
-
-            if not ch_text:
-                continue
-
-            # Extract snippet matching query (use TF-IDF scoring)
             snippet = ""
             if query:
                 try:
-                    # Simple TF-IDF match: split into sentences, score by query term overlap
-                    sentences = re.split(r'[。！？\n]', ch_text)
-                    query_terms = set(_tokenize(query))
-                    if query_terms:
-                        scored = []
-                        for sent in sentences:
-                            sent = sent.strip()
-                            if len(sent) >= 20:
-                                sent_terms = set(_tokenize(sent))
-                                overlap = len(query_terms & sent_terms)
-                                if overlap > 0:
-                                    scored.append((overlap, sent))
-                        if scored:
-                            scored.sort(reverse=True)
-                            # Take top 1-2 matching sentences
-                            snippet = "".join(s for _, s in scored[:2])
+                    hits = retrieve(
+                        paths, query, top_k=2,
+                        exclude_recent_chapters=0,
+                        current_chapter=chapter_num,
+                        min_score=0.05,
+                    )
+                    ch_hits = [h for h in hits if h.get("chapter") == ch]
+                    if ch_hits:
+                        snippet = "".join(h.get("text", "") for h in ch_hits[:2])
                 except Exception:
                     pass
 
             if not snippet:
-                # Fallback: take first ~200 chars
-                snippet = ch_text[:200]
+                try:
+                    from config import chapter_path
+                    ch_path = chapter_path(paths, ch)
+                    if ch_path.exists():
+                        snippet = ch_path.read_text(encoding="utf-8").strip()[:200]
+                except Exception:
+                    pass
+
+            if not snippet:
+                continue
 
             if len(snippet) > 400:
                 snippet = snippet[:400] + "…"

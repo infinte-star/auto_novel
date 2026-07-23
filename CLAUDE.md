@@ -142,6 +142,7 @@ Critical invariant in `pipeline.py:413-422`: `chapter_completed.json` must be wr
 4. `arbitrate_plan` — picks `selected_index` and emits a `merged_plan` plus `required_constraints`. Still runs with a single candidate: it merges rhythm diagnostics / recent quality feedback / used-element ledger into the plan
 
 ### Writing & revision (`writing.py`)
+- Writer system prompts use a **shared-base + genre-delta architecture**: `GENRE_PROFILES` dict holds per-genre deltas (role, self_review, core_discipline, structure_template, genre_bans, sensory_dialogue, time_marker_ban, extras), and `_build_write_system()` assembles the system prompt from shared constants (`_SELF_REVIEW_PREAMBLE`, `_OUTPUT_SECTION`, `_SENSORY_DIALOGUE_DEFAULT`, `_TIME_MARKER_BAN_DEFAULT`) + genre deltas + `ANTI_FRAGMENT_BAN` + `ANTI_PITFALL_BLOCK` + aesthetic. Adding a new genre only requires a new dict entry in `GENRE_PROFILES`. Genres: `history`, `xuanhuan_shuang`, `system_stream`, `urban_ability`, `romance_female`, `wanzu_xuanhuan`, `suspense`. (`rule_horror` falls back to `suspense`.)
 - `write_chapter_with_candidates` generates `candidate_chapters` parallel drafts at spread temperatures (`base ± 0.08·offset`), reviews each, keeps the highest-scoring
 - `write_chapter` injects a RAG `retrieval_block` (see below) into the writer prompt so early concrete facts that summary compression erased are back in context
 - `revise_chapter` first tries surgical `apply_review_patches` (replace/insert_after/delete by literal substring locator); only falls back to a full LLM rewrite when fewer than `revise_patch_min_frac` of patches apply cleanly
@@ -277,6 +278,18 @@ markdown render of those fields) consume it with zero further LLM calls.
 
 `compress_all_memory` consolidates per-chapter `## ChN` sections in bible/characters/timeline/threads when files exceed `memory_max_kb` or every `memory_compress_every` chapters; archives the old sections under `logs/memory_archive/`.
 
+### Shared prompt constants (cross-module deduplication)
+Several prompt fragments are shared across modules to eliminate redundancy and
+ensure consistency:
+- `memory.py:STYLE_HEALTH_GUARDRAILS` — the "健康文风护栏" prose-health guardrails,
+  referenced by `VOICE_CHAIN_SYSTEM` (memory.py) and `VOICE_ANCHOR_SYSTEM` (review.py)
+- `memory.py:_VOLUME_PLAN_STRUCTURE_SPEC` — the volume plan output format (OKR structure,
+  线索兑现表, pacing discipline), referenced by `VOLUME_PLAN_CHAIN_SYSTEM` (memory.py)
+  and `REPLAN_SYSTEM` (review.py) so both produce structurally identical volume plans
+- `planning.py:_EXECUTABILITY_DOCTRINE` — the executability scoring doctrine (score
+  baseline 6.5, "shootable action" definition, reversal structure requirement),
+  referenced by `CANDIDATE_PLAN_SYSTEM` and `ARBITER_SYSTEM`
+
 ### Persistence (`store.py`)
 SQLite (`story_state.db`, WAL mode) is the primary store with tables `events`,
 `chapter_metrics`, `entities`, `open_threads`, `agent_reports`, `stage_constraints`,
@@ -319,6 +332,8 @@ When the JSON contract matters, prompts are wrapped in `json_prompt(user)` which
 Explicit manual step: `python novel.py refine <name>` (`refine_after_complete`
 defaults to false). Reads finished `chapters/*.md` in 5-chapter groups, asks an LLM to assign per-chapter intensity (`polish` / `restructure` / `rewrite`) plus up to 4 anchor chapters from elsewhere in the book. Refined output goes to `chapters_refined/` and `book_refined.md`; `chapters/` and `book.md` are never modified. Per-group checkpoints under `logs/refine/group_NNNN.json` make the pass resumable. Sanity check `_refined_text_acceptable` rejects refines that shrink below `refine_min_keep_ratio` (default 0.6) or grow beyond an intensity-tiered ceiling (`polish` 1.5× via `refine_max_grow_ratio`, `restructure` 2.0×, `rewrite` 2.5×).
 
+Diagnose prompts mirror the writer's shared-base pattern: `DIAGNOSE_CORE` (shared preamble + intensity definitions + common dimensions) + `DIAGNOSE_GENRE_DIMS[preset]` (genre-specific dimensions) + `DIAGNOSE_COMMON_FOOTER` (task steps + JSON schema), assembled by `_build_diagnose_system()`. Adding a genre's diagnose prompt only requires a new entry in `DIAGNOSE_GENRE_DIMS`.
+
 ### Screenplay conversion (`screenplay.py`)
 Standalone novel-text → 短剧 (vertical-drama) script converter, decoupled from the
 generation pipeline. `convert_file(input, out)` / `convert_text(...)` split input on
@@ -350,4 +365,5 @@ it falls back to `config_template.yaml` (the shared keys). Tuned by `script_seg_
 - **`voice_baseline.md` is frozen on purpose.** `refresh_voice_anchors` anchors to it rather than re-deriving voice from recent prose; re-deriving from drifted prose is exactly the self-feeding loop that caused style collapse.
 - **API keys are committed in `config.yaml` / `config_template.yaml`.** Both are gitignored, but they hold live keys — don't echo them into tracked files or logs. New per-novel configs inherit the template's keys, so parallel novels share quota.
 - **`config_template.yaml` is gitignored but must exist on disk** for `novel.py create` to work. Don't delete it.
+- **`GENRE_PROFILES` shared constants affect all genres.** Modifying `_SENSORY_DIALOGUE_DEFAULT`, `_TIME_MARKER_BAN_DEFAULT`, `_SELF_REVIEW_PREAMBLE`, or `_OUTPUT_SECTION` in `writing.py` changes every genre's writer prompt at once. Per-genre overrides go in the `GENRE_PROFILES` dict entry (set `sensory_dialogue` or `time_marker_ban` to a non-empty string to override the default). Same applies to `DIAGNOSE_CORE`/`DIAGNOSE_COMMON_FOOTER` in `refine.py` and `_EXECUTABILITY_DOCTRINE` in `planning.py`.
 - **Ending awareness (`ending_aware`, default true) only fires when `max_chapters` is set.** In short-novel mode, the final chapter (`chapter_num == max_chapters`) gets a `CLOSING_RULES_BLOCK` (writing.py) + a planning ending directive, skips hook-only-revise (pipeline.py), and refine's diagnose/refine prompts demand closure instead of a cliffhanger. Detection lives in `config.py:is_final_chapter`. Pure char-target long novels (no `max_chapters`) have no deterministic finale, so this is inert there and per-chapter behaviour is unchanged.

@@ -90,17 +90,25 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
         "emotional_cadence_max_same": 3,
+        "fatigue_words": ["冷笑", "蝼蚁", "倒吸凉气", "瞳孔骤缩", "不可思议", "震惊",
+                          "竟然", "仿佛", "宛如", "不禁", "微微一笑", "嘴角微扬", "眼中闪过一丝"],
+        "paragraph_cv_min": 0.12,
+        "short_paragraph_warn": 45,
+        "short_paragraph_severe": 30,
+        "dialogue_pingpong_warn": 0.55,
     }
     profiles: dict[str, dict[str, Any]] = {
         "xuanhuan_shuang": dict(shuang),
         "system_stream": dict(shuang),
         "urban_ability": dict(shuang),
-        # 万族/战力：略长的战斗章、爽点间隔略宽。
         "wanzu_xuanhuan": {**shuang, "payoff_density_min": 0.4,
                            "chapter_words": 3000, "chapter_min_chars": 2400,
                            "chapter_max_chars": 4200,
                            "style_max_avg_sentence_chars": 40.0,
-                           "style_dialogue_ratio_min": 0.04},
+                           "style_dialogue_ratio_min": 0.04,
+                           "fatigue_words": ["冷笑", "蝼蚁", "倒吸凉气", "瞳孔骤缩", "不可思议",
+                                             "震惊", "竟然", "仿佛", "宛如", "不禁", "微微一笑",
+                                             "嘴角微扬", "眼中闪过一丝", "气血翻涌", "杀意凛然"]},
         # 悬疑：慢烧、线索开场、复杂容忍、高阅读门槛、物证兑现 block。
         "suspense": {
             "narrative_mode": "reasoning",
@@ -120,6 +128,12 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,
             "emotional_cadence_max_same": 4,
+            "fatigue_words": ["毛骨悚然", "不寒而栗", "头皮发麻", "鸡皮疙瘩", "心跳加速",
+                              "仿佛", "不禁", "宛如", "竟然", "一股寒意"],
+            "paragraph_cv_min": 0.18,
+            "short_paragraph_warn": 55,
+            "short_paragraph_severe": 35,
+            "dialogue_pingpong_warn": 0.45,
         },
         # 历史厚重：慢热、长章、关闭连续平路闸门、厚重长句。
         "history": {
@@ -139,6 +153,11 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_warn": 8.0,
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 4,
+            "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "微微颔首", "眼中闪过一丝"],
+            "paragraph_cv_min": 0.18,
+            "short_paragraph_warn": 55,
+            "short_paragraph_severe": 35,
+            "dialogue_pingpong_warn": 0.45,
         },
         # 女频言情：情绪弧主导、关系开场、情绪变奏最严。
         "romance_female": {
@@ -159,6 +178,7 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_bad": 10.0,
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 2,
+            "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "心跳加速", "脸颊微红", "呼吸一滞"],
         },
         # 规则怪谈/民俗无限流：悬疑推理内核 + 抖音快节奏。线索开场、物证兑现门（规则/破法
         # 必须落到可见后果），节奏比纯悬疑快，保留怪谈冷叙事（不下沉）。
@@ -180,6 +200,8 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,     # 规则怪谈命脉：规则真伪/破法要落到物证与可见后果
             "emotional_cadence_max_same": 4,
+            "fatigue_words": ["毛骨悚然", "不寒而栗", "头皮发麻", "仿佛", "不禁", "宛如",
+                              "竟然", "一股寒意", "浑身发冷"],
         },
     }
     # 别名：规则流 / 无限流 指向同一 profile。
@@ -190,7 +212,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
                "style_low_barrier_register": False, "style_min_avg_sentence_chars": 13.0,
                "style_max_avg_sentence_chars": 42.0, "style_dialogue_ratio_min": 0.04,
                "style_tech_jargon_per_kchar_warn": 8.0,
-               "style_tech_jargon_per_kchar_bad": 12.0}
+               "style_tech_jargon_per_kchar_bad": 12.0,
+               "fatigue_words": ["仿佛", "不禁", "宛如", "竟然"],
+               "short_paragraph_warn": 50, "short_paragraph_severe": 30,
+               "dialogue_pingpong_warn": 0.50}
     return dict(profiles.get(p, neutral))
 
 

@@ -209,6 +209,16 @@ def init_db(paths: Paths) -> Any:
         conn.commit()
     except Exception:
         pass
+    for _tc in (
+        "depends_on TEXT DEFAULT ''",
+        "priority INTEGER DEFAULT 5",
+        "half_life INTEGER DEFAULT 0",
+    ):
+        try:
+            conn.execute(f"ALTER TABLE open_threads ADD COLUMN {_tc}")
+            conn.commit()
+        except Exception:
+            pass
     for column in (
         "readthrough_score REAL",
         "hook_score REAL",
@@ -223,6 +233,11 @@ def init_db(paths: Paths) -> Any:
         "dialogue_char_ratio REAL",
         "tech_per_kchar REAL",
         "genre_score REAL",
+        "ai_cliche_per_kchar REAL",
+        "metaphor_per_kchar REAL",
+        "tell_not_show_per_kchar REAL",
+        "adverb_per_kchar REAL",
+        "ai_flavor_penalty REAL",
     ):
         try:
             conn.execute(f"ALTER TABLE chapter_metrics ADD COLUMN {column}")
@@ -649,6 +664,47 @@ def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
     except Exception:
         return []
+
+def hook_health_check(conn: Any, chapter_num: int, config: dict[str, Any]) -> dict[str, Any]:
+    orphan_threshold = int(config["novel"].get("hook_orphan_threshold", 30))
+    result: dict[str, Any] = {"orphaned": [], "blocked": [], "expired": [], "directives": []}
+    try:
+        with db_lock():
+            rows = conn.execute(
+                """SELECT id, description, status, introduced_chapter, due_chapter,
+                          updated_chapter, depends_on, priority, half_life
+                   FROM open_threads
+                   WHERE status IN ('open', 'building', 'advanced')""",
+            ).fetchall()
+    except Exception:
+        return result
+    open_ids = {r["id"] for r in rows}
+    for r in rows:
+        tid = r["id"]
+        desc = r["description"] or ""
+        intro = r["introduced_chapter"] or chapter_num
+        age = chapter_num - int(intro)
+        half_life = int(r["half_life"] or 0)
+        depends_on = str(r["depends_on"] or "").strip()
+        priority = int(r["priority"] or 5)
+        if depends_on and depends_on in open_ids:
+            result["blocked"].append({"id": tid, "description": desc, "blocked_by": depends_on})
+        if half_life > 0 and age > half_life * 1.5:
+            result["expired"].append({"id": tid, "description": desc, "age": age, "half_life": half_life, "priority": priority})
+        if age >= orphan_threshold and r["status"] == "open":
+            result["orphaned"].append({"id": tid, "description": desc, "age": age, "priority": priority})
+    if result["orphaned"]:
+        top = sorted(result["orphaned"], key=lambda x: -x["priority"])[:3]
+        result["directives"].append(
+            "【孤立钩子警告】以下伏笔已开放超过{}章未推进，请本章兑现或明确推进：{}".format(
+                orphan_threshold, "；".join(f'{h["description"][:60]}(已{h["age"]}章)' for h in top)))
+    if result["expired"]:
+        top = sorted(result["expired"], key=lambda x: -x["priority"])[:3]
+        result["directives"].append(
+            "【过期钩子】以下伏笔已超过最佳兑现窗口，优先收束：{}".format(
+                "；".join(f'{h["description"][:60]}(窗口{h["half_life"]}章,已{h["age"]}章)' for h in top)))
+    return result
+
 
 def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | None = None) -> dict[str, Any]:
     """Return an entity's stored state. The entities table only keeps the latest

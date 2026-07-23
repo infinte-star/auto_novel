@@ -226,6 +226,7 @@ def write_chapter_with_candidates(
             client, paths, conn, config, chapter_num, plan, decision, tail,
             cached_memory=cached_memory,
             temperature=base_temp if base_temp_override is not None else None,
+            chapter_aux_cache=chapter_aux_cache,
         )
         text, cov = _beat_gate_one(client, paths, config, chapter_num, plan, text)
         if cov is not None:
@@ -242,6 +243,7 @@ def write_chapter_with_candidates(
             text = write_chapter(
                 client, paths, conn, config, chapter_num, plan, decision, tail,
                 cached_memory=cached_memory, temperature=temp,
+                chapter_aux_cache=chapter_aux_cache,
             )
             return text
         except Exception as exc:
@@ -922,8 +924,7 @@ def generate_one_chapter(
         paths, conn, config,
         max_chars=int(config["novel"].get("plan_memory_chars", 60000) or 0),
     )
-    # Smaller context for write/revise/review hot path to reduce prefill time.
-    writing_memory = writing_memory_context(paths, conn, config)
+    # writing_memory is computed after the plan is known so POV filtering can apply.
     # Build review auxiliary context once per chapter so all review_chapter
     # calls (main loop + local_fix) share pre-fetched DB/file results.
     try:
@@ -961,6 +962,10 @@ def generate_one_chapter(
             save_checkpoint(paths, chapter_num, "validated_plan.json", {"plan": plan, "decision": decision})
         else:
             decision.setdefault("required_constraints", []).extend(violations)
+
+    # Smaller context for write/revise/review hot path; POV-filtered when plan specifies a viewpoint character.
+    _pov = str(plan.get("pov_character", "") or "").strip() or None
+    writing_memory = writing_memory_context(paths, conn, config, pov_character=_pov)
 
     existing_chapter = read_text(chapter_path(paths, chapter_num))
     chapter = load_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT) or existing_chapter
@@ -1141,7 +1146,20 @@ def generate_one_chapter(
                         paths,
                         f"Revising Ch{chapter_num} round={round_num} because score={review.get('score')}/10 < {threshold}",
                     )
-                    chapter = revise_chapter(client, paths, conn, config, chapter, review, plan, tail, cached_memory=writing_memory)
+                    revised_text = revise_chapter(client, paths, conn, config, chapter, review, plan, tail, cached_memory=writing_memory, chapter_aux_cache=_chapter_aux)
+                    if bool(config["novel"].get("revision_gate_enabled", True)):
+                        try:
+                            from quality import style_health
+                            pre_sh = style_health(pre_revise_text, config)
+                            post_sh = style_health(revised_text, config)
+                            pre_p = float(pre_sh.get("penalty", 0))
+                            post_p = float(post_sh.get("penalty", 0))
+                            if post_p > pre_p + 0.5:
+                                log(paths, f"Revision gate ROLLBACK Ch{chapter_num} round={round_num}: style_penalty {pre_p:.1f}→{post_p:.1f}")
+                                revised_text = pre_revise_text
+                        except Exception:
+                            pass
+                    chapter = revised_text
                     save_checkpoint(paths, chapter_num, revised_key, chapter)
                 save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, chapter)
 
@@ -1226,6 +1244,7 @@ def generate_one_chapter(
                             local_chapter = revise_chapter(
                                 client, paths, conn, config, local_chapter, local_review,
                                 plan, tail, cached_memory=writing_memory,
+                                chapter_aux_cache=_chapter_aux,
                             )
                             save_checkpoint(paths, chapter_num, lkey, local_chapter)
                         local_review = review_chapter(

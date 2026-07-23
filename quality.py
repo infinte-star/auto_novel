@@ -439,6 +439,510 @@ def style_health(
 
 
 # ---------------------------------------------------------------------------
+# AI 味确定性检测 (anti-AI-flavor gate)
+# ---------------------------------------------------------------------------
+# AI 生成小说的"AI味"——读者一眼能辨的机械痕迹——不属于文风塌缩，而是一类
+# 独立的质量退化：套话密集、比喻堆砌、情感贴标签、程度副词撑场面、总结式叙述、
+# 段落结构千篇一律。这些症状的 LLM 自评完全失效（模型写出来的东西，模型自己
+# 觉得"挺好的"），必须用确定性检测+前移惩罚来治。
+
+_AI_CLICHE_PATTERNS = re.compile(
+    # --- 情绪/微表情套话 ---
+    r"心中一沉|心头一震|心中涌起|心底涌起|心中升起|心头涌上|"
+    r"眼中闪过一丝|眼底闪过|目光闪烁|目光一凝|目光微凝|瞳孔一缩|瞳孔微缩|"
+    r"嘴角微微上扬|嘴角勾起一抹|嘴角划过一丝|嘴角不自觉|嘴角微扬|"
+    r"眉头微皱|眉头一皱|眉头紧锁|眉头微蹙|"
+    r"倒吸一口凉气|倒吸一口冷气|浑身一颤|浑身一震|"
+    r"心如刀绞|如释重负|心中五味杂陈|百感交集|"
+    r"一股暖流|一股寒意|一阵恶寒|"
+    # --- 动作套话 ---
+    r"缓缓开口|缓缓说道|缓缓站起|缓缓走|缓缓闭上|缓缓睁开|"
+    r"微微颔首|微微点头|轻轻点头|轻轻摇头|"
+    r"目光如炬|目光灼灼|目光深邃|"
+    r"身形一闪|身形一顿|脚步一顿|"
+    r"负手而立|双拳紧握|双手紧握|攥紧了拳头|"
+    r"深吸一口气|深深吸了一口气|长舒一口气|"
+    # --- 叙述腔套话 ---
+    r"一时间|此刻|这一刻|那一刻|一瞬间|刹那间|霎时间|"
+    r"毫无疑问|不言而喻|众所周知|不出所料|"
+    r"显然|事实上|实际上|说实话|不得不说|"
+    r"仿佛|恍若|犹如|宛如|好似|一如"
+)
+
+_STALE_METAPHORS = re.compile(
+    r"时间仿佛静止|时间好像静止|时间似乎凝固|"
+    r"心如刀绞|心如刀割|"
+    r"美得像画|美如画卷|"
+    r"如同一记重锤|像一记重锤|仿佛重锤|"
+    r"像是被抽空了|仿佛被抽空|"
+    r"仿佛被钉在原地|像是被钉在|如同钉在|"
+    r"如潮水般涌来|像潮水一样|如潮水般|"
+    r"打翻了五味瓶|五味杂陈|"
+    r"像是被泼了一盆冷水|如同一盆冷水|"
+    r"仿佛过了一个世纪|像过了一个世纪|"
+    r"命运的齿轮|历史的车轮|时代的洪流|"
+    r"像是做了一场梦|如同一场梦"
+)
+
+_SIMILE_PATTERNS = re.compile(
+    r"仿佛|犹如|宛如|恍若|好似|好像|一如|如同|像是|似乎|"
+    r"般地|一般地|似的"
+)
+
+_TELL_NOT_SHOW = re.compile(
+    r"[他她][感觉到了?|感到了?|知道|明白|清楚|意识到|觉得|心想|暗想|内心深处]"
+    r".{0,6}"
+    r"[震惊|愤怒|悲伤|恐惧|绝望|兴奋|激动|紧张|不安|焦虑|"
+    r"开心|高兴|难过|痛苦|愤恨|沮丧|失落|孤独|恐慌|惊恐|"
+    r"害怕|担忧|忧虑|欣慰|释然|无奈|茫然|困惑|惊讶|诧异]"
+)
+
+_DEGREE_ADVERBS = re.compile(
+    r"非常|极其|十分|无比|格外|异常|万分|分外|"
+    r"极为|极度|无限|莫大|至极|之极"
+)
+
+_NEGATIVE_PAIR = re.compile(
+    r"没有.{1,15}[，,].{0,4}也没有|"
+    r"不是.{1,15}[，,].{0,4}(?:也不是|更不是)|"
+    r"不曾.{1,10}[，,].{0,4}也不曾|"
+    r"无.{1,10}[，,].{0,4}(?:也无|亦无)|"
+    r"并非.{1,10}[，,].{0,4}(?:也并非|更非)|"
+    r"既不.{1,10}[，,].{0,4}也不"
+)
+
+_SUMMARY_NARRATION = re.compile(
+    r"就这样|一切才刚刚开始|这只是.{0,2}开始|从此以后|自此|"
+    r"一切都变了|一切都不同了|一切都已经|"
+    r"命运的齿轮.{0,4}转动|故事远没有结束|新的篇章|"
+    r"序幕才刚刚拉开|帷幕.{0,4}拉开|画上了句号|"
+    r"一切尘埃落定|一个新的时代|历史的转折点|"
+    r"冥冥之中|或许这就是|也许这就是|所谓的命运"
+)
+
+
+def ai_flavor_health(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic AI-flavor detection: clichés / metaphor spam / tell-not-show /
+    degree-adverb inflation / summary narration / paragraph monotony.
+
+    Returns the same {metrics, penalty, flags, directives} shape as style_health.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("ai_flavor_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    n = len(body)
+    if n < 200:
+        return {"metrics": {"chars": n}, "penalty": 0.0, "flags": [], "directives": []}
+
+    metrics: dict[str, Any] = {"chars": n}
+    flags: list[str] = []
+    directives: list[str] = []
+    penalty = 0.0
+    kchars = n / 1000.0
+
+    # --- 1. AI cliché density ---
+    cliche_matches = _AI_CLICHE_PATTERNS.findall(body)
+    cliche_per_kchar = round(len(cliche_matches) / max(kchars, 0.1), 2)
+    metrics["ai_cliche_count"] = len(cliche_matches)
+    metrics["ai_cliche_per_kchar"] = cliche_per_kchar
+    cliche_warn = float(cfg.get("ai_cliche_per_kchar_warn", 4.0))
+    cliche_bad = float(cfg.get("ai_cliche_per_kchar_bad", 8.0))
+    if cliche_per_kchar >= cliche_bad:
+        penalty += 1.5
+        flags.append(f"ai_cliche_overload({cliche_per_kchar:.1f}/k>={cliche_bad})")
+        top_cliches = _top_n_matches(cliche_matches, 5)
+        directives.append(
+            "严重AI味：套话密度过高（%.1f/千字），整章读起来像AI生成模板。"
+            "禁止使用以下表达及其变体：%s。"
+            "用具体的、只属于本场景的身体反应/动作/环境变化替代。"
+            % (cliche_per_kchar, "、".join(top_cliches))
+        )
+    elif cliche_per_kchar >= cliche_warn:
+        penalty += 0.5
+        top_cliches = _top_n_matches(cliche_matches, 4)
+        directives.append(
+            "AI味偏重：套话密度 %.1f/千字。减少以下表达：%s。"
+            "换用新鲜的、贴合当前情境的具体描写。"
+            % (cliche_per_kchar, "、".join(top_cliches))
+        )
+
+    # --- 2. Metaphor overload + stale metaphors ---
+    simile_hits = _SIMILE_PATTERNS.findall(body)
+    metaphor_per_kchar = round(len(simile_hits) / max(kchars, 0.1), 2)
+    metrics["metaphor_per_kchar"] = metaphor_per_kchar
+    stale_hits = _STALE_METAPHORS.findall(body)
+    metrics["stale_metaphor_count"] = len(stale_hits)
+    metaphor_warn = float(cfg.get("metaphor_per_kchar_warn", 5.0))
+    if metaphor_per_kchar >= metaphor_warn:
+        penalty += 0.5
+        flags.append(f"metaphor_overload({metaphor_per_kchar:.1f}/k>={metaphor_warn})")
+        directives.append(
+            "比喻过载（%.1f/千字）：每千字比喻控制在3个以内，"
+            "每个比喻必须新鲜准确且服务于情节，宁可朴素直白也不堆砌。"
+            % metaphor_per_kchar
+        )
+    if len(stale_hits) >= 2:
+        penalty += 0.5
+        stale_examples = list(dict.fromkeys(stale_hits))[:4]
+        flags.append(f"stale_metaphors({len(stale_hits)})")
+        directives.append(
+            "陈腐比喻 %d 处：%s。这些比喻已被用滥，禁止再用。"
+            "用只属于本场景的新鲜意象替代。"
+            % (len(stale_hits), "、".join("「%s」" % s for s in stale_examples))
+        )
+
+    # --- 3. Tell-not-show (emotion labeling) ---
+    tns_hits = _TELL_NOT_SHOW.findall(body)
+    tns_per_kchar = round(len(tns_hits) / max(kchars, 0.1), 2)
+    metrics["tell_not_show_count"] = len(tns_hits)
+    metrics["tell_not_show_per_kchar"] = tns_per_kchar
+    tns_warn = float(cfg.get("tell_not_show_per_kchar_warn", 3.0))
+    if tns_per_kchar >= tns_warn:
+        penalty += 0.5
+        flags.append(f"tell_not_show({tns_per_kchar:.1f}/k>={tns_warn})")
+        directives.append(
+            '情感贴标签（%.1f/千字）：不要写"他感到震惊/她觉得悲伤"，'
+            '改为展示：震惊时手中的东西掉了、悲伤时沉默地做了某个动作。'
+            '情绪必须通过行为、对话、生理反应间接呈现。'
+            % tns_per_kchar
+        )
+
+    # --- 4. Degree-adverb inflation ---
+    adv_hits = _DEGREE_ADVERBS.findall(body)
+    adv_per_kchar = round(len(adv_hits) / max(kchars, 0.1), 2)
+    metrics["adverb_count"] = len(adv_hits)
+    metrics["adverb_per_kchar"] = adv_per_kchar
+    adv_warn = float(cfg.get("adverb_inflation_per_kchar_warn", 4.0))
+    if adv_per_kchar >= adv_warn:
+        penalty += 0.5
+        flags.append(f"adverb_inflation({adv_per_kchar:.1f}/k>={adv_warn})")
+        directives.append(
+            '程度副词泛滥（%.1f/千字）：删掉"非常/极其/十分/无比"等词，'
+            '用精准的动词和具体的细节替代模糊的程度修饰。'
+            % adv_per_kchar
+        )
+
+    # --- 5. Summary narration ---
+    summary_hits = _SUMMARY_NARRATION.findall(body)
+    metrics["summary_narration_count"] = len(summary_hits)
+    if len(summary_hits) >= 2:
+        penalty += 0.5
+        examples = list(dict.fromkeys(summary_hits))[:3]
+        flags.append(f"summary_narration({len(summary_hits)})")
+        directives.append(
+            "总结式叙述 %d 处：%s。删掉这类上帝视角的总结句，"
+            "让读者从情节和角色行为中自行感受。"
+            % (len(summary_hits), "、".join("「%s」" % s for s in examples))
+        )
+
+    # --- 6. Paragraph-start monotony ---
+    paragraphs = [p.strip() for p in body.split("\n") if len(p.strip()) >= 8]
+    if len(paragraphs) >= 6:
+        starts = [p[:4] for p in paragraphs]
+        from collections import Counter
+        start_counts = Counter(starts)
+        most_common_count = start_counts.most_common(1)[0][1] if start_counts else 0
+        repeat_ratio = most_common_count / len(paragraphs)
+        metrics["paragraph_start_repeat_ratio"] = round(repeat_ratio, 2)
+        para_warn = float(cfg.get("paragraph_start_repeat_warn", 0.30))
+        if repeat_ratio >= para_warn:
+            dominant_start = start_counts.most_common(1)[0][0]
+            penalty += 0.5
+            flags.append(f"paragraph_monotony({repeat_ratio:.0%}>={para_warn:.0%})")
+            directives.append(
+                "段落开头单一：%.0f%%的段落以「%s」开头。"
+                "变化段落的起始方式：对话、动作、环境、心理交替开篇。"
+                % (repeat_ratio * 100, dominant_start)
+            )
+
+    # --- 7. Negative-pair constructions ("没有X，也没有Y") ---
+    neg_hits = _NEGATIVE_PAIR.findall(body)
+    neg_per_kchar = round(len(neg_hits) / max(kchars, 0.1), 2)
+    metrics["negative_pair_count"] = len(neg_hits)
+    metrics["negative_pair_per_kchar"] = neg_per_kchar
+    neg_warn = float(cfg.get("negative_pair_per_kchar_warn", 2.0))
+    neg_bad = float(cfg.get("negative_pair_per_kchar_bad", 4.0))
+    if neg_per_kchar >= neg_bad:
+        penalty += 1.0
+        flags.append(f"negative_pair_overload({neg_per_kchar:.1f}/k>={neg_bad})")
+        directives.append(
+            "否定对仗句式泛滥（%.1f/千字）：「没有X，也没有Y」「不是X，也不是Y」"
+            "是最明显的AI写作指纹。删去后半句或改写为正面描述。" % neg_per_kchar
+        )
+    elif neg_per_kchar >= neg_warn:
+        penalty += 0.5
+        flags.append(f"negative_pair({neg_per_kchar:.1f}/k>={neg_warn})")
+        directives.append(
+            "否定对仗偏多（%.1f/千字）：减少「没有X也没有Y」式句式，"
+            "直接一句说完即可，不要对称排列两个否定分句。" % neg_per_kchar
+        )
+
+    cap = float(cfg.get("ai_flavor_penalty_cap", 3.0))
+    penalty = round(min(penalty, cap), 2)
+    metrics["penalty"] = penalty
+    return {
+        "metrics": metrics,
+        "penalty": penalty,
+        "flags": flags,
+        "directives": directives[:6],
+    }
+
+
+def _top_n_matches(matches: list[str], n: int) -> list[str]:
+    """Return the top-N most frequent matches, deduplicated."""
+    from collections import Counter
+    counts = Counter(matches)
+    return [item for item, _ in counts.most_common(n)]
+
+
+# ---------------------------------------------------------------------------
+# 段落形态 + 模糊词密度检测 (paragraph shape + hedge word density)
+# ---------------------------------------------------------------------------
+_HEDGE_WORDS = re.compile(
+    r"似乎|好像|仿佛|大概|或许|也许|可能|某种|某个|在某种程度上|一定程度|有所|不由得|不禁|不知为何"
+)
+
+
+def paragraph_shape_health(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic paragraph-uniformity and hedge-word density check.
+
+    Returns the standard {metrics, penalty, flags, directives} shape.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("paragraph_shape_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    n = len(body)
+    if n < 300:
+        return {"metrics": {"chars": n}, "penalty": 0.0, "flags": [], "directives": []}
+
+    metrics: dict[str, Any] = {"chars": n}
+    flags: list[str] = []
+    directives: list[str] = []
+    penalty = 0.0
+
+    # --- 1. Paragraph length uniformity (coefficient of variation) ---
+    paragraphs = [p for p in body.split("\n") if len(p.strip()) >= 20]
+    if len(paragraphs) >= 5:
+        lengths = [len(p.strip()) for p in paragraphs]
+        mean_len = sum(lengths) / len(lengths)
+        if mean_len > 0:
+            variance = sum((x - mean_len) ** 2 for x in lengths) / len(lengths)
+            std_len = variance ** 0.5
+            cv = round(std_len / mean_len, 3)
+            metrics["paragraph_count"] = len(paragraphs)
+            metrics["paragraph_length_mean"] = round(mean_len, 1)
+            metrics["paragraph_length_cv"] = cv
+            cv_min = float(cfg.get("paragraph_cv_min", 0.15))
+            if cv < 0.10:
+                penalty += 1.0
+                flags.append(f"paragraph_uniform_severe(cv={cv:.2f}<0.10)")
+                directives.append(
+                    "段落长度高度整齐（变异系数 %.2f），像 AI 流水线产出。"
+                    "大幅增加段落长短交错——用1-2句短段制造节奏冲击，用长段深入细节。" % cv
+                )
+            elif cv < cv_min:
+                penalty += 0.5
+                flags.append(f"paragraph_uniform(cv={cv:.2f}<{cv_min})")
+                directives.append(
+                    "段落长度偏于整齐（变异系数 %.2f），增加段落的长短交错——"
+                    "短段制造节奏感，长段深入细节。" % cv
+                )
+
+    # --- 2. Short paragraph detection (avg paragraph length) ---
+    all_paras = [p for p in body.split("\n") if len(p.strip()) >= 8]
+    if len(all_paras) >= 5:
+        all_lens = [len(p.strip()) for p in all_paras]
+        avg_para = sum(all_lens) / len(all_lens)
+        short_count = sum(1 for l in all_lens if l < 30)
+        metrics["avg_paragraph_chars"] = round(avg_para, 1)
+        metrics["short_paragraph_ratio"] = round(short_count / len(all_lens), 2)
+        severe_threshold = float(cfg.get("short_paragraph_severe", 30))
+        warn_threshold = float(cfg.get("short_paragraph_warn", 50))
+        if avg_para < severe_threshold:
+            penalty += 1.5
+            flags.append(f"short_paragraph_severe(avg={avg_para:.0f}<{severe_threshold:.0f})")
+            directives.append(
+                "AI碎段病严重：段均仅 %.0f 字，几乎每句话单独一行，观感极差。"
+                "每段至少3-5句/60字以上（对话除外），把碎片合并成有起承转的段落。" % avg_para
+            )
+        elif avg_para < warn_threshold:
+            penalty += 0.5
+            flags.append(f"short_paragraph_warn(avg={avg_para:.0f}<{warn_threshold:.0f})")
+            directives.append(
+                "段落偏短（均 %.0f 字/段），合并相邻短句为完整段落，"
+                "让叙事有呼吸感而非碎片堆砌。" % avg_para
+            )
+
+    # --- 3. Hedge word density ---
+    kchars = n / 1000.0
+    hedge_matches = _HEDGE_WORDS.findall(body)
+    hedge_per_kchar = round(len(hedge_matches) / max(kchars, 0.1), 2)
+    metrics["hedge_count"] = len(hedge_matches)
+    metrics["hedge_per_kchar"] = hedge_per_kchar
+    hedge_warn = float(cfg.get("hedge_per_kchar_warn", 5.0))
+    hedge_bad = float(cfg.get("hedge_per_kchar_bad", 10.0))
+    if hedge_per_kchar >= hedge_bad:
+        penalty += 1.0
+        flags.append(f"hedge_overload({hedge_per_kchar:.1f}/k>={hedge_bad})")
+        top_hedges = _top_n_matches(hedge_matches, 3)
+        directives.append(
+            "模糊词密度过高（%.1f/千字），文风犹疑无力。"
+            "删掉或替换：%s。用确定性描写替代模棱两可的叙述。"
+            % (hedge_per_kchar, "、".join("「%s」" % h for h in top_hedges))
+        )
+    elif hedge_per_kchar >= hedge_warn:
+        penalty += 0.5
+        top_hedges = _top_n_matches(hedge_matches, 3)
+        directives.append(
+            "模糊词偏多（%.1f/千字）。减少：%s。换用确切的动作和事实。"
+            % (hedge_per_kchar, "、".join("「%s」" % h for h in top_hedges))
+        )
+
+    cap = float(cfg.get("paragraph_shape_penalty_cap", 3.0))
+    penalty = round(min(penalty, cap), 2)
+    return {
+        "metrics": metrics,
+        "penalty": penalty,
+        "flags": flags,
+        "directives": directives[:4],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Q&A 乒乓对话检测 (dialogue ping-pong)
+# ---------------------------------------------------------------------------
+_DIALOGUE_RE = re.compile(r'“([^”]+)”')
+
+
+def dialogue_pingpong(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect excessive question-answer ping-pong dialogue patterns.
+
+    Counts consecutive dialogue turns where a question mark line is immediately
+    followed by a non-question answer. High ratios indicate interview/interrogation
+    style dialogue that feels mechanical.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("dialogue_pingpong_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    turns = _DIALOGUE_RE.findall(body)
+    result: dict[str, Any] = {
+        "metrics": {"dialogue_turns": len(turns)},
+        "penalty": 0.0, "flags": [], "directives": [],
+    }
+    if len(turns) < 4:
+        return result
+
+    qa_pairs = 0
+    for i in range(len(turns) - 1):
+        if turns[i].rstrip().endswith("？") and not turns[i + 1].rstrip().endswith("？"):
+            qa_pairs += 1
+    qa_ratio = round(qa_pairs / max(len(turns) - 1, 1), 2)
+    result["metrics"]["qa_pairs"] = qa_pairs
+    result["metrics"]["qa_ratio"] = qa_ratio
+
+    warn = float(cfg.get("dialogue_pingpong_warn", 0.50))
+    bad = float(cfg.get("dialogue_pingpong_bad", 0.65))
+    if qa_ratio >= bad:
+        result["penalty"] = 1.0
+        result["flags"].append(f"dialogue_pingpong_severe(qa={qa_ratio:.0%}>={bad:.0%})")
+        result["directives"].append(
+            "Q&A乒乓对话严重（%.0f%%为一问一答），读者会觉得像审讯。"
+            "改为：多人交叉发言、用动作/心理/环境打断对话节奏、让角色主动说而非被问。" % (qa_ratio * 100)
+        )
+    elif qa_ratio >= warn:
+        result["penalty"] = 0.5
+        result["flags"].append(f"dialogue_pingpong(qa={qa_ratio:.0%}>={warn:.0%})")
+        result["directives"].append(
+            "Q&A对话偏多（%.0f%%），在对话间插入动作、神态、心理描写，"
+            "打破采访式节奏。" % (qa_ratio * 100)
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 章尾总结检测 (chapter ending summary quality)
+# ---------------------------------------------------------------------------
+_ENDING_SUMMARY_MARKERS = re.compile(
+    r"他知道|她知道|他明白|她明白|他清楚|她清楚|"
+    r"他意识到|她意识到|他理解|她理解|"
+    r"这一切|而这一切|至此|至少.{0,6}知道|"
+    r"心中.{0,4}清楚|心中.{0,4}明白|心里.{0,4}清楚|"
+    r"一切都已|一切似乎|一切终于"
+)
+
+
+def chapter_ending_quality(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect dry summary-style chapter endings (complements intra_chapter_repetition).
+
+    Scans the last 400 chars for summary markers and reflective-narration patterns
+    that make the ending feel like an essay conclusion rather than forward momentum.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("chapter_ending_quality_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    result: dict[str, Any] = {
+        "metrics": {}, "penalty": 0.0, "flags": [], "directives": [],
+    }
+    if len(body) < 800:
+        return result
+
+    tail_chars = int(cfg.get("ending_quality_tail_chars", 400))
+    tail = body[-tail_chars:]
+    markers = _ENDING_SUMMARY_MARKERS.findall(tail)
+    marker_count = len(markers)
+    result["metrics"]["ending_summary_markers"] = marker_count
+    result["metrics"]["ending_tail_chars"] = len(tail)
+
+    has_dialogue = "“" in tail
+    tail_sentences = [s.strip() for s in re.split(r'[。！？\n]', tail) if len(s.strip()) >= 4]
+    pronoun_start = sum(1 for s in tail_sentences if s and s[0] in "他她它")
+    result["metrics"]["ending_pronoun_start_ratio"] = round(
+        pronoun_start / max(len(tail_sentences), 1), 2
+    )
+
+    warn_threshold = int(cfg.get("chapter_ending_summary_warn", 3))
+    bad_threshold = int(cfg.get("chapter_ending_summary_bad", 5))
+
+    if marker_count >= bad_threshold or (marker_count >= warn_threshold and not has_dialogue):
+        result["penalty"] = 1.0
+        result["flags"].append(f"ending_summary_severe(markers={marker_count})")
+        examples = list(dict.fromkeys(markers))[:3]
+        result["directives"].append(
+            "章末总结病：最后%d字有%d处总结性叙述（%s），像散文收尾。"
+            "章末必须是前进的动作/对话/悬念，不是回顾式的'他知道/她明白'。"
+            % (tail_chars, marker_count, "、".join("「%s」" % m for m in examples))
+        )
+    elif marker_count >= warn_threshold:
+        result["penalty"] = 0.5
+        result["flags"].append(f"ending_summary(markers={marker_count})")
+        result["directives"].append(
+            "章末总结倾向（%d处标志词）：减少'他知道/她明白/这一切'式收束，"
+            "用动作或对话驱动结尾。" % marker_count
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 黄金三句开篇闸门 (opening golden-three-sentences gate)
 # ---------------------------------------------------------------------------
 # 番茄 "3 秒定生死"：开篇必须把读者丢进"正在发生的危机"（动作/对话/具体冲突），
@@ -2507,6 +3011,105 @@ def emotional_cadence(
         "streak": streak,
         "current_tone": current if recent_tones else "",
         "directives": directives,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 长跨度疲劳检测 (long-span fatigue: type/mood/tension monotony)
+# ---------------------------------------------------------------------------
+
+
+def long_span_fatigue(
+    conn: Any,
+    chapter_num: int,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Cross-chapter monotony detection over longer spans than emotional_cadence.
+
+    Checks payoff_type repetition, emotional diversity deficit, and tension
+    flatness using chapter_metrics DB data. Returns {metrics, penalty, flags,
+    directives}.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("long_span_fatigue_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+    if chapter_num < 5:
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    try:
+        from store import recent_metrics
+        rows = recent_metrics(conn, limit=12)
+    except Exception:
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+    if len(rows) < 4:
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    metrics: dict[str, Any] = {}
+    flags: list[str] = []
+    directives: list[str] = []
+    penalty = 0.0
+
+    # --- 1. Payoff type monotony ---
+    type_max = int(cfg.get("chapter_type_monotony_max", 4))
+    payoff_types = [str(r.get("payoff_type", "")).strip() for r in rows if r.get("payoff_type")]
+    if payoff_types:
+        streak = 1
+        for i in range(len(payoff_types) - 2, -1, -1):
+            if payoff_types[i] == payoff_types[-1]:
+                streak += 1
+            else:
+                break
+        metrics["payoff_type_streak"] = streak
+        if streak >= type_max and payoff_types[-1]:
+            penalty += 0.5
+            flags.append(f"payoff_type_monotony({streak}>={type_max})")
+            directives.append(
+                f"近 {streak} 章都是「{payoff_types[-1]}」爽点类型，读者审美疲劳。"
+                f"本章切换到不同的 payoff_type（如 reveal/reversal/emotional）。"
+            )
+
+    # --- 2. Emotional diversity deficit ---
+    tones = [str(r.get("emotional_tone", "")).strip() for r in rows[:8] if r.get("emotional_tone")]
+    if len(tones) >= 4:
+        distinct = len(set(tones))
+        metrics["emotional_diversity"] = distinct
+        if distinct < 3:
+            penalty += 0.5
+            flags.append(f"emotional_monotony(distinct={distinct}<3)")
+            directives.append(
+                f"近 {len(tones)} 章仅有 {distinct} 种情绪基调，变化不足。"
+                f"本章需要引入截然不同的情感色彩。"
+            )
+
+    # --- 3. Tension flatness ---
+    tensions = []
+    for r in rows[:6]:
+        t = r.get("tension")
+        if t is not None:
+            try:
+                tensions.append(float(t))
+            except (ValueError, TypeError):
+                pass
+    if len(tensions) >= 4:
+        mean_t = sum(tensions) / len(tensions)
+        variance_t = sum((x - mean_t) ** 2 for x in tensions) / len(tensions)
+        std_t = variance_t ** 0.5
+        metrics["tension_std"] = round(std_t, 2)
+        if std_t < 1.0:
+            penalty += 0.5
+            flags.append(f"tension_flat(std={std_t:.2f}<1.0)")
+            directives.append(
+                f"近 {len(tensions)} 章紧张度几乎不变（std={std_t:.1f}），"
+                f"需要制造明显的张弛起伏——高压场景后给一段喘息，或在平静中突然加压。"
+            )
+
+    cap = float(cfg.get("long_span_fatigue_penalty_cap", 1.5))
+    penalty = round(min(penalty, cap), 2)
+    return {
+        "metrics": metrics,
+        "penalty": penalty,
+        "flags": flags,
+        "directives": directives[:3],
     }
 
 

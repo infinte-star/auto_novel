@@ -1286,6 +1286,23 @@ def cmd_refine(name: str) -> int:
     if not paths.book.exists() or not read_text(paths.book).strip():
         print(f"[novel] ERROR: no book.md content for '{name}'. Run/finish the novel first.")
         return 2
+    # Refine model routing: if api.refine_model is set, run the whole refine pass on
+    # that model/endpoint (e.g. doubao for 网文味 polish while generation used deepseek).
+    # Overrides the main api model/endpoint just for this refine client; falls back to
+    # the main model when unset.
+    _api = config.get("api", {})
+    if str(_api.get("refine_model", "")).strip():
+        _api["model"] = str(_api["refine_model"]).strip()
+        _rb = str(_api.get("refine_base_url", "")).strip()
+        if _rb:
+            _api["base_url"] = _rb
+            _api["primary_base_url"] = _rb
+            _api["api_key_groups"] = ""  # don't fall back to the generation endpoints
+        _rk = str(_api.get("refine_api_key", "")).strip()
+        if _rk:
+            _api["api_key"] = _rk
+        _api["thinking_mode"] = str(_api.get("refine_thinking_mode", _api.get("thinking_mode", "disabled"))).strip()
+        print(f"[novel] refine using model={_api['model']} @ {_api.get('base_url')}")
     conn = init_db(paths)
     client = _build_client(config, paths)
     refine_book(client, paths, conn, config)
