@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from config import Paths, append_text, chapter_path, log, normalize_text, read_text, safe_score, write_text
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import STYLE_HEALTH_GUARDRAILS, _VOLUME_PLAN_STRUCTURE_SPEC, cacheable_prefix, contract_block, memory_context, rhythm_diagnostics, structural_repetition_analysis, writing_memory_context
+from quality import REGISTRY
 from store import (
     db_event,
     entity_state_as_of,
@@ -690,7 +691,7 @@ def review_chapter(
     # prose has collapsed into telegraphic em-dash fragments because the model's
     # own voice has drifted with it. Apply a deterministic penalty and feed the
     # fixes to the next chapter's writer + this chapter's revise loop.
-    if bool(config["novel"].get("style_health_enabled", True)):
+    if REGISTRY.is_enabled("style_health", config):
         try:
             from quality import style_health
 
@@ -704,8 +705,6 @@ def review_chapter(
 
                 trend_window = int(config["novel"].get("style_em_dash_trend_window", 5))
                 rows = recent_metrics(conn, max(trend_window, 1))
-                # recent_metrics returns newest-first; we want only chapters
-                # strictly before this one, ordered oldest→newest.
                 seq = []
                 for r in rows:
                     try:
@@ -734,25 +733,11 @@ def review_chapter(
                 em_history=em_history or None,
                 tech_history=tech_history or None,
             )
-            report["style_health"] = sh
-            penalty = float(sh.get("penalty", 0.0))
+            penalty = REGISTRY.accumulate(report, sh, "style_health", REGISTRY.tag_prefix("style_health"))
             if penalty > 0:
                 penalties += penalty
-                # Surface the fixes into the channels the pipeline already reads.
-                rr = report.setdefault("rhythm_risks", [])
-                for f in sh.get("flags", []):
-                    tag = f"style:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in sh.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Style-health Ch{chapter_num} penalty={penalty} "
-                    f"flags={sh.get('flags')} metrics={sh.get('metrics')}",
-                )
+                log(paths, f"Style-health Ch{chapter_num} penalty={penalty} "
+                    f"flags={sh.get('flags')} metrics={sh.get('metrics')}")
                 # A hard collapse must not be accepted on quality grounds alone.
                 if penalty >= float(config["novel"].get("style_penalty_block", 2.0)):
                     report["accepted"] = False
@@ -814,34 +799,20 @@ def review_chapter(
     # (clichés, metaphor spam, tell-not-show, degree-adverb inflation, summary
     # narration, paragraph monotony). Like style_health, the model's self-review
     # is blind to these because it generated them in the first place.
-    if bool(config["novel"].get("ai_flavor_enabled", True)):
+    if REGISTRY.is_enabled("ai_flavor_health", config):
         try:
             from quality import ai_flavor_health
             af = ai_flavor_health(chapter, config)
-            report["ai_flavor_health"] = af
-            af_penalty = float(af.get("penalty", 0.0))
-            if af_penalty > 0:
-                penalties += af_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in af.get("flags", []):
-                    tag = f"ai_flavor:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in af.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"AI-flavor Ch{chapter_num} penalty={af_penalty} "
-                    f"flags={af.get('flags')} metrics={af.get('metrics')}",
-                )
+            af_pen = REGISTRY.accumulate(report, af, "ai_flavor_health", REGISTRY.tag_prefix("ai_flavor_health"))
+            if af_pen > 0:
+                penalties += af_pen
+                log(paths, f"AI-flavor Ch{chapter_num} penalty={af_pen} flags={af.get('flags')} metrics={af.get('metrics')}")
         except Exception as exc:
-            log(paths, f"ai_flavor_health check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"ai_flavor_health failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # 黄金三句开篇闸门：前 opening_chapters 章，确定性拦截"景物/时段/设定铺垫"开场。
     # LLM 自评对文学性氛围开场打分偏高，这是它抓不到的下沉/追读病灶的确定性兜底。
-    if bool(config["novel"].get("opening_golden_gate_enabled", True)):
+    if REGISTRY.is_enabled("opening_hook_gate", config):
         try:
             from quality import opening_hook_gate
             og = opening_hook_gate(chapter, chapter_num, config)
@@ -851,12 +822,12 @@ def review_chapter(
                 if opening_pen > 0:
                     penalties += opening_pen
                     report.setdefault("rhythm_risks", []).append(
-                        f"opening:{','.join(og.get('flags', []))}")
+                        f"opening:{','.join(og['flags'])}")
                 wd = report.setdefault("writer_directives_for_next_chapter", [])
                 for d in og.get("directives", []):
                     if d not in wd:
                         wd.append(d)
-                log(paths, f"Opening gate Ch{chapter_num}: penalty={opening_pen} flags={og.get('flags')}")
+                log(paths, f"Opening gate Ch{chapter_num}: penalty={opening_pen} flags={og['flags']}")
                 if og.get("block"):
                     report["accepted"] = False
                     report.setdefault("problems", []).append(
@@ -865,162 +836,82 @@ def review_chapter(
             log(paths, f"opening_hook_gate failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Prose texture: quantitative vs poetic balance — inject variation directives
-    if bool(config["novel"].get("prose_texture_enabled", True)):
+    if REGISTRY.is_enabled("prose_texture", config):
         try:
             from quality import prose_texture
             pt = prose_texture(chapter, config)
-            report["prose_texture"] = pt
+            pt_pen = REGISTRY.accumulate(report, pt, "prose_texture", REGISTRY.tag_prefix("prose_texture"))
             if pt.get("directives"):
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in pt["directives"]:
-                    if d not in wd:
-                        wd.append(d)
-                log(paths, f"Prose-texture Ch{chapter_num}: balance={pt['balance']} "
-                    f"metrics={pt['metrics']}")
-            # Over-poetic (紫色文体) now bites the score, not just advises the next
-            # chapter — advisory-only steering let purple-prose drift accumulate until
-            # it cratered (Ch15: poetic_density 38, force-accepted at 1.0).
-            pt_penalty = float(pt.get("penalty", 0.0))
-            if pt_penalty > 0:
-                penalties += pt_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in pt.get("flags", []):
-                    tag = f"texture:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                log(paths, f"Prose-texture Ch{chapter_num} penalty={pt_penalty} "
+                log(paths, f"Prose-texture Ch{chapter_num}: balance={pt['balance']} metrics={pt['metrics']}")
+            if pt_pen > 0:
+                penalties += pt_pen
+                log(paths, f"Prose-texture Ch{chapter_num} penalty={pt_pen} "
                     f"(over_poetic, poetic_density={pt['metrics'].get('poetic_density')})")
         except Exception as exc:
-            log(paths, f"prose_texture check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"prose_texture failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Dialogue ratio gate: deterministic check that chapters contain enough
     # character dialogue (vs pure narration/internal monologue). Low dialogue
     # kills pacing and reader engagement in 都市/言情/悬疑 genres.
-    if bool(config["novel"].get("dialogue_health_enabled", True)):
+    if REGISTRY.is_enabled("dialogue_health", config):
         try:
             from quality import dialogue_health
             dh = dialogue_health(chapter, config)
-            report["dialogue_health"] = dh
-            dh_penalty = float(dh.get("penalty", 0.0))
-            if dh_penalty > 0:
-                penalties += dh_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in dh.get("flags", []):
-                    tag = f"dialogue:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in dh.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Dialogue-health Ch{chapter_num} penalty={dh_penalty} "
-                    f"ratio={dh.get('metrics', {}).get('dialogue_char_ratio', 0):.2%}",
-                )
+            dh_pen = REGISTRY.accumulate(report, dh, "dialogue_health", REGISTRY.tag_prefix("dialogue_health"))
+            if dh_pen > 0:
+                penalties += dh_pen
+                log(paths, f"Dialogue-health Ch{chapter_num} penalty={dh_pen} "
+                    f"ratio={dh.get('metrics', {}).get('dialogue_char_ratio', 0):.2%}")
         except Exception as exc:
-            log(paths, f"dialogue_health check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"dialogue_health failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    if bool(config["novel"].get("paragraph_shape_enabled", True)):
+    if REGISTRY.is_enabled("paragraph_shape_health", config):
         try:
             from quality import paragraph_shape_health
             ps = paragraph_shape_health(chapter, config)
-            report["paragraph_shape"] = ps
-            ps_penalty = float(ps.get("penalty", 0.0))
-            if ps_penalty > 0:
-                penalties += ps_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in ps.get("flags", []):
-                    tag = f"paragraph:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in ps.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Paragraph-shape Ch{chapter_num} penalty={ps_penalty} "
+            ps_pen = REGISTRY.accumulate(report, ps, "paragraph_shape", REGISTRY.tag_prefix("paragraph_shape_health"))
+            if ps_pen > 0:
+                penalties += ps_pen
+                log(paths, f"Paragraph-shape Ch{chapter_num} penalty={ps_pen} "
                     f"cv={ps.get('metrics', {}).get('paragraph_length_cv', '-')} "
-                    f"hedge={ps.get('metrics', {}).get('hedge_per_kchar', '-')}/k",
-                )
+                    f"hedge={ps.get('metrics', {}).get('hedge_per_kchar', '-')}/k")
         except Exception as exc:
-            log(paths, f"paragraph_shape check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"paragraph_shape failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    if bool(config["novel"].get("dialogue_pingpong_enabled", True)):
+    if REGISTRY.is_enabled("dialogue_pingpong", config):
         try:
             from quality import dialogue_pingpong
             dp = dialogue_pingpong(chapter, config)
-            report["dialogue_pingpong"] = dp
-            dp_penalty = float(dp.get("penalty", 0.0))
-            if dp_penalty > 0:
-                penalties += dp_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in dp.get("flags", []):
-                    tag = f"dialogue:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in dp.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Dialogue-pingpong Ch{chapter_num} penalty={dp_penalty} "
-                    f"qa_ratio={dp.get('metrics', {}).get('qa_ratio', '-')}",
-                )
+            dp_pen = REGISTRY.accumulate(report, dp, "dialogue_pingpong", REGISTRY.tag_prefix("dialogue_pingpong"))
+            if dp_pen > 0:
+                penalties += dp_pen
+                log(paths, f"Dialogue-pingpong Ch{chapter_num} penalty={dp_pen} "
+                    f"qa_ratio={dp.get('metrics', {}).get('qa_ratio', '-')}")
         except Exception as exc:
-            log(paths, f"dialogue_pingpong check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"dialogue_pingpong failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    if bool(config["novel"].get("chapter_ending_quality_enabled", True)):
+    if REGISTRY.is_enabled("chapter_ending_quality", config):
         try:
             from quality import chapter_ending_quality
             ceq = chapter_ending_quality(chapter, config)
-            report["chapter_ending_quality"] = ceq
-            ceq_penalty = float(ceq.get("penalty", 0.0))
-            if ceq_penalty > 0:
-                penalties += ceq_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in ceq.get("flags", []):
-                    tag = f"ending:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in ceq.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Chapter-ending-quality Ch{chapter_num} penalty={ceq_penalty} "
-                    f"markers={ceq.get('metrics', {}).get('ending_summary_markers', '-')}",
-                )
+            ceq_pen = REGISTRY.accumulate(report, ceq, "chapter_ending_quality", REGISTRY.tag_prefix("chapter_ending_quality"))
+            if ceq_pen > 0:
+                penalties += ceq_pen
+                log(paths, f"Chapter-ending Ch{chapter_num} penalty={ceq_pen} "
+                    f"markers={ceq.get('metrics', {}).get('ending_summary_markers', '-')}")
         except Exception as exc:
-            log(paths, f"chapter_ending_quality check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"chapter_ending_quality failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    if bool(config["novel"].get("long_span_fatigue_enabled", True)):
+    if REGISTRY.is_enabled("long_span_fatigue", config):
         try:
             from quality import long_span_fatigue
             lsf = long_span_fatigue(conn, chapter_num, config)
-            report["long_span_fatigue"] = lsf
-            lsf_penalty = float(lsf.get("penalty", 0.0))
-            if lsf_penalty > 0:
-                penalties += lsf_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in lsf.get("flags", []):
-                    tag = f"fatigue:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in lsf.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Long-span-fatigue Ch{chapter_num} penalty={lsf_penalty} "
-                    f"flags={lsf.get('flags', [])}",
-                )
+            lsf_pen = REGISTRY.accumulate(report, lsf, "long_span_fatigue", REGISTRY.tag_prefix("long_span_fatigue"))
+            if lsf_pen > 0:
+                penalties += lsf_pen
+                log(paths, f"Long-span-fatigue Ch{chapter_num} penalty={lsf_pen} flags={lsf.get('flags', [])}")
         except Exception as exc:
-            log(paths, f"long_span_fatigue check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"long_span_fatigue failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Chapter length penalty: deterministic check for mid-book shrinkage.
     try:
@@ -1044,7 +935,7 @@ def review_chapter(
     # '陆知白用左手' in 42/50 chapters). Runs every book_fossil_every chapters,
     # caches the avoid-list to logs/book_fossils.json so the writer can inject it
     # on EVERY subsequent chapter (not just the one chapter after this review).
-    if bool(config["novel"].get("book_fossil_enabled", True)):
+    if REGISTRY.is_enabled("book_wide_fossils", config):
         try:
             every = max(1, int(config["novel"].get("book_fossil_every", 5)))
             if chapter_num >= int(config["novel"].get("book_fossil_min_chapters", 6)) \
@@ -1115,7 +1006,7 @@ def review_chapter(
     # Descriptor-frequency gate: catch short (3-6 char) overused descriptors
     # that evade the clause min_len and ngram window. Runs on the same schedule
     # as book_wide_fossils to share the chapter-loading cost.
-    if bool(config["novel"].get("descriptor_freq_enabled", True)):
+    if REGISTRY.is_enabled("descriptor_frequency", config):
         try:
             d_every = max(1, int(config["novel"].get("descriptor_freq_every", 5)))
             if chapter_num >= int(config["novel"].get("descriptor_freq_min_spread", 15)) \
@@ -1158,7 +1049,7 @@ def review_chapter(
 
     # Genre-adherence gate: deterministic keyword check that chapter content
     # matches the declared style_preset.
-    if bool(config["novel"].get("genre_adherence_enabled", True)):
+    if REGISTRY.is_enabled("genre_adherence", config):
         try:
             from quality import genre_adherence
             recent_genre_scores: list[float] = []
@@ -1176,22 +1067,11 @@ def review_chapter(
             except Exception:
                 pass
             ga = genre_adherence(chapter, recent_genre_scores, config)
-            report["genre_adherence"] = ga
-            ga_penalty = float(ga.get("penalty", 0.0))
-            if ga_penalty > 0:
-                penalties += ga_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in ga.get("flags", []):
-                    tag = f"genre:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in ga.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(paths, f"Genre adherence Ch{chapter_num} "
-                    f"score={ga['genre_score']} penalty={ga_penalty} "
-                    f"flags={ga.get('flags')}")
+            ga_pen = REGISTRY.accumulate(report, ga, "genre_adherence", REGISTRY.tag_prefix("genre_adherence"))
+            if ga_pen > 0:
+                penalties += ga_pen
+                log(paths, f"Genre adherence Ch{chapter_num} score={ga['genre_score']} "
+                    f"penalty={ga_pen} flags={ga.get('flags')}")
             if str(ga.get("level", "")) == "reject":
                 report["accepted"] = False
                 report.setdefault("gate_rejects", []).append({
@@ -1205,7 +1085,7 @@ def review_chapter(
                     "章节内容与声明体裁不符，必须重新规划。"
                 )
         except Exception as exc:
-            log(paths, f"genre_adherence check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"genre_adherence failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Multi-lead character-service scan: in multi-男主/multi-lead books a secondary
     # lead can go silent for dozens of chapters while the contract's "非官配需完整
@@ -1268,30 +1148,27 @@ def review_chapter(
 
     # P2: 爽点 density — inject a payoff directive when the recent window has gone
     # too long without a strong reader payoff.
-    if bool(config["novel"].get("payoff_density_enabled", True)):
+    if REGISTRY.is_enabled("payoff_beat_density", config):
         try:
             from quality import payoff_beat_density
             from store import recent_metrics as _rm
             rows = _rm(conn, 6)  # newest-first
             recent_ptypes = [str(r.get("payoff_type", "")) for r in rows if r.get("payoff_type")]
             pd = payoff_beat_density(chapter, recent_ptypes, config)
-            report["payoff_density"] = pd
+            REGISTRY.accumulate(report, pd, "payoff_density", REGISTRY.tag_prefix("payoff_beat_density"))
             if pd.get("directives"):
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in pd["directives"]:
-                    if d not in wd:
-                        wd.append(d)
                 log(paths, f"Payoff density Ch{chapter_num}: {pd['metrics']}")
         except Exception as exc:
-            log(paths, f"payoff_beat_density check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"payoff_beat_density failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # 连续平路闸门：连续 N 章无强爽点且情绪冲击偏低 → 扣分 + 强制本章给中爽点/情绪高峰。
-    if bool(config["novel"].get("flat_streak_gate_enabled", True)):
+    if REGISTRY.is_enabled("flat_chapter_streak", config):
         try:
             from quality import flat_chapter_streak
             from store import recent_metrics as _rm2
             rows2 = _rm2(conn, int(config["novel"].get("flat_chapters_max_consecutive", 3)) + 2)
             fs = flat_chapter_streak(rows2, config)
+            # Custom rhythm_risk format (flat_streak:{N}) — cannot use accumulate for flags.
             report["flat_streak"] = fs
             fs_pen = float(fs.get("penalty", 0.0))
             if fs_pen > 0:
@@ -1304,27 +1181,23 @@ def review_chapter(
             if fs.get("flags"):
                 log(paths, f"Flat streak Ch{chapter_num}: streak={fs.get('streak')} penalty={fs_pen}")
         except Exception as exc:
-            log(paths, f"flat_chapter_streak check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"flat_chapter_streak failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Gap-9: shareable golden-line (可截图金句/传播性). Advisory — no penalty;
     # nudges the next chapter to plant a传播性金句 when this one had none.
-    if bool(config["novel"].get("shareable_line_enabled", True)):
+    if REGISTRY.is_enabled("shareable_line", config):
         try:
             from quality import shareable_line
             sl = shareable_line(chapter, config)
-            report["shareable_line"] = sl
+            REGISTRY.accumulate(report, sl, "shareable_line", REGISTRY.tag_prefix("shareable_line"))
             if sl.get("directives"):
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in sl["directives"]:
-                    if d not in wd:
-                        wd.append(d)
                 log(paths, f"Shareable line Ch{chapter_num}: none found (best_score={sl['metrics'].get('best_score')})")
         except Exception as exc:
-            log(paths, f"shareable_line check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"shareable_line failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # P2: information density — flag a near-pure transition chapter (no payoff,
     # no new info, no realized beats) and demand推进 next chapter.
-    if bool(config["novel"].get("info_density_enabled", True)):
+    if REGISTRY.is_enabled("information_density", config):
         try:
             from quality import information_density
             idr = information_density(chapter, plan, report, config)
@@ -1431,7 +1304,7 @@ def review_chapter(
     # chapters ("像一颗心脏在缓慢地跳动", "不是暂时的，是永久的", "锁扣声每N秒一次")
     # become tics that self-review treats as motif. Deterministically penalize the
     # chapter and feed an avoid-list directive to the next writer prompt.
-    if bool(config["novel"].get("style_cross_repeat_enabled", True)):
+    if REGISTRY.is_enabled("cross_chapter_repetition", config):
         try:
             from quality import cross_chapter_repetition
 
@@ -1447,24 +1320,11 @@ def review_chapter(
             prior_texts_long: list[str] = all_prior
             cr = cross_chapter_repetition(chapter, prior_texts, config,
                                           prior_texts_long=prior_texts_long)
-            report["cross_chapter_repetition"] = cr
-            cr_penalty = float(cr.get("penalty", 0.0))
-            if cr_penalty > 0:
-                penalties += cr_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in cr.get("flags", []):
-                    tag = f"repeat:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in cr.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Cross-repeat Ch{chapter_num} penalty={cr_penalty} "
-                    f"flags={cr.get('flags')} fossils={cr.get('metrics', {}).get('cross_repeat_fossils')}",
-                )
+            cr_pen = REGISTRY.accumulate(report, cr, "cross_chapter_repetition", REGISTRY.tag_prefix("cross_chapter_repetition"))
+            if cr_pen > 0:
+                penalties += cr_pen
+                log(paths, f"Cross-repeat Ch{chapter_num} penalty={cr_pen} "
+                    f"flags={cr.get('flags')} fossils={cr.get('metrics', {}).get('cross_repeat_fossils')}")
             # L2 escalation: entrenched-fossil collapse is a regenerate-not-revise
             # condition. Mark the report with a structured gate_reject so the
             # pipeline can route this chapter into a forced replan with the fossil
@@ -1485,13 +1345,10 @@ def review_chapter(
                     "GATE: 文体化石句复读已达坍塌级（确定性检测），本稿必须作废重做，"
                     "禁止沿用本稿的句式与比喻。"
                 )
-                log(
-                    paths,
-                    f"Cross-repeat GATE-REJECT Ch{chapter_num}: fossil collapse "
-                    f"({cr.get('metrics', {}).get('cross_repeat_fossils')} fossils) — chapter must be regenerated.",
-                )
+                log(paths, f"Cross-repeat GATE-REJECT Ch{chapter_num}: fossil collapse "
+                    f"({cr.get('metrics', {}).get('cross_repeat_fossils')} fossils) — chapter must be regenerated.")
         except Exception as exc:
-            log(paths, f"cross_chapter_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"cross_chapter_repetition failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # O1: adjacent-chapter duplication gate. The deadliest observed failure is a
     # chapter that re-narrates the previous chapter's ending near-verbatim
@@ -1501,30 +1358,17 @@ def review_chapter(
     # measurement against the previous chapter's actual text: warn-level adds a
     # penalty + avoid-list directive, block-level caps the score AND rejects so
     # the chapter is driven into rewrite instead of force-accept.
-    if bool(config["novel"].get("adjacent_repeat_enabled", True)) and chapter_num > 1:
+    if REGISTRY.is_enabled("adjacent_repetition", config) and chapter_num > 1:
         try:
             from quality import adjacent_repetition
 
             prev_text = read_text(chapter_path(paths, chapter_num - 1))
             ar = adjacent_repetition(chapter, prev_text, config)
-            report["adjacent_repetition"] = ar
-            ar_penalty = float(ar.get("penalty", 0.0))
-            if ar_penalty > 0:
-                penalties += ar_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in ar.get("flags", []):
-                    tag = f"repeat:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in ar.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Adjacent-repeat Ch{chapter_num} level={ar.get('level')} "
-                    f"penalty={ar_penalty} metrics={ar.get('metrics')}",
-                )
+            ar_pen = REGISTRY.accumulate(report, ar, "adjacent_repetition", REGISTRY.tag_prefix("adjacent_repetition"))
+            if ar_pen > 0:
+                penalties += ar_pen
+                log(paths, f"Adjacent-repeat Ch{chapter_num} level={ar.get('level')} "
+                    f"penalty={ar_pen} metrics={ar.get('metrics')}")
             if ar.get("level") == "block":
                 caps.append(float(config["novel"].get("adjacent_repeat_score_cap", 5.0)))
                 report["accepted"] = False
@@ -1540,36 +1384,23 @@ def review_chapter(
                     "directives": ar.get("directives", []),
                 })
         except Exception as exc:
-            log(paths, f"adjacent_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"adjacent_repetition failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # O1b: intra-chapter self-repetition gate. A chapter that ends with a
     # zero-增量 summary paragraph re-stating its own earlier reasoning (observed:
     # suspense_10ch Ch7, mimo, tail recapped the body's deduction) drags
     # readthrough without adding anything. warn adds penalty + directive; block
     # caps the score so the chapter is driven into a rewrite of its ending.
-    if bool(config["novel"].get("intra_repeat_enabled", True)):
+    if REGISTRY.is_enabled("intra_chapter_repetition", config):
         try:
             from quality import intra_chapter_repetition
 
             ir = intra_chapter_repetition(chapter, config)
-            report["intra_chapter_repetition"] = ir
-            ir_penalty = float(ir.get("penalty", 0.0))
-            if ir_penalty > 0:
-                penalties += ir_penalty
-                rr = report.setdefault("rhythm_risks", [])
-                for f in ir.get("flags", []):
-                    tag = f"repeat:{f}"
-                    if tag not in rr:
-                        rr.append(tag)
-                wd = report.setdefault("writer_directives_for_next_chapter", [])
-                for d in ir.get("directives", []):
-                    if d not in wd:
-                        wd.append(d)
-                log(
-                    paths,
-                    f"Intra-repeat Ch{chapter_num} level={ir.get('level')} "
-                    f"penalty={ir_penalty} metrics={ir.get('metrics')}",
-                )
+            ir_pen = REGISTRY.accumulate(report, ir, "intra_chapter_repetition", REGISTRY.tag_prefix("intra_chapter_repetition"))
+            if ir_pen > 0:
+                penalties += ir_pen
+                log(paths, f"Intra-repeat Ch{chapter_num} level={ir.get('level')} "
+                    f"penalty={ir_pen} metrics={ir.get('metrics')}")
             if ir.get("level") == "block":
                 caps.append(float(config["novel"].get("intra_repeat_score_cap", 6.0)))
                 report.setdefault("problems", []).append(
@@ -1578,7 +1409,7 @@ def review_chapter(
                     "章末必须改写成推动剧情的新钩子，删去零增量的总结复述。"
                 )
         except Exception as exc:
-            log(paths, f"intra_chapter_repetition check failed (non-fatal) Ch{chapter_num}: {exc}")
+            log(paths, f"intra_chapter_repetition failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # Creative-contract violations: author-declared hard rules (ability whitelist/
     # modality, blacklist, banned tropes, must-hold). This is the layer that

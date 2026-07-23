@@ -5,6 +5,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -718,6 +719,59 @@ def _recency_aware_state(raw: str, config: dict[str, Any], max_chars: int = 1200
 def opening_route_text(paths: Paths, cap: int = 6000) -> str:
     path = paths.volume_plan.parent / "opening_route.md"
     return _read_memory_file(path, cap) if path.exists() else ""
+
+# ---------------------------------------------------------------------------
+# Context Profile: explicit mapping of which context builder each consumer uses.
+# ---------------------------------------------------------------------------
+
+class ContextProfile(Enum):
+    """Named context profiles. Each maps to one underlying builder function."""
+
+    PLANNING = "planning"
+    """Full 4-tier context for plan creation and validation.
+    Builder: memory_context(). Budget: config plan_memory_chars.
+    Consumers: create_plan, validate_plan_continuity, replan."""
+
+    WRITING = "writing"
+    """Compact context for write/revise/review hot path.
+    Builder: writing_memory_context(). Budget: config writing_memory_chars.
+    Consumers: write_chapter, revise_chapter, review_chapter."""
+
+    CACHEABLE = "cacheable"
+    """Exact-same-bytes prefix shared across all LLM calls.
+    Builder: cacheable_prefix(). Consumers: call_llm (auto-injected)."""
+
+    SCREENING = "screening"
+    """Slim context for plan-review, screening, and arbitration.
+    Builder: lite_memory_context(). Budget: config plan_review_memory_chars.
+    Consumers: plan_review, candidate screening, arbitrate_plan."""
+
+
+def build_context(
+    profile: ContextProfile,
+    paths: Paths,
+    conn: Any,
+    config: dict[str, Any],
+    *,
+    pov_character: str | None = None,
+    max_chars: int | None = None,
+    log_fn: Any = None,
+) -> str:
+    """Dispatch to the appropriate context builder based on *profile*.
+
+    Recommended entry point for new code. Existing call sites can migrate
+    incrementally — the underlying builders remain importable directly.
+    """
+    if profile == ContextProfile.PLANNING:
+        return memory_context(paths, conn, config, max_chars=max_chars)
+    elif profile == ContextProfile.WRITING:
+        return writing_memory_context(paths, conn, config, pov_character=pov_character)
+    elif profile == ContextProfile.CACHEABLE:
+        return cacheable_prefix(paths, config, log_fn=log_fn)
+    elif profile == ContextProfile.SCREENING:
+        return lite_memory_context(paths, conn, config, max_chars=max_chars)
+    raise ValueError(f"Unknown context profile: {profile}")
+
 
 def memory_context(paths: Paths, conn: Any, config: dict[str, Any],
                    max_chars: int | None = None) -> str:

@@ -785,9 +785,11 @@ def call_llm(
     use_response_format = wants_json and bool(api.get("json_response_format", True))
     max_attempts = int(api.get("max_attempts", 6))
     salvaged_any = False
+    mt_escalate: int | None = None  # adaptive max_tokens bump after finish=length empty responses
     for attempt in range(max_attempts):
         started = time.perf_counter()
         reasoning_total = 0
+        finish_reason = None
         try:
             request = {
                 "model": model_name,
@@ -795,7 +797,7 @@ def call_llm(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "max_tokens": _effective_max_tokens(api, max_tokens),
+                "max_tokens": _effective_max_tokens(api, mt_escalate or max_tokens),
                 "temperature": float(api["temperature"]) if temperature is None else temperature,
             }
             if _active_role_prefix:
@@ -821,6 +823,22 @@ def call_llm(
                 thinking_param = _resolve_thinking_param(api)
             if thinking_param is not None:
                 extra_body["thinking"] = thinking_param
+            # Reasoning-model max_tokens floor. Reasoning models spend part of the
+            # token budget on a hidden chain of thought BEFORE any answer content,
+            # so a tiny max_tokens (e.g. a 2000-token structural_diagnose) is
+            # entirely consumed by reasoning and returns empty content with
+            # finish_reason=length — retrying the same cap fails identically.
+            # Applied UNCONDITIONALLY, NOT gated on our thinking flag: gateway
+            # proxies (e.g. ldapi) routinely reason even when we send
+            # thinking:{type:disabled}, so keying off our config misses them (live
+            # evidence: a disabled-thinking call still streamed 2002 reasoning
+            # chunks and returned empty). max_tokens is an UPPER bound, so this is
+            # cost-neutral for genuinely non-reasoning models (they still stop when
+            # done) and it only ever raises, never lowers — deliberate length caps
+            # (writer/refine at >=12000) sit above the floor and are untouched.
+            _rfloor = int(api.get("reasoning_min_max_tokens", 8000) or 0)
+            if _rfloor > 0 and int(request["max_tokens"]) < _rfloor:
+                request["max_tokens"] = _effective_max_tokens(api, _rfloor)
             _top_p = api.get("top_p")
             if _top_p is not None and str(_top_p).strip() and float(_top_p) != 1.0:
                 request["top_p"] = float(_top_p)
@@ -954,6 +972,7 @@ def call_llm(
             else:
                 msg = resp.choices[0].message
                 content = msg.content or ""
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
                 reasoning = getattr(msg, "reasoning_content", None) or ""
                 reasoning_total = len(reasoning)
                 elapsed = time.perf_counter() - started
@@ -967,6 +986,25 @@ def call_llm(
                     content = reasoning
             if not content.strip():
                 wait = _backoff_wait(attempt)
+                # finish=length + empty content means the model (a reasoner behind
+                # this proxy) burned the whole budget before emitting any answer.
+                # Retrying the identical cap is guaranteed to fail the same way —
+                # widen max_tokens for the next attempt (builds on the value
+                # actually used this attempt, so it compounds past the B-floor).
+                if str(finish_reason) == "length":
+                    _base = int(request["max_tokens"])
+                    _factor = float(api.get("length_empty_retry_factor", 2.0) or 2.0)
+                    _cap = int(api.get("length_empty_retry_cap", 32000) or 0)
+                    _bumped = int(_base * _factor)
+                    if _cap > 0:
+                        _bumped = min(_bumped, _cap)
+                    if _bumped > _base:
+                        mt_escalate = _bumped
+                        log(
+                            paths,
+                            f"finish=length with empty content; escalating max_tokens "
+                            f"{_base}->{_bumped} for next attempt (reasoning likely consumed the budget)",
+                        )
                 log(
                     paths,
                     f"LLM returned empty response attempt={attempt + 1}/{max_attempts} wait={wait:.1f}s "

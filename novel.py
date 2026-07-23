@@ -473,11 +473,6 @@ def _config_health_check(config_path: Path) -> list[str]:
     return warnings
 
 
-
-    """The command-line substring used to find/kill this novel's process."""
-    return f"novel.py run {name}"
-
-
 def _pid_file(name: str) -> Path:
     return novel_dir(name) / "logs" / "run.pid"
 

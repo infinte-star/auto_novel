@@ -1792,9 +1792,17 @@ def create_plan(
             try:
                 from quality import narrative_pattern_repetition
 
+                # Move-seq fatigue only needs the short window, but payoff_type
+                # monotony counts a consecutive RUN — with lookback=3 the run can
+                # never exceed 4, so a pt_block of 5 would be unreachable. Widen the
+                # history to cover the block threshold. The move-seq axis is
+                # unaffected: its `consecutive` count breaks at the first dissimilar
+                # plan and `best` is a max, so extra older plans can't change it.
+                _np_window = int(config["novel"].get("narrative_pattern_window", 3))
+                _pt_block = int(config["novel"].get("payoff_type_monotony_block", 5))
                 recent_seq = _recent_selected_plans(
                     conn,
-                    lookback=int(config["novel"].get("narrative_pattern_window", 3)),
+                    lookback=max(_np_window, _pt_block + 1),
                     exclude_chapter=chapter_num,
                 )
                 npr = narrative_pattern_repetition(plan, recent_seq, config)
@@ -1819,6 +1827,42 @@ def create_plan(
                     )
             except Exception as exc:
                 log(paths, f"narrative_pattern check failed (non-fatal) Ch{chapter_num}: {exc}")
+        # Tension-shape flatness (张弛): recent chapters at a near-constant intensity
+        # read as monotone even when payoff_type varies. The plan side can't see
+        # this — tension is measured post-hoc by extraction — so inject a binding
+        # relief/spike constraint here, where conn is available. Advisory-level (no
+        # retry): tension is extraction-derived and noisier than payoff_type, but it
+        # becomes a required_constraint the writer must honour and the reviewer
+        # verifies, rather than only a long_span_fatigue review penalty that never
+        # fed back into generation.
+        if bool(config["novel"].get("tension_variation_directive_enabled", True)):
+            try:
+                from store import recent_metrics as _rm
+                _tv = [
+                    float(r["tension"])
+                    for r in _rm(conn, limit=6)
+                    if r.get("tension") is not None
+                ]
+                if len(_tv) >= 4:
+                    _mean = sum(_tv) / len(_tv)
+                    _std = (sum((x - _mean) ** 2 for x in _tv) / len(_tv)) ** 0.5
+                    if _std < float(config["novel"].get("tension_flat_std_min", 1.0)):
+                        _hi = _mean >= 7.0
+                        _d = (
+                            f"张弛调节：近 {len(_tv)} 章紧张度几乎无起伏（"
+                            + ("持续高压" if _hi else "持续平缓")
+                            + f"，均值≈{_mean:.0f}/10）。本章需制造明显的张弛对比——"
+                            + (
+                                "先给一段可信的喘息/日常/情感缓冲，再在章末重新加压"
+                                if _hi
+                                else "打破平缓，制造一个骤然升级的高压转折"
+                            )
+                            + "，让整体节奏有呼吸感，而不是一路绷紧或一路平。"
+                        )
+                        if _d not in decision.setdefault("required_constraints", []):
+                            decision["required_constraints"].append(_d)
+            except Exception as exc:
+                log(paths, f"tension-variation directive failed (non-fatal) Ch{chapter_num}: {exc}")
         # Multi-lead character service (WARN-only, never blocks): if a recent review
         # flagged under-served principal-cast names, ask this plan to give one of
         # them a meaningful beat so secondary男主/lead lines don't starve.

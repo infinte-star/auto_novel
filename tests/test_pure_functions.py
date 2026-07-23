@@ -20,6 +20,7 @@ from quality import beat_coverage, plan_visual_payoff_check, reduce_em_dash_dens
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
 from quality import store_chapter_fingerprint, check_plan_against_fingerprints  # noqa: E402
 from quality import prose_texture, emotional_cadence  # noqa: E402
+from quality import location_transition  # noqa: E402
 from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
 from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from memory import _recency_aware_state  # noqa: E402
@@ -1216,6 +1217,98 @@ class EmotionalCadenceTests(unittest.TestCase):
         self.assertTrue("希望" in directive or "温情" in directive or "坚定" in directive)
 
 
+class LongSpanFatigueTests(unittest.TestCase):
+    """long_span_fatigue's tension-flatness must ignore the lazy-extraction
+    fingerprint (exactly-constant tension) but still catch a genuine flat arc."""
+
+    def _db_with_tensions(self, tensions, payoff="reveal"):
+        import shutil, tempfile
+        from pathlib import Path
+        import store
+        if store.sqlite3 is None:
+            self.skipTest("sqlite3 unavailable")
+        root = Path(tempfile.mkdtemp(prefix="lsf_"))
+        self._roots.append(root)
+        paths = _make_paths(root)
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        conn = store.init_db(paths)
+        with store.db_lock():
+            for i, t in enumerate(tensions, start=1):
+                conn.execute(
+                    "INSERT INTO chapter_metrics(chapter, payoff_type, tension, emotional_tone, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (i, payoff, t, f"tone{i}", "2026-01-01T00:00:00"),
+                )
+        return conn
+
+    def setUp(self):
+        self._roots = []
+
+    def tearDown(self):
+        import shutil
+        for r in self._roots:
+            shutil.rmtree(r, ignore_errors=True)
+
+    def test_constant_tension_suppresses_flat_penalty(self):
+        from quality import long_span_fatigue
+        conn = self._db_with_tensions([9, 9, 9, 9, 9, 9])
+        res = long_span_fatigue(conn, 7, {"novel": {}})
+        self.assertFalse(any("tension_flat" in f for f in res["flags"]))
+
+    def test_genuine_low_variation_still_flags(self):
+        from quality import long_span_fatigue
+        conn = self._db_with_tensions([8, 9, 9, 8, 9, 8])
+        res = long_span_fatigue(conn, 7, {"novel": {}})
+        self.assertTrue(any("tension_flat" in f for f in res["flags"]))
+
+    def test_payoff_monotony_uses_payoff_type_monotony_max_fallback(self):
+        # config sets only payoff_type_monotony_max (not chapter_type_monotony_max);
+        # long_span_fatigue must honour it via the fallback.
+        from quality import long_span_fatigue
+        conn = self._db_with_tensions([8, 9, 7, 8, 9, 7], payoff="reveal")
+        res = long_span_fatigue(conn, 7, {"novel": {"payoff_type_monotony_max": 3}})
+        self.assertTrue(any("payoff_type_monotony" in f for f in res["flags"]))
+
+
+class LocationTransitionTests(unittest.TestCase):
+    """副本/scene-entry detector: flag a genuine location change, not room moves
+    that share a place-noun."""
+
+    def test_same_venue_rooms_not_new(self):
+        # all 便利店 rooms share '便利店' -> continuation, not a new副本
+        cur = {"location": "顺安便利店夜班"}
+        recent = [{"location": "便利店收银台"}, {"location": "便利店储物间"}]
+        self.assertFalse(location_transition(cur, recent, {"novel": {}})["is_new"])
+
+    def test_new_dungeon_is_flagged(self):
+        cur = {"location": "通宵自习室（教学楼B座203室）"}
+        recent = [{"location": "顺安便利店"}, {"location": "便利店门口"}]
+        r = location_transition(cur, recent, {"novel": {}})
+        self.assertTrue(r["is_new"])
+        self.assertEqual(r["location"], "通宵自习室")
+
+    def test_no_history_not_new(self):
+        # Ch1 (no prior plans) must not fire — opening craft handles it
+        self.assertFalse(location_transition({"location": "自习室"}, [], {"novel": {}})["is_new"])
+
+    def test_missing_or_short_location_not_new(self):
+        self.assertFalse(location_transition({"location": ""}, [{"location": "便利店"}], {"novel": {}})["is_new"])
+        self.assertFalse(location_transition({}, [{"location": "便利店"}], {"novel": {}})["is_new"])
+
+    def test_exact_same_location_not_new(self):
+        self.assertFalse(
+            location_transition({"location": "便利店"}, [{"location": "便利店"}], {"novel": {}})["is_new"]
+        )
+
+    def test_threshold_configurable(self):
+        # a lenient threshold (0.0) never flags new; a strict one (0.99) always does
+        cur = {"location": "顺安便利店夜班"}
+        recent = [{"location": "便利店收银台"}]
+        # raise min_shared so the '便利店' overlap no longer counts, and force strict sim
+        cfg = {"novel": {"scene_entry_min_shared_chars": 99, "scene_entry_sim_threshold": 0.99}}
+        self.assertTrue(location_transition(cur, recent, cfg)["is_new"])
+
+
 class RelationshipStoreTests(unittest.TestCase):
     """Tests for character_relationships table and helpers."""
 
@@ -1988,6 +2081,51 @@ class ShuangwenFormulaGateTests(unittest.TestCase):
         c = {"beats": ["主角跟踪尾随目标", "被对方发现险些出事", "主角逃脱"], "payoff_type": "reveal"}
         r = narrative_pattern_repetition(c, [b, a], {"novel": {"payoff_type_monotony_max": 3}})
         self.assertTrue(any("payoff_type_monotony" in f for f in r["flags"]))
+        self.assertEqual(r["level"], "warn")  # run of 3 warns, does not block
+
+    # Distinct move-shapes (so move-seq similarity stays low) but all payoff_type
+    # 'reveal' — isolates the payoff-monotony axis from the move-seq block axis.
+    _REVEAL_RUN = [
+        {"beats": ["进入仓库勘查", "比对货物记录", "推断账目造假"], "payoff_type": "reveal"},
+        {"beats": ["约见对手摊牌", "对方威胁恐吓", "逼问追问真相"], "payoff_type": "reveal"},
+        {"beats": ["跟踪尾随目标", "被对方发现追逐", "翻墙逃脱脱身"], "payoff_type": "reveal"},
+        {"beats": ["翻查旧档案室", "拼合残缺信件", "看穿身世秘密"], "payoff_type": "reveal"},
+    ]
+
+    def test_payoff_type_monotony_blocks_on_long_run(self):
+        # current + 4 recents = run of 5 >= default pt_block(5) → BLOCK (forces retry)
+        cur = {"beats": ["蹲守码头暗处", "截获走私交接", "揭发内鬼身份"], "payoff_type": "reveal"}
+        r = narrative_pattern_repetition(cur, list(self._REVEAL_RUN), {"novel": {}})
+        self.assertEqual(r["level"], "block")
+        self.assertTrue(any("payoff_type_monotony" in f for f in r["flags"]))
+        self.assertTrue(any("硬性重规划" in d for d in r["directives"]))
+
+    def test_payoff_type_monotony_run_below_block_only_warns(self):
+        # run of 4 (< default pt_block 5), distinct shapes → warn, not block
+        cur = {"beats": ["蹲守码头暗处", "截获走私交接", "揭发内鬼身份"], "payoff_type": "reveal"}
+        r = narrative_pattern_repetition(cur, list(self._REVEAL_RUN[:3]), {"novel": {}})
+        self.assertEqual(r["level"], "warn")
+
+    def test_payoff_type_monotony_block_threshold_configurable(self):
+        # lowering pt_block to 3 makes a run of 3 block
+        cur = {"beats": ["蹲守码头暗处", "截获走私交接", "揭发内鬼身份"], "payoff_type": "reveal"}
+        r = narrative_pattern_repetition(
+            cur, list(self._REVEAL_RUN[:2]),
+            {"novel": {"payoff_type_monotony_block": 3}},
+        )
+        self.assertEqual(r["level"], "block")
+
+    def test_varied_payoff_types_do_not_block(self):
+        # a run where payoff_type actually rotates must NOT trip the monotony block
+        recents = [
+            {"beats": ["约见对手摊牌", "对方威胁恐吓", "逼问追问真相"], "payoff_type": "reversal"},
+            {"beats": ["跟踪尾随目标", "被对方发现追逐", "翻墙逃脱脱身"], "payoff_type": "emotional"},
+            {"beats": ["翻查旧档案室", "拼合残缺信件", "看穿身世秘密"], "payoff_type": "reveal"},
+            {"beats": ["进入仓库勘查", "比对货物记录", "推断账目造假"], "payoff_type": "reversal"},
+        ]
+        cur = {"beats": ["蹲守码头暗处", "截获走私交接", "揭发内鬼身份"], "payoff_type": "reveal"}
+        r = narrative_pattern_repetition(cur, recents, {"novel": {}})
+        self.assertNotEqual(r["level"], "block")
 
 
 class ChapterTitleDedupeTests(unittest.TestCase):
@@ -2146,6 +2284,237 @@ class GenreAdherenceTests(unittest.TestCase):
         }}
         r = genre_adherence(text, recent_scores=scores, config=cfg)
         self.assertEqual(r["level"], "advise")
+
+
+class GateRegistryTests(unittest.TestCase):
+    """Tests for the quality.GateRegistry infrastructure."""
+
+    def test_all_gates_registered(self):
+        from quality import REGISTRY
+        gates = REGISTRY.list_gates()
+        self.assertGreaterEqual(len(gates), 20)
+        for name in ("style_health", "ai_flavor_health", "cross_chapter_repetition",
+                      "dialogue_health", "beat_coverage", "scene_similarity"):
+            self.assertIn(name, gates)
+
+    def test_function_identity_preserved(self):
+        from quality import REGISTRY, style_health, ai_flavor_health
+        self.assertIs(REGISTRY.get("style_health"), style_health)
+        self.assertIs(REGISTRY.get("ai_flavor_health"), ai_flavor_health)
+
+    def test_is_enabled_default_true(self):
+        from quality import REGISTRY
+        self.assertTrue(REGISTRY.is_enabled("style_health", {"novel": {}}))
+
+    def test_is_enabled_disabled(self):
+        from quality import REGISTRY
+        self.assertFalse(REGISTRY.is_enabled("style_health", {"novel": {"style_health_enabled": False}}))
+
+    def test_is_enabled_none_config(self):
+        from quality import REGISTRY
+        self.assertTrue(REGISTRY.is_enabled("style_health", None))
+
+    def test_is_enabled_unknown_gate(self):
+        from quality import REGISTRY
+        self.assertTrue(REGISTRY.is_enabled("nonexistent_gate", {"novel": {}}))
+
+    def test_accumulate_penalty_and_flags(self):
+        from quality import REGISTRY
+        report: dict = {}
+        result = {"penalty": 1.5, "flags": ["em_dash_high", "fragment"], "directives": ["reduce em-dashes"]}
+        pen = REGISTRY.accumulate(report, result, "style_health", "style")
+        self.assertEqual(pen, 1.5)
+        self.assertIs(report["style_health"], result)
+        self.assertIn("style:em_dash_high", report["rhythm_risks"])
+        self.assertIn("style:fragment", report["rhythm_risks"])
+        self.assertIn("reduce em-dashes", report["writer_directives_for_next_chapter"])
+
+    def test_accumulate_zero_penalty_no_flags(self):
+        from quality import REGISTRY
+        report: dict = {}
+        result = {"penalty": 0.0, "flags": [], "directives": ["do something"]}
+        pen = REGISTRY.accumulate(report, result, "test_gate", "test")
+        self.assertEqual(pen, 0.0)
+        self.assertNotIn("rhythm_risks", report)
+        self.assertIn("do something", report["writer_directives_for_next_chapter"])
+
+    def test_accumulate_deduplicates_directives(self):
+        from quality import REGISTRY
+        report: dict = {"writer_directives_for_next_chapter": ["existing"]}
+        result1 = {"penalty": 0.0, "flags": [], "directives": ["existing", "new"]}
+        REGISTRY.accumulate(report, result1, "g1", "g")
+        self.assertEqual(report["writer_directives_for_next_chapter"], ["existing", "new"])
+
+    def test_tag_prefix(self):
+        from quality import REGISTRY
+        self.assertEqual(REGISTRY.tag_prefix("style_health"), "style")
+        self.assertEqual(REGISTRY.tag_prefix("ai_flavor_health"), "ai_flavor")
+        self.assertEqual(REGISTRY.tag_prefix("cross_chapter_repetition"), "repeat")
+
+    def test_list_gates_phase_filter(self):
+        from quality import REGISTRY
+        review_gates = REGISTRY.list_gates(phase="review")
+        planning_gates = REGISTRY.list_gates(phase="planning")
+        self.assertIn("style_health", review_gates)
+        self.assertNotIn("scene_similarity", review_gates)
+        self.assertIn("scene_similarity", planning_gates)
+        self.assertNotIn("style_health", planning_gates)
+
+    def test_get_unknown_returns_none(self):
+        from quality import REGISTRY
+        self.assertIsNone(REGISTRY.get("nonexistent_gate"))
+
+
+class RevisionTrackerTests(unittest.TestCase):
+    """Tests for RevisionTracker (Phase 5: revision plateau detection)."""
+
+    def _make(self, threshold=8.0, max_no_improvement=1, plateau_window=3, plateau_band=0.3):
+        from pipeline import RevisionTracker
+        return RevisionTracker(threshold, max_no_improvement, plateau_window, plateau_band)
+
+    def test_converged_immediately(self):
+        t = self._make(threshold=7.0)
+        self.assertEqual(t.record(8.0, True), "converged")
+
+    def test_converged_requires_accepted(self):
+        t = self._make(threshold=7.0)
+        self.assertEqual(t.record(8.0, False), "continue")
+
+    def test_stalled_after_no_improvement(self):
+        t = self._make(threshold=8.0, max_no_improvement=2)
+        self.assertEqual(t.record(6.0, False), "continue")  # round 0, best=6
+        self.assertEqual(t.record(5.5, False), "continue")   # no improve 1
+        self.assertEqual(t.record(5.0, False), "stalled")    # no improve 2
+
+    def test_improvement_resets_stall_counter(self):
+        t = self._make(threshold=8.0, max_no_improvement=2)
+        t.record(6.0, False)
+        t.record(5.5, False)  # no improve 1
+        t.record(6.5, False)  # improve — resets
+        t.record(6.0, False)  # no improve 1 again
+        self.assertEqual(t.record(5.5, False), "stalled")  # no improve 2
+
+    def test_plateau_detected(self):
+        t = self._make(threshold=8.0, max_no_improvement=5, plateau_window=3, plateau_band=0.3)
+        t.record(7.0, False)
+        t.record(7.2, False)
+        self.assertEqual(t.record(7.1, False), "plateau")
+
+    def test_no_plateau_when_spread_wide(self):
+        t = self._make(threshold=8.0, max_no_improvement=5, plateau_window=3, plateau_band=0.3)
+        t.record(7.0, False)
+        t.record(7.5, False)
+        self.assertEqual(t.record(7.0, False), "continue")
+
+    def test_plateau_window_respected(self):
+        t = self._make(threshold=9.0, max_no_improvement=5, plateau_window=4, plateau_band=0.3)
+        t.record(7.0, False)
+        t.record(7.1, False)
+        t.record(7.2, False)
+        self.assertEqual(t.record(7.0, False), "plateau")  # window=4 filled
+
+    def test_converged_takes_priority_over_plateau(self):
+        t = self._make(threshold=7.0, plateau_window=3, plateau_band=0.5)
+        t.record(6.8, True)
+        t.record(7.0, True)
+        self.assertEqual(t.record(7.1, True), "converged")
+
+    def test_summary(self):
+        t = self._make()
+        t.record(6.0, False)
+        t.record(7.0, False)
+        s = t.summary()
+        self.assertEqual(s["scores"], [6.0, 7.0])
+        self.assertEqual(s["best_score"], 7.0)
+        self.assertEqual(s["rounds"], 2)
+
+    def test_stall_not_triggered_on_round_zero(self):
+        t = self._make(threshold=8.0, max_no_improvement=1)
+        self.assertEqual(t.record(5.0, False), "continue")
+
+
+class ReasoningMaxTokensTests(unittest.TestCase):
+    """call_llm's reasoning-model max_tokens floor (proactive) + finish=length
+    escalation (reactive). Regression guard for the empty-response failure where
+    a reasoning model burns a tiny max_tokens budget on hidden CoT and returns
+    empty content with finish_reason=length, then retries the identical cap 6x.
+    """
+
+    def _run(self, *, thinking_mode, success_at, requested=2000, floor=8000):
+        import types
+        import tempfile
+        from pathlib import Path
+        import llm
+
+        received = []
+
+        class _Completions:
+            def create(self, **request):
+                mt = int(request["max_tokens"])
+                received.append(mt)
+                content = "OK-CONTENT" if mt >= success_at else ""
+                finish = "stop" if content else "length"
+                choice = types.SimpleNamespace(
+                    message=types.SimpleNamespace(content=content, reasoning_content=""),
+                    finish_reason=finish,
+                )
+                return types.SimpleNamespace(choices=[choice])
+
+        class _Client:
+            def __init__(self):
+                self.chat = types.SimpleNamespace(completions=_Completions())
+
+        api = {
+            "model": "fake-reasoner",
+            "temperature": 0.2,
+            "max_tokens": 65536,
+            "max_attempts": 6,
+            "stream": False,
+            "thinking_mode": thinking_mode,
+            "metrics_enabled": False,
+            "reasoning_min_max_tokens": floor,
+            "length_empty_retry_factor": 2.0,
+            "length_empty_retry_cap": 32000,
+        }
+        config = {"api": api}
+        with tempfile.TemporaryDirectory() as td:
+            paths = types.SimpleNamespace(logs_dir=Path(td))
+            orig_sleep = llm.time.sleep
+            llm.time.sleep = lambda *_a, **_k: None
+            try:
+                out = llm.call_llm(
+                    _Client(), paths, config, "sys", "user",
+                    max_tokens=requested, json_mode=False, tag="structural_diagnose",
+                )
+            finally:
+                llm.time.sleep = orig_sleep
+        return out, received
+
+    def test_floor_applied_when_reasoning_active(self):
+        # thinking auto => tiny 2000 request floored to 8000 on the first attempt.
+        out, received = self._run(thinking_mode="auto", success_at=8000)
+        self.assertEqual(out, "OK-CONTENT")
+        self.assertEqual(received, [8000])
+
+    def test_floor_applied_even_when_thinking_disabled(self):
+        # Gateways reason even when we send thinking:disabled, so the floor is
+        # UNCONDITIONAL: a 2000 request is still floored to 8000.
+        out, received = self._run(thinking_mode="disabled", success_at=8000)
+        self.assertEqual(out, "OK-CONTENT")
+        self.assertEqual(received, [8000])
+
+    def test_length_empty_escalates_past_floor(self):
+        # Still empty+length at the 8000 floor => escalate 8000 -> 16000.
+        out, received = self._run(thinking_mode="auto", success_at=16000)
+        self.assertEqual(out, "OK-CONTENT")
+        self.assertEqual(received, [8000, 16000])
+
+    def test_escalation_is_backstop_with_floor_off(self):
+        # Floor disabled (0) isolates the reactive backstop: finish=length empty
+        # still escalates 2000 -> 4000 on the next attempt.
+        out, received = self._run(thinking_mode="disabled", success_at=4000, floor=0)
+        self.assertEqual(out, "OK-CONTENT")
+        self.assertEqual(received, [2000, 4000])
 
 
 if __name__ == "__main__":

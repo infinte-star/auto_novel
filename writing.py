@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from checkpoint import load_checkpoint
@@ -1837,12 +1838,53 @@ def write_chapter(
             "严禁用总结句带过，严禁与大纲的具体描述矛盾。\n"
             + "\n".join(checklist_lines)
         )
+    capsule = contract_capsule(paths, config)
+    # 副本/场景入口显著性：when this chapter enters a NEW location (deterministic
+    # location_transition vs recent plans), the writer is overloaded with new-setting
+    # setup and reliably drops the numbered-rules discipline + degrades into
+    # telegraphic summary — the yeban_guize Ch8/Ch9 collapse (2.7/4.0). Inject a
+    # high-salience establishment block near the prompt tail. Genre-neutral (fires on
+    # any real location change); the numbered-rules clause is added only when the
+    # book's own contract asks for rule-listing (so 规则怪谈/无限流 books benefit and
+    # others just get the "establish the new scene, no telegraphic summary" nudge).
+    if bool(config["novel"].get("scene_entry_salience_enabled", True)) and chapter_num > 1:
+        try:
+            from config import log
+            from quality import location_transition
+            from planning import _recent_selected_plans
+            _recent = _recent_selected_plans(
+                conn,
+                lookback=int(config["novel"].get("scene_entry_lookback", 3)),
+                exclude_chapter=chapter_num,
+            )
+            _lt = location_transition(plan, _recent, config)
+            if _lt.get("is_new"):
+                _loc = _lt.get("location") or "新场景"
+                _rules_kw = ("编号", "守则", "清单", "逐条")
+                _wants_rules = bool(capsule) and any(k in capsule for k in _rules_kw)
+                _rule_line = (
+                    "本副本的明面守则必须在本章早段用编号清单（第一条…第N条）逐条列全、清楚可读，"
+                    "像开篇第1章那样；主角能额外读到的隐藏规则也以编号条目呈现，不得含糊带过。"
+                    if _wants_rules
+                    else "把新场景的关键设定、危险与目标交代清楚，让读者一进来就能跟上。"
+                )
+                user += (
+                    f"\n\n## ⚠ 本章进入全新场景/副本【{_loc}】——开新副本铁律（最高优先级）\n"
+                    "读者对这个新地点的规则/空间/人物一无所知，这是最容易写崩的一类章节。务必：\n"
+                    "1. 先把新场景【完整立起来】：可看见的空间、在场的人、时段与氛围，用成句的场景描写落地——"
+                    "严禁电报体、碎片式短句、破折号堆叠或一句话带过设定。\n"
+                    f"2. {_rule_line}\n"
+                    "3. 新副本的核心冲突要在本章内自成起承，不要依赖读者已知的旧副本设定来省略交代。\n"
+                    f"（检测：本章 location=「{_loc}」与近 {len(_recent)} 章场景相似度仅 {_lt.get('max_sim')}，判定为换副本入口。）"
+                )
+                log(paths, f"Scene-entry salience Ch{chapter_num}: new location=「{_loc}」 max_sim={_lt.get('max_sim')} rules={_wants_rules}")
+        except Exception as exc:
+            log(paths, f"scene-entry salience failed (non-fatal) Ch{chapter_num}: {exc}")
     # Recency anchor #2: the full contract sits high in the prompt where long context
     # dilutes it (v4 breached the ability whitelist/modality in 5/6 chapters). Re-
     # state ONLY the hard ability boundaries as the very last thing the writer
     # reads, where attention is strongest. Appended AFTER "写第N章" so it is the
     # final instruction in the user message.
-    capsule = contract_capsule(paths, config)
     if capsule:
         user += (
             "\n\n## ⚠ 写作前最后确认：能力边界（最高优先级，违反即作废重写）\n"
@@ -2179,6 +2221,7 @@ def update_structured_state(
     extraction: dict[str, Any],
     review: dict[str, Any],
     decision: dict[str, Any],
+    plan: dict[str, Any] | None = None,
 ) -> None:
     db_event(conn, chapter_num, "chapter_extraction", extraction)
 
@@ -2264,6 +2307,15 @@ def update_structured_state(
                 )
 
     metrics = extraction.get("metrics") or {}
+    # payoff_type / conflict_type are the arbiter's deliberate, bandit-varied plan
+    # intent. Prefer them over the extraction model's re-classification of the
+    # written prose: a cheap extraction model (deepseek-flash) collapses every
+    # chapter to payoff_type='reveal' regardless of the (varied) plan, which then
+    # fires false payoff-monotony penalties downstream (yeban_guize Ch5/7). Fall
+    # back to the extraction value only when the plan didn't declare one.
+    _plan = plan or {}
+    _plan_payoff_type = str(_plan.get("payoff_type") or "").strip() or None
+    _plan_conflict_type = str(_plan.get("conflict_type") or "").strip() or None
     _sh = review.get("style_health") or {}
     _sh_metrics = _sh.get("metrics") or {}
     _af = review.get("ai_flavor_health") or {}
@@ -2279,8 +2331,8 @@ def update_structured_state(
         "prose_score": safe_score(review.get("prose_score", review.get("aesthetic_score", 0))),
         "continuity_score": safe_score(review.get("continuity_score", 0)),
         "plan_score": plan_score(decision),
-        "payoff_type": metrics.get("payoff_type"),
-        "conflict_type": metrics.get("conflict_type"),
+        "payoff_type": _plan_payoff_type or metrics.get("payoff_type"),
+        "conflict_type": _plan_conflict_type or metrics.get("conflict_type"),
         "tension": metrics.get("tension"),
         "novelty": metrics.get("novelty"),
         "hook_strength": metrics.get("hook_strength"),
