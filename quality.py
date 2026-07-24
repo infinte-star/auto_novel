@@ -616,6 +616,49 @@ _SUMMARY_NARRATION = re.compile(
     r"冥冥之中|或许这就是|也许这就是|所谓的命运"
 )
 
+# 肯定式对比pivot（"不是X，而是Y" / "与其说…不如说" / "不仅…更是" 等）——英文里"Not just X,
+# but Y"被公认为最顽固、跨模型持续存在的 AI 结构指纹；中文对应上述迂回对比铺陈。注意与
+# _NEGATIVE_PAIR 区分：后者是双重否定对仗（"不是X，也不是Y"），这里是"否定→肯定"的转折pivot。
+_TEMPLATE_PIVOT = re.compile(
+    r"不是.{1,20}?[，,].{0,4}而是|"
+    r"与其说.{1,20}?[，,].{0,6}不如说|"
+    r"不仅仅?是?.{1,20}?[，,].{0,4}(?:而是|更是|还是|更)|"
+    r"与其.{1,15}?[，,].{0,4}不如|"
+    r"不止.{1,15}?[，,].{0,4}(?:还|更)|"
+    r"这不是.{1,20}?[，,].{0,4}这(?:才)?是"
+)
+
+
+def _anaphora_runs(body: str, min_run: int = 3) -> list[int]:
+    """机械排比检测：返回所有"≥min_run 个连续子句共享同一个 2 字句首"的连段长度。
+
+    捕捉三连及以上的同头句（如"他想起…，想起…，想起…" / "是A，是B，是C"）——这是 AI
+    最爱的机械排比指纹。跳过过短子句与引号开头子句以避开对白误报。
+    """
+    parts = re.split(r"[，,。！!？?；;\n]", body)
+    _subj = re.compile(r"^(?:他们|她们|它们|我们|你们|咱们|他|她|它|我|你|咱)")
+    prefixes: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if len(p) < 4 or p[0] in "「」“”\"'（(【《":
+            prefixes.append("")  # 断开连段，防对白/列表误报
+            continue
+        core = _subj.sub("", p)  # 剥去句首主语代词，让"她想起…/想起…/想起…"归并
+        prefixes.append(core[:2] if len(core) >= 2 else "")
+    runs: list[int] = []
+    i, n = 0, len(prefixes)
+    while i < n:
+        if not prefixes[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and prefixes[j + 1] == prefixes[i]:
+            j += 1
+        if j - i + 1 >= min_run:
+            runs.append(j - i + 1)
+        i = j + 1
+    return runs
+
 
 @REGISTRY.register("ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor")
 def ai_flavor_health(
@@ -778,6 +821,33 @@ def ai_flavor_health(
             "否定对仗偏多（%.1f/千字）：减少「没有X也没有Y」式句式，"
             "直接一句说完即可，不要对称排列两个否定分句。" % neg_per_kchar
         )
+
+    # --- 8. 模板对比pivot + 机械排比(三连及以上同头句) ---
+    pivot_hits = _TEMPLATE_PIVOT.findall(body)
+    pivot_per_kchar = round(len(pivot_hits) / max(kchars, 0.1), 2)
+    metrics["template_pivot_count"] = len(pivot_hits)
+    metrics["template_pivot_per_kchar"] = pivot_per_kchar
+    pivot_warn = float(cfg.get("template_pivot_per_kchar_warn", 1.2))
+    if pivot_per_kchar >= pivot_warn:
+        penalty += 0.5
+        flags.append(f"template_pivot({pivot_per_kchar:.1f}/k>={pivot_warn})")
+        directives.append(
+            "模板对比句式过多（%.1f/千字）：「不是X，而是Y」「与其说…不如说」「不仅…更是」"
+            "是最典型的AI结构指纹。删掉迂回的对比铺陈，直接一句陈述到位。" % pivot_per_kchar
+        )
+    runs = _anaphora_runs(body)
+    if runs:
+        longest = max(runs)
+        metrics["anaphora_runs"] = len(runs)
+        metrics["anaphora_longest"] = longest
+        run_warn = int(cfg.get("anaphora_run_warn", 4))
+        if longest >= run_warn or len(runs) >= 2:
+            penalty += 0.5
+            flags.append(f"parallel_anaphora(runs={len(runs)},max={longest})")
+            directives.append(
+                "机械排比：出现 %d 处三连及以上的同头句（最长 %d 连）。排比全章最多用一次且须有递进，"
+                "其余改成长短错落的正常叙述，别让句子像模板复读。" % (len(runs), longest)
+            )
 
     cap = float(cfg.get("ai_flavor_penalty_cap", 3.0))
     penalty = round(min(penalty, cap), 2)
@@ -3233,6 +3303,139 @@ def emotional_cadence(
 # ---------------------------------------------------------------------------
 # 长跨度疲劳检测 (long-span fatigue: type/mood/tension monotony)
 # ---------------------------------------------------------------------------
+
+
+# Chapter-mode taxonomy (Layer 1+2 治本 for premise/formula exhaustion). This is a
+# COARSER axis than payoff_type: it captures the reader-facing FORM of a chapter,
+# which is the level at which fatigue is actually felt. yeban_guize collapsed at
+# Ch28 because ~9 straight chapters were all "智斗解谜" (a reasoning puzzle) even
+# though their payoff_type labels (reversal/reveal/personnel) varied — so the
+# fine-grained payoff_type gate saw "variety" while the reviewer saw sameness.
+_CHAPTER_MODE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "reasoning": (
+        "推理", "解谜", "线索", "识破", "破解", "验证", "推演", "真相", "盘问",
+        "证据", "矛盾", "拆解", "识别", "规则解读", "谜题", "机关", "解读",
+    ),
+    "action": (
+        "逃", "追击", "追杀", "搏", "战斗", "袭击", "躲避", "反击", "营救",
+        "突围", "厮杀", "追逐", "格斗", "冲杀", "抢夺", "生死一线",
+    ),
+    "emotional": (
+        "牺牲", "死亡", "告别", "诀别", "悲", "痛哭", "愧疚", "绝望", "温情",
+        "泪", "崩溃", "创伤", "释怀", "情感爆发", "悼",
+    ),
+    "relational": (
+        "信任", "背叛", "结盟", "联手", "决裂", "坦白", "和解", "反目",
+        "示好", "同伴", "羁绊", "对峙表态", "摊牌",
+    ),
+    "advancement": (
+        "幕后", "阵营", "组织", "协会", "身世", "布局", "阴谋", "晋级",
+        "新讳地", "抵达", "离开", "元凶", "势力", "格局", "转场", "开新副本",
+    ),
+    "daily": (
+        "休整", "日常", "喘息", "过渡", "采买", "准备", "疗伤", "缓冲",
+    ),
+}
+
+
+def _classify_chapter_mode(plan: dict[str, Any]) -> str:
+    """Classify a plan into a coarse reader-facing chapter mode via keyword hits.
+
+    Deterministic, no LLM. Scans the plan's free-text fields; the mode with the
+    most keyword hits wins. Ties and no-hits fall back to ``reasoning`` (the
+    default suspense/rule-horror form) so the monotony gate errs toward flagging
+    an all-同型 run rather than silently missing it.
+    """
+    if not isinstance(plan, dict):
+        return "reasoning"
+    parts: list[str] = []
+    for k in ("title", "goal", "conflict", "payoff", "pressure", "hook", "risk",
+              "conflict_type", "payoff_type"):
+        v = plan.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    beats = plan.get("beats")
+    if isinstance(beats, list):
+        parts.extend(str(b) for b in beats)
+    text = " ".join(parts)
+    if not text.strip():
+        return "reasoning"
+    scores: dict[str, int] = {}
+    for mode, kws in _CHAPTER_MODE_KEYWORDS.items():
+        scores[mode] = sum(text.count(kw) for kw in kws)
+    best_mode = max(scores, key=lambda m: scores[m])
+    if scores[best_mode] <= 0:
+        return "reasoning"
+    return best_mode
+
+
+def chapter_mode_monotony(
+    plan: dict[str, Any],
+    recent_plans: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect reader-facing FORM monotony over a window (Layer 1+2 治本).
+
+    Unlike ``narrative_pattern_repetition`` (ordered move-seq) and the payoff_type
+    run, this measures the FREQUENCY of the current chapter's coarse mode across a
+    window of recent chapters — the reviewer's actual fatigue signal was frequency
+    ("近9章 reversal×9/reveal×7 智斗形态疲劳"), not a strict consecutive run.
+
+    Returns {"mode", "mode_frac", "window", "same_count", "level" (ok/warn/block),
+    "penalty", "flags", "directives"} — same shape family as the other gates.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "mode": None, "mode_frac": 0.0, "window": 0, "same_count": 0,
+        "level": "ok", "penalty": 0.0, "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("chapter_mode_enabled", True)):
+        return result
+    cur_mode = _classify_chapter_mode(plan)
+    result["mode"] = cur_mode
+    window = int(cfg.get("chapter_mode_window", 6))
+    recent = [rp for rp in (recent_plans or []) if isinstance(rp, dict)][:window]
+    # Frequency INCLUDING the current chapter.
+    same_count = sum(1 for rp in recent if _classify_chapter_mode(rp) == cur_mode)
+    total = len(recent) + 1
+    frac = (same_count + 1) / total if total > 0 else 0.0
+    result["window"] = total
+    result["same_count"] = same_count + 1
+    result["mode_frac"] = round(frac, 3)
+
+    min_window = int(cfg.get("chapter_mode_min_window", 4))
+    warn_frac = float(cfg.get("chapter_mode_warn_frac", 0.6))
+    block_frac = float(cfg.get("chapter_mode_block_frac", 0.8))
+    # Suggest a concrete alternative form so the directive is actionable.
+    _alts = {
+        "reasoning": "动作/追逐、情感冲击、或人物关系摊牌",
+        "action": "推理解谜、情感沉淀、或关系推进",
+        "emotional": "推理解谜、动作对抗、或推进元剧情",
+        "relational": "推理解谜、动作对抗、或情感爆发",
+        "advancement": "近距离智斗、动作对抗、或情感/关系戏",
+        "daily": "推理解谜、动作对抗、或推进主线",
+    }
+    alt = _alts.get(cur_mode, "与近期不同的章型")
+    if total < min_window:
+        return result
+    if frac >= block_frac:
+        result["level"] = "block"
+        result["penalty"] = max(result["penalty"], float(cfg.get("chapter_mode_block_penalty", 1.2)))
+        result["flags"].append(f"chapter_mode_monotony({cur_mode} {result['same_count']}/{total})")
+        result["directives"].append(
+            f"硬性重规划：近 {total} 章有 {result['same_count']} 章都是「{cur_mode}」型章节，"
+            f"读者会形态疲劳（套路耗尽）。本章必须改成另一种章型——{alt}——"
+            f"用不同的推进驱动力和读者体验，不要再写同一形态。"
+        )
+    elif frac >= warn_frac:
+        result["level"] = "warn"
+        result["penalty"] = max(result["penalty"], float(cfg.get("chapter_mode_warn_penalty", 0.5)))
+        result["flags"].append(f"chapter_mode_monotony({cur_mode} {result['same_count']}/{total})")
+        result["directives"].append(
+            f"已连续偏重「{cur_mode}」型章节（近 {total} 章占 {result['same_count']}）——"
+            f"建议本章换一种章型（{alt}）制造形态变化，避免读者审美疲劳。"
+        )
+    return result
 
 
 @REGISTRY.register("long_span_fatigue", config_key="long_span_fatigue_enabled", tag_prefix="fatigue")

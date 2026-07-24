@@ -140,6 +140,47 @@ VOLUME_PLAN_CHAIN_SYSTEM = """你是一部 200 万字以上中文网文的卷纲
 默认卷长按题材节奏定：快节奏/短章题材一卷约 15-30 章，慢热长篇一卷 40-80 章；无论长短都必须遵守上面的错峰兑现纪律。为控 token，先详写前 2 卷，其余各卷给 1 段概要。
 ⚠ 若下方给出明确的总章数上限（max_chapters=N），则必须严格按 N 章规划：章节区间与所有锚点章号都不得超过 N，最后一个高潮/真相锚点必须落在第 N 章或之前，短篇可只写 1 卷，禁止套用 60-80 章模板。"""
 
+# ── 群像/多主角增量（仅当 config novel.ensemble_cast 为真时注入）───────────────
+# 沿用 writing.py:GENRE_PROFILES 的「共享基座 + 体裁增量」架构：这些 delta 追加到
+# CHARACTERS_CHAIN_SYSTEM / VOLUME_PLAN_CHAIN_SYSTEM 之后，让地基生成把「多追求者/群像」
+# 特有的结构（人物差异化 + 高光轮值 + 关系线争宠升级 + 反转排期 + 心动破防节拍）产出并保留，
+# 而不是套用单主角+金手指模板时被丢弃。单 CP / 单主线书不注入，行为完全不变。
+_ENSEMBLE_CHARACTERS_DELTA = """
+
+## ⚠ 群像/多主角增量要求（本书为多追求者/群像结构，最高优先级，覆盖上面「2-4 个核心配角」的默认数量）
+不要只写主角 + 2-4 个配角。**简报里出现的每一位主要追求者/群像成员都必须各出一档完整档案，一个都不能省**（哪怕有七八位）。每位群像成员的档案除通用状态机外，必须显式包含：
+- **关系定位 / 追求方式**：他与主角的关系锚（合伙 / 守护 / 治愈 / 直球 / 灵魂知己 / 高智占有 / 青梅归属……）以及他独有的靠近方式；不同成员的方式**绝不能重复**。
+- **反差与缺口**：人前 vs 人后的反差，以及他自身必须克服的成长缺口（不是完美工具人）。
+- **入场符号**：一个专属道具 / 动作 / 台词习惯，读者一眼能把他和别人区分开（如虎口旧疤、粉色头盔、含薄荷糖、口头一个"姐"）。
+- **专属名场面（种子）**：一个只属于他、最能让读者上头的破防/高光瞬间雏形。
+- **一句话声音辨识**：用一句话钉死他说话的质感（如"短而稳""贫而正""柔而清""冷而锐""温而狠""熟而暖"），使全书七人开口即可辨。
+去同质化铁律：多位成员**不得做同一种好、同一件事、说同一类话**；每个人的价值必须由其职业、性格与共同历史唯一决定。反派同样要有自洽动机与能力上限，不得降智。"""
+
+_ENSEMBLE_VOLUME_PLAN_DELTA = """
+
+## ⚠ 群像/多主角卷纲增量（本书为多追求者/群像结构，最高优先级）
+下列四张表**并入每一卷"缺一不可"的必备小节清单**，与卷目标(O)/关键成果(KR)/线索兑现表**同级**：每一卷都必须逐张输出，每张以加粗小节名开头**单独成表**，精确到章号（短篇按 max_chapters 压进 N 章内）。**严禁把它们的内容折叠进大事件锚点/本卷兑现/线索兑现表**——即使内容有重叠也必须另起这四张独立的表：
+- **角色高光轮值表**：逐章列出该章哪些群像成员获得**独立高光瞬间**及其类型（体现各自独特追求方式）。硬约束：①每章至少 N 位成员有独立展示瞬间（N 由简报节奏定，一般≥3）；②任一核心成员**不得连续两章隐形**；③同一章内多位成员**不得做同质化的事**（禁止"七个人一起吃醋/一起送礼"而无区分）。核心成员密集出场，钩子成员错峰后补，不追求每人每章等量分镜。
+- **关系线 / 争宠升级曲线**：逐章标注争宠或关系推进的**强度档位**，且必须**逐章升级**（如隐性较劲 → 关系特权/专业能力碰撞 → 正面同框），严禁三章停在同一水位。每次同框场景都要产出新信息（暴露谁的态度 / 推进哪段关系 / 改变主角对某人的认知），不许只写"大家吃醋"而无后续。
+- **反转做成名场面排期**：把每一个身份/关系/命运反转逐条列出，标注**引爆章号**，且必须**错峰分散、互不撞车**（一章最多引爆一个重量级反转）。每个反转都必须落地为**有对话、有动作、有主角破防反应的当章场景**，严禁写成旁白/背景说明。
+- **心动/情绪破防节拍表**：逐章排布**每章恰好 1 处**"读者独享"的心动破防瞬间——用生理反应 + 嘴硬掩饰呈现（耳朵红、眼眶热、攥紧某物却说别的），让读者比角色先懂她的心动；逐章之间破防的方式要有变化，不得同质复读。
+主权纪律：所有关键决定必须由主角亲自做出，群像成员可助力但不得替她打赢任何一场仗；卷纲不得安排"英雄救美后主角只负责感动"的桥段，每次被帮助后主角必须有后续自主行动。"""
+
+# ── 爽点节拍增量（仅当 config novel.shuang_pacing 为真时注入）─────────────────
+# 爽文/番茄免费流的"爽"来自把一个爽点砸到底，而不是罗列名场面清单。通用卷纲 spec 在卷层只有
+# "本卷兑现"一行、没有爽点类型轮换/密度/即时兑现纪律，逐章爽点门在 planning.py。这个 delta 把
+# 爽点蓝图钉进卷纲：错峰轮换 + 每章唯一主爽点写透 + 憋屈不过夜 + 留后手不一次烧光，正面对治
+# "爽点多但爽不透 / 一章硬塞多个名场面导致过载崩章"。慢热悬疑/历史书不注入，行为不变。
+_SHUANG_PACING_VOLUME_PLAN_DELTA = """
+
+## ⚠ 爽点节拍增量（本书为爽文/快节奏，最高优先级）
+「爽点兑现节拍表」**并入每一卷"缺一不可"的必备小节清单**，与卷目标(O)/线索兑现表同级：每一卷都必须以加粗小节名 `**爽点兑现节拍表**` 开头**单独成表**、逐章精确到章号（短篇压进 max_chapters 内），**严禁把它折叠进大事件锚点/本卷兑现**。表内每章一行，逐条遵守：
+- **爽点类型错峰轮换**：逐章标注该章的**主爽点类型**（打脸反杀 / 逆袭翻盘 / 暴富暴涨 / 装逼扮猪吃虎 / 身份反转苏爆 / 实力碾压 / 打脸回响……）。相邻章的主爽点类型**不得同味连用**，避免读者审美疲劳。
+- **每章唯一主爽点、砸到底**：一章只锁定**一个主爽点**作为当章高潮，用完整弧写透——**憋**（铺垫压抑/被轻视）→ **炸**（当众引爆/碾压兑现）→ **余韵**（打脸回响/地位跃迁/旁观者反应）。其余支线、其他角色高光一律降为**副爽点或钩子**，**严禁一章平均堆 5-8 个名场面**（平均用力=每个都爽不透=过载崩章）。
+- **憋屈不过夜（即时兑现）**：主角当章受的辱、被压制的憋屈，**必须在同一章内给出可见反击/兑现**，不许隔章拖欠；每章读者都要拿到"这口气出了"的当章满足。
+- **可见的跃迁刻度**：每个逆袭/暴富/涨粉类爽点都要有**读者一眼可见的数字或地位变化**（粉丝数、销量、排名、身份），不要只写"她成功了"这类抽象兑现。
+- **不许一次烧光**：全书**最大的爽点/反转严禁在开局一次性用尽**；爽点强度要逐章/逐阶段升级，卷末留更大的钩子和后手。"""
+
 FRAME_CHAIN_SYSTEM = """你是长篇小说引擎的开篇定稿器。基于下方世界观/人物/卷纲，产出本书启动所需的几个简短字段。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
 {
@@ -449,6 +490,23 @@ def _bootstrap_chain(
     instead of 8 artifacts competing for one JSON budget with no grounding. Returns
     the same dict shape the single-shot path produced, so the caller is unchanged.
     """
+    # Ensemble / multi-lead books (novel.ensemble_cast) need the full cast profiled
+    # (not just 2-4 side characters) and the volume plan to carry spotlight-rotation /
+    # rival-escalation / reversal-schedule / heart-flutter tables. Single-CP or
+    # single-protagonist books leave this off and behave exactly as before.
+    ensemble = bool(config["novel"].get("ensemble_cast", False))
+    shuang = bool(config["novel"].get("shuang_pacing", False))
+    if ensemble:
+        log(paths, "Bootstrap chain: ensemble_cast ON — injecting group-cast deltas")
+    if shuang:
+        log(paths, "Bootstrap chain: shuang_pacing ON — injecting payoff-cadence delta")
+    characters_system = CHARACTERS_CHAIN_SYSTEM + (_ENSEMBLE_CHARACTERS_DELTA if ensemble else "")
+    volume_plan_system = (
+        VOLUME_PLAN_CHAIN_SYSTEM
+        + (_ENSEMBLE_VOLUME_PLAN_DELTA if ensemble else "")
+        + (_SHUANG_PACING_VOLUME_PLAN_DELTA if shuang else "")
+    )
+
     log(paths, "Bootstrap chain: bible → characters → voice → volume_plan → frame")
     data: dict[str, Any] = {}
 
@@ -459,7 +517,7 @@ def _bootstrap_chain(
     data["bible"] = bible
 
     characters = _gen_md_section(
-        client, paths, config, CHARACTERS_CHAIN_SYSTEM,
+        client, paths, config, characters_system,
         f"## 创作简报\n{brief}\n\n## 世界观圣经（必须在此之上设计人物）\n{bible}",
         tag="bootstrap_characters", max_tokens=16000,
     )
@@ -473,7 +531,7 @@ def _bootstrap_chain(
     data["voice"] = voice
 
     volume_plan = _gen_md_section(
-        client, paths, config, VOLUME_PLAN_CHAIN_SYSTEM,
+        client, paths, config, volume_plan_system,
         f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:5000]}\n\n## 人物档案\n{characters[:5000]}",
         tag="bootstrap_volume_plan", max_tokens=16000,
     )

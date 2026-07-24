@@ -1880,6 +1880,29 @@ def write_chapter(
                 log(paths, f"Scene-entry salience Ch{chapter_num}: new location=「{_loc}」 max_sim={_lt.get('max_sim')} rules={_wants_rules}")
         except Exception as exc:
             log(paths, f"scene-entry salience failed (non-fatal) Ch{chapter_num}: {exc}")
+    # Recovery mode at the TAIL (highest-salience anchor). The mid-prompt copy in
+    # carryover_block is routinely ignored by this weak instruction-following
+    # writer (same failure mode as the ability whitelist below) — which is why the
+    # 城中村 arc kept over-elaborating (sentence density climbed 23→30.6 chars) and
+    # scored 6.8-7.0 despite an active recovery directive, tripping the quality
+    # circuit breaker. Restate it as a concrete, hard constraint at the very end
+    # where attention is strongest.
+    try:
+        _rec_path = paths.logs_dir / "recovery_directive.json"
+        if _rec_path.exists():
+            _rd = json.loads(read_text(_rec_path)) or {}
+            if chapter_num <= int(_rd.get("active_until", 0)) and _rd.get("directive"):
+                user += (
+                    f"\n\n## ⚠ 写作前最后确认：质量恢复硬约束（最高优先级，触发：{_rd.get('reason','')}）\n"
+                    "近几章因【过度精细描写 / 技术与机制细节堆砌 / 反复渲染同一身体代价（流血、刺痛、视力衰退）】"
+                    "越写越密，导致阅读疲劳、质量下滑并触发熔断。本章务必：\n"
+                    "1. 句子写短、写利落——回到前 10 章的句长与节奏，不要长句套长句；每个自然段都要推进信息或冲突。\n"
+                    "2. 机制/技术细节压到最低限度，够读者理解即可，严禁用工序化细节堆篇幅。\n"
+                    "3. 同一生理反应（流血/刺痛/视力）全章只在关键处点一次，不反复渲染。\n"
+                    "4. 对白承担推进（传信息/制造冲突/暴露性格），删掉空转铺陈与内心独白。\n"
+                )
+    except Exception:
+        pass
     # Recency anchor #2: the full contract sits high in the prompt where long context
     # dilutes it (v4 breached the ability whitelist/modality in 5/6 chapters). Re-
     # state ONLY the hard ability boundaries as the very last thing the writer

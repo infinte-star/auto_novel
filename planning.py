@@ -1827,6 +1827,41 @@ def create_plan(
                     )
             except Exception as exc:
                 log(paths, f"narrative_pattern check failed (non-fatal) Ch{chapter_num}: {exc}")
+        # Chapter-mode monotony (Layer 1+2 治本 for premise/formula exhaustion). A
+        # COARSER axis than payoff_type: catches "近 N 章都是同一读者形态（如全是智斗
+        # 解谜）" even when payoff_type labels vary — the yeban_guize Ch28 collapse
+        # cause. warn → advisory variety directive (Layer 1, fires before collapse);
+        # block → forced replan with a hard different-form constraint (Layer 2).
+        if bool(config["novel"].get("chapter_mode_enabled", True)):
+            try:
+                from quality import chapter_mode_monotony
+
+                _cm_window = int(config["novel"].get("chapter_mode_window", 6))
+                recent_modes = _recent_selected_plans(
+                    conn, lookback=_cm_window, exclude_chapter=chapter_num,
+                )
+                cmm = chapter_mode_monotony(plan, recent_modes, config)
+                decision["chapter_mode"] = cmm
+                if cmm.get("flags"):
+                    log(
+                        paths,
+                        f"Chapter-mode Ch{chapter_num}: level={cmm.get('level')} "
+                        f"mode={cmm.get('mode')} frac={cmm.get('mode_frac')} "
+                        f"({cmm.get('same_count')}/{cmm.get('window')})",
+                    )
+                    for directive in cmm.get("directives", []):
+                        if directive not in decision.setdefault("required_constraints", []):
+                            decision["required_constraints"].append(directive)
+                if cmm.get("level") == "block":
+                    duplicate_blocked = True
+                    db_event(
+                        conn,
+                        chapter_num,
+                        "chapter_mode_retry",
+                        {"chapter_mode": cmm, "plan": plan},
+                    )
+            except Exception as exc:
+                log(paths, f"chapter_mode check failed (non-fatal) Ch{chapter_num}: {exc}")
         # Tension-shape flatness (张弛): recent chapters at a near-constant intensity
         # read as monotone even when payoff_type varies. The plan side can't see
         # this — tension is measured post-hoc by extraction — so inject a binding

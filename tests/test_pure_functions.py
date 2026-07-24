@@ -168,6 +168,47 @@ class StyleHealthTests(unittest.TestCase):
         self.assertLessEqual(res["penalty"], 4.0)
 
 
+class AiFlavorPivotTests(unittest.TestCase):
+    """Template-pivot + mechanical-anaphora detection added to ai_flavor_health."""
+
+    cfg = {"novel": {"ai_flavor_enabled": True}}
+
+    def test_affirmative_pivot_flagged(self):
+        from quality import ai_flavor_health
+        text = (
+            "她要的不是同情，而是尊重。与其说她在卖货，不如说她在证明自己。"
+            "不仅仅是冻梨，更是这片土地的心意。"
+        ) * 8  # exceed the 200-char floor of ai_flavor_health
+        res = ai_flavor_health(text, self.cfg)
+        self.assertGreater(res["metrics"].get("template_pivot_per_kchar", 0), 0)
+        self.assertTrue(any("template_pivot" in f for f in res["flags"]))
+        self.assertTrue(res["directives"])
+
+    def test_anaphora_tricolon_flagged(self):
+        from quality import ai_flavor_health
+        text = ("她想起了父亲，想起了奶奶，想起了那口老铁锅，眼眶悄悄热了。") * 10
+        res = ai_flavor_health(text, self.cfg)
+        self.assertGreaterEqual(res["metrics"].get("anaphora_longest", 0), 3)
+        self.assertTrue(any("anaphora" in f for f in res["flags"]))
+
+    def test_clean_concrete_prose_not_flagged(self):
+        from quality import ai_flavor_health
+        text = (
+            "七个人排成一排在没膝的雪里铲路，奶奶搬把椅子坐屋檐下直播。"
+            "陆时砚拎着铁锹，肩上落了层薄雪。她弯腰捡起断掉的粉笔，把箭头画完。"
+        ) * 4
+        res = ai_flavor_health(text, self.cfg)
+        self.assertEqual(res["metrics"].get("template_pivot_per_kchar", 0), 0.0)
+        self.assertFalse(any("template_pivot" in f or "anaphora" in f for f in res["flags"]))
+
+    def test_negation_pivot_not_double_counted_as_negative_pair(self):
+        # "不是X，而是Y" is a pivot (this check), NOT the negative-pair "不是X，也不是Y".
+        from quality import _TEMPLATE_PIVOT, _NEGATIVE_PAIR
+        pivot = "这不是运气，而是本事。"
+        self.assertTrue(_TEMPLATE_PIVOT.search(pivot))
+        self.assertFalse(_NEGATIVE_PAIR.search(pivot))
+
+
 class SceneSimilarityTests(unittest.TestCase):
     def test_identical_plans_high_similarity(self):
         plan = {"conflict": "夺嫡之争", "payoff": "扳倒权臣", "goal": "掌控兵权",
@@ -2515,6 +2556,72 @@ class ReasoningMaxTokensTests(unittest.TestCase):
         out, received = self._run(thinking_mode="disabled", success_at=4000, floor=0)
         self.assertEqual(out, "OK-CONTENT")
         self.assertEqual(received, [2000, 4000])
+
+
+class ChapterModeMonotonyTests(unittest.TestCase):
+    """Layer 1+2 治本: coarse chapter-mode classification + form-monotony gate.
+
+    Guards the premise/formula-exhaustion fix — yeban_guize collapsed at Ch28
+    because ~9 straight chapters were all "智斗解谜" while payoff_type labels
+    varied, so the fine-grained gate missed it.
+    """
+
+    def _cm(self, cur, recent, **cfg):
+        from quality import chapter_mode_monotony
+        return chapter_mode_monotony(cur, recent, {"novel": cfg})
+
+    def test_classify_modes(self):
+        from quality import _classify_chapter_mode
+        self.assertEqual(_classify_chapter_mode({"goal": "通过线索推理识破规则解谜"}), "reasoning")
+        self.assertEqual(_classify_chapter_mode({"goal": "追击逃亡", "beats": ["搏斗", "突围反击"]}), "action")
+        self.assertEqual(_classify_chapter_mode({"goal": "妹妹牺牲告别", "payoff": "痛哭诀别"}), "emotional")
+        self.assertEqual(_classify_chapter_mode({"goal": "信任结盟坦白摊牌"}), "relational")
+        self.assertEqual(_classify_chapter_mode({"goal": "揭露幕后阵营布局阴谋"}), "advancement")
+
+    def test_empty_plan_defaults_reasoning(self):
+        from quality import _classify_chapter_mode
+        self.assertEqual(_classify_chapter_mode({}), "reasoning")
+        self.assertEqual(_classify_chapter_mode({"goal": ""}), "reasoning")
+
+    def test_block_on_all_same_mode(self):
+        recent = [{"goal": "推理解谜线索"} for _ in range(5)]
+        r = self._cm({"goal": "推理识破真相"}, recent)
+        self.assertEqual(r["level"], "block")
+        self.assertEqual(r["mode"], "reasoning")
+        self.assertTrue(any("硬性重规划" in d for d in r["directives"]))
+
+    def test_ok_on_varied_modes(self):
+        recent = [
+            {"goal": "追击战斗"}, {"goal": "妹妹牺牲痛哭"}, {"goal": "信任结盟坦白"},
+            {"goal": "幕后阵营布局"}, {"goal": "休整过渡缓冲"},
+        ]
+        r = self._cm({"goal": "推理解谜"}, recent)
+        self.assertEqual(r["level"], "ok")
+
+    def test_warn_on_majority_not_all(self):
+        # 4 reasoning + 1 action in window of 5, current reasoning => 5/6 ~0.83
+        # tune thresholds so this lands in warn (>=0.6) not block (>=0.9).
+        recent = [{"goal": "推理"}, {"goal": "推理"}, {"goal": "推理"}, {"goal": "追击战斗"}, {"goal": "推理"}]
+        r = self._cm({"goal": "推理"}, recent, chapter_mode_block_frac=0.9, chapter_mode_warn_frac=0.6)
+        self.assertEqual(r["level"], "warn")
+        self.assertTrue(any("建议本章换一种章型" in d for d in r["directives"]))
+
+    def test_below_min_window_no_flag(self):
+        # total (recent+current) below min_window => never flags, avoids早期误报.
+        r = self._cm({"goal": "推理"}, [{"goal": "推理"}, {"goal": "推理"}])
+        self.assertEqual(r["level"], "ok")
+        self.assertEqual(r["flags"], [])
+
+    def test_disabled_returns_ok(self):
+        recent = [{"goal": "推理解谜"} for _ in range(5)]
+        r = self._cm({"goal": "推理"}, recent, chapter_mode_enabled=False)
+        self.assertEqual(r["level"], "ok")
+
+    def test_block_frac_configurable(self):
+        recent = [{"goal": "推理"} for _ in range(5)]
+        # Raise block threshold above 1.0 => can never block, degrades to warn.
+        r = self._cm({"goal": "推理"}, recent, chapter_mode_block_frac=1.1)
+        self.assertEqual(r["level"], "warn")
 
 
 if __name__ == "__main__":
