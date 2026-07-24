@@ -26,7 +26,8 @@ _EXECUTABILITY_DOCTRINE = """
 - 高潮场景禁止被压缩成一句概括，或用纸条/口头转述（如"断电前用纸条告知方法"）：必须原子化为多个连续的可见动作 beat，让读者跟着角色一步步看到过程。
 - payoff_type 不得伪装：没有挣来的兑现就不要标 reveal/reversal，必须在 pressure 与 beats 里补足代价与铺垫。
 - 若采用反转，须按 setup→misdirect→overturn 组织：先建立并强化一个被相信的事实/信任源，再推翻它；禁止凭空冒出真相的突兀反转。
-- 悬疑/推理的核心 payoff 禁止只停留在"逻辑上可推出"这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、正/反、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。"""
+- 悬疑/推理的核心 payoff 禁止只停留在"逻辑上可推出"这类抽象判断；必须设计成读者一眼能复盘的视觉矛盾：有/无、左/右、正/反、死前/死后、照片/现场、倒影/实体、物件/身体状态冲突。
+- 少而深（生成减负）：单章 beats **聚焦 1 个主 beat（当章高潮/主爽点）+ 最多 3-4 个副 beat**，宁可把一个 payoff 写透（憋→炸→余韵），也不要平均堆 5-8 个名场面。beat 过多会让写手一次扛不动、名场面清单化、每个都爽不透——这是首稿写崩的头号成因。"""
 
 CANDIDATE_PLAN_SYSTEM = """你是工业化长篇小说引擎中的章节规划 agent。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。为所请求的章节生成一份候选大纲。
@@ -1700,6 +1701,13 @@ def create_plan(
         reports = load_checkpoint(paths, chapter_num, reports_key)
         if isinstance(reports, list) and reports:
             log(paths, f"Resuming cached agent reports Ch{chapter_num} attempt={attempt}")
+        elif len(screened_plans) <= 1 and bool(config["novel"].get("plan_skip_review_single", True)):
+            # ②(a) 单候选下融合6轴评审多在给唯一方案盖章（rubber-stamp）——跳过省 1 次 LLM 调用/章。
+            # arbitrate_plan 仍靠节奏诊断/已用元素台账/校准信号选定并合并 required_constraints；
+            # 章成稿质量由写手侧确定性 gate 兜底（对齐"1轮+外部校验"证据）。多候选（风险上扬）路径不变。
+            reports = [[] for _ in screened_plans] or [[]]
+            save_checkpoint(paths, chapter_num, reports_key, reports)
+            log(paths, f"Skipping fused plan-review Ch{chapter_num}: single candidate (trust writer-side gates)")
         else:
             reports = review_candidate_plans(client, paths, conn, config, chapter_num, screened_plans, cached_memory=mem)
             save_checkpoint(paths, chapter_num, reports_key, reports)
@@ -1716,6 +1724,16 @@ def create_plan(
             _log(paths, f"Got arbitration result, saving Ch{chapter_num}...")
             save_checkpoint(paths, chapter_num, arbitration_key, {"plan": plan, "decision": decision})
             _log(paths, f"Arbitration checkpoint saved Ch{chapter_num}")
+
+        # ①(a) 生成减负：每章 beat 数上限。密集章把过多 beat 挤进单次出稿会"名场面清单化"、写不透
+        # （试跑 Ch2/Ch5 实证）。确定性截断到 chapter_max_beats（保主线顺序，取前 N 条）。提示侧也要求
+        # planner 少而深（见 _EXECUTABILITY_DOCTRINE）；此处是安全网，防写手一次扛太多 payoff。
+        _max_beats = int(config["novel"].get("chapter_max_beats", 5) or 0)
+        if _max_beats > 0 and isinstance(plan, dict):
+            _beats = plan.get("beats")
+            if isinstance(_beats, list) and len(_beats) > _max_beats:
+                plan["beats"] = _beats[:_max_beats]
+                log(paths, f"Beat cap Ch{chapter_num}: {len(_beats)}→{_max_beats} beats (生成减负)")
 
         score = plan_score(decision)
         log(paths, f"Arbiter selected Ch{chapter_num} plan score={score}")

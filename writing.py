@@ -1465,6 +1465,63 @@ def _chapter_write_max_tokens(config: dict[str, Any]) -> int | None:
     return max(int(cmax * ratio) + margin, 1200)
 
 
+def _split_beats_into_scenes(beats: list, max_segments: int) -> list[list]:
+    """把有序 beat 列表切成 2..max_segments 个连续分组（保序，约 2 beat/段）。"""
+    clean = [b for b in beats if str(b).strip()]
+    n = len(clean)
+    if n < 2:
+        return [clean] if clean else []
+    k = min(max(2, max_segments), (n + 1) // 2)  # ~2 beat/段，上限 max_segments
+    k = max(2, k)
+    per = -(-n // k)  # ceil
+    return [clean[i:i + per] for i in range(0, n, per)]
+
+
+def _write_chapter_by_scenes(
+    client: OpenAI, paths: Paths, config: dict[str, Any], chapter_num: int,
+    system: str, base_user: str, beats: list, temp: float, prefix: str | None, log,
+) -> str:
+    """①(b) 分场景顺序出稿：密集章拆成 2-3 段，每段只写少量 beat 并承接上段结尾，最后拼接。
+
+    降低单次生成的多目标挤压（覆盖 N beat + 保 voice + 够字数 + 自审），让密集章写透而非
+    名场面清单化。任一段失败/过短即抛异常，由 write_chapter 回退单次出稿（安全网）。
+    """
+    max_seg = int(config["novel"].get("scene_draft_max_segments", 3) or 3)
+    groups = _split_beats_into_scenes(beats, max_seg)
+    if len(groups) < 2:
+        raise ValueError("beats 不足以分段")
+    k = len(groups)
+    cw = int(config["novel"].get("chapter_words", 3000) or 3000)
+    per_words = max(700, cw // k)
+    segments: list[str] = []
+    for i, grp in enumerate(groups, 1):
+        prev_tail = segments[-1][-300:] if segments else ""
+        seg_instr = (
+            f"\n\n## ⚠ 分段出稿：本次只写本章的第 {i}/{k} 段（不是整章）\n"
+            f"- 本段只覆盖以下 beat，并把它写透（有铺垫、有当场发生的动作与对白、有读者可见的结果），约 {per_words} 字：\n"
+            + "\n".join(f"  - {str(b).strip()}" for b in grp) + "\n"
+            + ("- 本段是开头段：承接上一章结尾、当章钩子尽早抛出，不要在本段收束全章。\n" if i == 1 else "")
+            + ("- 本段是结尾段：完成本章收束并留章末钩子。\n" if i == k else "- 本段是中段：只推进，不收束。\n")
+            + (f"- 紧接上一段结尾自然往下写，**不要重复**上段已写内容、不要重出章节标题：\n『…{prev_tail}』\n" if prev_tail else "")
+            + "- 只输出本段正文；除第 1 段外不要再写「第N章」标题行。"
+        )
+        raw = call_llm(
+            client, paths, config, system, base_user + seg_instr,
+            temperature=temp, cacheable_prefix=prefix,
+            max_tokens=_chapter_write_max_tokens(config), tag="write",
+        )
+        seg = normalize_chapter(raw).strip()
+        if i > 1:  # 去掉非首段误带的「第N章…」标题行
+            seg = re.sub(
+                r"^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章[^\n]*\n", "", seg
+            ).strip()
+        if len(seg) < 200:
+            raise ValueError(f"第 {i}/{k} 段过短（{len(seg)} 字）")
+        segments.append(seg)
+        log(paths, f"write_chapter Ch{chapter_num} scene {i}/{k}: {len(seg)} 字")
+    return "\n\n".join(segments)
+
+
 def write_chapter(
     client: OpenAI,
     paths: Paths,
@@ -1919,6 +1976,23 @@ def write_chapter(
     prefix = cacheable_prefix(paths, config)
     from config import log
     log(paths, f"write_chapter Ch{chapter_num} calling LLM with temp={temp:.2f} user_len={len(user)} system_len={len(system)}")
+    # ①(b) 密集章分场景顺序出稿（gated，默认 off）：beat 多时拆 2-3 段逐段写透，
+    # 降低单次多目标挤压。任一段失败即回退到下方单次出稿（安全网）。
+    _beats = plan.get("beats") if isinstance(plan, dict) else None
+    _beat_count = len(_beats) if isinstance(_beats, list) else 0
+    if (
+        bool(config["novel"].get("scene_drafting_enabled", False))
+        and _beat_count >= int(config["novel"].get("scene_draft_min_beats", 5) or 999)
+    ):
+        try:
+            log(paths, f"write_chapter Ch{chapter_num} SCENE-DRAFT mode (beats={_beat_count})")
+            body = _write_chapter_by_scenes(
+                client, paths, config, chapter_num, system, user, _beats, temp, prefix, log
+            )
+            log(paths, f"write_chapter Ch{chapter_num} scene-draft assembled {len(body)} chars")
+            return normalize_chapter(body)
+        except Exception as exc:
+            log(paths, f"scene-draft failed Ch{chapter_num} ({exc}); 回退单次出稿")
     raw = call_llm(client, paths, config, system, user, temperature=temp, cacheable_prefix=prefix,
                    max_tokens=_chapter_write_max_tokens(config), tag="write")
     log(paths, f"write_chapter Ch{chapter_num} LLM returned {len(raw)} chars")

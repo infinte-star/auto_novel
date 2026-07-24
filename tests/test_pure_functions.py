@@ -209,6 +209,35 @@ class AiFlavorPivotTests(unittest.TestCase):
         self.assertFalse(_NEGATIVE_PAIR.search(pivot))
 
 
+class SceneDraftSplitTests(unittest.TestCase):
+    """_split_beats_into_scenes: ①(b) 密集章分段助手（保序、≤max_segments、~2 beat/段）。"""
+
+    def test_splits_into_at_most_max_segments(self):
+        from writing import _split_beats_into_scenes
+        beats = [f"b{i}" for i in range(8)]
+        groups = _split_beats_into_scenes(beats, 3)
+        self.assertLessEqual(len(groups), 3)
+        self.assertGreaterEqual(len(groups), 2)
+        # 保序 + 无丢失
+        self.assertEqual([b for g in groups for b in g], beats)
+
+    def test_five_beats_three_segments(self):
+        from writing import _split_beats_into_scenes
+        groups = _split_beats_into_scenes([f"b{i}" for i in range(5)], 3)
+        self.assertEqual(len(groups), 3)  # ceil(5/2)=3 段
+
+    def test_short_beatlist_not_segmented(self):
+        from writing import _split_beats_into_scenes
+        self.assertEqual(len(_split_beats_into_scenes(["only"], 3)), 1)
+        self.assertEqual(_split_beats_into_scenes([], 3), [])
+
+    def test_blank_beats_dropped(self):
+        from writing import _split_beats_into_scenes
+        groups = _split_beats_into_scenes(["a", "  ", "", "b", "c", "d"], 3)
+        flat = [b for g in groups for b in g]
+        self.assertEqual(flat, ["a", "b", "c", "d"])
+
+
 class SceneSimilarityTests(unittest.TestCase):
     def test_identical_plans_high_similarity(self):
         plan = {"conflict": "夺嫡之争", "payoff": "扳倒权臣", "goal": "掌控兵权",

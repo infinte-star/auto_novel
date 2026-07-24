@@ -518,9 +518,13 @@ def review_chapter(
 
 ## 章节正文
 {chapter[:_review_chars]}"""
+    # ②(b) diversify：评审温度可调（默认 0.2，低温=更挑剔，行为不变）。真正的"生成≠评审"
+    # 多样性来自把 api.review_base_url/review_model 设成与写作不同的模型——评审就不会与写手
+    # "同流合污"（试跑反复出现 style-audit MISMATCH=评审自报文风失真）。见 config_template 注释。
+    _review_temp = float(config["novel"].get("review_temperature", 0.2))
     raw = call_llm(
         client, paths, config, REVIEW_SYSTEM, json_prompt(user),
-        max_tokens=32000, temperature=0.2, cacheable_prefix=cacheable_prefix(paths, config),
+        max_tokens=32000, temperature=_review_temp, cacheable_prefix=cacheable_prefix(paths, config),
         tag="review",
     )
     report = load_json_with_repair(
