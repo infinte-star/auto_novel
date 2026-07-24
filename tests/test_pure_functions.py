@@ -209,6 +209,44 @@ class AiFlavorPivotTests(unittest.TestCase):
         self.assertFalse(_NEGATIVE_PAIR.search(pivot))
 
 
+class ScheduleRowExtractionTests(unittest.TestCase):
+    """_extract_schedule_rows: 轻规划(plan_from_schedule)从卷纲逐章表读第 N 章排期行。"""
+
+    VP = "\n".join([
+        "## 第二卷（第25-48章）",
+        "- **角色高光轮值表**：",
+        "| 章号 | 核心成员高光 | 钩子成员 |",
+        "|------|-------------|---------|",
+        "| Ch12 | 陆时砚、谢观澜 | 顾峥 |",
+        "| Ch120 | 不该被Ch12匹配到 | x |",
+        "| 第13章 | 白景昀认亲 | 江野 |",
+        "| Ch12-14 | 卷区间行，不该被单章匹配 | y |",
+        "- **爽点兑现节拍表**：",
+        "| 章号 | 主爽点类型 | 兑现 |",
+        "| Ch12 | 打脸反杀 | 实锤僵尸粉 |",
+    ])
+
+    def test_extracts_exact_chapter_rows(self):
+        from planning import _extract_schedule_rows
+        out = _extract_schedule_rows(self.VP, 12)
+        self.assertIn("陆时砚、谢观澜", out)      # 角色高光表 Ch12 行
+        self.assertIn("打脸反杀", out)           # 爽点节拍表 Ch12 行
+        self.assertNotIn("不该被Ch12匹配", out)  # Ch120 排除
+        self.assertNotIn("卷区间行", out)         # Ch12-14 排除
+        self.assertNotIn("白景昀", out)          # 第13章 不混入
+
+    def test_other_chapter(self):
+        from planning import _extract_schedule_rows
+        out = _extract_schedule_rows(self.VP, 13)
+        self.assertIn("白景昀认亲", out)
+        self.assertNotIn("陆时砚", out)
+
+    def test_missing_chapter_returns_empty(self):
+        from planning import _extract_schedule_rows
+        self.assertEqual(_extract_schedule_rows(self.VP, 99), "")
+        self.assertEqual(_extract_schedule_rows("", 12), "")
+
+
 class SceneDraftSplitTests(unittest.TestCase):
     """_split_beats_into_scenes: ①(b) 密集章分段助手（保序、≤max_segments、~2 beat/段）。"""
 
@@ -2651,6 +2689,87 @@ class ChapterModeMonotonyTests(unittest.TestCase):
         # Raise block threshold above 1.0 => can never block, degrades to warn.
         r = self._cm({"goal": "推理"}, recent, chapter_mode_block_frac=1.1)
         self.assertEqual(r["level"], "warn")
+
+    def test_baseline_bias_keeps_reasoning_when_other_within_margin(self):
+        # reasoning present (推理/识破) + emotional content higher but within margin
+        # => stays "reasoning" (the yeban misclassification the bias fixes).
+        from quality import _classify_chapter_mode
+        pl = {"goal": "林越推理识破隐规则", "payoff": "妹妹牺牲告别痛哭诀别绝望"}
+        self.assertEqual(_classify_chapter_mode(pl, "reasoning", 3), "reasoning")
+
+    def test_baseline_bias_allows_clear_formbreak(self):
+        # A chapter that CLEARLY departs (other mode exceeds baseline by > margin)
+        # is allowed through as a genuine form-break.
+        from quality import _classify_chapter_mode
+        pl = {"goal": "揭露幕后阵营组织布局阴谋势力格局", "payoff": "推理"}  # advancement>>reasoning
+        self.assertEqual(_classify_chapter_mode(pl, "reasoning", 3), "advancement")
+
+    def test_baseline_configurable_per_genre(self):
+        # Non-suspense genres can set a different baseline form.
+        from quality import _classify_chapter_mode
+        pl = {"goal": "追击战斗搏斗", "payoff": "推理识破"}  # action vs reasoning
+        # baseline=action, margin high => stays action even with some reasoning
+        self.assertEqual(_classify_chapter_mode(pl, "action", 3), "action")
+
+
+class VolumeTransitionTests(unittest.TestCase):
+    """Layer 二 治本: deterministic volume/arc boundary transition steer.
+
+    Guards against arc overstay (yeban_guize ground the 城中村 arc to Ch28 because
+    nothing enforced the planned Ch21 → 卷二 transition).
+    """
+
+    VP = (
+        "## 第1卷：第八条（第1-20章）\n### 卷目标(O)\n林越活过三处讳地。\n\n"
+        "## 第2卷：守夜人（第21-47章）\n### 卷目标(O)\n林越进入守夜人协会换取7号讳地准入。\n"
+    )
+
+    def _vt(self, ch, **cfg):
+        from planning import volume_transition_directive
+        return volume_transition_directive(ch, self.VP, {"novel": cfg})
+
+    def test_parse_ranges(self):
+        from planning import parse_volume_ranges
+        r = parse_volume_ranges(self.VP)
+        self.assertEqual([(x["start"], x["end"]) for x in r], [(1, 20), (21, 47)])
+        self.assertEqual(r[1]["name"], "守夜人")
+
+    def test_transition_fires_at_volume_boundary(self):
+        # Ch21/22 = 卷二开篇 grace window => hard transition (the missed pivot).
+        for ch in (21, 22):
+            v = self._vt(ch)
+            self.assertEqual(v["level"], "transition")
+            self.assertTrue(v["is_transition"])
+            self.assertIn("卷务转场", v["block"])
+
+    def test_no_transition_first_volume(self):
+        # Ch1 is the first volume's opening — no previous volume to close.
+        v = self._vt(1)
+        self.assertFalse(v["is_transition"])
+
+    def test_mid_volume_is_context_not_transition(self):
+        v = self._vt(25)  # 25-21=4 >= grace(2)
+        self.assertEqual(v["level"], "context")
+        self.assertFalse(v["is_transition"])
+
+    def test_goal_extracted_into_block(self):
+        v = self._vt(21)
+        self.assertIn("守夜人协会", v["block"])
+
+    def test_grace_configurable(self):
+        # grace=1 => only Ch21 transitions, Ch22 is context.
+        self.assertTrue(self._vt(21, volume_transition_grace=1)["is_transition"])
+        self.assertFalse(self._vt(22, volume_transition_grace=1)["is_transition"])
+
+    def test_disabled_returns_ok(self):
+        v = self._vt(21, volume_transition_enabled=False)
+        self.assertEqual(v["level"], "ok")
+        self.assertEqual(v["block"], "")
+
+    def test_no_ranges_degrades_gracefully(self):
+        from planning import volume_transition_directive
+        v = volume_transition_directive(21, "no volume headers here", {"novel": {}})
+        self.assertEqual(v["level"], "ok")
 
 
 if __name__ == "__main__":

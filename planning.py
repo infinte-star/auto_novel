@@ -543,6 +543,82 @@ def _genre_constraint_block(config: dict[str, Any]) -> str:
     )
 
 
+def parse_volume_ranges(volume_plan_text: str) -> list[dict[str, Any]]:
+    """Parse '## 第N卷：<name>（第A-B章）' headers from a volume_plan. Deterministic.
+
+    Returns [{label, name, start, end, pos}] in document order. Tolerant of
+    full/half-width colons and parens.
+    """
+    ranges: list[dict[str, Any]] = []
+    if not volume_plan_text:
+        return ranges
+    pat = re.compile(
+        r"##\s*第\s*([0-9一二三四五六七八九十]+)\s*卷\s*[：:]\s*(.*?)\s*[（(]\s*第\s*(\d+)\s*[-–—~]\s*(\d+)\s*章"
+    )
+    for m in pat.finditer(volume_plan_text):
+        ranges.append({
+            "label": m.group(1), "name": m.group(2).strip(),
+            "start": int(m.group(3)), "end": int(m.group(4)), "pos": m.start(),
+        })
+    return ranges
+
+
+def _volume_goal_head(volume_plan_text: str, vol: dict[str, Any], ranges: list[dict[str, Any]], limit: int = 220) -> str:
+    """Extract a volume section's '### 卷目标(O)' text (up to the next volume)."""
+    start = int(vol.get("pos", 0))
+    later = [r["pos"] for r in ranges if r["pos"] > start]
+    section = volume_plan_text[start:(min(later) if later else len(volume_plan_text))]
+    m = re.search(r"###\s*卷目标\(?O?\)?\s*\n+(.+?)(?:\n#|\Z)", section, re.S)
+    return " ".join(m.group(1).split())[:limit] if m else ""
+
+
+def volume_transition_directive(chapter_num: int, volume_plan_text: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic volume/arc boundary steer (治本 for arc overstay).
+
+    Parses the volume_plan's 第N卷（第A-B章）ranges. When chapter_num sits in the
+    opening `volume_transition_grace` window of a volume (other than the first),
+    emits a HARD transition block telling the planner to close the previous
+    volume and switch scene/form to this volume's goal — automating the manual
+    pivot yeban_guize needed (it overstayed the 城中村 arc to Ch28 because nothing
+    enforced the planned Ch21 → 卷二 transition). Mid-volume, emits a light
+    context note so the planner stays volume-aware and rotates form. Pure
+    parse+inject, no LLM; degrades to an empty block on any failure.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    res: dict[str, Any] = {"level": "ok", "block": "", "volume": None, "is_transition": False}
+    if not bool(cfg.get("volume_transition_enabled", True)):
+        return res
+    ranges = parse_volume_ranges(volume_plan_text)
+    if not ranges:
+        return res
+    cur = next((r for r in ranges if r["start"] <= chapter_num <= r["end"]), None)
+    if cur is None:
+        cur = max(ranges, key=lambda r: r["end"])  # past all ranges → last (finale) volume
+    res["volume"] = f"第{cur['label']}卷 {cur['name']}".strip()
+    goal = _volume_goal_head(volume_plan_text, cur, ranges)
+    grace = max(int(cfg.get("volume_transition_grace", 2)), 1)
+    is_first = cur["start"] <= min(r["start"] for r in ranges)
+    in_open_window = 0 <= (chapter_num - cur["start"]) < grace
+    if in_open_window and not is_first:
+        res["level"] = "transition"
+        res["is_transition"] = True
+        res["block"] = (
+            f"## ⚠ 卷务转场（最高优先级）\n"
+            f"本章（第{chapter_num}章）进入【{res['volume']}】开篇转场区。务必：\n"
+            f"1. 收束上一卷的场景与悬念——不要延续上一卷的地点/机制/套路继续磨；\n"
+            f"2. 把场景与章型切换到本卷设定，推进本卷主线。\n"
+            + (f"本卷目标：{goal}\n" if goal else "")
+        )
+    else:
+        res["level"] = "context"
+        res["block"] = (
+            f"## 本卷定位\n本章属【{res['volume']}】。"
+            + (f"本卷目标：{goal}" if goal else "")
+            + "\n推进本卷主线，并与近几章的章型/形态错开，避免同型连发。\n"
+        )
+    return res
+
+
 def generate_candidate_plans(
     client: OpenAI,
     paths: Paths,
@@ -609,9 +685,12 @@ def generate_candidate_plans(
     # milestones so the planner is told which payoff/高潮 should land around now.
     # Pure parse+inject, no LLM call; degrades to "" on any parse failure.
     beat_block = ""
+    volume_block = ""
+    _vp_text = ""
     try:
         from config import read_text as _read_text
 
+        _vp_text = _read_text(paths.volume_plan)
         max_chapters = int(config["novel"].get("max_chapters", 0) or 0)
         if max_chapters:
             est_total = max_chapters
@@ -619,7 +698,7 @@ def generate_candidate_plans(
             cw = int(config["novel"].get("chapter_words", 3000) or 3000)
             est_total = int(config["novel"].get("target_words", 0) or 0) // max(cw, 1)
         beat_block, _eff_gap = beat_directive(
-            _read_text(paths.volume_plan),
+            _vp_text,
             chapter_num,
             est_total,
             diagnostics.get("chapters_since_payoff"),
@@ -628,6 +707,18 @@ def generate_candidate_plans(
         )
     except Exception:
         beat_block = ""
+    # Volume/arc boundary steer (治本 for arc overstay): auto-inject a hard
+    # transition directive at a volume's opening window so the planner closes the
+    # previous arc and switches form — the yeban_guize 城中村 overstay-to-collapse
+    # root cause. Pure parse+inject; degrades to "" on failure.
+    try:
+        _vt = volume_transition_directive(chapter_num, _vp_text, config)
+        volume_block = _vt.get("block", "")
+        if _vt.get("is_transition"):
+            log(paths, f"Volume transition Ch{chapter_num}: -> {_vt.get('volume')}")
+            db_event(conn, chapter_num, "volume_transition", {"volume": _vt.get("volume")})
+    except Exception:
+        volume_block = ""
     platform_block = ""
     benchmark_block = ""
     try:
@@ -812,6 +903,7 @@ def generate_candidate_plans(
 {overdue_rev_block}
 
 {f"## 情感节奏警告{chr(10)}{emotional_cadence_block}{chr(10)}" if emotional_cadence_block else ""}{chr(10).join(f"## 钩子生命周期警告{chr(10)}{d}" for d in hook_directives) + chr(10) if hook_directives else ""}
+{volume_block}
 {beat_block}
 
 ## 上章结尾
@@ -1581,6 +1673,126 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
     return base
 
 
+def _read_schedule_rows(paths: Paths, chapter_num: int) -> str:
+    """从 volume_plan.md 抽取第 N 章的排期行（角色高光轮值 / 爽点兑现节拍 / 反转排期 / 伏笔兑现表）。
+
+    这些表本会话已固化为「按章号排布」的 markdown 表——本身就是一份确定性的逐章计划。
+    抽不到（旧书无表 / 格式不符）返回 ""，调用方据此回退重型规划。章号匹配精确到 N（排除 120/12-14）。
+    """
+    try:
+        from config import read_text as _read_text
+        vp = _read_text(paths.volume_plan)
+    except Exception:
+        return ""
+    return _extract_schedule_rows(vp or "", chapter_num)
+
+
+def _extract_schedule_rows(vp_text: str, chapter_num: int) -> str:
+    """纯函数：从卷纲 markdown 里抽第 N 章的表行（章号 cell 精确匹配 N，排除 120/12-14）。"""
+    if not vp_text:
+        return ""
+    import re as _re
+    dig = str(int(chapter_num))
+    head_pat = _re.compile(rf"^(?:Ch|第)?\s*{dig}(?![0-9\-])")  # 排除 120（多位）与 12-14（卷区间）
+    rows: list[str] = []
+    for line in vp_text.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or set(s) <= set("|-: "):  # 跳过表分隔行
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not cells:
+            continue
+        head = cells[0]
+        if len(head) <= 14 and head_pat.match(head):
+            rows.append(s)
+    return "\n".join(dict.fromkeys(rows))
+
+
+def _schedule_plan_eligible(
+    paths: Paths, conn: Any, config: dict[str, Any], chapter_num: int,
+    checkpoint_label: str, replan_feedback: str | None,
+) -> bool:
+    """轻规划（plan_from_schedule）适用性闸：仅在低风险常态路径启用，否则回退重型规划。"""
+    if not bool(config["novel"].get("plan_from_schedule", False)):
+        return False
+    if checkpoint_label != "initial" or replan_feedback:
+        return False  # 重规划/结构性重做走重型路径（需要多候选+诊断）
+    if chapter_num <= int(config["novel"].get("opening_chapters", 3)):
+        return False  # 冷启动：steering 尚空，走重型
+    if _recovery_active(paths, chapter_num):
+        return False  # 崩溃恢复期：需要计划多样性
+    try:  # 近期低分 = 风险信号 → 重型
+        rows = recent_metrics(conn, int(config["novel"].get("risk_upshift_window", 3)))
+        floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
+        sc = [safe_score(r.get("score", 0)) for r in rows if r.get("score") is not None]
+        if sc and min(sc) < floor:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def plan_from_schedule(
+    client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any],
+    chapter_num: int, tail: str, cached_memory: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """轻规划：读卷纲第 N 章排期表 + 1 次 LLM 轻展开成计划 JSON，跳过 bandit/多候选/融合评审/仲裁。
+
+    一致性锚在「一次精心生成的卷纲排期」而非每章重新博弈。抽不到排期 / 展开失败 → 返回 None
+    让调用方回退重型规划。计划本身若不佳，由写手侧评审/确定性门→结构性重规划（重型）兜底。
+    """
+    schedule = _read_schedule_rows(paths, chapter_num)
+    if not schedule or len(schedule) < 20:
+        return None  # 卷纲无该章排期表 → 回退重型
+    try:
+        mem = cached_memory or lite_memory_context(
+            paths, conn, config,
+            max_chars=int(config["novel"].get("plan_arbitrate_memory_chars", 20000) or 0),
+        )
+    except Exception:
+        mem = cached_memory or ""
+    constraints = get_active_constraints(conn, chapter_num) or []
+    max_beats = int(config["novel"].get("chapter_max_beats", 5) or 5)
+    cons_block = ""
+    if constraints:
+        cons_block = "\n## 必须遵守的约束（required_constraints）\n" + "\n".join(f"- {c}" for c in constraints[:12])
+    user = (
+        f"## 本章（第{chapter_num}章）已排定排期（来自卷纲逐章表，不得推翻，只做落地展开与具体化）\n"
+        f"{schedule}\n\n"
+        f"## 承接（上一章结尾）\n{tail[-1500:]}\n\n"
+        f"## 记忆（事实与设定参照）\n{mem}\n"
+        f"{cons_block}\n\n"
+        f"## 任务\n严格依据上面「已排定排期」把第{chapter_num}章展开成一份可执行的章节计划 JSON："
+        f"把排期里的角色高光/主爽点/反转/伏笔兑现落成具体、可拍的 beats 与 payoff；"
+        f"不要另起炉灶或改变本章该发生的事。beats 少而深：1 个主 beat + 最多 {max_beats-1} 个副 beat，"
+        f"每个都写成'谁用具体动作操作具体物体、产生读者可见结果'的可拍句子。"
+        f"输出与候选大纲相同的 JSON schema。"
+    )
+    raw = call_llm(
+        client, paths, config, CANDIDATE_PLAN_SYSTEM, json_prompt(user),
+        temperature=float(config["novel"].get("plan_candidate_temp_base", 0.6)),
+        tag="plan_from_schedule",
+    )
+    plan = load_json_with_repair(client, paths, config, raw, fallback=None)
+    if not isinstance(plan, dict) or not plan.get("beats"):
+        return None  # 展开失败 → 回退重型
+    # beat 上限（与重型路径一致的生成减负）
+    _beats = plan.get("beats")
+    if isinstance(_beats, list) and len(_beats) > max_beats:
+        plan["beats"] = _beats[:max_beats]
+    pass_score = float(config["novel"].get("min_plan_score", 8.0))
+    decision = {
+        "selected_index": 0,
+        "scores": [{"index": 0, "score": pass_score}],
+        "required_constraints": list(constraints),
+        "merged_plan": plan,
+        "rationale": "plan_from_schedule 轻规划：读卷纲逐章排期表 + 轻展开（跳过多候选/融合评审/仲裁）；"
+                     "计划质量由写手侧评审+确定性门兜底，不佳则触发结构性重规划（重型）。",
+        "source": "schedule",
+    }
+    return plan, decision
+
+
 def create_plan(
     client: OpenAI,
     paths: Paths,
@@ -1596,6 +1808,23 @@ def create_plan(
     if isinstance(cached, dict) and cached.get("plan") and cached.get("decision"):
         log(paths, f"Resuming cached {checkpoint_label} plan Ch{chapter_num}")
         return cached["plan"], cached["decision"]
+
+    # ── 轻规划路径（plan_from_schedule，gated，默认 off）──────────────────────
+    # 读卷纲逐章排期表 + 1 次轻展开，跳过 bandit/多候选/筛选/融合评审/仲裁。仅低风险常态章启用；
+    # 冷启动/重规划/恢复期/近期低分 → 回退下方重型路径。抽不到排期或展开失败也回退。重型路径完全不动。
+    if _schedule_plan_eligible(paths, conn, config, chapter_num, checkpoint_label, replan_feedback):
+        try:
+            light = plan_from_schedule(client, paths, conn, config, chapter_num, tail, cached_memory=cached_memory)
+            if light is not None:
+                plan, decision = light
+                save_checkpoint(paths, chapter_num, f"plan_{checkpoint_label}_selected.json",
+                                {"plan": plan, "decision": decision})
+                log(paths, f"Light plan (plan_from_schedule) Ch{chapter_num}: score={plan_score(decision)} "
+                           f"beats={len(plan.get('beats') or [])} — 跳过重型规划")
+                return plan, decision
+            log(paths, f"plan_from_schedule Ch{chapter_num}: 无排期/展开失败 → 回退重型规划")
+        except Exception as exc:
+            log(paths, f"plan_from_schedule failed Ch{chapter_num} ({exc}) → 回退重型规划")
 
     mem = cached_memory or memory_context(
         paths, conn, config,
