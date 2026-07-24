@@ -3338,16 +3338,21 @@ _CHAPTER_MODE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _classify_chapter_mode(plan: dict[str, Any]) -> str:
+def _classify_chapter_mode(plan: dict[str, Any], baseline: str = "reasoning", margin: int = 3) -> str:
     """Classify a plan into a coarse reader-facing chapter mode via keyword hits.
 
-    Deterministic, no LLM. Scans the plan's free-text fields; the mode with the
-    most keyword hits wins. Ties and no-hits fall back to ``reasoning`` (the
-    default suspense/rule-horror form) so the monotony gate errs toward flagging
-    an all-同型 run rather than silently missing it.
+    Deterministic, no LLM. BIASED toward *baseline* (the genre's core form, e.g.
+    "reasoning" for suspense/rule-horror): a non-baseline mode wins ONLY if its
+    keyword hits exceed the baseline's by more than *margin*. Rationale (learned
+    from yeban_guize): in a puzzle-genre almost every chapter carries incidental
+    emotional/advancement content (牺牲/协会/幕后), so a naive raw-max classifier
+    mislabels fundamentally-智斗 chapters as emotional/advancement and misses the
+    "every chapter is the same KIND of chapter" fatigue the reviewer actually
+    feels. The bias makes a genuine form-break (a chapter that CLEARLY departs
+    from the baseline) the only thing that escapes the baseline label.
     """
     if not isinstance(plan, dict):
-        return "reasoning"
+        return baseline
     parts: list[str] = []
     for k in ("title", "goal", "conflict", "payoff", "pressure", "hook", "risk",
               "conflict_type", "payoff_type"):
@@ -3359,14 +3364,22 @@ def _classify_chapter_mode(plan: dict[str, Any]) -> str:
         parts.extend(str(b) for b in beats)
     text = " ".join(parts)
     if not text.strip():
-        return "reasoning"
+        return baseline
     scores: dict[str, int] = {}
     for mode, kws in _CHAPTER_MODE_KEYWORDS.items():
         scores[mode] = sum(text.count(kw) for kw in kws)
-    best_mode = max(scores, key=lambda m: scores[m])
-    if scores[best_mode] <= 0:
-        return "reasoning"
-    return best_mode
+    base_score = scores.get(baseline, 0)
+    others = {m: s for m, s in scores.items() if m != baseline and s > 0}
+    if others:
+        top = max(others, key=lambda m: others[m])
+        if scores[top] > base_score + margin:  # a CLEAR form-break beats the baseline
+            return top
+    if base_score > 0:
+        return baseline
+    # Baseline entirely absent — fall back to the strongest present mode.
+    if others:
+        return max(others, key=lambda m: others[m])
+    return baseline
 
 
 def chapter_mode_monotony(
@@ -3391,12 +3404,14 @@ def chapter_mode_monotony(
     }
     if not bool(cfg.get("chapter_mode_enabled", True)):
         return result
-    cur_mode = _classify_chapter_mode(plan)
+    _baseline = str(cfg.get("chapter_mode_baseline", "reasoning"))
+    _margin = int(cfg.get("chapter_mode_baseline_margin", 3))
+    cur_mode = _classify_chapter_mode(plan, _baseline, _margin)
     result["mode"] = cur_mode
     window = int(cfg.get("chapter_mode_window", 6))
     recent = [rp for rp in (recent_plans or []) if isinstance(rp, dict)][:window]
     # Frequency INCLUDING the current chapter.
-    same_count = sum(1 for rp in recent if _classify_chapter_mode(rp) == cur_mode)
+    same_count = sum(1 for rp in recent if _classify_chapter_mode(rp, _baseline, _margin) == cur_mode)
     total = len(recent) + 1
     frac = (same_count + 1) / total if total > 0 else 0.0
     result["window"] = total
