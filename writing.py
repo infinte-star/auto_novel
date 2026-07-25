@@ -1592,7 +1592,22 @@ def write_chapter(
             system = system + "\n\n" + _swa_sys
     except Exception:
         pass
-    mem = cached_memory or writing_memory_context(paths, conn, config)
+    # 洞察2 ①：精简上下文（gated,默认off）。写手天花板=模型+提示词；脚手架只该①喂紧凑正确的最小
+    # 上下文 ②防漂移/重复 ③廉价兜底。实测 writing_memory_context 里最占的是卷纲头(~6k)+近期指标JSON
+    # (~2.5k)，把真正的主干（当前状态+接下来12章方向+线索+约束）淹没了。lean 模式：①用 lite 记忆
+    # （紧凑故事状态，实测 ↓53%）作主干 + 定点 RAG 兜住被压缩抹掉的事实；②剥离 exemplar/结构化召回/
+    # 对标画像。防重复的负面清单/化石块、契约 capsule 保留（脚手架职责②）。
+    lean_ctx = bool(config["novel"].get("lean_context_enabled", False))
+    if lean_ctx:
+        from memory import lite_memory_context
+        from config import log as _leanlog
+        mem = lite_memory_context(
+            paths, conn, config,
+            max_chars=int(config["novel"].get("lean_context_max_chars", 12000) or 0),
+        )
+        _leanlog(paths, f"write_chapter Ch{chapter_num} LEAN-CONTEXT: lite主干({len(mem)}字)+定点RAG，剥离exemplar/结构化召回/对标画像")
+    else:
+        mem = cached_memory or writing_memory_context(paths, conn, config)
     partial_beats = carried_over_partial_beats(paths, chapter_num)
     directives = writer_directives_for_chapter(paths, chapter_num)
     carryover_block = ""
@@ -1782,8 +1797,10 @@ def write_chapter(
     if rag_block:
         carryover_block += "\n" + rag_block + "\n"
     # P0-3: Golden exemplar RAG (top-scoring chapters matching plan type)
+    # 洞察2 ①：lean 模式剥离以下三块（exemplar/结构化召回/对标画像）——nice-to-have 但体量大，
+    # 会淹没紧凑故事状态这个主干。RAG(rag_block,上面)保留作定点召回。
     exemplar_block_text = ""
-    if bool(config["novel"].get("exemplar_rag_enabled", True)):
+    if not lean_ctx and bool(config["novel"].get("exemplar_rag_enabled", True)):
         try:
             from retrieval import exemplar_block
 
@@ -1793,7 +1810,7 @@ def write_chapter(
             _log(paths, f"Exemplar RAG block build failed (non-fatal) Ch{chapter_num}: {exc}")
     if exemplar_block_text:
         carryover_block += "\n" + exemplar_block_text + "\n"
-    if bool(config["novel"].get("structured_recall_enabled", True)):
+    if not lean_ctx and bool(config["novel"].get("structured_recall_enabled", True)):
         try:
             from retrieval import structured_recall_block
             sr_block = structured_recall_block(conn, config, plan, chapter_num)
@@ -1802,15 +1819,16 @@ def write_chapter(
         except Exception as exc:
             from config import log as _log
             _log(paths, f"Structured recall failed (non-fatal) Ch{chapter_num}: {exc}")
-    try:
-        from benchmark import benchmark_context, platform_guidance
+    if not lean_ctx:
+        try:
+            from benchmark import benchmark_context, platform_guidance
 
-        carryover_block += "\n## 平台/读者画像\n" + platform_guidance(config) + "\n"
-        bm = benchmark_context(paths, config, json.dumps(plan, ensure_ascii=False) + "\n" + tail, max_chars=4000)
-        if bm:
-            carryover_block += "\n" + bm + "\n"
-    except Exception:
-        pass
+            carryover_block += "\n## 平台/读者画像\n" + platform_guidance(config) + "\n"
+            bm = benchmark_context(paths, config, json.dumps(plan, ensure_ascii=False) + "\n" + tail, max_chars=4000)
+            if bm:
+                carryover_block += "\n" + bm + "\n"
+        except Exception:
+            pass
     opening_chapters = int(config["novel"].get("opening_chapters", 3))
     if chapter_num <= opening_chapters:
         carryover_block += "\n" + OPENING_RULES_BLOCK + "\n"

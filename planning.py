@@ -1719,16 +1719,21 @@ def _schedule_plan_eligible(
         return False  # 重规划/结构性重做走重型路径（需要多候选+诊断）
     if chapter_num <= int(config["novel"].get("opening_chapters", 3)):
         return False  # 冷启动：steering 尚空，走重型
-    if _recovery_active(paths, chapter_num):
-        return False  # 崩溃恢复期：需要计划多样性
-    try:  # 近期低分 = 风险信号 → 重型
-        rows = recent_metrics(conn, int(config["novel"].get("risk_upshift_window", 3)))
-        floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
-        sc = [safe_score(r.get("score", 0)) for r in rows if r.get("score") is not None]
-        if sc and min(sc) < floor:
+    # 注：曾在此以"恢复期/近期低分→回退重型"为由禁用轻规划，但 A/B 证明轻规划(读排期少而深)
+    # 质量优于重型，且中段塌陷恰恰是因为重型规划失去卷纲路线图后走平——此时更需要"锚定排期"的
+    # 轻规划，而非多候选广度。失败仍由写手侧评审→结构性重规划(重型)兜底。故不再按低分/恢复期禁用。
+    # 可用 plan_from_schedule_only_when_safe=true 恢复旧的保守行为。
+    if bool(config["novel"].get("plan_from_schedule_only_when_safe", False)):
+        if _recovery_active(paths, chapter_num):
             return False
-    except Exception:
-        pass
+        try:
+            rows = recent_metrics(conn, int(config["novel"].get("risk_upshift_window", 3)))
+            floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
+            sc = [safe_score(r.get("score", 0)) for r in rows if r.get("score") is not None]
+            if sc and min(sc) < floor:
+                return False
+        except Exception:
+            pass
     return True
 
 
