@@ -137,7 +137,7 @@ and why `api.stream: true` is mandatory for one of them: LESSONS §1. Check
 | `refine.py`, `fossil_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
 | `compare.py` | `compare` / `ablate` / `fork` experiment harness |
 | `trial.py`, `benchmark.py` | opening trials, local sample library |
-| `tools/*.py` | zero/low-LLM analysis: `gate_census`, `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory` |
+| `tools/*.py` | zero/low-LLM analysis: `fpy_prime` (acceptance metric), `replay_gates` (settles gate-logic changes), `gate_census`, `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory` |
 
 ## Architecture
 
@@ -217,6 +217,8 @@ prose drifts telegraphic and the model rates it 9+. Incident record: LESSONS §3
 | `quality.scene_similarity(plan, recent_plans)` | `scene_dedupe_enabled`, `scene_dedupe_sim_warn`/`_block`/`_identical`, `scene_dedupe_short_novel_block`, `scene_dedupe_candidate_block` | Jaccard similarity of a plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent selected plans |
 | `quality.cross_chapter_repetition` | `style_cross_repeat_reject_count` (8) | signature clauses reused verbatim across chapters → a `level` of `advise` or `reject` |
 | `quality.dialogue_health` | `dialogue_health_enabled`, `dialogue_char_ratio_min` (0.10), `dialogue_char_ratio_target` (0.20) | dialogue-ratio gate over text inside `"…"`; the writer prompt also warns when recent chapters run low |
+| `quality.book_wide_fossils` | `book_fossil_enabled`, `book_fossil_chapter_frac` (0.30), `book_fossil_min_chapters` (6), `book_fossil_hard_ratio`, `book_fossil_struct_count` | 6-char CJK n-grams recurring across a large fraction of the WHOLE book (what `cross_chapter_repetition`'s 6-chapter window structurally misses). **A hard fossil requires `current_chapter` and only indicts a chapter that actually contains the phrase** — the ratio is book-cumulative, so without that the gate latches on and rejects compliant chapters forever. `book_fossil_hard_ratio` is floored at the candidacy fraction (below it, every candidate is automatically hard). LESSONS §13 |
+| `quality.chapter_mode_monotony` | `chapter_mode_enabled`, `chapter_mode_baseline`, `chapter_mode_window` (6), `chapter_mode_min_window` (4), `chapter_mode_warn_frac`/`_block_frac` | frequency of the current chapter's coarse form across a window → warn/block (block forces a plan retry). **The frac is counted with the UNBIASED classifier even under a genre baseline**; the biased classifier returns the baseline label unless a chapter clearly breaks form, so under a baseline the frac floors near 1.0 and is not comparable to `_block_frac` at all. The biased label is still what gets reported and named in the directive. LESSONS §13 |
 | chapter length | `chapter_min_chars` (2800), `chapter_length_penalty_cap` | proportional penalty below the floor; the floor is also a writer directive |
 | opening diversity | `opening_diversity_enabled` | `writing.py:_prewrite_quality_contract` injects the first line of the last 5 chapters + a diversity requirement |
 | `retrieval.py` RAG | `rag_enabled`, `rag_top_k`, `rag_exclude_recent` | dependency-free TF-IDF char-bigram index (no embeddings). `index_chapter` is called idempotently from `save_chapter` → `logs/retrieval_index.json`; `retrieval_block` builds the "## 相关历史原文（检索…）" section; `backfill_index` indexes a finished book |
@@ -310,9 +312,34 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads 62%–99% (vs 12%–63% for "self-score ≥ 8.0") and
-names the failing gate for every miss; the leading killers are `gate_rejects` (39,
-but 27 in tangshuting alone) and `hard_contract` (32, spread across 6 novels).
+by one ruler. Library-wide it reads **81.8% → 85.8%** after the latching-gate fixes
+(vs 12%–63% for "self-score ≥ 8.0"), every book with ≥25 chapters is ≥80%, and it
+names the failing gate for every miss; the leading remaining killers are
+`hard_contract` (31) and `style_collapse` (24). **Read those two as concentrated,
+not library-wide**: a census of every archived HARD contract violation puts 30 of
+35 in the tangshuting family (one book plus its `_v1_backup`/`_e2e` copies) and one
+single bootstrap contradiction, so `hard_contract` is one book counted several
+times, not a common cause. LESSONS §13.
+
+**`fpy_prime` cannot settle a change to a gate's LOGIC** — it replays archived
+payloads, so a verdict already baked into them is frozen and the tool reports the
+old answer forever. Use **`python tools/replay_gates.py [novel…] [--fix A,B]
+[--detail]`** for that: it recomputes the changed gates from the primary data they
+read (chapter texts, archived `plan_initial_attempt0_arbitration.json`, each
+novel's own config) and re-runs `_hard_block_reasons` on the corrected payload.
+Two traps it encodes, each of which gave a wrong answer first: `scene_dedupe_retry`
+is the **generic** `duplicate_blocked` marker shared by three gates, not the
+scene-dedupe gate's own event; and the plan-gate chain is sequential with
+`continue`, so a replan may only be dropped after the gates downstream of the
+removed blocker get their first chance to speak. LESSONS §13.
+
+**Before adding any blocking gate, answer: what can THIS chapter do to turn it
+green?** If nothing, the gate latches and every forced retry it buys is a
+guaranteed first-pass failure. Three measured instances (fossil hard-rejects on a
+frozen book-cumulative ratio, `chapter_mode_monotony` counting a genre label,
+`CONTRACT_SYSTEM` fabricating an `ability_whitelist` for an ability-free brief) cost
+4.0pt of library FPY′ between them — same defect class as the deleted
+`fingerprint_warn_threshold`. LESSONS §13.
 
 **A retro-replay must normalize engine semantics that have since changed**, or it
 reports fixed bugs as live problems. `review.py`'s contract backstop stamped
@@ -431,6 +458,7 @@ bible/characters/timeline/threads when files exceed `memory_max_kb` or every
 - **Background-task ordering is load-bearing.** The barriers in `generate_one_chapter` (`wait_label("chapter_finalize_ch{n-1}")` and the prefetch wait) keep memory/threads consistent; re-ordering them lets the next plan see stale state.
 - **`chapter_completed.json` must be written synchronously** in `pipeline._stage_finalize`, never deferred to the background task (loop-leak invariant above).
 - **`save_chapter` refuses to write chapters under 500 chars** (`writing.py:2739`), so provider refusals never persist as legitimate chapters.
+- **`extract_contract` must run BEFORE `_bootstrap_chain`** in `memory.bootstrap`, and its markdown is passed into the bible + characters calls (`contract_md=`). Those two files are where abilities get declared; generated without the contract, they can invent an ability the brief explicitly bans, and it becomes canon the writer reads every chapter while the reviewer measures against the contract — a contradiction no chapter can resolve. Costs zero extra LLM calls (same call, moved earlier). LESSONS §13.
 - **`cacheable_prefix` content changes invalidate the prompt cache** for every subsequent chapter — only modify it when the cache cost is worth it.
 - **`cold_reader_review` must NOT use the cacheable_prefix.** Its whole value is being a judge that hasn't been steeped in the (possibly drifted) book context.
 - **`style_health` is the objective anchor against score inflation.** Don't relax its thresholds to make chapters "pass"; the penalty exists to fight the model's over-rating of fragmented prose, not to be tuned away.

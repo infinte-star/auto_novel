@@ -301,9 +301,17 @@ CONTRACT_SYSTEM = """你是长篇小说引擎的「创作契约」抽取器。�
 - `iron_rules`（开写铁律）只放最高优先级、每章开写都要自检的 1-3 条——它们会被放到写手提示词注意力最强的末尾锚点。挑「历史/本能最易被漏且违反即毁章」的（题材招牌规则、主角能力硬边界）；与 must_hold 的区别是"每章必检的头等红线"而非泛化硬设定；没有合适的就留空。
 - 宁缺毋滥：只收作者真正钉死的红线；模糊的、探索留白的、风格偏好类内容不要收进来。
 - 能力白名单只列主角及对剧情有关键作用的人物的**核心**能力，不要把普通技能（会开车、会做饭）也列上。
-- **主角的核心金手指/中心异能（贯穿全书、驱动主线的那一个能力）必须出现在 `ability_whitelist`**，
-  即使简报只是强烈暗示而未逐字定义——这是全书每一章都要据以校验的第一红线，绝不能遗漏。若简报里
-  该能力边界/模态/代价不明确，也要以最贴近简报的表述钉一条进白名单，宁可粗略也不能缺席。
+- **先判断简报到底有没有金手指。** 只有当简报确实建立了一个超出常人的特殊能力/异能/系统/规则外挂时，
+  才写 `ability_whitelist`；此时那个贯穿全书、驱动主线的核心能力必须在列，即使简报只是强烈暗示而未
+  逐字定义，边界/模态/代价不明确也要以最贴近简报的表述钉一条，宁可粗略也不能缺席。
+- **写实题材必须让 `ability_whitelist` 留空。** 现代都市/言情/职场/美食/商战这类"主角只是个能力出众的
+  普通人"的简报，没有任何异能可抽——此时白名单留空数组，把她的专业本事（味觉灵敏、镜头感、法律常识）
+  写进 `must_hold` 或干脆不写。绝对不要因为这个字段存在就发明一个能力：白名单是**逐章 HARD 校验的
+  验收红线**，凭空捏一条出来，等于给全书每一章预埋一条永远无法满足的违约——审校每章都会判"能力越界"，
+  写手改任何一个字都清不掉，返工全部白烧。实测：一本 200 章的写实女频，简报第 309 行明写"没有神奇味觉，
+  不是天才厨师"，bootstrap 仍然两头出错——契约把第 147 章的一次情节反转（对比五版食谱各自的错字）升格成
+  全书唯一的能力白名单条目，bible 又另外编出简报明令禁止的「味觉共情」；此后每章"尝味道"都被判 HARD
+  越界（白名单只允许那一条），仅归档语料里就造成 13 章首稿失败。宁缺毋滥在这一条上是硬要求。
 - 每条都要短、具体、可判定（一个审校者读完能直接判断某一章有没有违反）。
 - 若简报几乎没有可抽取的硬约束，相应数组留空即可，不要硬凑。"""
 
@@ -555,7 +563,8 @@ def _gen_md_section(
 
 
 def _bootstrap_chain(
-    client: OpenAI, paths: Paths, config: dict[str, Any], brief: str, max_chapters: int
+    client: OpenAI, paths: Paths, config: dict[str, Any], brief: str, max_chapters: int,
+    contract_md: str = "",
 ) -> dict[str, Any]:
     """Dependency-ordered foundation: bible → characters → voice → volume_plan → frame.
 
@@ -563,6 +572,15 @@ def _bootstrap_chain(
     grounded in a real bible, voice in both, and the volume_plan in all of them —
     instead of 8 artifacts competing for one JSON budget with no grounding. Returns
     the same dict shape the single-shot path produced, so the caller is unchanged.
+
+    `contract_md` is the already-extracted creative contract (empty when contract
+    extraction is disabled or failed, in which case this behaves exactly as before).
+    It is injected into the bible and characters calls because those two files are
+    where abilities get DECLARED, and an ability invented here becomes canon the
+    writer reads every chapter while the reviewer measures against the contract —
+    a contradiction no individual chapter can resolve. Measured cost of not doing
+    this: LESSONS §13, the `CONTRACT_SYSTEM` entry (tangshuting's 味觉共情 — 30 of
+    the library's 35 archived HARD contract violations sit in that one book family).
     """
     # Ensemble / multi-lead books (novel.ensemble_cast) need the full cast profiled
     # (not just 2-4 side characters) and the volume plan to carry spotlight-rotation /
@@ -581,18 +599,33 @@ def _bootstrap_chain(
         + (_SHUANG_PACING_VOLUME_PLAN_DELTA if shuang else "")
     )
 
-    log(paths, "Bootstrap chain: bible → characters → voice → volume_plan → frame")
+    # The contract is the brief's own red lines, already machine-extracted. Handing it
+    # to the two ability-declaring calls costs zero extra LLM calls and closes the
+    # only bootstrap contradiction the per-chapter loop cannot repair.
+    contract_constraint = ""
+    if contract_md:
+        contract_constraint = (
+            "\n\n## 创作契约（已从本简报抽取，最高优先级，本节必须服从）\n"
+            f"{contract_md}\n\n"
+            "硬性要求：**不得发明「能力白名单」之外的超常能力/异能/天赋**，也不得让人物做到"
+            "「能力黑名单」明令做不到的事。白名单与黑名单就是简报作者钉死的红线——与之冲突的设定"
+            "一律不许写进世界观与人物，哪怕它更好看。若简报明确写了某种能力「没有」，就必须真的没有。"
+        )
+
+    log(paths, "Bootstrap chain: bible → characters → voice → volume_plan → frame"
+               + (" (contract-constrained)" if contract_constraint else ""))
     data: dict[str, Any] = {}
 
     bible = _gen_md_section(
         client, paths, config, BIBLE_CHAIN_SYSTEM,
-        f"## 创作简报\n{brief}", tag="bootstrap_bible", max_tokens=20000,
+        f"## 创作简报\n{brief}{contract_constraint}", tag="bootstrap_bible", max_tokens=20000,
     )
     data["bible"] = bible
 
     characters = _gen_md_section(
         client, paths, config, characters_system,
-        f"## 创作简报\n{brief}\n\n## 世界观圣经（必须在此之上设计人物）\n{bible}",
+        f"## 创作简报\n{brief}\n\n## 世界观圣经（必须在此之上设计人物）\n{bible}"
+        f"{contract_constraint}",
         tag="bootstrap_characters", max_tokens=16000,
     )
     data["characters"] = characters
@@ -721,8 +754,40 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
         val = _as_markdown(data.get(key))
         return val if val else f"# {heading}\n\n（bootstrap 未生成，待连载补全）"
 
+    # Extract the machine-checkable creative contract (ability whitelist/blacklist,
+    # banned tropes, must-hold settings) FIRST, so it can constrain the bible and
+    # characters generation below instead of only being enforced against chapters
+    # written from a bible that already contradicts it. Fail-degrades to {} (never
+    # blocks); an empty contract leaves the chain byte-for-byte as it was.
+    # NOTE: pass the BOOSTED brief so a boost-introduced golden finger is covered.
+    contract = extract_contract(client, paths, conn, config, brief=brief)
+    if contract:
+        log(paths, "Extracted creative contract -> memory/contract.md")
+    elif bool(config["novel"].get("contract_enabled", True)):
+        # extract_contract fail-degrades to {} on any error (incl. transient 429).
+        # A missing contract.md silently disables the ability-whitelist / modality
+        # enforcement for the ENTIRE book — exactly the guard that caught 5/6 of
+        # v4's breaches. Make the loss loud so it isn't mistaken for a clean run.
+        log(
+            paths,
+            "WARNING: creative contract extraction returned empty — ability-boundary "
+            "enforcement (whitelist/modality/blacklist) will be INACTIVE this run, and "
+            "the bible/characters generation below runs UNCONSTRAINED. This usually "
+            "means the contract LLM call failed (quota/auth). Re-run after keys "
+            "recover to restore contract enforcement.",
+        )
+
     if bool(config["novel"].get("bootstrap_chain_enabled", True)):
-        data = _bootstrap_chain(client, paths, config, brief, max_chapters)
+        # Render from the dict rather than reusing `contract_capsule`: that helper is
+        # gated on `contract_capsule_enabled`, a WRITER-prompt toggle, so borrowing it
+        # would let someone disabling the writer's tail anchor silently also disable
+        # this bootstrap constraint. Two purposes, two switches.
+        contract_md = _contract_to_markdown(contract) if contract else ""
+        if len(contract_md) > 6000:
+            contract_md = contract_md[:6000] + "\n…（契约过长已截断）"
+        data = _bootstrap_chain(
+            client, paths, config, brief, max_chapters, contract_md=contract_md,
+        )
     else:
         # Legacy single-shot path: one JSON completion for all 8 artifacts.
         raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7, tag="bootstrap")
@@ -753,11 +818,6 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     # Verification pass: surface (and, for voice, repair) foundation defects before
     # they propagate into every chapter. Advisory/log-only except voice regen.
     _verify_bootstrap(client, paths, config, data)
-    # Extract the machine-checkable creative contract (ability whitelist/blacklist,
-    # banned tropes, must-hold settings) so the per-chapter write/review path can
-    # enforce author-declared hard rules. Fail-degrades to {} (never blocks).
-    # NOTE: pass the BOOSTED brief so a boost-introduced golden finger is covered.
-    contract = extract_contract(client, paths, conn, config, brief=brief)
     # 吸量包（Gap-4）：开写前先用番茄书名/三段式简介公式产出候选，吸量是流量漏斗第一层。
     # 纯顾问产物（hook_package.md），不进 cacheable_prefix，失败静默不阻塞 bootstrap。
     if bool(config["novel"].get("hook_package_enabled", True)):
@@ -773,20 +833,6 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
                     log(paths, f"Hook package scoring step failed (non-fatal): {exc}")
         except Exception as exc:
             log(paths, f"Hook package bootstrap step failed (non-fatal): {exc}")
-    if contract:
-        log(paths, "Extracted creative contract -> memory/contract.md")
-    elif bool(config["novel"].get("contract_enabled", True)):
-        # extract_contract fail-degrades to {} on any error (incl. transient 429).
-        # A missing contract.md silently disables the ability-whitelist / modality
-        # enforcement for the ENTIRE book — exactly the guard that caught 5/6 of
-        # v4's breaches. Make the loss loud so it isn't mistaken for a clean run.
-        log(
-            paths,
-            "WARNING: creative contract extraction returned empty — ability-boundary "
-            "enforcement (whitelist/modality/blacklist) will be INACTIVE this run. "
-            "This usually means the contract LLM call failed (quota/auth). Re-run "
-            "after keys recover to restore contract enforcement.",
-        )
 
 def estimate_chars_budget(config: dict[str, Any]) -> int:
     context_window = int(config["api"].get("context_window", 1000000))

@@ -1672,13 +1672,18 @@ class BookWideFossilTests(unittest.TestCase):
 
     def test_hard_fossil_by_ratio(self):
         from quality import book_wide_fossils
-        # fossil in 8/10 chapters = 0.8 frac, well above default hard_ratio 0.20
+        # fossil in 8/10 chapters (Ch1-8) = 0.8 frac, above the candidacy floor.
+        # `current_chapter` is now REQUIRED for a hard verdict: the hard list is a
+        # blocking reject, and a chapter that contains none of the entrenched
+        # phrases cannot lower a book-cumulative ratio by rewriting itself. Full
+        # rationale + the non-latching cases: tests/test_latching_gates.py.
         texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
-        res = book_wide_fossils(texts, {"novel": {}})
+        res = book_wide_fossils(texts, {"novel": {}}, current_chapter=3)
         self.assertTrue(res.get("hard_fossils"), "0.8-frac fossil must be marked hard")
         self.assertTrue(all(f["hard"] for f in res["hard_fossils"]))
         # raise the ratio above the fossil's frac -> no hard fossils, soft still there
-        res2 = book_wide_fossils(texts, {"novel": {"book_fossil_hard_ratio": 0.95}})
+        res2 = book_wide_fossils(texts, {"novel": {"book_fossil_hard_ratio": 0.95}},
+                                 current_chapter=3)
         self.assertFalse(res2.get("hard_fossils"))
         self.assertTrue(res2["fossils"])  # still detected, just not hard
 

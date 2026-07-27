@@ -1767,6 +1767,7 @@ def book_wide_fossils(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
     whitelist: set[str] | None = None,
+    current_chapter: int | None = None,
 ) -> dict[str, Any]:
     """Detect micro-phrase tics recurring across a large fraction of the WHOLE
     book — the slow habit-stiffening that `cross_chapter_repetition` (6-chapter
@@ -1779,8 +1780,13 @@ def book_wide_fossils(
     appears in, and flags those crossing a book-fraction / absolute-chapter
     threshold. Overlapping windows are collapsed to one representative phrase.
 
-    Returns {"fossils": [{"phrase","chapter_count","frac"}], "phrases": [str],
-    "directives": [str], "metrics": {...}}. Safe no-op on empty input.
+    Returns {"fossils": [{"phrase","chapter_count","frac","in_current"}],
+    "phrases": [str], "hard_fossils": [...], "directives": [str], "metrics": {...}}.
+    Safe no-op on empty input.
+
+    ``current_chapter`` is the chapter under review. It decides ``in_current`` on
+    every fossil and, through it, which fossils are eligible to become
+    ``hard_fossils`` — see the hard-fossil block below for why that matters.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     result: dict[str, Any] = {
@@ -1828,17 +1834,46 @@ def book_wide_fossils(
             "phrase": g,
             "chapter_count": count,
             "frac": round(count / max(total, 1), 2),
+            # Does the chapter under review actually use this fossil? See below.
+            "in_current": (current_chapter is not None
+                           and current_chapter in gram_chapters.get(g, ())),
         })
         if len(fossils) >= cap:
             break
 
     # Hard fossils: a SINGLE phrase saturating a large fraction of the whole book
-    # (default >= 20% of chapters, e.g. tangshuting「老市场街七号」65/199≈33%) is a
-    # structural fossil on its own, even when the DISTINCT-phrase count stays under
-    # the reject threshold. review.py routes any hard fossil to STRUCTURAL replan.
-    hard_ratio = float(cfg.get("book_fossil_hard_ratio", 0.20))
+    # is a structural fossil on its own, even when the DISTINCT-phrase count stays
+    # under the reject threshold. review.py routes any hard fossil to STRUCTURAL
+    # replan, so this list is a BLOCKING verdict and must only indict the chapter
+    # actually in front of it.
+    #
+    # It previously indicted every chapter, on two independent counts (measured over
+    # 34 archived (chapter, phrase) flags in tangshuting / tangshuting_e2e /
+    # yeban_guize -- 22 of them false):
+    #
+    #  1. It is a CUMULATIVE property of the book, attributed to the CURRENT
+    #     chapter. Once「声音压得很低」sat in 82/199 tangshuting chapters, the ratio
+    #     could not be brought back under the threshold by writing anything at all
+    #     (the numerator is frozen, the denominator grows by 1/chapter: 274 more
+    #     clean chapters would be needed). So the gate latched ON and rejected
+    #     Ch95-Ch120 six consecutive times for a phrase those chapters never
+    #     contained -- punishing the writer for complying. `in_current` is the fix:
+    #     a chapter that uses none of the entrenched phrases has done the only thing
+    #     the gate can ask of it, and passes. The phrases still ship as
+    #     `directives` + `phrases` every scan, so avoidance pressure is unchanged.
+    #
+    #  2. `book_fossil_hard_ratio` (0.20) was unreachable from below and therefore
+    #     dead: candidacy already requires `frac >= book_fossil_chapter_frac` (0.30)
+    #     -- and >= min_ch/total, which is itself >= 0.30 for every book size -- so
+    #     EVERY fossil was automatically "hard" and the two-tier design collapsed
+    #     into "reject on any fossil at all". Same defect class as the deleted
+    #     `fingerprint_warn_threshold` (LESSONS §8). The threshold is now taken as
+    #     `max(hard_ratio, candidacy_frac)` so the config key describes what the
+    #     code does instead of silently doing nothing.
+    hard_ratio = max(float(cfg.get("book_fossil_hard_ratio", 0.20)), frac_thr)
     hard_fossils = [
-        {**f, "hard": True} for f in fossils if f["frac"] >= hard_ratio
+        {**f, "hard": True} for f in fossils
+        if f["frac"] >= hard_ratio and f["in_current"]
     ]
 
     result["fossils"] = fossils
@@ -3353,8 +3388,29 @@ def chapter_mode_monotony(
     result["mode"] = cur_mode
     window = int(cfg.get("chapter_mode_window", 6))
     recent = [rp for rp in (recent_plans or []) if isinstance(rp, dict)][:window]
-    # Frequency INCLUDING the current chapter.
-    same_count = sum(1 for rp in recent if _classify_chapter_mode(rp, _baseline, _margin) == cur_mode)
+
+    # The FRACTION is measured on the UNBIASED classification, even when a genre
+    # baseline is configured. The biased classifier (see `_classify_chapter_mode`)
+    # deliberately returns the baseline label unless a chapter CLEARLY breaks form,
+    # so under a baseline the frac has a floor near 1.0 and cannot be compared to
+    # `chapter_mode_block_frac` at all. Measured: with baseline="reasoning"
+    # (config.py's default for suspense) 38/41 tangshuting_e2e plans and 13/13
+    # guize_guaitan plans classify as "reasoning", so frac >= 0.93 by construction
+    # against a 0.80 block line -- the gate was ON permanently. It blocked 18
+    # tangshuting_e2e chapters and 16 of them (89%) were STILL blocked after the
+    # forced plan retry, because re-rolling a plan cannot change the genre. That
+    # made it the single largest source of `replanned:initial` first-pass failures
+    # while buying a re-roll of the most expensive call in the engine (~132k prompt).
+    # Unbiased, the same books read 30/41 and 11/13 -- monotony that is real, local,
+    # and escapable, which is what the gate was built to catch.
+    #
+    # The BIASED label is still what gets reported and named in the directive: it is
+    # the better description of what the chapter is, it just cannot be counted.
+    _mode_for_frac = _classify_chapter_mode(plan, "auto", _margin)
+    same_count = sum(
+        1 for rp in recent
+        if _classify_chapter_mode(rp, "auto", _margin) == _mode_for_frac
+    )
     total = len(recent) + 1
     frac = (same_count + 1) / total if total > 0 else 0.0
     result["window"] = total

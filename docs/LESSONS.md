@@ -441,3 +441,160 @@ headers, and omits the section entirely when the tail is empty
 any short budget returns early, so tier4 can only appear when tier2/tier3 went in
 whole. `tests/test_memory_tiers.py` holds the invariant in both directions — no
 row twice, and no gap between the tiers.
+
+---
+
+## 13. Latching gates: a block conditioned on state the attempt cannot change
+
+The single largest FPY′ defect class found so far, and the one to check FIRST when
+a book's first-pass rate is low. Shape:
+
+> a BLOCKING gate measures a property the current attempt has no way to move, so
+> the block is unactionable, the forced retry provably fails, and every one of
+> those retries is counted as a first-draft failure.
+
+It is not a threshold-tuning problem — re-thresholding a latched gate just moves
+where it latches. Three instances, all measured, plus the already-deleted
+`fingerprint_warn_threshold` (§8) as prior art:
+
+**`book_wide_fossils` hard rejects — cumulative book property charged to one
+chapter.** `hard_fossils` routes to STRUCTURAL replan, and its input was
+`frac = chapters_containing(phrase) / chapters_total`. Once 「声音压得很低」sat in
+82/199 tangshuting chapters the numerator was frozen and the denominator grew by
+1/chapter, so **274 more clean chapters** would have been needed to get back under
+the line. The gate latched ON and rejected Ch95–Ch120 six consecutive times for a
+phrase those chapters did not contain — punishing the writer for complying. Of 34
+archived (chapter, phrase) hard flags across three novels, **22 were false**. Fix:
+a fossil may only turn hard when the chapter under review actually uses it
+(`in_current`). The phrases still ship as `phrases` + `directives` on every scan,
+so avoidance pressure is unchanged; only the *verdict* narrowed.
+
+Second defect in the same function: `book_fossil_hard_ratio` (0.20) was
+**unreachable from below**. Candidacy already requires `frac >=
+book_fossil_chapter_frac` (0.30) — and `>= min_ch/total`, itself ≥ 0.30 at every
+book size — so every fossil was automatically hard and the two-tier design
+collapsed into "reject on any fossil at all". It is now
+`max(hard_ratio, candidacy_frac)`, so the key describes what the code does.
+
+**`chapter_mode_monotony` — counting a genre label instead of a form.** The frac
+was measured with the genre-BIASED classifier, which by design returns the
+baseline label unless a chapter *clearly* breaks form. Under `baseline:
+"reasoning"` (config.py's default for suspense) **38/41** tangshuting_e2e plans
+and **13/13** guize_guaitan plans classify as `reasoning`, so frac ≥ 0.93 by
+construction against a 0.80 block line — permanently on. It blocked 18
+tangshuting_e2e chapters and **16 (89%) were still blocked after the forced
+retry**, because re-rolling a plan cannot change the genre, while buying a re-roll
+of the engine's most expensive call (~132k prompt). The frac now uses the unbiased
+classifier (same books read 30/41 and 11/13 — monotony that is real, local, and
+escapable); the biased label is still what gets reported and named in the
+directive, because it is the better *description*, it just cannot be *counted*.
+
+**`CONTRACT_SYSTEM`'s forced `ability_whitelist` — a red line invented at
+bootstrap.** The extractor prompt demanded the core 金手指 appear in
+`ability_whitelist` "even if the brief only strongly implies it… 宁可粗略也不能缺席".
+tangshuting's brief is a 20.9k-char realistic 都市甜宠/美食探店 plan with **no
+ability system at all** (`grep -c` for both invented names: 0). Forced to produce
+one, bootstrap wrote 「错字食谱暗码解密」into contract.md and a *different*,
+contradictory 「味觉共情」into bible.md. The whitelist is a per-chapter HARD
+acceptance rule, so from Ch1 onward every scene where she tastes something was
+`ability_out_of_scope` — **13 first-draft failures** across tangshuting +
+tangshuting_v1_backup, none of them clearable by any rewrite. The prompt now
+branches on whether the brief actually establishes a special ability and requires
+an empty array for realistic briefs; `_contract_to_markdown` already omits the
+whole section on an empty list, so the reviewer then has no clause to cite
+(`tests/test_latching_gates.py` pins both halves).
+
+That prompt fix stops the contract from inventing a red line, but not the *bible*
+from inventing an ability — and those are two separate bugs with one symptom. A
+census of every archived HARD contract violation (35 across 31 chapters) found
+**30 of them in the tangshuting family alone** (11 tangshuting + 19 its
+`_v1_backup` copy), 2 in an ablation fork, 2 in yeban_guize: `hard_contract` is
+*not* the library-wide killer an earlier reading of FPY′ made it look like — it
+is one book, one contradiction, counted once per derivative copy. The brief bans
+the invented ability **in so many words** (`prompt.md:309`, 能力边界：没有神奇味觉，
+不是天才厨师), and the contract extractor got that right (whitelist omits it,
+blacklist says 不能凭空知道未亲自品尝的食物味道). The bible said the opposite
+because `extract_contract` ran **last in `bootstrap()`** — after bible and
+characters were already written and conditioned on the brief alone. So the one
+artifact that had correctly parsed the author's red lines could not constrain the
+two artifacts that declare abilities, and 味觉共情 became canon in the two files
+the writer reads every chapter (11 + 22 mentions) while the reviewer measured
+against the contract. No chapter can resolve that: obeying the contract means
+contradicting characters.md.
+
+Fix: extract the contract FIRST and inject it into the bible + characters calls as
+a top-priority constraint (`_bootstrap_chain(contract_md=…)`). **Zero added LLM
+calls** — the same call, moved earlier. Forward-only, as bootstrap runs once per
+book; an empty/disabled contract leaves the chain exactly as it was.
+
+A deterministic "bible declared an off-contract ability" detector was also built
+and **rejected on measurement**: flagging bolded terms on ability-declaring lines
+that appear nowhere in contract.md fires on **8/8 books**, surfacing 味觉共情×33
+buried among character names (沈兰梅×280), volume headers (卷四×12) and generic
+words (身份, 弱点, 动机). No discrimination ⇒ it would only have been one more
+noisy advisory. Prefer constraining generation over detecting the mess afterwards
+when the generator is the thing you control.
+
+### Measuring a gate fix: `tools/replay_gates.py`
+
+`fpy_prime` replays *archived payloads*, so a gate verdict baked into those
+payloads is frozen and **a gate-logic change cannot show up in FPY′ at all** —
+the tool keeps reporting the old verdict forever. `tools/replay_gates.py`
+recomputes the changed gates from the primary data they read (chapter texts,
+archived `plan_initial_attempt0_arbitration.json`, each novel's own config) and
+re-runs `_hard_block_reasons` on the corrected payload, so the fix is settled by
+the same ruler as everything else.
+
+Two traps it exists to avoid, both of which produced a wrong answer first:
+
+- **`scene_dedupe_retry` is NOT the scene-dedupe gate's event.** It is the generic
+  `duplicate_blocked` retry marker shared by scene_similarity + narrative_pattern
+  + chapter_mode (`planning.py:2061`), written only when a further attempt follows
+  (`attempt < max_attempts - 1`). Counting it as a gate made chapter_mode look
+  like it co-fired with a second independent blocker on 18/18 chapters — a
+  faithful scene_similarity replay of those same plans reads **max_sim 0.041–0.068
+  against a 0.82 block line**. Never infer causation from a replan event name.
+- **The plan-gate chain is sequential with `continue`.** While chapter_mode was
+  blocking, `visual_payoff` / `executability` / plan-score downstream of it never
+  ran. Dropping a replan because one gate went quiet, without giving the rest
+  their first chance to speak, fabricates a gain — so the replay re-runs the
+  *whole* chain in engine order and reports a survivor histogram (11 survived:
+  8 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
+
+Measured, `--fix` isolating each arm over 643 archived chapters:
+
+| arm | library FPY′ | notes |
+| --- | --- | --- |
+| baseline | 526/643 = **81.8%** | 4 books < 80% |
+| fossil `in_current` only | 539/643 = 83.8% (+2.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
+| chapter_mode frac only | 537/643 = 83.5% (+1.7) | tangshuting_e2e 62.2→86.7 |
+| **both** | 552/643 = **85.8%** (+4.0) | e2e →91.1 (+28.9, super-additive) |
+
+Super-additive because both gates were blocking the *same* chapters: fixing one
+leaves the chapter failing on the other, so neither arm alone can show the full
+gain. **Isolate arms to attribute, but decide on the combined number.**
+
+### Two fixes measured and rejected before writing code
+
+Per "无效的删除" — a candidate that cannot show a gain offline gets deleted at the
+design stage, not merged and watched:
+
+- **Canon-membership fossil whitelist** (auto-whitelist n-grams that appear in
+  bible/characters as proper nouns). Replayed payoff **≤2 chapters (+0.3pt)**, and
+  it would have whitelisted the generic clause 「有什么东西在」. Rejected: the
+  existing quoted-name whitelist already covers the real cases.
+- **D2 containment** ("an ability-whitelist rule violated from Ch1 that is never
+  once satisfied ⇒ downgrade to SOFT"). Principled and offline-replayable, but it
+  is containment for exactly the case the `CONTRACT_SYSTEM` fix prevents, and
+  adding a general gate-relaxation mechanism on one book's evidence is the
+  over-engineering the design principles forbid. Rejected in favour of the root
+  cause.
+
+### Also found, not worth a fix
+
+`writing.py:879-909` splits the cached `logs/book_fossils.json` into hard/soft at
+`frac >= 0.20`. Across all 8 novels **every** cached fossil has `frac >= 0.31`, so
+the `soft_fossils` branch is dead library-wide. Harmless (it is a prompt-assembly
+branch, not a verdict) and it would come alive if `book_fossil_chapter_frac` were
+ever lowered — left in place, recorded here so the next reader is not surprised by
+a branch that never renders.

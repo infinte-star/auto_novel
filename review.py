@@ -940,7 +940,8 @@ def review_chapter(
                         _wl.add(_m)
                 except Exception:
                     pass
-                bf = book_wide_fossils(texts, config, whitelist=_wl)
+                bf = book_wide_fossils(texts, config, whitelist=_wl,
+                                       current_chapter=chapter_num)
                 report["book_fossils"] = bf
                 if bf.get("phrases"):
                     try:
@@ -968,10 +969,13 @@ def review_chapter(
                             "count": len(bf["phrases"]),
                             "phrases": bf["phrases"][:8],
                         })
-                    # A SINGLE phrase recurring in >= hard_ratio of the book (e.g.
-                    # tangshuting「老市场街七号」65/199≈33%) is a structural fossil in
-                    # its own right even when the DISTINCT-phrase count stays below
-                    # struct_count. Route it to STRUCTURAL replan via the same gate.
+                    # A SINGLE entrenched phrase THAT THIS CHAPTER USES is a
+                    # structural fossil in its own right even when the
+                    # DISTINCT-phrase count stays below struct_count. Route it to
+                    # STRUCTURAL replan via the same gate. `hard_fossils` is
+                    # restricted to `in_current` fossils by `quality.book_wide_fossils`
+                    # -- rejecting a chapter for a phrase it does not contain is what
+                    # made this gate latch ON for tangshuting Ch90-200.
                     hard = bf.get("hard_fossils") or []
                     if hard:
                         report.setdefault("gate_rejects", []).append({
