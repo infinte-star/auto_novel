@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -2620,12 +2621,37 @@ def check_plan_against_fingerprints(
     }
 
 
-def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
-    """Render the full fingerprint library as avoidance context for plan generation.
+# How the fingerprint library is summarized for the planner. Constants rather
+# than config keys: these are properties of the move vocabulary (11 tokens), not
+# something a user tunes per novel (Code over Config, REDESIGN §5).
+_FP_MIN_REPEAT = 3     # a pattern is only "高频" once it has happened this often
+_FP_TOP_BIGRAMS = 12
+_FP_TOP_TRIGRAMS = 6
 
-    Unlike check_plan_against_fingerprints (which compares a specific plan),
-    this returns a summary of ALL stored narrative move sequences so the
-    generator can see the full structural history and avoid repeating it.
+
+def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
+    """Summarize the fingerprint library as avoidance context for plan generation.
+
+    This used to enumerate one line per completed chapter (`Ch7: enter_space→…`).
+    Measured, that was the largest single block in the engine's largest prompt --
+    22,813 of 116,592 chars (19.6%) at Ch201, growing linearly with the book --
+    and it could not deliver the signal its own header promises ("特别是那些高频
+    出现的流程组合"): tangshuting's 200 chapters hold **194 distinct flows**, so
+    exact whole-flow repetition is 3 patterns over 8 chapters. Two hundred
+    all-but-unique strings is noise by construction.
+
+    The repetition is real one level down, in the 11-token move vocabulary:
+    `collect_evidence→deduce_conclusion` ×29, `enter_space→collect_evidence` ×26,
+    91 of 106 bigrams recurring ≥3 times. So this now emits the aggregate --
+    recurring bigrams/trigrams plus payoff/conflict/move frequencies -- which is
+    what the header actually asks for, in ~1k chars that do NOT grow with the
+    book.
+
+    What was lost: the planner can no longer read Ch137's flow off this block.
+    That was never how the check worked. `check_plan_against_fingerprints` scores
+    a concrete candidate against every stored fingerprint deterministically and
+    injects `Ch{n}已用流程: …` for the top-3 matches, and the recent chapters are
+    quoted verbatim by planning.py's `narrative_pattern_block`.
     """
     if conn is None:
         return "None"
@@ -2638,7 +2664,12 @@ def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
         return "None"
     if not rows:
         return "None"
-    entries: list[str] = []
+    moves_counts: Counter[str] = Counter()
+    bigrams: Counter[str] = Counter()
+    trigrams: Counter[str] = Counter()
+    payoffs: Counter[str] = Counter()
+    conflicts: Counter[str] = Counter()
+    n_chapters = 0
     for ch, mov_json, pt, ct in rows:
         try:
             moves = json.loads(mov_json)
@@ -2646,14 +2677,39 @@ def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
             continue
         if not moves:
             continue
-        flow = "→".join(moves)
-        meta = ""
+        n_chapters += 1
+        moves_counts.update(moves)
+        bigrams.update("→".join(moves[i:i + 2]) for i in range(len(moves) - 1))
+        trigrams.update("→".join(moves[i:i + 3]) for i in range(len(moves) - 2))
         if pt:
-            meta += f" payoff={pt}"
+            payoffs[str(pt)] += 1
         if ct:
-            meta += f" conflict={ct}"
-        entries.append(f"Ch{ch}: {flow}{meta}")
-    return "\n".join(entries) if entries else "None"
+            conflicts[str(ct)] += 1
+    if not n_chapters:
+        return "None"
+
+    def _hot(counter: Counter[str], top: int) -> list[tuple[str, int]]:
+        return [(k, v) for k, v in counter.most_common(top) if v >= _FP_MIN_REPEAT]
+
+    lines = [f"（全书 {n_chapters} 章累积统计，非逐章清单；下列组合越靠前越滥用）"]
+    hot_bi = _hot(bigrams, _FP_TOP_BIGRAMS)
+    if hot_bi:
+        lines.append("高频相邻推进对（本章至少避开前 3 条）：")
+        lines += [f"- {p} ×{n}" for p, n in hot_bi]
+    hot_tri = _hot(trigrams, _FP_TOP_TRIGRAMS)
+    if hot_tri:
+        lines.append("高频三连流程（整段形状已用滥，禁止再走一遍）：")
+        lines += [f"- {p} ×{n}" for p, n in hot_tri]
+    if payoffs:
+        lines.append("已用兑现类型频次：" + " ".join(
+            f"{k}×{v}" for k, v in payoffs.most_common(8)))
+    if conflicts:
+        lines.append("已用冲突类型频次：" + " ".join(
+            f"{k}×{v}" for k, v in conflicts.most_common(8)))
+    if moves_counts:
+        lines.append("单步使用频次：" + " ".join(
+            f"{k}×{v}" for k, v in moves_counts.most_common(10)))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
