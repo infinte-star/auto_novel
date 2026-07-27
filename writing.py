@@ -1083,11 +1083,18 @@ def _prewrite_quality_contract(
         "缺一项即判该 beat 为 partial 并扣分。严禁用结果或声音替代动作本身（如 beat 写“手摸搭扣”，正文写成“搭扣响了”不合格），"
         "严禁用“一笔带过/读了也读不出/他决定放弃”等总结句抹掉 beat 要求的挣扎、动机或铺垫，也严禁让正文与大纲的具体描述自相矛盾（如大纲“无人影”正文却写“有灯光人在”）。",
         f"- 目标：首稿总分必须达到 {threshold:.1f}+；readthrough/payoff/novelty/prose/continuity 五个维度都不得低于 {dimension_floor:.1f}。",
-        f"- 当前大纲仲裁分：{selected_plan_score:.1f}/10。若大纲分偏低，正文必须用更具体的场景执行弥补，不得照抄抽象意图。",
         "- 本章必须同时具备：清晰剧情推进、主角主动选择、可见压力、挣来的兑现、具体章末钩子。",
         "- 新鲜度必须落到场景、信息来源、冲突类型或章末手法之一；不能只换措辞重复近期章节。",
         "- 写作前在内部逐项自检上述门槛；不要输出检查过程，只输出合格正文。",
     ]
+    # The arbiter score only exists on the committee path; the arc planner emits
+    # no score (see arc.card_to_plan) and plan_score() returns 0.0 for it.
+    # Printing "当前大纲仲裁分：0.0/10" would tell the writer its plan is garbage.
+    if selected_plan_score > 0:
+        lines.insert(
+            2,
+            f"- 当前大纲仲裁分：{selected_plan_score:.1f}/10。若大纲分偏低，正文必须用更具体的场景执行弥补，不得照抄抽象意图。",
+        )
     # Show the writer the审稿员的扣分清单 directly, framed as "首稿就要避免"。
     # These mirror review.py REVIEW_SYSTEM 的软性惩罚项——把"事后被扣分"前移成"事前的硬约束"。
     lines.append("\n### 终审扣分重点（系统指令中的铁律全部适用，以下为额外重点）")
@@ -1380,6 +1387,38 @@ _EM_DASH_REWRITE_SYSTEM = (
     "2. 改写后的句子\n"
     "......"
 )
+
+
+def _em_dash_remediation(
+    client: "OpenAI",
+    paths: "Paths",
+    config: dict[str, Any],
+    text: str,
+    sh: dict[str, Any] | None,
+) -> str:
+    """Two-layer em-dash remediation, run only when style_health flagged collapse.
+
+    Layer 2 is a targeted sentence-level LLM rewrite; layer 3 is the programmatic
+    fallback for whatever density survives it. Both revise exits (surgical-patch
+    fast path and full rewrite) need exactly this, and used to carry a
+    line-for-line copy of it each.
+    """
+    if not text or not any("em_dash" in f for f in ((sh or {}).get("flags") or [])):
+        return text
+    from config import log as _log
+    from quality import reduce_em_dash_density, style_health as _sh_check
+
+    if bool(config["novel"].get("em_dash_targeted_rewrite_enabled", True)):
+        text = reduce_em_dashes_targeted(client, paths, config, text)
+    em_after = float((_sh_check(text, config).get("metrics") or {}).get("em_dash_per_kchar", 0))
+    em_target = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
+    if em_after > em_target and bool(config["novel"].get("em_dash_reduce_enabled", True)):
+        before = text.count("——")
+        text = reduce_em_dash_density(text, config)
+        density = text.count("——") / max(len(text) / 1000, 1e-9)
+        _log(paths, f"Programmatic em-dash reduction: {before}->{text.count('——')} dashes, "
+                    f"density {em_after:.1f}->{density:.1f}/k")
+    return text
 
 
 def reduce_em_dashes_targeted(
@@ -2218,18 +2257,7 @@ def revise_chapter(
             _log(paths, f"Revise via patches applied={applied}/{total} (>= {threshold_hit}); skipping full rewrite")
             patched_ch = normalize_chapter(patched)
             # Even on patch fast-path, apply em-dash remediation if flagged.
-            _sh_flags_p = (sh or {}).get("flags", []) if sh else []
-            if any("em_dash" in f for f in _sh_flags_p):
-                if bool(config["novel"].get("em_dash_targeted_rewrite_enabled", True)):
-                    patched_ch = reduce_em_dashes_targeted(client, paths, config, patched_ch)
-                from quality import style_health as _sh_chk
-                _sh_p = _sh_chk(patched_ch, config)
-                _em_p = float(_sh_p.get("metrics", {}).get("em_dash_per_kchar", 0))
-                _em_t = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
-                if _em_p > _em_t and bool(config["novel"].get("em_dash_reduce_enabled", True)):
-                    from quality import reduce_em_dash_density
-                    patched_ch = reduce_em_dash_density(patched_ch, config)
-            return patched_ch
+            return _em_dash_remediation(client, paths, config, patched_ch, sh)
         else:
             from config import log as _log
             _log(paths, f"Revise patches too few hit ({applied}/{total} < {threshold_hit}); falling back to LLM rewrite")
@@ -2272,24 +2300,7 @@ def revise_chapter(
         _log(paths, f"Revise rejected: size grew {len(chapter)}->{len(revised)} ({len(revised)/len(chapter):.1f}x > {max_grow}x)")
         revised = chapter
     # Layer 5: em-dash remediation pipeline (only when style_health flagged em-dash collapse).
-    _sh_flags = (sh or {}).get("flags", []) if sh else []
-    if any("em_dash" in f for f in _sh_flags):
-        # Layer 2: targeted sentence-level rewrite.
-        if bool(config["novel"].get("em_dash_targeted_rewrite_enabled", True)):
-            revised = reduce_em_dashes_targeted(client, paths, config, revised)
-        # Layer 3: programmatic fallback if density still above target.
-        from quality import style_health as _sh_check
-        sh_after = _sh_check(revised, config)
-        em_after = float(sh_after.get("metrics", {}).get("em_dash_per_kchar", 0))
-        em_target = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
-        if em_after > em_target and bool(config["novel"].get("em_dash_reduce_enabled", True)):
-            from quality import reduce_em_dash_density
-            before_len = revised.count("——")
-            revised = reduce_em_dash_density(revised, config)
-            after_len = revised.count("——")
-            from config import log as _log
-            _log(paths, f"Programmatic em-dash reduction: {before_len}->{after_len} dashes, density {em_after:.1f}->{revised.count('——')/(len(revised)/1000):.1f}/k")
-    return revised
+    return _em_dash_remediation(client, paths, config, revised, sh)
 
 def extract_events(
     client: OpenAI,

@@ -47,7 +47,8 @@ python novel.py benchmark list|add ...   # manage the local 爆款 sample librar
 python novel.py script --input PATH      # convert ANY novel text file -> 短剧 screenplay (standalone)
 python novel.py script <name> --chapters 1-3  # convert chapters 1..3 of novels/<name>/
 python novel.py compare <a> <b>          # deterministic side-by-side report (scores/penalties/fossils/cost/config diff) -> experiments/
-python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped
+python novel.py ablate <name> --flip <key> [--chapters N]  # scaffold a chapter-capped copy with ONE config key flipped (starts at Ch1)
+python novel.py fork <name> --as <new> [--flip <key>] [--chapters N]  # branch at HEAD for a mid-book A/B (preferred over ablate)
 python novel.py refine <name>            # explicit post-completion refine pass (chapters_refined/ + book_refined.md; resumable)
 python novel.py fix-fossils <name>       # deterministic fossil replacement (chapters_fixed/ + book_fixed.md)
 python novel.py package <name>           # book packaging (titles/intros/tags/synopsis) for a finished novel
@@ -129,6 +130,20 @@ helps — only `writing_reasoning_effort: none` does (first byte ~29s, 3.1k char
 in ~170s at the default `max_tokens: 65536`). That endpoint also 504s on any
 non-stream request, so `api.stream: true` is mandatory for it.
 
+**But treat both knobs as requests, not guarantees, and never as an A/B
+variable.** Measured 2026-07-27 (`tools/probe_reasoning.py`, 8 tiers × 2
+`max_tokens`, same gateway but `deepseek-v4-pro`): all 11 calls streamed
+5.7k–7.2k reasoning chars — including `thinking:{"type":"disabled"}`,
+`reasoning_effort: none`, and sending neither — with no correlation to the tier
+and not one 504 (TTFB 1.6–76.7s, two over 70s still succeeded). Across the
+library's production logs, reasoning shows up on 0% of calls on 12 days and
+47–69% on two others; `yeban_guize` and `guize_guaitan` share a config yet differ
+65 points. The gateway routes one model name to several upstreams and decides for
+itself. `novel.py stats` prints the measured per-role coverage
+(`_reasoning_coverage`) — check that both sides match before trusting any
+`novel.py compare`. Actually controlling reasoning requires a different
+endpoint/model; config alone will not do it.
+
 ## Architecture
 
 ### Top-level loop (`pipeline.py:main`)
@@ -154,6 +169,48 @@ Critical invariant in `pipeline.py:413-422`: `chapter_completed.json` must be wr
 2. Optional `screen_candidates` (skipped when `plan_skip_screen: true`, or automatically at ≤3 candidates)
 3. `review_candidate_plans` — fused 6-axis review (world/character/rhythm/payoff/foreshadowing/reader) per candidate, one LLM call expanded into 6 legacy reports via `_explode_fused_axes` (the only review path — the legacy 6-parallel-calls variant was removed)
 4. `arbitrate_plan` — picks `selected_index` and emits a `merged_plan` plus `required_constraints`. Still runs with a single candidate: it merges rhythm diagnostics / recent quality feedback / used-element ledger into the plan
+
+### Arc planner (`arc.py`, `arc_planning_enabled`, default **false**)
+An alternative to the five-stage committee above (REDESIGN.md L2), motivated by
+the measured finding that `replan` is the #1 rework cause in every novel
+(33–68% of chapters): the rework battleground is planning, not writing. ONE
+high-reasoning call every `arc_span` (default 10) chapters emits one
+**ChapterCard** per chapter of the arc, so 错峰兑现 / 场地轮换 / 开场轮换 /
+整段推进 are decided once with whole-arc vision instead of being patched
+chapter-by-chapter by gates that can only look backwards.
+
+- Integration is **one seam**: `planning.create_plan` calls `plan_from_arc` right
+  after the resume-from-checkpoint block, only when `checkpoint_label ==
+  "initial"` and `replan_feedback is None`. Every replan keeps the committee, so
+  a bad card still has the old safety net. `pipeline.py` is untouched.
+- `card_to_plan` **projects** a card onto the existing plan schema
+  (`wants→goal`, `blocked_by→conflict`, `where→location`, `exit_hook→hook`, …)
+  so writing/review/quality/store need zero changes. Card-only fields
+  (`opening_type`, `forbid`, `turn`) ride along in the plan dict, which
+  `writing.py` dumps into the prompt wholesale.
+- `decision["scores"]` is **deliberately empty**: there is no arbiter here, and a
+  fake score would poison `chapter_metrics.plan_score` and the writer's quality
+  contract. `plan_score()` returns 0.0 and `_prewrite_quality_contract` therefore
+  suppresses its 大纲仲裁分 line instead of printing `0.0/10`.
+- `plan_from_arc` **never raises** — any failure (no card, bad JSON, still-invalid
+  card after one `repair_card` call) returns `None` and falls through to the
+  committee.
+- `validate_card` is the zero-LLM pre-write gate: empty required fields,
+  `opening_type` equal to the previous chapter's, same `where` as the previous
+  chapter, the same `payoff_type` three chapters running, scene similarity ≥
+  `scene_dedupe_sim_block`, plus CRITICAL continuity violations. It follows the
+  committee's severity policy exactly (`pipeline._stage_plan`): only CRITICAL
+  forces repair; overdue threads and un-cashed setups are advisories appended to
+  `required_constraints`. Treating advisories as repair triggers fires a repair
+  on nearly every chapter (5 fired on the first live card) and eats the saving.
+- Cards persist in `logs/arc_cards.json`; `arc_window` is anchored at Ch1 so it is
+  a pure function of the chapter number and a resumed/forked run recomputes the
+  same boundaries. Generation clips to `max(start, chapter_num)` so a run that
+  starts mid-block never plans already-written chapters.
+- Scene-dedupe in the arc arm must union `_recent_selected_plans` with recent
+  cards projected through `card_to_plan`: `_recent_selected_plans` reads
+  `plan_arbitration` events, which the arc path never emits, so an all-arc run
+  would silently lose the check.
 
 ### Writing & revision (`writing.py`)
 - Writer system prompts use a **shared-base + genre-delta architecture**: `GENRE_PROFILES` dict holds per-genre deltas (role, self_review, core_discipline, structure_template, genre_bans, sensory_dialogue, time_marker_ban, extras), and `_build_write_system()` assembles the system prompt from shared constants (`_SELF_REVIEW_PREAMBLE`, `_OUTPUT_SECTION`, `_SENSORY_DIALOGUE_DEFAULT`, `_TIME_MARKER_BAN_DEFAULT`) + genre deltas + `ANTI_FRAGMENT_BAN` + `ANTI_PITFALL_BLOCK` + aesthetic. Adding a new genre only requires a new dict entry in `GENRE_PROFILES`. Genres: `history`, `xuanhuan_shuang`, `system_stream`, `urban_ability`, `romance_female`, `wanzu_xuanhuan`, `suspense`. (`rule_horror` falls back to `suspense`.)
@@ -202,6 +259,17 @@ to catch its own degeneration.
   a "## 相关历史原文（检索…）" section from the plan's fields for the writer prompt.
   `backfill_index` indexes a finished book. Gated by `rag_enabled` (`rag_top_k`,
   `rag_exclude_recent`).
+- **`retrieval.exemplar_block`** (gated by `exemplar_rag_enabled`, default false) —
+  quotes the book's own strongest chapters back to the writer as style anchors.
+  Selection is **rank-based** (top `exemplar_rag_top_k` by score plus a small
+  on-type bonus), NOT an absolute score threshold: 1021 measured chapters
+  self-score 7.4–8.7, so the old `exemplar_rag_score_min: 8.8` selected nothing.
+  The type bonus is deliberately small (0.3 payoff / 0.15 conflict) because an
+  on-type mediocre chapter is a worse model than an off-type excellent one. It
+  picks one dialogue-dense and one action/scene-dense exemplar (measured by
+  `_dialogue_ratio`) so the two are not redundant, caps and caches the file reads,
+  and preserves paragraph indentation — the old newline-flattening was itself
+  nudging the prose telegraphic.
 - **`review.py:cold_reader_review`** — an independent terminal review run every
   `cold_reader_every` chapters that **deliberately omits the cacheable_prefix**, so
   it cannot ratify the drifting voice the way the main reviewer (which shares the
@@ -228,6 +296,113 @@ to catch its own degeneration.
   line of the last 5 chapters and injects them into the writer prompt with a
   diversity requirement, preventing consecutive same-type openings. Gated by
   `opening_diversity_enabled`.
+
+### Rework trigger + repair ladder (`pipeline._rework_needed`, `fix.py`)
+ONE predicate decides whether a draft has to be reworked, and it is called at
+four sites: the per-round early break in `_stage_review_revise`, the replan gate
+in `_stage_quality_replan`, `_stage_force_accept`, and the resume-authority check
+in `generate_one_chapter`. Mode is set by `rework_trigger`:
+
+- `score` (**default**) — the historical behaviour, bit for bit:
+  `score < quality_threshold or not accepted`. `tests/test_fix.py` asserts
+  point-for-point equality with the old expression over a
+  (score × accepted × gate_rejects) grid, so the default config cannot drift.
+- `deterministic` — rework only on measured evidence: `_hard_block_reasons`
+  (gate_rejects, style collapse ≥ `style_penalty_block`, hard contradictions,
+  hard contract violations, `length_band`/`opening_hook_gate` block,
+  adjacent-repeat block, ≥ `constraint_violation_block_count` unmet
+  constraints), a score below `rework_score_floor` (6.5), or an `accepted=False`
+  the threshold cannot explain. Whole-chapter rewrite survives as the
+  below-floor rescue path.
+
+Why the second mode exists: `quality_threshold` is 8.0 and the library's 1023
+measured self-scores have a median of **exactly 8.00** (34% below 8.0, only 6%
+below 6.5), so ~1/3 of chapters enter the rework loop *by construction* — while
+that same self-score has no demonstrated discrimination (1021 chapters span
+7.4–8.7, 6 rejections). The pipeline currently answers noise with structural
+replans, the #1 rework cause in every novel. **Do not "fix" a low FPY by moving
+`quality_threshold`; that just relocates the median problem.**
+
+Two things are load-bearing here:
+- **`RevisionTracker.record()` cannot deliver this.** It reports `converged`
+  only when `score >= threshold AND accepted`, and `accepted` is itself derived
+  from `quality_threshold` (`review.py:1486`), so lowering the tracker's
+  threshold can never release a 7.6 chapter. The release has to be an explicit
+  `_rework_needed` break after each review round.
+- **Ledger hygiene.** A 7.x chapter accepted in deterministic mode goes through
+  `_accept_without_debt`: it is NOT stamped `force_accepted` and NOT written to
+  `quality_debt.json` (it records a `quality_note` db_event instead). Otherwise
+  `consecutive_force_accept_limit` × `circuit_breaker_score_floor` and refine
+  prioritization would be swamped by noise-band chapters. `rework_score_floor`
+  is aligned with `circuit_breaker_score_floor` for the same reason.
+
+`fix.py` is the repair ladder that catches what no longer triggers rework. Layer
+membership is declared ON the gate (`@REGISTRY.register(..., repair="L0"|"L1"|
+"L2"|"advisory")` in `quality.py`); `fix.ACTION_BY_GATE` only maps a gate to an
+action, so declaring a layer is never a promise that a fixer exists.
+- **L0** (zero LLM, always runs): em-dash reduction, fragment-line merging,
+  bank-only fossil rotation, scenery-opening demotion.
+- **L1** (≤ `fix_max_l1_calls` bounded calls, skipped for force-accepted drafts):
+  targeted expand-to-band, dialogue injection, em-dash rewording — each
+  extracts a handful of passages, rewrites them in one numbered-list call, and
+  splices them back. Never a whole-chapter rewrite.
+- Every fixer is **keep-only-if-the-metric-improved** (same pattern as
+  `_beat_gate_one` and the revision-gate rollback), which is what makes
+  `_stage_fix` safe to run unconditionally.
+- `_stage_fix` records `style_health_after_fix` rather than overwriting
+  `style_health`: the latter is the measurement `score` was computed from, and
+  overwriting it would leave score and penalty describing different texts.
+- Two gates store their result under a key that is NOT the gate name
+  (`length_band_check`→`length_band`, `book_wide_fossils`→`book_fossils`); read
+  them via `fix.gate_result`. Also do NOT use `REGISTRY.is_enabled` as a
+  "did this gate run" test — `length_band_check`'s config key only controls its
+  penalty (default false) while the gate always runs.
+- Fossil rotation is **bank-only on purpose**: of 109 distinct fossil phrases
+  across 647 archived reviews, `FOSSIL_REPLACEMENTS` covers the generic-cliché
+  subset (`声音压得很低`, 49 firings) and the rest are book-specific proper nouns
+  (`老市场街七号`, 42) that must never be rotated — swapping those is canon
+  corruption, not repair.
+
+Zero-LLM tooling: `python tools/gate_census.py` (per-gate ran/fired/penalty over
+archived reviews — the data behind any gate-deletion decision; measured total is
+0.42 penalty per review over 651 reviews) and `python tools/replay_l0.py` (replays
+L0 over finished chapters; 647 reviews → 29 chapters repaired, 0 made worse, all
+length changes within ±2%).
+
+**Read the census's two columns separately.** `fire%` is a *verdict* (penalty,
+level, block, or flagged spans); `advise%` is a directive with no verdict behind
+it. Conflating them is not cosmetic: the gates do not share one result shape, and
+counting any non-empty list as a firing reports `information_density` at 91% when
+its actual verdict rate (`low_information`, ≥3 of 4 probes) is 6.8%. Conversely a
+penalty-only test scores that same gate a structural 0/649 — it emits no penalty
+at all — which reads as "dead gate" when it means "never measured."
+
+**A silent gate is a bug report, not a deletion candidate.** Before deleting one,
+compare its threshold against the metric's measured distribution:
+- `genre_adherence` showed 0 firings in 215 runs because `review.py` called a
+  `store.get_connection` that **does not exist**; the `AttributeError` was
+  swallowed by a bare `except: pass`, so `recent_genre_scores` was always empty
+  and `low_streak` could never exceed 1 — while tangshuting's own
+  `chapter_metrics` holds negative-score streaks of up to 8. Fixed to use the
+  `conn` `review_chapter` is already handed.
+- Fixing the wiring alone would have been worse than the bug. `genre_score` is a
+  signed keyword-density difference whose library-wide median is **exactly
+  0.000** (neither keyword list matched — no evidence), so the old
+  `genre_drift_threshold: 0.3` scores "no evidence" as "drift": replayed over 357
+  real scores it puts **46.8%** of chapters over the reject streak (86% in some
+  novels), and a reject forces a STRUCTURAL replan. The threshold must sit
+  strictly below zero; `-1.0` replays to warn 4.8% / reject 2.5%. The reject
+  branch is additionally gated off by default (`genre_drift_reject_enabled:
+  false`) because it has never executed in production.
+- `dialogue_pingpong` (threshold 0.50 vs observed max qa_ratio **0.140**) and
+  `chapter_ending_quality` (threshold 3 summary markers vs observed max **1**)
+  were unreachable by construction, had no entry in `fix.ACTION_BY_GATE`, and
+  each duplicated a gate that does fire (`dialogue_health` at 34.8%; the
+  `hook_strength`/`revise_hook_only` path). Both deleted.
+- `adjacent_repetition` also shows 0/641, but its warn line (0.10 clause overlap)
+  sits just above the observed max (0.090) rather than 3× above it, it feeds
+  `_hard_block_reasons`, and the repo has a recorded true positive above its
+  block line (suspense_v11 Ch3, overlap 0.73). Kept.
 
 ### Fossil fix (`fossil_fix.py`)
 Post-processing tool: `python novel.py fix-fossils <name>` scans finished
@@ -262,6 +437,39 @@ Zero LLM calls — purely deterministic.
   against the source. Metadata saved under `experiments/ablate_*.json`. Every
   engine change should carry an ablation report instead of a hand-compared full
   rerun.
+- `novel.py fork <name> --as <new> [--flip <key>] [--set V] [--chapters N]` —
+  **the A/B tool to reach for on anything mid-book.** `ablate` always restarts at
+  Ch1, and this repo's own recorded lesson is that short opening runs fabricate
+  positive results (score inflation on short chapters, no mid-book problem zone).
+  `fork` branches at HEAD instead: it copies `memory/`, `chapters/`, `book.md`,
+  `state.md`, `story_state.db` and the RAG index, so both arms start from a
+  byte-identical mid-book state. It forks at HEAD **only** — memory markdown and
+  the entity/thread tables describe the book as of its last written chapter and
+  there is no faithful rollback to an earlier one.
+  - `logs/` is deliberately NOT copied (except the RAG index, the one logs
+    artifact carrying story content), so FPY / cost / reasoning-coverage describe
+    only the chapters the fork writes.
+  - Budgeting prefers raising `target_words` over setting `max_chapters`, because
+    `max_chapters` switches on the ending-aware machinery and would make the tail
+    unrepresentative. When the source already has `max_chapters`, it extends that.
+  - Metadata lands in `experiments/fork_<new>.json`. Run both arms, verify
+    reasoning coverage matches in `novel.py stats`, then `novel.py compare`.
+  - **Check `consecutive_force_accept_limit` against the source's tail scores
+    before launching.** The force-accept circuit breaker in
+    `pipeline._stage_force_accept` counts backwards through `chapter_metrics`,
+    which the fork inherits, so a source whose last chapter scored below
+    `circuit_breaker_score_floor` gives every fork a hair trigger: with the
+    default limit of 2, one weak first chapter kills the run outright
+    (`RuntimeError: Circuit breaker…`, seen killing an arm at Ch26 off a Ch25 of
+    4.6). Raise the limit in BOTH arms so the inherited chapter can't decide the
+    experiment — and raise it identically, or you have added a second variable.
+  - `novel.py run` on Windows does not return until the pipeline child exits
+    (the PowerShell `Start-Process` launcher blocks in `check_output`), so launch
+    it as a background job and confirm with `grep -c "Start target_chars"` in
+    `run.log` rather than waiting on the command. Note also that this venv is a
+    **virtualenv** whose `python.exe` is a redirector stub, so every run appears
+    twice in a process list (`stub → real interpreter`); that is one pipeline,
+    not two, and `logs/run.pid` records the real one.
 
 ### Cross-book telemetry (`telemetry.py`)
 Each novel runs as an isolated process with its own `story_state.db`.
@@ -395,7 +603,7 @@ it falls back to `config_template.yaml` (the shared keys). Tuned by `script_seg_
 - **`cold_reader_review` must NOT use the cacheable_prefix.** Its entire value is being an independent judge that hasn't been steeped in the (possibly drifted) book context — sharing the prefix would defeat the point and re-introduce the rating inflation it exists to catch.
 - **`style_health` is the objective anchor against score inflation.** Don't relax its thresholds to make chapters "pass"; the model's self-review already over-rates fragmented prose. The penalty is meant to fight that, not be tuned away.
 - **`voice_baseline.md` is frozen on purpose.** `refresh_voice_anchors` anchors to it rather than re-deriving voice from recent prose; re-deriving from drifted prose is exactly the self-feeding loop that caused style collapse.
-- **API keys are committed in `config.yaml` / `config_template.yaml`.** Both are gitignored, but they hold live keys — don't echo them into tracked files or logs. New per-novel configs inherit the template's keys, so parallel novels share quota.
-- **`config_template.yaml` is gitignored but must exist on disk** for `novel.py create` to work. Don't delete it.
+- **Live API keys sit in `config.yaml` / `config_template.yaml` / `novels/*/config.yaml`.** All are gitignored — don't echo them into tracked files or logs. New per-novel configs inherit the template's keys, so parallel novels share quota.
+- **`config_template.yaml` is gitignored but must exist on disk** for `novel.py create` to work. Don't delete it. It was *also tracked* until 2026-07-28, which made the ignore rule inert (gitignore does not apply to already-tracked files) and left a live key one `git commit -a` away from publication — `git rm --cached` fixed that. The key never reached history; verified with `git log --all -S<key>` and a blob scan. When adding config keys, edit **both** `config_template.yaml` (your working copy, with keys) and the tracked credential-free `config_template.example.yaml`, which is what `novel.py create` falls back to on a fresh clone. `.gitignore` needs the `!config_template.example.yaml` negation because the broad `config_*.yaml` rule would otherwise swallow it.
 - **`GENRE_PROFILES` shared constants affect all genres.** Modifying `_SENSORY_DIALOGUE_DEFAULT`, `_TIME_MARKER_BAN_DEFAULT`, `_SELF_REVIEW_PREAMBLE`, or `_OUTPUT_SECTION` in `writing.py` changes every genre's writer prompt at once. Per-genre overrides go in the `GENRE_PROFILES` dict entry (set `sensory_dialogue` or `time_marker_ban` to a non-empty string to override the default). Same applies to `DIAGNOSE_CORE`/`DIAGNOSE_COMMON_FOOTER` in `refine.py` and `_EXECUTABILITY_DOCTRINE` in `planning.py`.
 - **Ending awareness (`ending_aware`, default true) only fires when `max_chapters` is set.** In short-novel mode, the final chapter (`chapter_num == max_chapters`) gets a `CLOSING_RULES_BLOCK` (writing.py) + a planning ending directive, skips hook-only-revise (pipeline.py), and refine's diagnose/refine prompts demand closure instead of a cliffhanger. Detection lives in `config.py:is_final_chapter`. Pure char-target long novels (no `max_chapters`) have no deterministic finale, so this is inert there and per-chapter behaviour is unchanged.

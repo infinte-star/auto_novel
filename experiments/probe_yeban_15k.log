@@ -1,0 +1,17 @@
+Novel: yeban_guize   Role: writing
+Endpoint: https://ai.littlesheep.cc/v1
+Model: deepseek-v4-pro   temperature=0.8   probe max_tokens=4096
+============================================================================================
+tier                       prompt     TTFB    total     out   think  result
+--------------------------------------------------------------------------------------------
+effort=none (current)         15k    14.3s   136.5s     226    5932  OK
+effort=low                    15k    74.1s   168.2s       0    6115  FAIL budget spent on reasoning
+effort=medium                 15k    18.5s   174.0s     791    5307  OK
+effort=high                   15k    59.7s   225.0s       0    5956  FAIL budget spent on reasoning
+thinking=disabled             15k     6.5s   194.7s       0    6080  FAIL budget spent on reasoning
+thinking=enabled/4k           15k    76.7s   241.6s       0    6053  FAIL budget spent on reasoning
+thinking=enabled/16k          15k    23.3s   146.8s      98    6009  OK
+(omit both)                   15k    12.7s   131.8s       0    6174  FAIL budget spent on reasoning
+--------------------------------------------------------------------------------------------
+Strongest tier that returned output: thinking=enabled/16k (TTFB 23.34s at 15k prompt)
+Raw results -> experiments/probe_yeban_15k.json

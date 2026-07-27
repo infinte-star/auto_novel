@@ -30,6 +30,11 @@ from typing import Any
 # directive accumulation, logging).
 # ---------------------------------------------------------------------------
 
+# Repair layers a gate may declare (REDESIGN L6). Ordered cheapest-first: this
+# tuple is also the execution order of the repair ladder in `fix.py`.
+REPAIR_LAYERS = ("L0", "L1", "L2", "advisory")
+
+
 class GateRegistry:
     """Lightweight registry for deterministic quality gates."""
 
@@ -46,8 +51,24 @@ class GateRegistry:
         config_default: bool = True,
         tag_prefix: str | None = None,
         phase: str = "review",
+        repair: str = "advisory",
     ):
-        """Decorator: register gate metadata. Preserves function identity."""
+        """Decorator: register gate metadata. Preserves function identity.
+
+        *repair* declares HOW a firing of this gate is meant to be fixed, which
+        is what makes `fix.py`'s ladder possible (REDESIGN L6):
+
+        - ``"L0"``  deterministic text transform, zero LLM calls
+        - ``"L1"``  bounded single-call patch on part of the chapter
+        - ``"L2"``  plan-level: fix the plan / the NEXT card, never this prose
+        - ``"advisory"`` directive only; must NOT trigger rework by itself
+
+        This is metadata, not behaviour: nothing in the review path reads it, so
+        annotating a gate cannot change its score.
+        """
+        if repair not in REPAIR_LAYERS:
+            raise ValueError(f"unknown repair layer {repair!r} for gate {name}")
+
         def wrapper(fn):
             self._gates[name] = {
                 "fn": fn,
@@ -55,6 +76,7 @@ class GateRegistry:
                 "config_default": config_default,
                 "tag_prefix": tag_prefix or name.replace("_health", "").replace("_quality", ""),
                 "phase": phase,
+                "repair": repair,
             }
             return fn
         return wrapper
@@ -72,16 +94,32 @@ class GateRegistry:
         spec = self._gates.get(name)
         return spec["tag_prefix"] if spec else name
 
+    def repair(self, name: str) -> str:
+        """Return the declared repair layer for gate *name*.
+
+        Unknown gates are ``"advisory"``: an unregistered signal must never be
+        able to trigger rework or a repair action on its own.
+        """
+        spec = self._gates.get(name)
+        return spec["repair"] if spec else "advisory"
+
     def get(self, name: str):
         """Return the registered gate function, or None."""
         spec = self._gates.get(name)
         return spec["fn"] if spec else None
 
-    def list_gates(self, phase: str | None = None) -> dict[str, dict[str, Any]]:
-        """List registered gates, optionally filtered by phase."""
-        if phase is None:
-            return dict(self._gates)
-        return {k: v for k, v in self._gates.items() if v["phase"] == phase}
+    def list_gates(
+        self,
+        phase: str | None = None,
+        repair: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """List registered gates, optionally filtered by phase and/or repair layer."""
+        items = self._gates.items()
+        if phase is not None:
+            items = [(k, v) for k, v in items if v["phase"] == phase]
+        if repair is not None:
+            items = [(k, v) for k, v in items if v["repair"] == repair]
+        return dict(items)
 
     @staticmethod
     def accumulate(
@@ -174,7 +212,7 @@ def _strip_title_line(text: str) -> str:
     return text
 
 
-@REGISTRY.register("style_health", config_key="style_health_enabled", tag_prefix="style")
+@REGISTRY.register("style_health", config_key="style_health_enabled", tag_prefix="style", repair="L0")
 def style_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -660,7 +698,7 @@ def _anaphora_runs(body: str, min_run: int = 3) -> list[int]:
     return runs
 
 
-@REGISTRY.register("ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor")
+@REGISTRY.register("ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor", repair="advisory")
 def ai_flavor_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -875,7 +913,7 @@ _HEDGE_WORDS = re.compile(
 )
 
 
-@REGISTRY.register("paragraph_shape_health", config_key="paragraph_shape_enabled", tag_prefix="paragraph")
+@REGISTRY.register("paragraph_shape_health", config_key="paragraph_shape_enabled", tag_prefix="paragraph", repair="advisory")
 def paragraph_shape_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -986,130 +1024,6 @@ def paragraph_shape_health(
     }
 
 
-# ---------------------------------------------------------------------------
-# Q&A 乒乓对话检测 (dialogue ping-pong)
-# ---------------------------------------------------------------------------
-_DIALOGUE_RE = re.compile(r'“([^”]+)”')
-
-
-@REGISTRY.register("dialogue_pingpong", config_key="dialogue_pingpong_enabled", tag_prefix="dialogue")
-def dialogue_pingpong(
-    text: str,
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Detect excessive question-answer ping-pong dialogue patterns.
-
-    Counts consecutive dialogue turns where a question mark line is immediately
-    followed by a non-question answer. High ratios indicate interview/interrogation
-    style dialogue that feels mechanical.
-    """
-    cfg = (config or {}).get("novel", {}) if config else {}
-    if not bool(cfg.get("dialogue_pingpong_enabled", True)):
-        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
-
-    body = _strip_title_line(text)
-    turns = _DIALOGUE_RE.findall(body)
-    result: dict[str, Any] = {
-        "metrics": {"dialogue_turns": len(turns)},
-        "penalty": 0.0, "flags": [], "directives": [],
-    }
-    if len(turns) < 4:
-        return result
-
-    qa_pairs = 0
-    for i in range(len(turns) - 1):
-        if turns[i].rstrip().endswith("？") and not turns[i + 1].rstrip().endswith("？"):
-            qa_pairs += 1
-    qa_ratio = round(qa_pairs / max(len(turns) - 1, 1), 2)
-    result["metrics"]["qa_pairs"] = qa_pairs
-    result["metrics"]["qa_ratio"] = qa_ratio
-
-    warn = float(cfg.get("dialogue_pingpong_warn", 0.50))
-    bad = float(cfg.get("dialogue_pingpong_bad", 0.65))
-    if qa_ratio >= bad:
-        result["penalty"] = 1.0
-        result["flags"].append(f"dialogue_pingpong_severe(qa={qa_ratio:.0%}>={bad:.0%})")
-        result["directives"].append(
-            "Q&A乒乓对话严重（%.0f%%为一问一答），读者会觉得像审讯。"
-            "改为：多人交叉发言、用动作/心理/环境打断对话节奏、让角色主动说而非被问。" % (qa_ratio * 100)
-        )
-    elif qa_ratio >= warn:
-        result["penalty"] = 0.5
-        result["flags"].append(f"dialogue_pingpong(qa={qa_ratio:.0%}>={warn:.0%})")
-        result["directives"].append(
-            "Q&A对话偏多（%.0f%%），在对话间插入动作、神态、心理描写，"
-            "打破采访式节奏。" % (qa_ratio * 100)
-        )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# 章尾总结检测 (chapter ending summary quality)
-# ---------------------------------------------------------------------------
-_ENDING_SUMMARY_MARKERS = re.compile(
-    r"他知道|她知道|他明白|她明白|他清楚|她清楚|"
-    r"他意识到|她意识到|他理解|她理解|"
-    r"这一切|而这一切|至此|至少.{0,6}知道|"
-    r"心中.{0,4}清楚|心中.{0,4}明白|心里.{0,4}清楚|"
-    r"一切都已|一切似乎|一切终于"
-)
-
-
-@REGISTRY.register("chapter_ending_quality", config_key="chapter_ending_quality_enabled", tag_prefix="ending")
-def chapter_ending_quality(
-    text: str,
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Detect dry summary-style chapter endings (complements intra_chapter_repetition).
-
-    Scans the last 400 chars for summary markers and reflective-narration patterns
-    that make the ending feel like an essay conclusion rather than forward momentum.
-    """
-    cfg = (config or {}).get("novel", {}) if config else {}
-    if not bool(cfg.get("chapter_ending_quality_enabled", True)):
-        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
-
-    body = _strip_title_line(text)
-    result: dict[str, Any] = {
-        "metrics": {}, "penalty": 0.0, "flags": [], "directives": [],
-    }
-    if len(body) < 800:
-        return result
-
-    tail_chars = int(cfg.get("ending_quality_tail_chars", 400))
-    tail = body[-tail_chars:]
-    markers = _ENDING_SUMMARY_MARKERS.findall(tail)
-    marker_count = len(markers)
-    result["metrics"]["ending_summary_markers"] = marker_count
-    result["metrics"]["ending_tail_chars"] = len(tail)
-
-    has_dialogue = "“" in tail
-    tail_sentences = [s.strip() for s in re.split(r'[。！？\n]', tail) if len(s.strip()) >= 4]
-    pronoun_start = sum(1 for s in tail_sentences if s and s[0] in "他她它")
-    result["metrics"]["ending_pronoun_start_ratio"] = round(
-        pronoun_start / max(len(tail_sentences), 1), 2
-    )
-
-    warn_threshold = int(cfg.get("chapter_ending_summary_warn", 3))
-    bad_threshold = int(cfg.get("chapter_ending_summary_bad", 5))
-
-    if marker_count >= bad_threshold or (marker_count >= warn_threshold and not has_dialogue):
-        result["penalty"] = 1.0
-        result["flags"].append(f"ending_summary_severe(markers={marker_count})")
-        examples = list(dict.fromkeys(markers))[:3]
-        result["directives"].append(
-            "章末总结病：最后%d字有%d处总结性叙述（%s），像散文收尾。"
-            "章末必须是前进的动作/对话/悬念，不是回顾式的'他知道/她明白'。"
-            % (tail_chars, marker_count, "、".join("「%s」" % m for m in examples))
-        )
-    elif marker_count >= warn_threshold:
-        result["penalty"] = 0.5
-        result["flags"].append(f"ending_summary(markers={marker_count})")
-        result["directives"].append(
-            "章末总结倾向（%d处标志词）：减少'他知道/她明白/这一切'式收束，"
-            "用动作或对话驱动结尾。" % marker_count
-        )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1142,7 +1056,7 @@ _OPENING_RELATIONSHIP_MARKERS = re.compile(
 )
 
 
-@REGISTRY.register("opening_hook_gate", config_key="opening_golden_gate_enabled", tag_prefix="opening")
+@REGISTRY.register("opening_hook_gate", config_key="opening_golden_gate_enabled", tag_prefix="opening", repair="L0")
 def opening_hook_gate(
     text: str,
     chapter_num: int,
@@ -1242,7 +1156,7 @@ def opening_hook_gate(
 # ---------------------------------------------------------------------------
 
 
-@REGISTRY.register("length_band_check", config_key="length_band_penalty_enabled", config_default=False, tag_prefix="length")
+@REGISTRY.register("length_band_check", config_key="length_band_penalty_enabled", config_default=False, tag_prefix="length", repair="L1")
 def length_band_check(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1296,7 +1210,7 @@ _FLAT_STRONG_PAYOFF_TYPES = {
 }
 
 
-@REGISTRY.register("flat_chapter_streak", config_key="flat_streak_gate_enabled", tag_prefix="flat_streak")
+@REGISTRY.register("flat_chapter_streak", config_key="flat_streak_gate_enabled", tag_prefix="flat_streak", repair="advisory")
 def flat_chapter_streak(
     recent_rows: list[dict[str, Any]] | None,
     config: dict[str, Any] | None = None,
@@ -1531,7 +1445,7 @@ def location_transition(
 # fed into both the draft loop (regenerate) and review (cap + reject).
 # ---------------------------------------------------------------------------
 
-@REGISTRY.register("adjacent_repetition", config_key="adjacent_repeat_enabled", tag_prefix="repeat")
+@REGISTRY.register("adjacent_repetition", config_key="adjacent_repeat_enabled", tag_prefix="repeat", repair="L2")
 def adjacent_repetition(
     text: str,
     prev_text: str,
@@ -1586,7 +1500,7 @@ def adjacent_repetition(
     return result
 
 
-@REGISTRY.register("hook_tail_repetition", config_key="adjacent_repeat_enabled", tag_prefix="hook")
+@REGISTRY.register("hook_tail_repetition", config_key="adjacent_repeat_enabled", tag_prefix="hook", repair="L1")
 def hook_tail_repetition(
     text: str,
     prev_texts: list[str] | None,
@@ -1633,7 +1547,7 @@ def hook_tail_repetition(
 # this fine because each paragraph reads well in isolation. This deterministic
 # check measures how much the chapter's TAIL re-states its own EARLIER content.
 
-@REGISTRY.register("intra_chapter_repetition", config_key="intra_repeat_enabled", tag_prefix="repeat")
+@REGISTRY.register("intra_chapter_repetition", config_key="intra_repeat_enabled", tag_prefix="repeat", repair="L1")
 def intra_chapter_repetition(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1725,7 +1639,7 @@ def _normalize_clause(s: str) -> str:
     return re.sub(r"[0-9一二三四五六七八九十两零]+", "#", s)
 
 
-@REGISTRY.register("cross_chapter_repetition", config_key="style_cross_repeat_enabled", tag_prefix="repeat")
+@REGISTRY.register("cross_chapter_repetition", config_key="style_cross_repeat_enabled", tag_prefix="repeat", repair="L0")
 def cross_chapter_repetition(
     text: str,
     prior_texts: list[str] | None,
@@ -1847,7 +1761,7 @@ def _overlaps_kept(phrase: str, kept: list[str], min_shared: int = 4) -> bool:
     return False
 
 
-@REGISTRY.register("book_wide_fossils", config_key="book_fossil_enabled", tag_prefix="fossil")
+@REGISTRY.register("book_wide_fossils", config_key="book_fossil_enabled", tag_prefix="fossil", repair="L0")
 def book_wide_fossils(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
@@ -1954,7 +1868,7 @@ def book_wide_fossils(
 # toward narration/internal-monologue when unconstrained.
 # ---------------------------------------------------------------------------
 
-@REGISTRY.register("dialogue_health", config_key="dialogue_health_enabled", tag_prefix="dialogue")
+@REGISTRY.register("dialogue_health", config_key="dialogue_health_enabled", tag_prefix="dialogue", repair="L1")
 def dialogue_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -2127,7 +2041,7 @@ _STOPWORD_TRIGRAMS = frozenset({
 })
 
 
-@REGISTRY.register("descriptor_frequency", config_key="descriptor_freq_enabled", tag_prefix="descriptor")
+@REGISTRY.register("descriptor_frequency", config_key="descriptor_freq_enabled", tag_prefix="descriptor", repair="L0")
 def descriptor_frequency(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
@@ -2299,7 +2213,7 @@ GENRE_KEYWORDS: dict[str, dict[str, list[str]]] = {
 }
 
 
-@REGISTRY.register("genre_adherence", config_key="genre_adherence_enabled", tag_prefix="genre")
+@REGISTRY.register("genre_adherence", config_key="genre_adherence_enabled", tag_prefix="genre", repair="L2")
 def genre_adherence(
     text: str,
     recent_scores: list[float] | None = None,
@@ -2337,7 +2251,14 @@ def genre_adherence(
         "negative_density": round(neg_density, 3),
     }
 
-    threshold = float(cfg.get("genre_drift_threshold", 0.0))
+    # The threshold MUST sit strictly below zero. `genre_score` is a signed
+    # keyword-density difference, and its library-wide median is exactly 0.000 --
+    # a large mass of chapters where neither the positive nor the negative
+    # keyword list matched at all. A threshold of 0.3 (the old template value)
+    # therefore scores "no evidence" as "drift": replayed over the library's 357
+    # real scores it puts 46.8% of chapters over the reject streak (86% in some
+    # novels). At -1.0 the same replay gives warn 4.8% / reject 2.5%.
+    threshold = float(cfg.get("genre_drift_threshold", -1.0))
     consec_warn = int(cfg.get("genre_drift_consecutive", 3))
     consec_reject = int(cfg.get("genre_drift_reject_consecutive", 5))
 
@@ -2369,7 +2290,15 @@ def genre_adherence(
             "持续偏离该体裁核心场景。"
             "本章必须回归体裁核心。"
         )
-        result["level"] = "reject"
+        # The reject path forces a STRUCTURAL replan, and this verdict rests on
+        # a keyword-density heuristic that has never been validated against a
+        # human read. Its streak lookup was broken from the start (see
+        # review.py), so it has never fired in 215 archived runs -- meaning the
+        # reject branch is untested in production. Replaying it over the
+        # library's real genre_score series rejects 9-11% of chapters in the
+        # tangshuting family, which would make it a top-3 replan source on
+        # heuristic evidence alone. Ship the measurement, gate the rejection.
+        result["level"] = "reject" if bool(cfg.get("genre_drift_reject_enabled", False)) else "advise"
     elif low_streak >= consec_warn:
         result["penalty"] = 0.5
         result["flags"].append(f"genre_drift_warn(streak={low_streak})")
@@ -2481,7 +2410,7 @@ def _fragment_hit(fragment: str, chapter_text: str, chapter_bigrams: set[str], m
     return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= min_bigram_cov
 
 
-@REGISTRY.register("beat_coverage", config_key="beat_coverage_enabled", tag_prefix="beat", phase="pipeline")
+@REGISTRY.register("beat_coverage", config_key="beat_coverage_enabled", tag_prefix="beat", phase="pipeline", repair="L1")
 def beat_coverage(
     chapter_text: str,
     plan: dict[str, Any],
@@ -2577,7 +2506,7 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-@REGISTRY.register("scene_similarity", config_key="scene_dedupe_enabled", tag_prefix="scene", phase="planning")
+@REGISTRY.register("scene_similarity", config_key="scene_dedupe_enabled", tag_prefix="scene", phase="planning", repair="L2")
 def scene_similarity(plan: dict[str, Any], recent_plans: list[dict[str, Any]]) -> dict[str, Any]:
     """Max Jaccard similarity of this plan's skeleton vs each recent plan.
 
@@ -2751,7 +2680,7 @@ _CONCRETE_ACTION_SIG = re.compile(
 )
 
 
-@REGISTRY.register("plan_executability_gate", config_key="plan_executability_gate_enabled", tag_prefix="plan", phase="planning")
+@REGISTRY.register("plan_executability_gate", config_key="plan_executability_gate_enabled", tag_prefix="plan", phase="planning", repair="L2")
 def plan_executability_gate(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Deterministic check that the plan's payoff/climax is a shootable action.
 
@@ -2905,7 +2834,7 @@ def _sequence_similarity(a: list[str], b: list[str]) -> float:
     return 0.7 * set_sim + 0.3 * order_sim
 
 
-@REGISTRY.register("narrative_pattern_repetition", config_key="narrative_pattern_enabled", tag_prefix="pattern", phase="planning")
+@REGISTRY.register("narrative_pattern_repetition", config_key="narrative_pattern_enabled", tag_prefix="pattern", phase="planning", repair="L2")
 def narrative_pattern_repetition(
     plan: dict[str, Any],
     recent_plans: list[dict[str, Any]],
@@ -3064,7 +2993,7 @@ _CONCRETE_VISUAL_NOUNS = (
 )
 
 
-@REGISTRY.register("plan_visual_payoff_check", config_key="plan_visual_payoff_enabled", config_default=True, tag_prefix="plan", phase="planning")
+@REGISTRY.register("plan_visual_payoff_check", config_key="plan_visual_payoff_enabled", config_default=True, tag_prefix="plan", phase="planning", repair="L2")
 def plan_visual_payoff_check(plan: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Detect abstract mystery payoffs before prose generation.
 
@@ -3172,7 +3101,7 @@ _PSEUDO_TECH_TERMS = re.compile(
 )
 
 
-@REGISTRY.register("prose_texture", config_key="prose_texture_enabled", tag_prefix="texture")
+@REGISTRY.register("prose_texture", config_key="prose_texture_enabled", tag_prefix="texture", repair="advisory")
 def prose_texture(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3250,7 +3179,7 @@ def prose_texture(
     }
 
 
-@REGISTRY.register("emotional_cadence", config_key="emotional_cadence_enabled", config_default=True, tag_prefix="cadence", phase="planning")
+@REGISTRY.register("emotional_cadence", config_key="emotional_cadence_enabled", config_default=True, tag_prefix="cadence", phase="planning", repair="L2")
 def emotional_cadence(
     recent_tones: list[str],
     config: dict[str, Any] | None = None,
@@ -3467,7 +3396,7 @@ def chapter_mode_monotony(
     return result
 
 
-@REGISTRY.register("long_span_fatigue", config_key="long_span_fatigue_enabled", tag_prefix="fatigue")
+@REGISTRY.register("long_span_fatigue", config_key="long_span_fatigue_enabled", tag_prefix="fatigue", repair="advisory")
 def long_span_fatigue(
     conn: Any,
     chapter_num: int,
@@ -3585,7 +3514,7 @@ _PAYOFF_MARKERS = re.compile(
 )
 
 
-@REGISTRY.register("payoff_beat_density", config_key="payoff_density_enabled", tag_prefix="payoff")
+@REGISTRY.register("payoff_beat_density", config_key="payoff_density_enabled", tag_prefix="payoff", repair="advisory")
 def payoff_beat_density(
     text: str,
     recent_payoff_types: list[str] | None = None,
@@ -3668,7 +3597,7 @@ def _quotable_score(line: str) -> float:
     return s
 
 
-@REGISTRY.register("shareable_line", config_key="shareable_line_enabled", tag_prefix="shareable")
+@REGISTRY.register("shareable_line", config_key="shareable_line_enabled", tag_prefix="shareable", repair="advisory")
 def shareable_line(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3723,7 +3652,7 @@ def shareable_line(
     return result
 
 
-@REGISTRY.register("information_density", config_key="info_density_enabled", tag_prefix="info")
+@REGISTRY.register("information_density", config_key="info_density_enabled", tag_prefix="info", repair="advisory")
 def information_density(
     text: str,
     plan: dict[str, Any] | None = None,

@@ -42,6 +42,8 @@ PLAN_TAGS = frozenset({
     "plan_candidate",
     "plan_screen",
     "plan_arbitrate",
+    "arc_plan",
+    "arc_card_repair",
     "structural_diagnose",
     "bootstrap",
     "bootstrap_bible",

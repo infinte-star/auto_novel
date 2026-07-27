@@ -47,6 +47,12 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 PROJECT_DIR = Path(__file__).resolve().parent
 NOVELS_DIR = PROJECT_DIR / "novels"
 CONFIG_TEMPLATE = PROJECT_DIR / "config_template.yaml"
+# `config_template.yaml` carries live API keys and is gitignored, so a fresh
+# clone does not have one. The example is the same file with every credential
+# and endpoint blanked; `create` falls back to it and tells the user to fill in
+# the keys. Keeping the real template untracked is what stops `git commit -a`
+# from publishing the keys.
+CONFIG_TEMPLATE_EXAMPLE = PROJECT_DIR / "config_template.example.yaml"
 PROMPT_TEMPLATE = PROJECT_DIR / "prompt_template.md"
 PLACEHOLDER = "__NOVEL__"
 
@@ -91,16 +97,23 @@ def cmd_create(name: str) -> int:
     if target.exists():
         print(f"[novel] ERROR: {target} already exists; refusing to overwrite.")
         return 2
-    if not CONFIG_TEMPLATE.exists():
-        print(f"[novel] ERROR: template not found: {CONFIG_TEMPLATE}")
+    template = CONFIG_TEMPLATE if CONFIG_TEMPLATE.exists() else CONFIG_TEMPLATE_EXAMPLE
+    if not template.exists():
+        print(f"[novel] ERROR: template not found: {CONFIG_TEMPLATE} "
+              f"(nor the fallback {CONFIG_TEMPLATE_EXAMPLE.name})")
         return 2
 
     (target / "chapters").mkdir(parents=True, exist_ok=True)
     (target / "memory").mkdir(parents=True, exist_ok=True)
     (target / "logs").mkdir(parents=True, exist_ok=True)
 
-    config_text = CONFIG_TEMPLATE.read_text(encoding="utf-8").replace(PLACEHOLDER, name)
+    config_text = template.read_text(encoding="utf-8").replace(PLACEHOLDER, name)
     (target / "config.yaml").write_text(config_text, encoding="utf-8")
+    if template is CONFIG_TEMPLATE_EXAMPLE:
+        print(f"[novel] NOTE: {CONFIG_TEMPLATE.name} not found; scaffolded from "
+              f"{CONFIG_TEMPLATE_EXAMPLE.name}, which has NO API credentials. "
+              f"Fill in api.base_url / api.api_key in {target / 'config.yaml'} "
+              f"before running.")
 
     prompt_text = (
         PROMPT_TEMPLATE.read_text(encoding="utf-8")
@@ -1144,6 +1157,139 @@ def _llm_tag_breakdown(nd: Path) -> list[tuple[str, int]] | None:
     return sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
 
 
+_FPY_REWORK_MARKERS: dict[str, tuple[str, ...]] = {
+    # (label, glob pattern) — a chapter is NOT first-pass if any pattern matches.
+    "replan": ("plan_quality_replan_*_candidates.json", "plan_critical_*_candidates.json"),
+    "plan_retry": ("plan_initial_attempt[1-9]*_candidates.json",),
+    "revise": ("chapter_revised_round*.md", "quality_debt_patched.md", "local_fix_round*.md"),
+    "re_review": ("review_round[1-9]*.json",),
+    "debt": ("quality_debt.json",),
+    "hook_redo": ("hook_revised.json",),
+}
+
+
+def _fpy_stats(nd: Path) -> dict[str, Any] | None:
+    """First-Pass Yield: fraction of chapters written with zero rework.
+
+    A chapter counts as first-pass when its checkpoint dir shows exactly one
+    plan attempt, no replan, one review round, no revision/patch/hook redo and
+    no quality debt. Derived from ``logs/checkpoints/chNNNN/`` artifacts (exact,
+    per-chapter) rather than llm_calls.jsonl (which has no chapter field).
+
+    FPY is the north-star metric: every point of it removes a whole rework loop
+    from the critical path. Returns None when no completed chapter is found.
+    """
+    ck_root = nd / "logs" / "checkpoints"
+    if not ck_root.is_dir():
+        return None
+
+    total = 0
+    clean = 0
+    reasons: dict[str, int] = {k: 0 for k in _FPY_REWORK_MARKERS}
+    dirty_chapters: list[int] = []
+
+    for ch_dir in sorted(ck_root.glob("ch[0-9]*")):
+        if not ch_dir.is_dir() or not (ch_dir / "chapter_completed.json").exists():
+            continue  # only fully-finished chapters are comparable
+        total += 1
+        hits = [
+            label
+            for label, patterns in _FPY_REWORK_MARKERS.items()
+            if any(next(ch_dir.glob(p), None) is not None for p in patterns)
+        ]
+        if hits:
+            for label in hits:
+                reasons[label] += 1
+            try:
+                dirty_chapters.append(int(ch_dir.name[2:]))
+            except ValueError:
+                pass
+        else:
+            clean += 1
+
+    if total == 0:
+        return None
+    return {
+        "total": total,
+        "clean": clean,
+        "fpy": clean / total,
+        "reasons": reasons,
+        "dirty_chapters": dirty_chapters,
+    }
+
+
+def _print_fpy(nd: Path) -> None:
+    """Render the FPY block for `novel.py stats`. Silent when no data."""
+    fpy = _fpy_stats(nd)
+    if fpy is None:
+        return
+    total = fpy["total"]
+    print()
+    print(f"First-pass yield: {fpy['clean']}/{total} = {fpy['fpy']:.0%}   (zero-rework chapters)")
+    rework = [(lbl, n) for lbl, n in fpy["reasons"].items() if n]
+    if rework:
+        print("  rework causes (chapters affected, may overlap):")
+        for label, n in sorted(rework, key=lambda x: x[1], reverse=True):
+            print(f"    {label:<12} {n:>4}  ({n / total:>5.0%})")
+
+
+# Roles worth reporting reasoning coverage for, in pipeline order.
+_REASONING_TAGS = ("write", "arc_plan", "plan_candidate", "plan_arbitrate", "review_chapter", "extract_events")
+
+
+def _reasoning_coverage(nd: Path) -> list[tuple[str, int, int]] | None:
+    """Share of successful LLM calls per tag that actually streamed reasoning.
+
+    The ``{role}_thinking_mode`` / ``{role}_reasoning_effort`` knobs are requests,
+    not guarantees. Reseller gateways route one model name to several upstreams and
+    honour the knobs inconsistently: measured 2026-07-27 against
+    ``ai.littlesheep.cc/v1`` + ``deepseek-v4-pro``, all 11 probe calls streamed
+    5.7k-7.2k reasoning chars — including the ``thinking: {"type": "disabled"}``
+    tier the writing role actually asks for — while the same novel's 107 production
+    write calls days earlier streamed none. Across the library, reasoning shows up
+    on 0% of calls most days and 47-69% on others.
+
+    So reasoning presence is an uncontrolled variable in every A/B this repo runs.
+    Print it next to FPY so a run can't be compared against another without seeing
+    whether the writer was thinking in both. Returns None when nothing is logged.
+    """
+    metrics_path = nd / "logs" / "llm_calls.jsonl"
+    if not metrics_path.exists():
+        return None
+    counts: dict[str, list[int]] = {}
+    try:
+        with metrics_path.open(encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("ok") is not True:
+                    continue
+                slot = counts.setdefault(str(row.get("tag") or "?"), [0, 0])
+                slot[0] += 1
+                if int(row.get("reasoning_chars") or 0) > 0:
+                    slot[1] += 1
+    except OSError:
+        return None
+    rows = [(tag, *counts[tag]) for tag in _REASONING_TAGS if tag in counts]
+    return rows or None
+
+
+def _print_reasoning_coverage(nd: Path) -> None:
+    """Render the reasoning-coverage block for `novel.py stats`. Silent when no data."""
+    rows = _reasoning_coverage(nd)
+    if rows is None:
+        return
+    print()
+    print("Reasoning actually streamed (gateway may ignore the thinking/effort knobs):")
+    for tag, calls, thinking in rows:
+        print(f"    {tag:<16} {thinking:>5}/{calls:<5} = {thinking / calls:>4.0%}")
+
+
 def cmd_stats(name: str) -> int:
     """Rich quality + cost report for a specific novel."""
     nd = NOVELS_DIR / name
@@ -1206,6 +1352,10 @@ def cmd_stats(name: str) -> int:
             f"Force-accepted: {force_accepted_total}/{total_ckpts}"
         )
 
+    # ── First-pass yield (north-star) ────────────────────────────────────────
+    _print_fpy(nd)
+    _print_reasoning_coverage(nd)
+
     # ── LLM cost summary ─────────────────────────────────────────────────────
     llm_stats = _llm_call_stats(nd)
     if llm_stats is not None:
@@ -1217,6 +1367,13 @@ def cmd_stats(name: str) -> int:
             f"Total chars: {_fmt_chars(total_llm_chars)}   "
             f"Est. cost: ~${cost:.2f}"
         )
+        _fpy = _fpy_stats(nd)
+        if _fpy and _fpy["total"]:
+            print(
+                f"Per chapter: {ok_calls / _fpy['total']:.1f} calls   "
+                f"{_fmt_chars(int(prompt_chars / _fpy['total']))} prompt   "
+                f"~${cost / _fpy['total']:.2f}"
+            )
 
     # ── Per-tag breakdown ────────────────────────────────────────────────────
     tag_breakdown = _llm_tag_breakdown(nd)
@@ -1426,12 +1583,23 @@ def main() -> int:
     p_compare = sub.add_parser("compare", help="deterministic side-by-side report for two novels (scores/penalties/cost/config diff)")
     p_compare.add_argument("name_a")
     p_compare.add_argument("name_b")
+    p_compare.add_argument("--from", dest="ch_from", type=int, default=0,
+                           help="first chapter to include in the chapter metrics (fork A/B: the fork point + 1)")
+    p_compare.add_argument("--to", dest="ch_to", type=int, default=0,
+                           help="last chapter to include in the chapter metrics")
 
     p_ablate = sub.add_parser("ablate", help="scaffold a chapter-capped copy of a novel with ONE config key flipped")
     p_ablate.add_argument("name")
     p_ablate.add_argument("--flip", required=True, help="config key to flip, e.g. style_cross_repeat_enabled")
     p_ablate.add_argument("--set", dest="set_value", default=None, help="explicit new value (required for non-boolean keys)")
     p_ablate.add_argument("--chapters", type=int, default=8, help="max_chapters cap for the ablation run (default 8)")
+
+    p_fork = sub.add_parser("fork", help="fork a novel at its current head into a new novel that continues from there (mid-book A/B)")
+    p_fork.add_argument("name")
+    p_fork.add_argument("--as", dest="as_name", required=True, help="name of the new novel")
+    p_fork.add_argument("--flip", default=None, help="optional config key to flip in the fork, e.g. arc_planning_enabled")
+    p_fork.add_argument("--set", dest="set_value", default=None, help="explicit new value for --flip (required for non-boolean keys)")
+    p_fork.add_argument("--chapters", type=int, default=30, help="how many MORE chapters the fork should write (default 30)")
 
     p_telemetry = sub.add_parser("telemetry", help="global cross-novel telemetry repository")
     telemetry_sub = p_telemetry.add_subparsers(dest="telemetry_command", required=True)
@@ -1481,10 +1649,15 @@ def main() -> int:
         return cmd_refine(args.name)
     if args.command == "compare":
         from compare import cmd_compare
-        return cmd_compare(args.name_a, args.name_b)
+        return cmd_compare(args.name_a, args.name_b, ch_from=args.ch_from, ch_to=args.ch_to)
     if args.command == "ablate":
         from compare import cmd_ablate
         return cmd_ablate(args.name, flip_key=args.flip, set_value=args.set_value, chapters=args.chapters)
+
+    if args.command == "fork":
+        from compare import cmd_fork
+        return cmd_fork(args.name, as_name=args.as_name, flip_key=args.flip,
+                        set_value=args.set_value, chapters=args.chapters)
     if args.command == "telemetry":
         if args.telemetry_command == "backfill":
             return cmd_telemetry_backfill()

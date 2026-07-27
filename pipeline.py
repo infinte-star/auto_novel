@@ -55,6 +55,7 @@ from review import adaptive_replan, anchor_completion_gate, horizon_review, revi
 from store import db_event, init_db, validate_plan_continuity
 from writing import extract_events, revise_chapter, save_chapter, update_state_file, update_structured_state, write_chapter
 from writing import apply_review_patches
+import fix
 import telemetry
 
 
@@ -488,14 +489,7 @@ def write_chapter_with_candidates(
 
     if len(valid) == 1:
         idx, text = valid[0]
-        if bool(config["novel"].get("em_dash_reduce_enabled", True)):
-            try:
-                from quality import style_health as _sh1, reduce_em_dash_density as _red1
-                _m1 = _sh1(text, config)
-                if float(_m1.get("metrics", {}).get("em_dash_per_kchar", 0)) > float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0)):
-                    text = _red1(text, config)
-            except Exception:
-                pass
+        text = fix.reduce_em_dash_if_needed(text, config)
         log(paths, f"Only 1/{n} valid draft for Ch{chapter_num} idx={idx}; skipping comparative review")
         return text, None
 
@@ -514,16 +508,7 @@ def write_chapter_with_candidates(
         idx, text = item
         # Pre-review em-dash reduction: clean the text before scoring so the
         # style_health penalty reflects the final saved version, not the raw draft.
-        if bool(config["novel"].get("em_dash_reduce_enabled", True)):
-            try:
-                from quality import style_health as _sh_pre, reduce_em_dash_density as _red_pre
-                _sh_m = _sh_pre(text, config)
-                _em_d = float(_sh_m.get("metrics", {}).get("em_dash_per_kchar", 0))
-                _em_tgt = float(config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
-                if _em_d > _em_tgt:
-                    text = _red_pre(text, config)
-            except Exception:
-                pass
+        text = fix.reduce_em_dash_if_needed(text, config)
         try:
             report = review_chapter(client, paths, conn, config, chapter_num, plan, text, tail, cached_memory=cached_memory, chapter_aux_cache=_aux)
         except Exception as exc:
@@ -782,6 +767,102 @@ def _apply_force_accept_patches(
     )
     log(paths, f"Quality-debt patch landing Ch{chapter_num}: applied={applied}/{total}")
     return patched, new_review
+
+
+def _hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[str]:
+    """Enumerate the DETERMINISTIC reasons this draft is a write-off.
+
+    These are the checks in `review.py` that set ``accepted = False`` on their own
+    evidence rather than by comparing the LLM's self-score against a threshold:
+    gate rejects, style collapse, hard factcheck contradictions, gross length,
+    hard blocks from the opening / adjacent-repetition gates, and a pile-up of
+    unmet arbiter constraints. Every one of them is measured, not judged.
+    """
+    cfg = config["novel"]
+    reasons: list[str] = []
+
+    grs = [g for g in (review.get("gate_rejects") or []) if isinstance(g, dict)]
+    if grs:
+        reasons.append("gate_rejects=" + ",".join(str(g.get("gate", "?")) for g in grs[:4]))
+
+    sh_pen = float((review.get("style_health") or {}).get("penalty", 0.0) or 0.0)
+    if sh_pen >= float(cfg.get("style_penalty_block", 2.0)):
+        reasons.append(f"style_collapse(penalty={sh_pen:.1f})")
+
+    if bool(cfg.get("factcheck_hard_blocks_accept", True)):
+        hard = [c for c in (review.get("contradictions") or [])
+                if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
+        if hard:
+            reasons.append(f"hard_contradictions={len(hard)}")
+
+    hard_contract = [c for c in (review.get("contract_violations") or [])
+                     if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
+    if hard_contract and bool(cfg.get("contract_blocks_accept", True)):
+        reasons.append(f"hard_contract={len(hard_contract)}")
+
+    for key, label in (("length_band", "length_band"), ("opening_hook_gate", "opening_gate")):
+        if (review.get(key) or {}).get("block"):
+            reasons.append(f"{label}_block")
+    if str((review.get("adjacent_repetition") or {}).get("level", "")) == "block":
+        reasons.append("adjacent_repeat_block")
+
+    failed = review.get("constraint_violations_structured") or []
+    if len(failed) >= int(cfg.get("constraint_violation_block_count", 3)):
+        reasons.append(f"constraints_unmet={len(failed)}")
+
+    return reasons
+
+
+def _rework_needed(
+    review: dict[str, Any],
+    config: dict[str, Any],
+    chapter_num: int = 0,
+) -> tuple[bool, str]:
+    """THE rework predicate: does this draft have to be revised/replanned?
+
+    Two modes, chosen by ``rework_trigger``:
+
+    ``score`` (default) — the historical behaviour, bit for bit:
+    ``score < quality_threshold or not accepted``.
+
+    ``deterministic`` — rework only on measured evidence. Motivation (REDESIGN
+    L5/L6): `quality_threshold` is 8.0 and the library's 1023 measured self-scores
+    have a median of exactly 8.00, so a third of all chapters enter the rework
+    loop *by construction*. That same self-score has no demonstrated
+    discrimination (1021 chapters span 7.4-8.7, 6 rejections), which means the
+    difference between 7.6 and 8.1 is noise — and the pipeline currently answers
+    noise with a structural replan, the #1 rework cause in every novel.
+    So here rework fires only on (a) a deterministic hard block, (b) a score under
+    ``rework_score_floor`` (default 6.5, aligned with `circuit_breaker_score_floor`,
+    the bottom 6% of the distribution), or (c) an `accepted=False` that the score
+    comparison cannot explain — i.e. some block we did not enumerate above.
+    Everything in between is accepted as written and handed to the repair ladder.
+
+    Returns ``(needed, reason)``; *reason* is empty when no rework is needed.
+    """
+    cfg = config["novel"]
+    score = safe_score(review.get("score", 0))
+    accepted = bool(review.get("accepted", True))
+    threshold = float(cfg["quality_threshold"])
+
+    if str(cfg.get("rework_trigger", "score")).strip().lower() != "deterministic":
+        if score < threshold:
+            return True, f"score {score}/10 < threshold {threshold}"
+        if not accepted:
+            return True, "review marked not accepted"
+        return False, ""
+
+    reasons = _hard_block_reasons(review, config)
+    floor = float(cfg.get("rework_score_floor", 6.5))
+    if score < floor:
+        reasons.append(f"score {score}/10 < floor {floor}")
+    if not accepted and not reasons and score >= threshold:
+        # accepted=False that the threshold cannot explain: an unenumerated
+        # deterministic block fired. Fail towards rework, never silently past it.
+        reasons.append("accepted=False with no threshold shortfall")
+    if reasons:
+        return True, "; ".join(reasons)
+    return False, ""
 
 
 def _classify_replan_failure(review: dict[str, Any], config: dict[str, Any]) -> tuple[str, str]:
@@ -1227,9 +1308,14 @@ def _stage_review_revise(state: ChapterState) -> None:
                 state.chapter = normalize_chapter(str(revised))
                 log(state.paths, f"Resuming revised chapter Ch{state.chapter_num} round={round_num}")
             else:
+                # Report the trigger's own reason: in `deterministic` mode the
+                # threshold is not what put us here, and a "< 8.0" log line
+                # would misattribute every revise in the A/B.
+                _rw_reason = _rework_needed(state.review, state.config, state.chapter_num)[1] \
+                    or f"score={state.review.get('score')}/10 < {threshold}"
                 log(
                     state.paths,
-                    f"Revising Ch{state.chapter_num} round={round_num} because score={state.review.get('score')}/10 < {threshold}",
+                    f"Revising Ch{state.chapter_num} round={round_num} because {_rw_reason}",
                 )
                 revised_text = revise_chapter(
                     state.client, state.paths, state.conn, state.config,
@@ -1287,6 +1373,20 @@ def _stage_review_revise(state: ChapterState) -> None:
         if signal == "converged":
             state.review["accepted"] = True
             break
+        # Deterministic mode: the tracker can only ever report "converged" for a
+        # chapter that cleared `quality_threshold` AND was accepted (record()
+        # requires both), so lowering its threshold would never let a 7.6 out.
+        # Ask the trigger directly instead — same place, same shape as the
+        # macro-fail early break above.
+        needed, why = _rework_needed(state.review, state.config, state.chapter_num)
+        if not needed:
+            state.review["accepted"] = True
+            log(
+                state.paths,
+                f"Ch{state.chapter_num} round={round_num} accepted without rework "
+                f"(score={current_score}/10, no deterministic block).",
+            )
+            break
         if signal != "continue" and round_num > 0:
             log(
                 state.paths,
@@ -1299,12 +1399,14 @@ def _stage_review_revise(state: ChapterState) -> None:
 def _stage_quality_replan(state: ChapterState) -> None:
     """Handle quality replan routing: local fix, structural replan, force-accept."""
     threshold = float(state.config["novel"]["quality_threshold"])
+    rework, rework_reason = _rework_needed(state.review, state.config, state.chapter_num)
     if not (
         bool(state.config["novel"].get("replan_on_low_quality", True))
-        and (safe_score(state.review.get("score", 0)) < threshold or not state.review.get("accepted", True))
+        and rework
         and not load_checkpoint(state.paths, state.chapter_num, "quality_replan_done.json")
     ):
         return
+    log(state.paths, f"Rework triggered Ch{state.chapter_num}: {rework_reason}")
 
     try:
         fail_kind, fail_reason = _classify_replan_failure(state.review, state.config)
@@ -1349,10 +1451,7 @@ def _stage_quality_replan(state: ChapterState) -> None:
                     save_checkpoint(state.paths, state.chapter_num, CHAPTER_CURRENT_CHECKPOINT, state.chapter)
                     save_checkpoint(state.paths, state.chapter_num, "final_review.json", state.review)
                     improved = True
-                if (
-                    safe_score(local_review.get("score", 0)) >= threshold
-                    and local_review.get("accepted", True)
-                ):
+                if not _rework_needed(local_review, state.config, state.chapter_num)[0]:
                     state.review["accepted"] = True
                     break
             save_checkpoint(
@@ -1493,11 +1592,63 @@ def _stage_quality_replan(state: ChapterState) -> None:
         log(state.paths, f"Quality replan failed (non-fatal) Ch{state.chapter_num}: {exc}")
 
 
+def _accept_without_debt(state: ChapterState) -> None:
+    """Accept a draft that needs no rework, keeping the books clean.
+
+    Only reachable in ``rework_trigger: deterministic`` (in score mode a draft
+    that needs no rework is at or above `quality_threshold`, so nothing here
+    changes). It exists to keep two ledgers honest for the 7.x band that the
+    deterministic trigger now lets through:
+
+    - `force_accepted` / `quality_debt.json` MUST NOT be stamped. The circuit
+      breaker counts consecutive chapters under `circuit_breaker_score_floor` and
+      refine prioritizes quality-debt chapters; flooding both with noise-band
+      chapters would blind them to the real ones.
+    - the chapter is still worth a breadcrumb, so a light `quality_note` event is
+      recorded with the score and any advisory gate flags.
+    """
+    if str(state.config["novel"].get("rework_trigger", "score")).strip().lower() != "deterministic":
+        return
+    score = safe_score(state.review.get("score", 0))
+    threshold = float(state.config["novel"]["quality_threshold"])
+    # Adopt an earlier, strictly better draft if one exists and it is also clean.
+    best_score = safe_score(state.best_review.get("score", 0))
+    if (
+        best_score > score
+        and state.best_chapter
+        and not _rework_needed(state.best_review, state.config, state.chapter_num)[0]
+    ):
+        state.chapter = state.best_chapter
+        state.review = dict(state.best_review)
+        score = best_score
+    state.review["accepted"] = True
+    if score >= threshold:
+        return
+    try:
+        note = {
+            "chapter": state.chapter_num,
+            "score": score,
+            "threshold": threshold,
+            "style_penalty": (state.review.get("style_health") or {}).get("penalty", 0.0),
+            "rhythm_risks": [str(r) for r in (state.review.get("rhythm_risks") or [])[:6]],
+        }
+        db_event(state.conn, state.chapter_num, "quality_note", note)
+        log(
+            state.paths,
+            f"Ch{state.chapter_num} accepted below threshold without rework "
+            f"(score={score}/10 < {threshold}, no deterministic block) — "
+            f"logged as quality_note, NOT quality debt.",
+        )
+    except Exception as exc:
+        log(state.paths, f"Quality-note record failed (non-fatal) Ch{state.chapter_num}: {exc}")
+
+
 def _stage_force_accept(state: ChapterState) -> None:
     """Fall back to the best draft and handle force-accept when quality is still below threshold."""
     threshold = float(state.config["novel"]["quality_threshold"])
     max_rounds = int(state.config["novel"]["max_revision_rounds"])
-    if not (safe_score(state.review.get("score", 0)) < threshold or not state.review.get("accepted", True)):
+    if not _rework_needed(state.review, state.config, state.chapter_num)[0]:
+        _accept_without_debt(state)
         return
 
     state.chapter = state.best_chapter
@@ -1553,7 +1704,7 @@ def _stage_force_accept(state: ChapterState) -> None:
         except Exception as exc:
             log(state.paths, f"Hard-floor replan Ch{state.chapter_num} failed: {exc}. Falling back to force-accept.")
 
-    if safe_score(state.review.get("score", 0)) < threshold or not state.review.get("accepted", True):
+    if _rework_needed(state.review, state.config, state.chapter_num)[0]:
         consecutive_force_accept_limit = int(state.config["novel"].get("consecutive_force_accept_limit", 2))
         breaker_floor = float(state.config["novel"].get("circuit_breaker_score_floor", 7.0))
         if consecutive_force_accept_limit > 0 and state.chapter_num > consecutive_force_accept_limit:
@@ -1639,6 +1790,81 @@ def _stage_force_accept(state: ChapterState) -> None:
         log(state.paths, f"Quality-debt registered Ch{state.chapter_num} (score={state.review.get('score')}/10) for refine priority")
     except Exception as exc:
         log(state.paths, f"Quality-debt registration failed (non-fatal) Ch{state.chapter_num}: {exc}")
+
+
+def _stage_fix(state: ChapterState) -> None:
+    """Repair ladder: fix what the gates found instead of re-rolling the chapter.
+
+    Runs after the chapter has been accepted (by conviction or by force), so the
+    text it sees is final and it can only improve what ships. L0 is deterministic
+    and always runs; L1 spends at most `fix_max_l1_calls` bounded calls, and is
+    skipped entirely for a force-accepted draft — that chapter failed a replan, so
+    its problems are structural and a定点 patch would only paper over them.
+
+    Every fixer inside `fix.py` re-measures its own gate and returns the original
+    text when the repair did not help, so this stage cannot make a chapter worse.
+    """
+    cfg = state.config["novel"]
+    if not bool(cfg.get("fix_ladder_enabled", True)):
+        return
+    review = state.review or {}
+    try:
+        planned = fix.plan_repairs(review, state.config)
+    except Exception as exc:
+        log(state.paths, f"Fix ladder planning failed (non-fatal) Ch{state.chapter_num}: {exc}")
+        return
+    if not planned:
+        return
+
+    before_len = len(state.chapter)
+    try:
+        fixed, applied_l0 = fix.apply_l0(state.chapter, review, state.config, state.chapter_num)
+    except Exception as exc:
+        log(state.paths, f"Fix L0 failed (non-fatal) Ch{state.chapter_num}: {exc}")
+        fixed, applied_l0 = state.chapter, []
+
+    applied_l1: list[str] = []
+    l1_wanted = [s["action"] for s in planned if s["layer"] == "L1"]
+    if l1_wanted and not review.get("force_accepted"):
+        try:
+            fixed, applied_l1 = fix.apply_l1(
+                state.client, state.paths, state.config, state.chapter_num, fixed, review,
+            )
+        except Exception as exc:
+            log(state.paths, f"Fix L1 failed (non-fatal) Ch{state.chapter_num}: {exc}")
+
+    if not (applied_l0 or applied_l1):
+        return
+    state.chapter = normalize_chapter(fixed)
+    save_checkpoint(state.paths, state.chapter_num, CHAPTER_CURRENT_CHECKPOINT, state.chapter)
+    save_checkpoint(state.paths, state.chapter_num, "fix_ladder.json", {
+        "planned": planned,
+        "applied_l0": applied_l0,
+        "applied_l1": applied_l1,
+        "chars_before": before_len,
+        "chars_after": len(state.chapter),
+    })
+    log(
+        state.paths,
+        f"Fix ladder Ch{state.chapter_num}: L0={applied_l0 or '-'} L1={applied_l1 or '-'} "
+        f"chars {before_len}->{len(state.chapter)}",
+    )
+    # Re-measure the prose metrics on the text we actually ship, but record it
+    # under a SEPARATE key: `style_health` is the measurement the score was
+    # computed from, and overwriting it would leave `score` and `style_penalty`
+    # describing different texts in chapter_metrics.
+    try:
+        from quality import style_health as _sh_fix
+        after = _sh_fix(state.chapter, state.config)
+        state.review["style_health_after_fix"] = after
+        save_checkpoint(state.paths, state.chapter_num, "final_review.json", state.review)
+        log(
+            state.paths,
+            f"Fix ladder Ch{state.chapter_num} style penalty "
+            f"{(review.get('style_health') or {}).get('penalty', 0.0)} -> {after.get('penalty', 0.0)}",
+        )
+    except Exception:
+        pass
 
 
 def _stage_hook_revise(state: ChapterState) -> None:
@@ -1750,21 +1976,13 @@ def _stage_save(state: ChapterState) -> None:
         except Exception as exc:
             log(state.paths, f"Chapter title refine failed (non-fatal) Ch{state.chapter_num}: {exc}")
 
-    if bool(state.config["novel"].get("em_dash_reduce_enabled", True)):
-        try:
-            from quality import style_health as _sh_final, reduce_em_dash_density as _reduce_em
-            _sh_f = _sh_final(state.chapter, state.config)
-            _em_f = float(_sh_f.get("metrics", {}).get("em_dash_per_kchar", 0))
-            _em_tgt = float(state.config["novel"].get("em_dash_reduce_target_per_kchar", 3.0))
-            if _em_f > _em_tgt:
-                _before = state.chapter.count("——")
-                state.chapter = _reduce_em(state.chapter, state.config)
-                _after = state.chapter.count("——")
-                if _before != _after:
-                    log(state.paths, f"Pre-save em-dash reduction Ch{state.chapter_num}: {_before}->{_after} dashes, {_em_f:.1f}/k")
-                    save_checkpoint(state.paths, state.chapter_num, CHAPTER_CURRENT_CHECKPOINT, state.chapter)
-        except Exception as exc:
-            log(state.paths, f"Pre-save em-dash reduction failed (non-fatal) Ch{state.chapter_num}: {exc}")
+    _before = state.chapter.count("——")
+    _reduced = fix.reduce_em_dash_if_needed(state.chapter, state.config)
+    if _reduced != state.chapter:
+        state.chapter = _reduced
+        log(state.paths, f"Pre-save em-dash reduction Ch{state.chapter_num}: "
+                         f"{_before}->{state.chapter.count('——')} dashes")
+        save_checkpoint(state.paths, state.chapter_num, CHAPTER_CURRENT_CHECKPOINT, state.chapter)
 
     if chapter_path(state.paths, state.chapter_num).exists():
         log(state.paths, f"Chapter file already exists Ch{state.chapter_num}; skipping duplicate save")
@@ -2034,11 +2252,15 @@ def generate_one_chapter(
 
     threshold = float(config["novel"]["quality_threshold"])
     final_review = load_checkpoint(paths, chapter_num, "final_review.json")
+    # Authority goes through the same rework predicate the stages use. In `score`
+    # mode this is exactly `score >= threshold and accepted`, as before; in
+    # `deterministic` mode it is what keeps a legitimately-shipped 7.x chapter
+    # from being re-reviewed from scratch on every resume.
     final_is_authoritative = (
         isinstance(final_review, dict)
         and (
-            (safe_score(final_review.get("score", 0)) >= threshold and final_review.get("accepted", True))
-            or bool(final_review.get("force_accepted"))
+            bool(final_review.get("force_accepted"))
+            or not _rework_needed(final_review, config, chapter_num)[0]
         )
     )
     if final_is_authoritative:
@@ -2057,6 +2279,7 @@ def generate_one_chapter(
         _stage_review_revise(state)
         _stage_quality_replan(state)
         _stage_force_accept(state)
+        _stage_fix(state)
         _stage_hook_revise(state)
         save_checkpoint(paths, chapter_num, CHAPTER_CURRENT_CHECKPOINT, state.chapter)
         save_checkpoint(paths, chapter_num, "final_review.json", state.review)

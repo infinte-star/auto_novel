@@ -212,10 +212,6 @@ def _migrate_monolithic_to_shards(paths: Paths) -> None:
         )
 
 
-def bool_enabled(paths: Paths) -> bool:  # noqa: D401 - tiny helper
-    return True
-
-
 def _load_index(paths: Paths) -> dict[str, Any] | None:
     """Return the merged index dict {passages, df, chapters, n_docs} or None.
 
@@ -419,6 +415,53 @@ def retrieval_block(
     return "\n".join(lines)
 
 
+_DIALOGUE_QUOTES = (("“", "”"), ("「", "」"), ("『", "』"))
+
+# Per-novel cache of (chapter -> (head_text, dialogue_ratio)). exemplar_block is
+# called once per write, and without this it would re-read the same handful of
+# exemplar files from disk on every chapter — the "per-write full-chapter disk
+# I/O" that got this feature switched off in the first place.
+_EXEMPLAR_HEAD_CACHE: dict[tuple[str, int], tuple[str, float]] = {}
+
+
+def _dialogue_ratio(text: str) -> float:
+    """Share of chars sitting inside Chinese quote pairs. Pure, no config gate."""
+    if not text:
+        return 0.0
+    inside = 0
+    for open_q, close_q in _DIALOGUE_QUOTES:
+        depth = 0
+        for ch in text:
+            if ch == open_q:
+                depth += 1
+            elif ch == close_q and depth:
+                depth -= 1
+            elif depth:
+                inside += 1
+    return inside / len(text)
+
+
+def _exemplar_head(paths: Paths, chapter: int, budget: int) -> tuple[str, float]:
+    """Bounded read of a chapter's opening ``budget`` chars + its dialogue ratio."""
+    key = (str(paths.chapters_dir), chapter)
+    hit = _EXEMPLAR_HEAD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    text = ""
+    try:
+        from config import chapter_path
+
+        ch_path = chapter_path(paths, chapter)
+        if ch_path.exists():
+            with ch_path.open(encoding="utf-8", errors="replace") as fh:
+                text = fh.read(budget)
+    except OSError:
+        text = ""
+    result = (text.strip(), _dialogue_ratio(text))
+    _EXEMPLAR_HEAD_CACHE[key] = result
+    return result
+
+
 def exemplar_block(
     paths: Paths,
     conn: Any,
@@ -426,132 +469,100 @@ def exemplar_block(
     plan: dict[str, Any],
     chapter_num: int,
 ) -> str:
-    """P0-3: Build a '黄金范例' block from top-scoring chapters matching the plan's type.
+    """Show the writer TWO complementary high-scoring chapters of this same book.
 
-    Selects chapters with score >= threshold from chapter_metrics, filters by
-    payoff_type/conflict_type match when available, retrieves text snippets matching
-    the plan's concrete fields, and formats them as positive exemplars with their
-    scores and what made them succeed.
+    REDESIGN.md L4. Imitating a concrete sample beats obeying an abstract style
+    rule, and the book's own best chapters are the only samples guaranteed to be
+    on-voice, on-world and on-genre.
 
-    This block MUST stay in the variable (non-cacheable) prompt segment — it's
-    injected alongside retrieval_block in write_chapter's user message, never in
-    cacheable_prefix, so changing selection logic doesn't invalidate the cache.
+    Rewritten 2026-07 (it had been switched off). Three things were wrong:
+
+    * **Absolute score threshold.** ``exemplar_rag_score_min: 8.8`` against a
+      library whose 1021 chapters all self-score 7.4–8.7 selects almost nothing,
+      so the block was usually empty even when enabled. Selection is now
+      rank-based: the top ``exemplar_rag_top_k`` chapters by score, which always
+      yields the book's actual best regardless of where its band sits.
+    * **Redundant exemplars.** Ranking by score alone returns two chapters that
+      demonstrate the same thing. We now pick one dialogue-dense and one
+      action/scene-dense chapter, so the pair spans the two modes a chapter has
+      to switch between (dialogue ratio measured deterministically, not by LLM).
+    * **Unbounded IO + destroyed formatting.** It read whole chapter files on
+      every write and then flattened the excerpt onto one line — which is itself
+      a nudge toward the telegraphic prose ``style_health`` exists to fight.
+      Reads are now capped and cached, and paragraph breaks are preserved the
+      way ``retrieval_block`` preserves them.
+
+    Stays in the variable (non-cacheable) prompt segment, so changing selection
+    logic never invalidates the prompt cache.
     """
-    if not bool(config["novel"].get("exemplar_rag_enabled", True)):
+    if not bool(config["novel"].get("exemplar_rag_enabled", False)):
         return ""
     if chapter_num <= int(config["novel"].get("exemplar_rag_min_chapter", 8)):
         return ""
 
     try:
         from store import recent_metrics
-        # Get all chapters with metrics
-        all_metrics = []
-        try:
-            # Fetch more chapters to find top performers
-            candidates = recent_metrics(conn, limit=min(chapter_num - 1, 100))
-            all_metrics = [m for m in candidates if isinstance(m, dict)]
-        except Exception:
-            pass
 
-        if not all_metrics:
-            return ""
-
-        # Filter by score threshold
-        threshold = float(config["novel"].get("exemplar_rag_score_min", 8.8))
-        high_scorers = [
-            m for m in all_metrics
-            if m.get("score") is not None and float(m.get("score", 0)) >= threshold
+        rows = [
+            m for m in recent_metrics(conn, limit=min(max(chapter_num - 1, 1), 100))
+            if isinstance(m, dict) and m.get("chapter") is not None and m.get("score") is not None
         ]
-
-        if not high_scorers:
+        if not rows:
             return ""
 
-        # Optional: filter by payoff_type or conflict_type match
+        # Rank-based, with a type-match bonus so a same-payoff_type chapter wins
+        # ties. The bonus is small on purpose: an on-type mediocre chapter is a
+        # worse model than an off-type excellent one.
         plan_payoff = str(plan.get("payoff_type", "")).strip() if isinstance(plan, dict) else ""
         plan_conflict = str(plan.get("conflict_type", "")).strip() if isinstance(plan, dict) else ""
 
-        matched = []
-        for m in high_scorers:
-            ch_payoff = str(m.get("payoff_type", "")).strip()
-            ch_conflict = str(m.get("conflict_type", "")).strip()
-            # Prefer same type, but accept any high scorer if no match
-            if plan_payoff and ch_payoff == plan_payoff:
-                matched.append((m, 2))  # strong match
-            elif plan_conflict and ch_conflict == plan_conflict:
-                matched.append((m, 1))  # weak match
-            else:
-                matched.append((m, 0))  # no type match
+        def rank_key(m: dict[str, Any]) -> float:
+            bonus = 0.0
+            if plan_payoff and str(m.get("payoff_type", "")).strip() == plan_payoff:
+                bonus += 0.3
+            elif plan_conflict and str(m.get("conflict_type", "")).strip() == plan_conflict:
+                bonus += 0.15
+            try:
+                return float(m.get("score", 0)) + bonus
+            except (TypeError, ValueError):
+                return bonus
 
-        # Sort by match score then by chapter score
-        matched.sort(key=lambda x: (x[1], x[0].get("score", 0)), reverse=True)
-        top_exemplars = [m for m, _ in matched[:int(config["novel"].get("exemplar_rag_top_k", 3))]]
+        top_k = max(2, int(config["novel"].get("exemplar_rag_top_k", 6)))
+        pool = sorted(rows, key=rank_key, reverse=True)[:top_k]
+        budget = max(200, int(config["novel"].get("exemplar_snippet_chars", 800)))
 
-        if not top_exemplars:
+        measured: list[tuple[dict[str, Any], str, float]] = []
+        for m in pool:
+            head, ratio = _exemplar_head(paths, int(m["chapter"]), budget * 2)
+            if len(head) >= 200:
+                measured.append((m, head, ratio))
+        if not measured:
             return ""
 
-        # Build query from plan fields (same as retrieval_block)
-        query_parts: list[str] = []
-        for key in ("title", "goal", "conflict", "payoff", "pressure"):
-            v = plan.get(key)
-            if v:
-                query_parts.append(str(v))
-        query = " ".join(query_parts).strip()
+        # One dialogue-dense + one action/scene-dense exemplar.
+        by_dialogue = sorted(measured, key=lambda x: x[2], reverse=True)
+        picked = [by_dialogue[0]]
+        for cand in reversed(by_dialogue):
+            if cand[0]["chapter"] != picked[0][0]["chapter"]:
+                picked.append(cand)
+                break
 
         lines = [
-            "## 黄金范例（本书高分章节，供学习节奏与执行手法）",
-            "以下章节在终局质量评分中达到高分（≥8.8/10）。参考其节奏把控、beat 落地方式、钩子设计，",
-            "但**必须用你自己的措辞和场景重写**，严禁照搬原句或结构。",
+            "## 黄金范例（本书自己评分最高的章节原文，学它的执行方式）",
+            "下面两段分别示范「对白密度」与「动作/场景密度」两种写法。"
+            "参考它们的句子长度、动作落地方式、对白节奏与信息给出顺序，"
+            "但**必须用你自己的场景和措辞**，严禁照搬原句、原意象或原结构。",
         ]
-
-        for ex in top_exemplars:
-            ch = ex.get("chapter")
-            score = ex.get("score")
-            if ch is None:
-                continue
-
-            snippet = ""
-            if query:
-                try:
-                    hits = retrieve(
-                        paths, query, top_k=2,
-                        exclude_recent_chapters=0,
-                        current_chapter=chapter_num,
-                        min_score=0.05,
-                    )
-                    ch_hits = [h for h in hits if h.get("chapter") == ch]
-                    if ch_hits:
-                        snippet = "".join(h.get("text", "") for h in ch_hits[:2])
-                except Exception:
-                    pass
-
-            if not snippet:
-                try:
-                    from config import chapter_path
-                    ch_path = chapter_path(paths, ch)
-                    if ch_path.exists():
-                        snippet = ch_path.read_text(encoding="utf-8").strip()[:200]
-                except Exception:
-                    pass
-
-            if not snippet:
-                continue
-
-            if len(snippet) > 400:
-                snippet = snippet[:400] + "…"
-
-            # Format strengths
-            strengths = []
-            if ex.get("hook_score") and float(ex.get("hook_score", 0)) >= 8.5:
-                strengths.append(f"强钩子({ex.get('hook_score')}/10)")
-            if ex.get("payoff_score") and float(ex.get("payoff_score", 0)) >= 8.5:
-                strengths.append(f"高兑现({ex.get('payoff_score')}/10)")
-            if ex.get("novelty_score") and float(ex.get("novelty_score", 0)) >= 8.0:
-                strengths.append(f"新意({ex.get('novelty_score')}/10)")
-            strength_text = "、".join(strengths) if strengths else "整体高分"
-
-            lines.append(f"\n- **Ch{ch} 终评 {score}/10** ({strength_text})")
-            lines.append(f"  {snippet.replace(chr(10), ' ')[:300]}")
-
+        labels = ("对白密集范例", "动作/场景密集范例")
+        for label, (m, head, ratio) in zip(labels, picked):
+            snippet = head[:budget].strip()
+            if len(head) > budget:
+                snippet += "…"
+            snippet = snippet.replace("\n", "\n    ")
+            lines.append(
+                f"\n- **{label} · Ch{m['chapter']} 终评 {m.get('score')}/10 "
+                f"（对白占比 {ratio:.0%}）**\n    {snippet}"
+            )
         return "\n".join(lines)
 
     except Exception as exc:

@@ -81,16 +81,16 @@ api:
   length_empty_retry_factor: 2.0
   length_empty_retry_cap: 32000
   # 留空 *_base_url 即关闭该角色路由、走主力模型。
-  review_base_url:
-  review_api_key:
+  review_base_url: ""
+  review_api_key: ""
   review_keys:
   review_model: deepseek-v4-pro
   review_thinking_mode: auto
   review_thinking_budget_tokens: 0
   # —— 按角色路由（可选，留空 *_base_url 即关闭该角色路由，走主力模型）——
   # 规划（bootstrap/plan/replan/contract）→ 强推理模型
-  planning_base_url:
-  planning_api_key:
+  planning_base_url: ""
+  planning_api_key: ""
   planning_keys:
   planning_model:
   planning_thinking_mode: auto
@@ -101,16 +101,16 @@ api:
   #      thinking_mode=auto（不发参数）与 thinking:{type:disabled} 都 504，
   #      只有 OpenAI 式 reasoning_effort: none 能压住（首字 ~29s / 3.1k 字约 170s）。
   #      writing_reasoning_effort 由 llm.py 注入 extra_body 顶层；留空即不发该参数。
-  writing_base_url:
-  writing_api_key:
+  writing_base_url: ""
+  writing_api_key: ""
   writing_keys:
   writing_model: gemini-2.5-pro
   writing_thinking_mode: auto
   writing_thinking_budget_tokens: 0
   writing_reasoning_effort: none
   # 提取（extract/state_update/memory_compress）→ deepseek-v4-flash @ littlesheep（便宜结构化）
-  extraction_base_url:
-  extraction_api_key:
+  extraction_base_url: ""
+  extraction_api_key: ""
   extraction_keys:
   extraction_model: deepseek-v4-flash
   extraction_thinking_mode: disabled
@@ -118,8 +118,8 @@ api:
   # 精修（python novel.py refine <name>，完本后手动步骤）→ doubao-seed-2-1-turbo @ xkool
   # 生成用 deepseek 保结构，refine 用 doubao 补"网文味/爽感"。留空 refine_model 则 refine 走主力模型。
   # cmd_refine 读到 refine_model 即用下列端点跑整个精修 pass。
-  refine_base_url:
-  refine_api_key:
+  refine_base_url: ""
+  refine_api_key: ""
   refine_model: doubao-seed-2-1-turbo
   refine_thinking_mode: disabled
 
@@ -133,6 +133,32 @@ novel:
   # chapter_words: 2800            # 题材profile自动设定;取消注释可手动覆盖
   target_words: 2000000
   quality_threshold: 8.0
+  # ── 返工触发器（REDESIGN L5/L6, P4）─────────────────────────────────────────
+  # score（默认，行为与历史完全一致）：score < quality_threshold 或 accepted=False
+  #   即触发 revise → replan → force-accept 循环。实测问题：全库 1023 章自评
+  #   median 恰好 8.00，门槛正压在中位数上，所以约 1/3 的章按构造进返工，而这条
+  #   自评本身无判别力（7.4-8.7 全带、6 次 accepted=0）——等于在对噪声做结构性重做。
+  # deterministic：返工只由确定性信号触发（gate_rejects / 硬矛盾 / 硬契约 /
+  #   length_band 与 opening_hook 的 block / 确定性 cap 导致的 accepted=False /
+  #   score < rework_score_floor）。7.x 段的章正常接受（记 quality_note，
+  #   不记 quality_debt，也不算 force_accept——否则熔断器会被噪声章淹掉），
+  #   命中的门交给下面的修复阶梯定点修。整章重写保留为 <rework_score_floor 的救援路径。
+  # A/B 未通过前保持 score。
+  rework_trigger: score
+  rework_score_floor: 6.5          # 与 consecutive_force_accept_limit 的 circuit_breaker_score_floor 对齐
+  # ── 修复阶梯 fix.py（L0 确定性 / L1 有界单次调用）───────────────────────────
+  # L0 零 LLM：破折号降密 / 碎句合并 / 化石同义轮换 / 开场行下移。每一步 keep-only-
+  # if-metric-improved（style_health 罚分不升才保留）。离线回放 647 份归档 review：
+  # 29 章命中，0 章变差，长度变化全部在 ±2% 内。
+  # L1 每次一个有界调用（定点扩写到章长带 / 定点对白注入 / 定点降破折号），同样只在
+  # 目标指标真的改善时保留。fix_max_l1_calls 是每章上限。
+  fix_ladder_enabled: true
+  fix_l0_enabled: true
+  fix_max_l1_calls: 2
+  # fix_merge_max_line_chars: 120  # 碎句合并后的单行长度上限
+  # fix_fossil_max_keep: 1         # 化石短语每章保留次数
+  # fix_expand_max_paragraphs: 4   # L1 定点扩写最多改写的段数
+  # fix_dialogue_max_paragraphs: 4
   # MVP cost model: single plan candidate / single draft by default. Breadth is
   # spent only when deterministic risk signals fire (see risk_upshift_* below,
   # which widens candidate_plans to risk_upshift_candidates), and the structural
@@ -148,6 +174,16 @@ novel:
   plan_retry_score: 6.5
   plan_max_attempts: 2
   plan_skip_screen: true
+  # 弧级规划（REDESIGN.md L2）：每 arc_span 章跑「一次」高推理调用产出 arc_span 张
+  # ChapterCard，替代逐章的「策略老虎机 → N 候选 → 预筛 → 6 轴融合评审 → 仲裁」五段委员会。
+  # 卡片投影到既有 plan schema，写作/评审/门/存储零改动。只接管首次规划；
+  # 所有 replan 路径仍走委员会。任何失败自动回落委员会。
+  # 全库实测返工头号原因是 replan（占章数 33%-68%），这一项直接打它。
+  # 默认关闭：A/B 通过前不要开（`novel.py ablate <name> --flip arc_planning_enabled`）。
+  arc_planning_enabled: false
+  arc_span: 10                   # 每次弧规划覆盖的章数（3-20，越大越省但越远的卡片越可能失准）
+  arc_max_tokens: 32000          # 一次要出 arc_span 张卡片，输出预算必须够
+  arc_temperature: 0.75
   # ①(a) 生成减负：每章 beat 数上限。密集章把过多 beat 挤进单次出稿会"名场面清单化"、写不透。
   # planner 被要求少而深（1主+≤3-4副），此为安全网：确定性截断到该值（保主线顺序）。0=关闭。
   chapter_max_beats: 5
@@ -526,12 +562,15 @@ novel:
   # 在 LLM review 前筛掉必触发 gate_reject 或罚分过高的草稿，省评审成本、防低质稿以分胜出。
   candidate_prescreen_enabled: true
   candidate_prescreen_penalty_block: 3.0
-  # P0-3 黄金范例 RAG：从本书高分章节（≥8.8/10）中检索与当前 plan 类型匹配的片段，
-  # 作为正例注入写手 prompt（变量段，不影响 cacheable_prefix），学习节奏与执行手法。
-  exemplar_rag_enabled: false   # disabled: un-IDF'd second ranker + per-write full-chapter disk I/O, redundant with rag retrieval_block
+  # P0-3 黄金范例：注入本书评分最高章节的原文节选（变量段，不影响 cacheable_prefix），
+  # 让写手模仿具体样本而非抽象文风规则。2026-07 重写（REDESIGN.md L4）：
+  # 排名制选取（原 ≥8.8 绝对阈值在全库 7.4-8.7 的压缩分布下几乎永远选不出东西）、
+  # 取「对白密集 + 动作密集」两段互补范例、有界读盘 + 缓存（原来每次写作全章读盘）。
+  # 仍默认关闭：改动尚未做过 A/B，开启前请单独验证，不要和别的变量一起翻。
+  exemplar_rag_enabled: false
   exemplar_rag_min_chapter: 8
-  exemplar_rag_score_min: 8.8
-  exemplar_rag_top_k: 3
+  exemplar_rag_top_k: 6          # 候选池大小；最终仍只注入 2 段互补范例
+  exemplar_snippet_chars: 800    # 每段范例的字符上限
   # P0-4 required_constraints 契约结构化：仲裁层输出结构化约束（id/type/check_method/target），
   # 评审层机械验证每条约束是否兑现，未通过则扣分 + 反馈给下章写手。
   constraint_verification_enabled: true
@@ -574,7 +613,6 @@ novel:
   script_review_max_rounds: 1
   script_review_min_score: 8.0
   # 10章包追读审校：检查承诺账本、爽点兑现、重复疲劳和下一包指令
-  # 【未使用 / dead】代码只读取 pack_review_every / pack_review_barrier，从不读取此开关——当前无法用它关闭包审校。
   pack_review_enabled: true
   pack_review_every: 10
   pack_review_barrier: true
@@ -772,9 +810,16 @@ novel:
   genre_adherence_enabled: true
   genre_adherence_window: 5
   genre_negative_weight: 2.0
-  genre_drift_threshold: 0.3
+  # genre_score 是有符号的关键词密度差，全库 357 章的中位数恰好是 0.000（正负词表都没命中
+  # ＝无证据）。阈值必须严格小于 0，否则"无证据"被判成"漂移"：旧值 0.3 回放全库会让 46.8%
+  # 的章越过 reject 连击线（个别书 86%）。-1.0 回放为 warn 4.8% / reject 2.5%。
+  genre_drift_threshold: -1.0
   genre_drift_consecutive: 3
   genre_drift_reject_consecutive: 5
+  # reject 分支会强制结构性 replan，而该判定只是关键词启发式，且因 review.py 的连击查询一直
+  # 报错（store.get_connection 不存在）而在 215 次归档运行里从未真正触发过——生产未验证。
+  # 默认降级为 advise（仍出 directive + 罚分），校准过后再考虑打开。
+  genre_drift_reject_enabled: false
   # 多线角色服务度量：多男主/多线小说里次要线易长期断供。每 every 章扫描 characters.md 里的
   # 主要人物（## 小节名），统计其在最近 window 章正文的出场率，低于 floor 的角色经 planning
   # 软提示要求补高光（仅 WARN，不硬拦截/重规划）。

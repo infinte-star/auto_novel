@@ -1,0 +1,38 @@
+[
+  {
+    "ok": true,
+    "ttfb": 9.03,
+    "elapsed": 190.48,
+    "out_chars": 2301,
+    "reasoning_chars": 7170,
+    "error": "",
+    "tier": "effort=none (current)",
+    "prompt_chars": 15000,
+    "model": "deepseek-v4-pro",
+    "base_url": "https://ai.littlesheep.cc/v1"
+  },
+  {
+    "ok": true,
+    "ttfb": 2.42,
+    "elapsed": 155.23,
+    "out_chars": 1728,
+    "reasoning_chars": 6724,
+    "error": "",
+    "tier": "effort=medium",
+    "prompt_chars": 15000,
+    "model": "deepseek-v4-pro",
+    "base_url": "https://ai.littlesheep.cc/v1"
+  },
+  {
+    "ok": true,
+    "ttfb": 1.56,
+    "elapsed": 138.28,
+    "out_chars": 1919,
+    "reasoning_chars": 5692,
+    "error": "",
+    "tier": "thinking=disabled",
+    "prompt_chars": 15000,
+    "model": "deepseek-v4-pro",
+    "base_url": "https://ai.littlesheep.cc/v1"
+  }
+]

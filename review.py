@@ -882,30 +882,6 @@ def review_chapter(
         except Exception as exc:
             log(paths, f"paragraph_shape failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    if REGISTRY.is_enabled("dialogue_pingpong", config):
-        try:
-            from quality import dialogue_pingpong
-            dp = dialogue_pingpong(chapter, config)
-            dp_pen = REGISTRY.accumulate(report, dp, "dialogue_pingpong", REGISTRY.tag_prefix("dialogue_pingpong"))
-            if dp_pen > 0:
-                penalties += dp_pen
-                log(paths, f"Dialogue-pingpong Ch{chapter_num} penalty={dp_pen} "
-                    f"qa_ratio={dp.get('metrics', {}).get('qa_ratio', '-')}")
-        except Exception as exc:
-            log(paths, f"dialogue_pingpong failed (non-fatal) Ch{chapter_num}: {exc}")
-
-    if REGISTRY.is_enabled("chapter_ending_quality", config):
-        try:
-            from quality import chapter_ending_quality
-            ceq = chapter_ending_quality(chapter, config)
-            ceq_pen = REGISTRY.accumulate(report, ceq, "chapter_ending_quality", REGISTRY.tag_prefix("chapter_ending_quality"))
-            if ceq_pen > 0:
-                penalties += ceq_pen
-                log(paths, f"Chapter-ending Ch{chapter_num} penalty={ceq_pen} "
-                    f"markers={ceq.get('metrics', {}).get('ending_summary_markers', '-')}")
-        except Exception as exc:
-            log(paths, f"chapter_ending_quality failed (non-fatal) Ch{chapter_num}: {exc}")
-
     if REGISTRY.is_enabled("long_span_fatigue", config):
         try:
             from quality import long_span_fatigue
@@ -1056,11 +1032,17 @@ def review_chapter(
     if REGISTRY.is_enabled("genre_adherence", config):
         try:
             from quality import genre_adherence
+            # Use the connection review_chapter was handed. This used to call a
+            # `store.get_connection` that does not exist, so the AttributeError
+            # was swallowed below and recent_genre_scores was ALWAYS empty --
+            # low_streak could never exceed 1 and the gate could never reach
+            # genre_drift_consecutive (3). Measured: 215 runs, 0 firings, while
+            # tangshuting's own chapter_metrics holds negative-score streaks of
+            # up to 8. The gate was inert, not clean.
             recent_genre_scores: list[float] = []
             try:
                 import store as _store
-                conn = _store.get_connection(str(paths.db))
-                if conn and not isinstance(conn, _store.JsonStoryStore):
+                if conn is not None and not isinstance(conn, _store.JsonStoryStore):
                     cursor = conn.execute(
                         "SELECT genre_score FROM chapter_metrics "
                         "WHERE chapter < ? AND genre_score IS NOT NULL "
@@ -1068,8 +1050,8 @@ def review_chapter(
                         (chapter_num, int(config["novel"].get("genre_adherence_window", 5))),
                     )
                     recent_genre_scores = [row[0] for row in cursor.fetchall()][::-1]
-            except Exception:
-                pass
+            except Exception as exc:
+                log(paths, f"genre_adherence streak lookup failed (non-fatal) Ch{chapter_num}: {exc}")
             ga = genre_adherence(chapter, recent_genre_scores, config)
             ga_pen = REGISTRY.accumulate(report, ga, "genre_adherence", REGISTRY.tag_prefix("genre_adherence"))
             if ga_pen > 0:
@@ -2098,12 +2080,13 @@ def horizon_review(
     except Exception as exc:
         log(paths, f"Cold-reader review failed (non-fatal) Ch{chapter_num}: {exc}")
 
-    # --- 2. Pack review (always) ---
-    try:
-        pack_review(client, paths, conn, config, chapter_num)
-        log(paths, f"Completed pack review Ch{chapter_num}")
-    except Exception as exc:
-        log(paths, f"Pack review failed (non-fatal) Ch{chapter_num}: {exc}")
+    # --- 2. Pack review ---
+    if bool(config["novel"].get("pack_review_enabled", True)):
+        try:
+            pack_review(client, paths, conn, config, chapter_num)
+            log(paths, f"Completed pack review Ch{chapter_num}")
+        except Exception as exc:
+            log(paths, f"Pack review failed (non-fatal) Ch{chapter_num}: {exc}")
 
     # --- 3. Macro progress check (only from Ch20 onwards) ---
     macro_every = int(config["novel"].get("macro_progress_every", 10))

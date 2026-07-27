@@ -43,6 +43,9 @@ config_template.yaml
 novels/*/config.yaml
 # Per-endpoint screenplay configs also embed live API keys (e.g. config_script_gpt55.yaml).
 config_*.yaml
+# ...but the credential-free scaffold IS tracked: it is what `novel.py create`
+# falls back to on a fresh clone. Keep every value in it blank.
+!config_template.example.yaml
 .env
 .env.*
 

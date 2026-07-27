@@ -1237,49 +1237,6 @@ def _fused_review_one_plan(
     return _explode_fused_axes(fallback)
 
 
-def agent_review_plan(
-    client: OpenAI,
-    paths: Paths,
-    conn: Any,
-    config: dict[str, Any],
-    chapter_num: int,
-    plan: dict[str, Any],
-) -> list[dict[str, Any]]:
-    user = f"""## 记忆
-{lite_memory_context(paths, conn, config)}
-
-## 节奏诊断JSON
-{json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
-
-## 候选大纲JSON
-{json.dumps(plan, ensure_ascii=False, indent=2)}
-
-审校第 {chapter_num} 章大纲。"""
-
-    fused_enabled = bool(config["novel"].get("fused_plan_review", True))
-    if fused_enabled:
-        reports = _fused_review_one_plan(client, paths, config, user)
-    else:
-        reports = _fused_review_one_plan(client, paths, config, user)
-        log(paths, "Note: fused_plan_review=false ignored; always using fused review")
-
-    for report in reports:
-        agent = report["agent"]
-        with db_lock():
-            conn.execute(
-                "INSERT INTO agent_reports(chapter, agent, score, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    chapter_num,
-                    agent,
-                    safe_score(report.get("score", 0)),
-                    json.dumps(report, ensure_ascii=False),
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
-    with db_lock():
-        conn.commit()
-    return reports
-
 def review_candidate_plans(
     client: OpenAI,
     paths: Paths,
@@ -1716,6 +1673,25 @@ def create_plan(
     if isinstance(cached, dict) and cached.get("plan") and cached.get("decision"):
         log(paths, f"Resuming cached {checkpoint_label} plan Ch{chapter_num}")
         return cached["plan"], cached["decision"]
+
+    # Arc fast path (REDESIGN.md L2): one arc-level call every `arc_span`
+    # chapters replaces the five-stage committee below. Deliberately scoped to
+    # the INITIAL plan only — every replan keeps the committee, so a bad card
+    # still has the old safety net and the A/B stays single-variable.
+    # Returns None on any failure, which falls through to the committee.
+    if checkpoint_label == "initial" and replan_feedback is None:
+        from arc import arc_enabled, plan_from_arc
+
+        if arc_enabled(config):
+            arc_result = plan_from_arc(
+                client, paths, conn, config, chapter_num, cached_memory=cached_memory,
+            )
+            if arc_result is not None:
+                save_checkpoint(
+                    paths, chapter_num, f"plan_{checkpoint_label}_selected.json",
+                    {"plan": arc_result[0], "decision": arc_result[1]},
+                )
+                return arc_result
 
     mem = cached_memory or memory_context(
         paths, conn, config,

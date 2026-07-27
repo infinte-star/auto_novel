@@ -279,22 +279,6 @@ def init_db(paths: Paths) -> Any:
         """)
     except Exception:
         pass
-    try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS arc_history (
-                arc_number INTEGER PRIMARY KEY,
-                start_chapter INTEGER NOT NULL,
-                end_chapter INTEGER,
-                arc_title TEXT,
-                summary TEXT,
-                key_outcomes TEXT,
-                status TEXT DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-        """)
-    except Exception:
-        pass
     return conn
 
 def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) -> None:
@@ -379,94 +363,6 @@ def recent_events(conn: Any, limit: int = 80, event_types: Any = None) -> list[d
             pass
         out.append(item)
     return out
-
-def recent_panel_drop_rate(conn: Any, limit: int = 3) -> float | None:
-    """Mean drop_rate over the most recent `limit` reader_panel reports.
-
-    The reader panel (reader_panel.py) is the pipeline's only proxy for the
-    real-platform 追读率/弃书率 signal番茄 never exposes back to the engine. This
-    surfaces a rolling drop_rate that `should_replan` / `_effective_candidate_count`
-    can act on. Returns None when there is no panel data (panel disabled, or too
-    early), so callers can treat "no signal" distinctly from "low drop". Never
-    raises — any store/JSON-fallback failure degrades to None.
-    """
-    try:
-        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
-    except Exception:
-        return None
-    drops: list[float] = []
-    for r in rows:
-        payload = r.get("payload") if isinstance(r, dict) else None
-        if isinstance(payload, dict) and payload.get("drop_rate") is not None:
-            try:
-                drops.append(float(payload["drop_rate"]))
-            except (TypeError, ValueError):
-                continue
-    if not drops:
-        return None
-    return sum(drops) / len(drops)
-
-
-def recent_panel_excitement(conn: Any, limit: int = 3) -> float | None:
-    """Mean panel excitement (1-10) over the most recent `limit` reader_panel
-    reports — the retention counterpart to recent_panel_drop_rate, used by the
-    P2 review gate. Prefers the genre-weighted `weighted_excitement` (P1) when
-    present, else the raw `avg_excitement`. Returns None when there is no panel
-    data so callers distinguish "no signal" from "low excitement". Never raises.
-    """
-    try:
-        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
-    except Exception:
-        return None
-    vals: list[float] = []
-    for r in rows:
-        payload = r.get("payload") if isinstance(r, dict) else None
-        if not isinstance(payload, dict):
-            continue
-        v = payload.get("weighted_excitement", payload.get("avg_excitement"))
-        if v is not None:
-            try:
-                vals.append(float(v))
-            except (TypeError, ValueError):
-                continue
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
-
-
-def panel_series(
-    conn: Any, start_chapter: int = 0, end_chapter: int = 0, limit: int = 400
-) -> list[tuple[int, float, float]]:
-    """Return (chapter, excitement, drop_rate) for every reader_panel report,
-    optionally restricted to [start_chapter, end_chapter] (0 = unbounded).
-    Oldest-first. Feeds retention.retention_by_block (P0) and rolling_plan arc
-    retention (P3). Never raises."""
-    try:
-        rows = recent_events(conn, max(1, int(limit)), {"panel_report"})
-    except Exception:
-        return []
-    out: list[tuple[int, float, float]] = []
-    for r in rows:
-        payload = r.get("payload") if isinstance(r, dict) else None
-        if not isinstance(payload, dict):
-            continue
-        try:
-            ch = int(payload.get("chapter", r.get("chapter", 0)))
-        except (TypeError, ValueError):
-            continue
-        if start_chapter and ch < start_chapter:
-            continue
-        if end_chapter and ch > end_chapter:
-            continue
-        ex = payload.get("weighted_excitement", payload.get("avg_excitement"))
-        dr = payload.get("weighted_drop_rate", payload.get("drop_rate"))
-        try:
-            out.append((ch, float(ex if ex is not None else 5.0), float(dr if dr is not None else 0.0)))
-        except (TypeError, ValueError):
-            continue
-    out.sort(key=lambda t: t[0])
-    return out
-
 
 def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
     try:
@@ -1142,54 +1038,3 @@ def get_overdue_revelations(conn: Any, chapter_num: int, grace: int = 5, limit: 
         ]
     except Exception:
         return []
-
-
-# ---------------------------------------------------------------------------
-# Arc history (rolling planning)
-# ---------------------------------------------------------------------------
-
-def get_current_arc(conn: Any) -> dict[str, Any] | None:
-    try:
-        with db_lock():
-            row = conn.execute(
-                "SELECT * FROM arc_history WHERE status='active' ORDER BY arc_number DESC LIMIT 1"
-            ).fetchone()
-        return dict(row) if row else None
-    except Exception:
-        return None
-
-
-def get_arc_summaries(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
-    try:
-        with db_lock():
-            rows = conn.execute(
-                "SELECT * FROM arc_history WHERE status='completed' ORDER BY arc_number DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-    except Exception:
-        return []
-
-
-def start_arc(conn: Any, arc_number: int, start_chapter: int, arc_title: str = "") -> None:
-    with db_lock():
-        conn.execute(
-            """INSERT OR REPLACE INTO arc_history(arc_number, start_chapter, arc_title, status, created_at)
-               VALUES (?, ?, ?, 'active', ?)""",
-            (arc_number, start_chapter, arc_title, datetime.now().isoformat(timespec="seconds")),
-        )
-        conn.commit()
-
-
-def complete_arc(
-    conn: Any, arc_number: int, end_chapter: int, summary: str, key_outcomes: str = ""
-) -> None:
-    with db_lock():
-        conn.execute(
-            """UPDATE arc_history
-               SET end_chapter=?, summary=?, key_outcomes=?, status='completed', completed_at=?
-               WHERE arc_number=?""",
-            (end_chapter, summary, key_outcomes,
-             datetime.now().isoformat(timespec="seconds"), arc_number),
-        )
-        conn.commit()

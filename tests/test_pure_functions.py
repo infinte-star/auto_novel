@@ -2386,20 +2386,43 @@ class DescriptorFrequencyTests(unittest.TestCase):
 class GenreAdherenceTests(unittest.TestCase):
     """0C: Genre drift detection via deterministic keyword scoring."""
 
-    def test_pure_negative_triggers_reject(self):
-        text = "枪口对准了她。排爆小组赶到冷库。劫持人质的嫌犯持刀械斗。尸体横陈。" * 5
-        scores = [-2.0, -1.5, -1.8, -2.1]
-        cfg = {"novel": {
+    _DRIFT_TEXT = "枪口对准了她。排爆小组赶到冷库。劫持人质的嫌犯持刀械斗。尸体横陈。" * 5
+    _DRIFT_SCORES = [-2.0, -1.5, -1.8, -2.1]
+
+    @staticmethod
+    def _drift_cfg(**over):
+        cfg = {
             "genre_adherence_enabled": True,
             "style_preset": "romance_female",
             "genre_negative_weight": 2.0,
             "genre_drift_threshold": 0.0,
             "genre_drift_consecutive": 3,
             "genre_drift_reject_consecutive": 5,
-        }}
-        r = genre_adherence(text, recent_scores=scores, config=cfg)
+        }
+        cfg.update(over)
+        return {"novel": cfg}
+
+    def test_pure_negative_advises_by_default(self):
+        """A full reject forces a structural replan, so it is opt-in."""
+        r = genre_adherence(self._DRIFT_TEXT, recent_scores=self._DRIFT_SCORES,
+                            config=self._drift_cfg())
+        self.assertEqual(r["level"], "advise")
+        self.assertGreater(r["penalty"], 0)
+        self.assertGreaterEqual(r["metrics"]["low_streak"], 5)
+
+    def test_pure_negative_triggers_reject_when_enabled(self):
+        r = genre_adherence(self._DRIFT_TEXT, recent_scores=self._DRIFT_SCORES,
+                            config=self._drift_cfg(genre_drift_reject_enabled=True))
         self.assertEqual(r["level"], "reject")
         self.assertGreater(r["penalty"], 0)
+
+    def test_zero_score_is_no_evidence_not_drift(self):
+        """genre_score == 0 means neither keyword list matched. The library's
+        median is exactly 0.000, so a threshold above it reads 'no evidence' as
+        'drift' and rejected 46.8% of real chapters."""
+        r = genre_adherence(self._DRIFT_TEXT, recent_scores=[0.0, 0.0, 0.0, 0.0, 0.0],
+                            config=self._drift_cfg(genre_drift_threshold=-1.0))
+        self.assertLessEqual(r["metrics"]["low_streak"], 1)
 
     def test_positive_text_passes(self):
         text = "她脸红心跳，甜蜜的吻让她整个人都软了。厨房里香味扑鼻，他温柔地说喜欢她做的饭菜。" * 3

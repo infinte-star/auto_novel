@@ -95,7 +95,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "paragraph_cv_min": 0.12,
         "short_paragraph_warn": 45,
         "short_paragraph_severe": 30,
-        "dialogue_pingpong_warn": 0.55,
         # 章型单调闸：形态表(智斗/动作/情感/关系/推进/日常)对打斗-晋级型爽文够用，
         # 但没有哪个形态是它的"核心形态"，故不加偏置（auto=纯 argmax）。
         "chapter_mode_enabled": True,
@@ -137,7 +136,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "paragraph_cv_min": 0.18,
             "short_paragraph_warn": 55,
             "short_paragraph_severe": 35,
-            "dialogue_pingpong_warn": 0.45,
             # 智斗解谜是本题材的核心形态 → 偏置到 reasoning，只有"明显脱离智斗"的章
             # 才算换形态（否则满是协会/牺牲内容词的智斗章会被误判成别的形态而漏掉疲劳）。
             "chapter_mode_enabled": True,
@@ -165,7 +163,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "paragraph_cv_min": 0.18,
             "short_paragraph_warn": 55,
             "short_paragraph_severe": 35,
-            "dialogue_pingpong_warn": 0.45,
             "chapter_mode_enabled": True,
             "chapter_mode_baseline": "auto",
         },
@@ -235,8 +232,7 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
                "style_tech_jargon_per_kchar_warn": 8.0,
                "style_tech_jargon_per_kchar_bad": 12.0,
                "fatigue_words": ["仿佛", "不禁", "宛如", "竟然"],
-               "short_paragraph_warn": 50, "short_paragraph_severe": 30,
-               "dialogue_pingpong_warn": 0.50}
+               "short_paragraph_warn": 50, "short_paragraph_severe": 30}
     return dict(profiles.get(p, neutral))
 
 
