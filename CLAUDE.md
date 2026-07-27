@@ -284,7 +284,26 @@ promise that a fixer exists.
   Never a whole-chapter rewrite.
 - Every fixer is **keep-only-if-the-metric-improved** (same pattern as
   `_beat_gate_one` and the revision-gate rollback), which is what makes `_stage_fix`
-  safe to run unconditionally.
+  safe to run unconditionally. **A metric check cannot catch broken Chinese**, so any
+  grammar guard must be structural instead: `fossil_fix._safe_alt` refuses a variant
+  that would follow an attributive 「的/之」 without sharing the phrase's head noun
+  (「顾峥的声音压得很低」 → 「顾峥的压着嗓子」), and keeping the fossil beats emitting
+  that.
+- **The repair target is per-gate, and getting it wrong makes the fixer a no-op.**
+  Density gates (`cross_chapter_repetition`, `descriptor_frequency`) are answered by
+  keep-1 rotation; a `book_wide_fossils` hard reject is a book-cumulative ratio and
+  can only be cleared by ZERO occurrences in this chapter, so `fix.rotate_fossils`
+  runs two passes with two targets. Under the old shared keep-1 target it replaced
+  nothing in 10 of 12 real cases (they contain the phrase exactly once). LESSONS §13.
+- **A repair that must prevent a rework cannot live in `_stage_fix`.** A fossil
+  `gate_rejects` entry routes `_classify_replan_failure` straight to STRUCTURAL, and
+  `_stage_fix` runs after that decision. `pipeline._repair_fossil_rejects` therefore
+  sits inside the review loop (after the review is archived, before the rework
+  decision) and is **verify-then-drop**: the reject is removed only once every phrase
+  it named is provably absent from the rotated text — which also makes it idempotent
+  on the resume path, where a cached review meets an already-rotated chapter. It
+  re-derives `failure_codes` (consulted *before* the gate list) and touches neither
+  the archived `review_round{n}.json` nor `score`/`style_health`.
 - `_stage_fix` records `style_health_after_fix` rather than overwriting
   `style_health`: the latter is the measurement `score` was computed from, and
   overwriting it would leave score and penalty describing different texts.

@@ -17,6 +17,7 @@ is covered by the offline replay + the live A/B instead.
 import unittest
 
 import fix
+import fossil_fix
 import pipeline
 import planning
 from quality import REGISTRY
@@ -256,6 +257,65 @@ class RotateFossilsTest(unittest.TestCase):
         out, replaced = fix.rotate_fossils(text, {}, _config(), 1)
         self.assertEqual((out, replaced), (text, []))
 
+    def test_hard_fossil_targets_zero_not_keep_one(self):
+        """A book-cumulative hard reject can only be cleared by ZERO occurrences.
+
+        Measured: 10 of the 12 archived chapters rejected on an entrenched bank
+        phrase contain it exactly ONCE, so under the shared keep-1 target this
+        fixer replaced nothing at all and the repair declared for the gate could
+        never turn it green.
+        """
+        text = "他声音压得很低，说了一句。"
+        review = {"book_fossils": {"hard_fossils": [{"phrase": "声音压得很低"}]}}
+        out, replaced = fix.rotate_fossils(text, review, _config(), 3)
+        self.assertEqual(replaced, ["声音压得很低"])
+        self.assertNotIn("声音压得很低", out)
+
+    def test_soft_and_hard_phrases_keep_their_own_targets(self):
+        """One call, two targets: hard → 0 left, soft → keep 1."""
+        text = ("他声音压得很低。" * 2) + ("她深吸一口气。" * 3)
+        review = {"book_fossils": {
+            "hard_fossils": [{"phrase": "声音压得很低"}],
+            "fossils": [{"phrase": "深吸一口气"}],
+        }}
+        out, replaced = fix.rotate_fossils(text, review, _config(), 1)
+        self.assertEqual(set(replaced), {"深吸一口气", "声音压得很低"})
+        self.assertNotIn("声音压得很低", out)
+        self.assertEqual(out.count("深吸一口气"), 1)
+
+
+class SafeAltTest(unittest.TestCase):
+    """A metric-improvement check cannot catch broken Chinese, so the grammar
+    guard has to be structural. See fossil_fix._safe_alt."""
+
+    ALTS = fossil_fix.FOSSIL_REPLACEMENTS["声音压得很低"]
+
+    def test_after_an_attributive_de_only_a_same_head_variant_is_offered(self):
+        alt = fossil_fix._safe_alt("声音压得很低", self.ALTS, 0, "的")
+        self.assertIsNotNone(alt)
+        self.assertTrue(alt.startswith("声"), alt)
+
+    def test_mid_sentence_any_variant_is_fine(self):
+        alt = fossil_fix._safe_alt("声音压得很低", self.ALTS, 0, "他")
+        self.assertEqual(alt, self.ALTS[0])
+
+    def test_no_same_head_variant_means_keep_the_fossil(self):
+        self.assertIsNone(fossil_fix._safe_alt("声音压得很低", ["压着嗓子"], 0, "的"))
+
+    def test_empty_bank_entry(self):
+        self.assertIsNone(fossil_fix._safe_alt("声音压得很低", [], 0, ""))
+
+    def test_attributive_position_is_never_left_ungrammatical(self):
+        """The real Ch195 shape: 「顾峥的声音压得很低」 must not become
+        「顾峥的压着嗓子」."""
+        text = "顾峥的声音压得很低，只有她听得见。"
+        review = {"book_fossils": {"hard_fossils": [{"phrase": "声音压得很低"}]}}
+        out, replaced = fix.rotate_fossils(text, review, _config(), 195)
+        self.assertEqual(replaced, ["声音压得很低"])
+        self.assertNotIn("的压着嗓子", out)
+        self.assertNotIn("的用气声说", out)
+        self.assertTrue(out.startswith("顾峥的声"), out)
+
 
 class ApplyL0Test(unittest.TestCase):
     def test_no_fired_gate_means_no_change(self):
@@ -332,6 +392,145 @@ class RiskUpshiftFloorTest(unittest.TestCase):
         self.assertEqual(
             planning._risk_score_floor(_config(rework_trigger="  DETERMINISTIC ")), 6.5)
         self.assertEqual(planning._risk_score_floor(_config(rework_trigger="typo")), 7.0)
+
+
+class RepairFossilRejectsTest(unittest.TestCase):
+    """`pipeline._repair_fossil_rejects` clears a fossil reject only after the
+    phrase is provably gone. It changes the text, never the ruler.
+
+    Why it lives in the review loop rather than in `_stage_fix`: a fossil
+    gate_reject routes `_classify_replan_failure` straight to a STRUCTURAL replan,
+    and `_stage_fix` runs after that decision — the free repair could never
+    prevent the expensive re-roll it exists to replace.
+    """
+
+    def _state(self, root, text, review):
+        from config import Paths
+
+        paths = Paths(
+            book=root / "book.md", state=root / "state.md", title=root / "title.txt",
+            bible=root / "b.md", characters=root / "c.md", timeline=root / "t.md",
+            threads=root / "th.md", volume_plan=root / "vp.md", compass=root / "cp.md",
+            voices=root / "vs.md", voice=root / "v.md", contract=root / "ct.md",
+            glossary=root / "g.md", chapters_dir=root / "chapters",
+            logs_dir=root / "logs", database=root / "story_state.db",
+        )
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        st = pipeline.ChapterState(
+            client=None, paths=paths, conn=None, config=_config(),
+            chapter_num=7, background=None, resume=False,
+        )
+        st.chapter = text
+        st.review = review
+        return st
+
+    def _run(self, text, review):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            st = self._state(Path(td), text, review)
+            return st, pipeline._repair_fossil_rejects(st, 0)
+
+    def _reject_review(self, **extra):
+        review = {
+            "score": 6.0, "accepted": True,
+            "gate_rejects": [{"gate": "book_wide_fossils_ratio",
+                              "phrases": ["声音压得很低"], "fracs": [0.31]}],
+            "book_fossils": {"hard_fossils": [{"phrase": "声音压得很低", "frac": 0.31}]},
+            "failure_codes": ["fossil_repetition"],
+        }
+        review.update(extra)
+        return review
+
+    def test_repaired_reject_is_cleared_and_the_phrase_is_gone(self):
+        st, did = self._run("他声音压得很低，只说了一句。", self._reject_review())
+        self.assertTrue(did)
+        self.assertEqual(st.review["gate_rejects"], [])
+        self.assertNotIn("声音压得很低", st.chapter)
+        self.assertEqual(st.review["fossil_rotate"]["replaced"], ["声音压得很低"])
+        self.assertEqual(st.review["fossil_rotate"]["stale_gates"], [])
+
+    def test_failure_codes_are_rederived_not_left_stale(self):
+        """`_classify_replan_failure` reads `failure_codes` BEFORE gate_rejects, so
+        a stale `fossil_repetition` code would keep forcing the structural replan."""
+        import taxonomy
+
+        review = self._reject_review()
+        self.assertEqual(taxonomy.replan_kind(review["failure_codes"]), "structural")
+        st, _ = self._run("他声音压得很低。", review)
+        self.assertNotIn("failure_codes", st.review)
+        self.assertIsNone(taxonomy.replan_kind(st.review.get("failure_codes") or []))
+
+    def test_an_unrelated_code_source_is_preserved(self):
+        """Re-derivation must not amount to wiping the field: a code that comes from
+        `problems` rather than from the repaired gate has to survive."""
+        review = self._reject_review(problems=["REPEAT: 大段复述上一章"])
+        review["failure_codes"] = ["adjacent_repeat", "fossil_repetition"]
+        st, _ = self._run("他声音压得很低。", review)
+        self.assertEqual(st.review["failure_codes"], ["adjacent_repeat"])
+
+    def test_unrelated_rejects_survive(self):
+        review = self._reject_review()
+        review["gate_rejects"].append({"gate": "contract_hard", "count": 2})
+        st, did = self._run("他声音压得很低。", review)
+        self.assertTrue(did)
+        self.assertEqual([g["gate"] for g in st.review["gate_rejects"]], ["contract_hard"])
+
+    def test_unrotatable_phrase_keeps_the_reject(self):
+        """Bank-only rotation: a book-specific proper noun must stay, and so must
+        the reject that named it."""
+        review = self._reject_review()
+        review["gate_rejects"][0]["phrases"] = ["老市场街七号"]
+        review["book_fossils"] = {"hard_fossils": [{"phrase": "老市场街七号"}]}
+        st, did = self._run("老市场街七号的门开了。", review)
+        self.assertFalse(did)
+        self.assertEqual(len(st.review["gate_rejects"]), 1)
+        self.assertIn("老市场街七号", st.chapter)
+
+    def test_stale_reject_on_an_absent_phrase_is_cleared_and_labelled(self):
+        """A reject for a phrase this chapter does not contain is the latching-gate
+        failure mode — a forced replan with nothing here to act on. It clears, but
+        as `stale`, so a gate bug never hides inside a repair."""
+        st, did = self._run("门开了，谁也没说话。", self._reject_review())
+        self.assertTrue(did)
+        self.assertEqual(st.review["gate_rejects"], [])
+        self.assertEqual(st.review["fossil_rotate"]["stale_gates"],
+                         ["book_wide_fossils_ratio"])
+        self.assertEqual(st.review["fossil_rotate"]["resolved_gates"], [])
+
+    def test_idempotent_on_resume(self):
+        """Resume replays the cached review against an already-rotated chapter;
+        the reject must still clear even though nothing is left to replace."""
+        st, _ = self._run("他声音压得很低。", self._reject_review())
+        st2, did = self._run(st.chapter, self._reject_review())
+        self.assertTrue(did)
+        self.assertEqual(st2.review["gate_rejects"], [])
+
+    def test_no_fossil_reject_is_a_no_op(self):
+        review = {"score": 6.0, "gate_rejects": [{"gate": "contract_hard"}]}
+        st, did = self._run("他声音压得很低。", review)
+        self.assertFalse(did)
+        self.assertIn("声音压得很低", st.chapter)
+        self.assertNotIn("fossil_rotate", st.review)
+
+    def test_disabled_with_l0(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            st = self._state(Path(td), "他声音压得很低。", self._reject_review())
+            st.config = _config(fix_l0_enabled=False)
+            self.assertFalse(pipeline._repair_fossil_rejects(st, 0))
+            self.assertEqual(len(st.review["gate_rejects"]), 1)
+
+    def test_score_and_penalty_are_never_touched(self):
+        """The score was computed from the pre-rotation text. Crediting the fossil
+        penalty back would leave score and measurement describing different texts —
+        the same trap `_stage_fix` avoids with `style_health_after_fix`."""
+        st, _ = self._run("他声音压得很低。", self._reject_review())
+        self.assertEqual(st.review["score"], 6.0)
+        self.assertEqual(st.review["book_fossils"]["hard_fossils"][0]["frac"], 0.31)
 
 
 if __name__ == "__main__":

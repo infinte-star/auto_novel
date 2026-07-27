@@ -274,12 +274,26 @@ def rotate_fossils(
     if isinstance(extra, dict):
         bank.update(extra)
 
+    # Two targets, because the gates ask different questions. `cross_chapter_repetition`
+    # / `descriptor_frequency` complain about DENSITY, so keeping one occurrence and
+    # rotating the rest answers them. A hard `book_wide_fossils` reject complains that
+    # the phrase recurs across a large fraction of the BOOK, and the ratio is
+    # book-cumulative -- `quality.book_wide_fossils` only indicts a chapter that
+    # actually contains the phrase (`in_current`), so the only way this chapter turns
+    # the gate green is to contain it ZERO times. Measured: 10 of the 12 archived
+    # chapters still rejected on an entrenched bank phrase contain it exactly once, so
+    # under the shared keep-1 target this fixer replaced nothing at all and the repair
+    # declared for the gate could never clear it. LESSONS §13.
     phrases: list[str] = []
+    zero_target: set[str] = set()
 
-    def _add(p: Any) -> None:
+    def _add(p: Any, *, zero: bool = False) -> None:
         p = str(p or "").strip()
-        if p and p in bank and p not in phrases:
-            phrases.append(p)
+        if p and p in bank:
+            if p not in phrases:
+                phrases.append(p)
+            if zero:
+                zero_target.add(p)
 
     ccr = gate_result(review, "cross_chapter_repetition")
     if isinstance(ccr, dict):
@@ -295,6 +309,11 @@ def rotate_fossils(
                 _add(item)
     bwf = gate_result(review, "book_wide_fossils")
     if isinstance(bwf, dict):
+        for item in bwf.get("hard_fossils") or []:
+            if isinstance(item, dict):
+                _add(item.get("phrase"), zero=True)
+            else:
+                _add(item, zero=True)
         for item in bwf.get("fossils") or []:
             if isinstance(item, dict):
                 _add(item.get("phrase"))
@@ -310,17 +329,24 @@ def rotate_fossils(
 
     if not phrases:
         return text, []
-    try:
-        fixed, stats = fix_chapter(
-            text,
-            [{"phrase": p} for p in phrases],
-            bank,
-            max_per_chapter=int(cfg.get("fix_fossil_max_keep", 1)),
-            chapter_num=chapter_num,
-        )
-    except Exception:
-        return text, []
-    replaced = [p for p, s in (stats or {}).items() if int(s.get("replaced", 0)) > 0]
+    keep = int(cfg.get("fix_fossil_max_keep", 1))
+    groups = [([p for p in phrases if p in zero_target], 0),
+              ([p for p in phrases if p not in zero_target], keep)]
+    fixed, replaced = text, []
+    for group, max_keep in groups:
+        if not group:
+            continue
+        try:
+            fixed, stats = fix_chapter(
+                fixed,
+                [{"phrase": p} for p in group],
+                bank,
+                max_per_chapter=max_keep,
+                chapter_num=chapter_num,
+            )
+        except Exception:
+            return text, []
+        replaced += [p for p, s in (stats or {}).items() if int(s.get("replaced", 0)) > 0]
     return (fixed, replaced) if replaced else (text, [])
 
 

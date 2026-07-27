@@ -619,6 +619,43 @@ per "No silent caps": a silently narrowed corpus reads exactly like a clean one.
 Explicit names on the command line bypass the filter entirely, or an A/B could no
 longer read its own forked arms. `tests/test_corpus_discovery.py` pins all of it.
 
+### 声明了修复层 ≠ 修复真的能生效（2026-07-28）
+
+`gate_rejects` 是 FPY′ 的头号剩余杀手（全库 20 次）。追到底，**每一本都只有一条**
+入库短语，而且 11/12 是同一条 bank 短语 `声音压得很低`。它在写作时**已经**排在
+writer avoid-list 的 rank 0（`tools/_fossil_probe.py` 逐章重算过 1..N-1 的
+avoid-list 确认），所以这不是闸门锁死，是写手不合规——本章完全有办法把它变绿。
+
+`quality.py` 用 `@REGISTRY.register(..., repair="L0")` 给这个门声明了确定性修复，
+`fix.rotate_fossils` 也确实存在。但**声明不等于能生效**，三个缺陷叠在一起让这条修复
+在真实数据上一次都没成功过：
+
+1. **修复目标错了。** `rotate_fossils` 对所有短语共用 `fix_fossil_max_keep: 1`，而
+   12 章里有 10 章**只出现一次**——`kept = min(1, 1)` ⇒ 一次替换都不做。而
+   `book_wide_fossils` 的 hard reject 是**全书累计比率**，只能靠本章**零出现**转绿。
+   密度门（`cross_chapter_repetition`/`descriptor_frequency`）保留 1 次是对的，比率门
+   必须清零：现在 `rotate_fossils` 分两组、两个目标各跑一次 `fix_chapter`。
+2. **缺语法护栏。** Ch195 的原文是「顾峥的声音压得很低」；bank 的头两个变体是动词短语，
+   直接换进去会写出「顾峥的压着嗓子」。`keep-only-if-metric-improved` 抓不到这个——
+   化石计数确实降了。护栏必须是**结构性**的：`fossil_fix._safe_alt` 在前一个字是
+   「的/之」时只允许与原短语同中心词的变体，没有就宁可留着化石。
+3. **修复跑在返工判决之后。** `_stage_fix` 排在 `_stage_quality_replan` 后面，所以为这个
+   门声明的免费修复永远来不及阻止它触发的重做。新增 `pipeline._repair_fossil_rejects`
+   插在 review 归档之后、返工判决之前，**先证后销**：只有当 reject 点名的短语在改写后
+   的正文里确实一个都不剩，才把这条 reject 摘掉（对拿到的是缓存 review 的 resume 路径
+   天然幂等）。归档的 `review_round{n}.json` 与 `style_health` 一律不动。
+
+**实测收益要说实话。** 归档 29 章带化石 reject：11 章零 LLM 转绿（长度变化
+−0.12%…+0.93%），16 章是 `current_chapter` 修复前的锁死残留（现在按 `stale` 单独记账，
+不让闸门 bug 藏在修复里），2 章是书内专名（bank-only，正确地不动）。但
+`_classify_replan_failure` 的结构性判定在 11 章里**只翻转了 1 章**——其余 10 章因为维度
+分独立偏低，摘掉 reject 后照样走 structural。而且 `book_fossils` 的 `penalty` 全库都是
+`None`，所以把化石提前轮换掉也**不会**抬分（这直接否掉了「把轮换挪到 review 之前」的
+方案）。所以这次改动的价值是：**一条声明过但从未生效的修复终于能生效**、11 章入库正文
+免费变干净（且不再把这条化石写进全书累计比率去污染后面每一章）、以及在
+`rework_trigger: deterministic` 下少一个硬闸——**不是**省调用。FPY′ 不动也是对的：首稿
+确实带着化石。
+
 ### Two fixes measured and rejected before writing code
 
 Per "无效的删除" — a candidate that cannot show a gain offline gets deleted at the

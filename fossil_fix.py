@@ -24,8 +24,12 @@ FOSSIL_REPLACEMENTS: dict[str, list[str]] = {
         "虎口那道白印", "虎口愈合的旧伤", "虎口上结痂的伤痕",
         "手背蜿蜒的疤", "掌根那条淡粉色的线", "虎口磨出的茧旁那道浅沟",
     ],
+    # The first two variants are verb phrases, so they cannot follow an attributive
+    # 「的」(「顾峥的声音压得很低」). `_safe_alt` needs at least one variant sharing the
+    # phrase's head noun for those positions -- that is what 声音低下去 / 声音低得发闷
+    # are for. Keep at least one 声-headed variant in this entry.
     "声音压得很低": [
-        "压着嗓子", "用气声说", "几乎贴着耳朵说",
+        "压着嗓子", "用气声说", "几乎贴着耳朵说", "声音低下去", "声音低得发闷",
         "声量放到只有两人能听到的程度", "咬着字根说", "把声线收到嗓子底部",
     ],
     "每个字都像": [
@@ -172,6 +176,29 @@ def scan_fossils(
 # fix_chapter
 # ---------------------------------------------------------------------------
 
+# Characters that turn what follows into a noun phrase. A replacement variant that
+# does not itself start with a noun cannot be spliced in after one.
+_ATTRIBUTIVE = ("的", "之")
+
+
+def _safe_alt(phrase: str, alts: list[str], seed: int, prev: str) -> str | None:
+    """Pick a rotation variant that stays grammatical at this position.
+
+    Returns None when no variant is safe, in which case the caller must keep the
+    fossil. Measured need: of the 12 archived chapters still rejected on an
+    entrenched bank phrase, one reads 「顾峥的声音压得很低」 -- rotating it with the
+    bank's verb-phrase variant would emit 「顾峥的压着嗓子」. See the caller's
+    comment for why a downstream metric check cannot catch that.
+    """
+    if not alts:
+        return None
+    ordered = [alts[(seed + i) % len(alts)] for i in range(len(alts))]
+    if prev in _ATTRIBUTIVE:
+        # Only a variant sharing the phrase's head noun keeps the noun phrase intact.
+        ordered = [a for a in ordered if a[:1] == phrase[:1]]
+    return ordered[0] if ordered else None
+
+
 def fix_chapter(
     text: str,
     fossils: list[dict[str, Any]],
@@ -203,37 +230,49 @@ def fix_chapter(
             stats[phrase] = {"original_count": count, "kept": count, "replaced": 0}
             continue
 
-        # Build replacement list by rotating through alts seeded on chapter_num
-        # so different chapters get different variants
-        replace_list: list[str] = []
-        base_idx = chapter_num * 7  # spread offset across chapters
-        for i in range(to_replace):
-            replace_list.append(alts[(base_idx + i) % len(alts)])
-
-        # Replace occurrences: keep the first `kept`, replace the rest
+        # Replace occurrences: keep the first `kept`, replace the rest. The variant
+        # is chosen per occurrence (offset by chapter_num so different chapters get
+        # different variants) because the 「的」 guard below can reject one.
         pieces: list[str] = []
         remaining = result
         occurrence = 0
         replace_idx = 0
+        replaced = skipped = 0
+        base_idx = chapter_num * 7  # spread offset across chapters
 
         while phrase in remaining:
             pos = remaining.index(phrase)
             pieces.append(remaining[:pos])
             occurrence += 1
+            prev = "".join(pieces)[-1:]
             if occurrence <= kept:
                 pieces.append(phrase)
             else:
-                pieces.append(replace_list[replace_idx])
-                replace_idx += 1
+                alt = _safe_alt(phrase, alts, base_idx + replace_idx, prev)
+                if alt is None:
+                    # An attributive 「的」 in front makes the phrase a noun phrase
+                    # ("顾峥的声音压得很低"); swapping in a verb-phrase variant would
+                    # emit "顾峥的压着嗓子". Keeping a fossil beats emitting broken
+                    # Chinese, and no metric downstream can catch broken grammar --
+                    # the keep-if-improved check would see the fossil count drop and
+                    # accept it. So this skip is the guard, not a fallback.
+                    pieces.append(phrase)
+                    skipped += 1
+                else:
+                    pieces.append(alt)
+                    replace_idx += 1
+                    replaced += 1
             remaining = remaining[pos + len(phrase):]
         pieces.append(remaining)
         result = "".join(pieces)
 
         stats[phrase] = {
             "original_count": count,
-            "kept": kept,
-            "replaced": to_replace,
+            "kept": count - replaced,
+            "replaced": replaced,
         }
+        if skipped:
+            stats[phrase]["skipped_unsafe"] = skipped
 
     return result, stats
 

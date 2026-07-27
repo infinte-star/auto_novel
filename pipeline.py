@@ -1274,6 +1274,109 @@ def _stage_write(state: ChapterState) -> None:
         save_checkpoint(state.paths, state.chapter_num, "review_round0.json", state.candidate_review)
 
 
+# Gates whose reject names the offending phrases, so a rotation can be VERIFIED
+# against the reject itself rather than by re-scanning the whole book.
+_FOSSIL_REJECT_GATES = ("book_wide_fossils_ratio", "book_wide_fossils")
+
+
+def _repair_fossil_rejects(state: ChapterState, round_num: int) -> bool:
+    """Rotate entrenched bank fossils, then drop only the rejects thereby resolved.
+
+    This is NOT gate relaxation, and the difference is the verify step: the reject
+    is dropped only after every phrase it named is provably absent from the rewritten
+    text, so the gate would return green if re-run. The text changed; the ruler did
+    not.
+
+    Why it has to happen here rather than in `_stage_fix`: a `book_wide_fossils_ratio`
+    reject sets `accepted=False`, which `_classify_replan_failure` routes straight to
+    a STRUCTURAL replan (a new plan plus forced multi-draft sampling). `_stage_fix`
+    runs after that decision, so the repair declared for the gate could never prevent
+    the re-roll it was supposed to replace.
+
+    Measured on the archived corpus (12 chapters whose first draft was rejected on a
+    fossil the chapter really contains): 11 are one bank phrase, 「声音压得很低」, at
+    rank 0 of the writer's own avoid-list — already knowable at write time, so the
+    writer simply did not comply. All 11 rotate clean with zero LLM calls and a length
+    change under ±0.3%. Two defects had to be fixed for that to be true: the shared
+    keep-1 rotation target (10 of the 12 contain the phrase exactly ONCE, so nothing
+    was ever replaced) and the missing 「的」 grammar guard. LESSONS §13.
+
+    The archived `review_round{n}.json` is deliberately left verbatim -- it is the
+    honest record of what the first draft contained, and FPY' must keep counting these
+    as first-draft misses. What this saves is the replan, not the yield.
+    """
+    if not bool(state.config["novel"].get("fix_l0_enabled", True)):
+        return False
+    rejects = [g for g in (state.review.get("gate_rejects") or []) if isinstance(g, dict)]
+    if not any(str(g.get("gate")) in _FOSSIL_REJECT_GATES for g in rejects):
+        return False
+    try:
+        from fix import rotate_fossils
+        fixed, replaced = rotate_fossils(
+            state.chapter, state.review, state.config, state.chapter_num)
+    except Exception:
+        return False
+    fixed = fixed or state.chapter
+
+    # The verify step is "is the phrase still in the text", NOT "did we replace
+    # something". That also makes the repair idempotent on resume: the cached
+    # review still carries the reject while `chapter_current` is already rotated,
+    # and a rotation that finds nothing left to replace must still clear it.
+    # A reject whose phrases were absent before we touched anything is stale --
+    # keeping it would force a structural replan that has nothing in this chapter
+    # to act on, which is the latching-gate failure mode. It is logged separately
+    # so a gate bug never hides inside a repair.
+    kept, resolved, stale = [], [], []
+    for g in rejects:
+        phrases = [str(p) for p in (g.get("phrases") or []) if p]
+        if (str(g.get("gate")) in _FOSSIL_REJECT_GATES
+                and phrases and not any(p in fixed for p in phrases)):
+            (resolved if any(p in state.chapter for p in phrases) else stale).append(g)
+        else:
+            kept.append(g)
+    if not resolved and not stale:
+        return False
+
+    record = {
+        "round": round_num,
+        "replaced": replaced,
+        "resolved_gates": [str(g.get("gate")) for g in resolved],
+        "stale_gates": [str(g.get("gate")) for g in stale],
+    }
+    if replaced:
+        state.chapter = normalize_chapter(fixed)
+        save_checkpoint(state.paths, state.chapter_num,
+                        CHAPTER_CURRENT_CHECKPOINT, state.chapter)
+    state.review["gate_rejects"] = kept
+    state.review["fossil_rotate"] = record
+    # `failure_codes` is DERIVED from gate_rejects, and `_classify_replan_failure`
+    # consults it BEFORE the gate list -- leaving a stale `fossil_repetition` code
+    # behind would keep forcing the structural replan this repair exists to avoid.
+    # Re-derive with review.py's own pure function rather than editing the list.
+    if bool(state.config["novel"].get("failure_taxonomy_enabled", True)):
+        try:
+            import taxonomy
+            codes = taxonomy.codes_from_review(state.review)
+            if codes:
+                state.review["failure_codes"] = codes
+            else:
+                state.review.pop("failure_codes", None)
+        except Exception:
+            pass
+    save_checkpoint(state.paths, state.chapter_num,
+                    f"fossil_rotate_round{round_num}.json", record)
+    log(state.paths,
+        f"L0 fossil rotation Ch{state.chapter_num} round={round_num}: "
+        f"replaced {'/'.join(replaced) or '(none)'}; cleared {len(resolved)} reject(s)"
+        + (f", {len(stale)} stale (phrase absent)" if stale else "")
+        + f", {len(kept)} remain")
+    try:
+        db_event(state.conn, state.chapter_num, "fossil_rotate", record)
+    except Exception:
+        pass
+    return True
+
+
 def _stage_review_revise(state: ChapterState) -> None:
     """Run the review-revise loop with plateau detection."""
     threshold = float(state.config["novel"]["quality_threshold"])
@@ -1349,6 +1452,8 @@ def _stage_review_revise(state: ChapterState) -> None:
             )
             save_checkpoint(state.paths, state.chapter_num, review_key, state.review)
             log(state.paths, f"Reviewed Ch{state.chapter_num} round={round_num} score={state.review.get('score')}/10")
+
+        _repair_fossil_rejects(state, round_num)
 
         if round_num > 0:
             try:
