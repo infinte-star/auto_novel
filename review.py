@@ -1405,10 +1405,17 @@ def review_chapter(
     cv = [c for c in report.get("contract_violations", []) if isinstance(c, dict)]
     # Deterministic backstop: the reviewer sometimes RECOGNISES an ability/modality
     # breach but routes the description into "problems" (free text) instead of the
-    # structured "contract_violations" field that drives the HARD block. If a
-    # contract was provided and a problem clearly names an ability-boundary issue,
-    # synthesize a structured violation so the block still fires. Only triggers when
-    # the model itself flagged it — we never invent a breach from nothing.
+    # structured "contract_violations" field. If a contract was provided and a problem
+    # clearly names an ability-boundary issue, synthesize a structured violation so it
+    # is at least penalized and surfaced. Only triggers when the model itself flagged
+    # it — we never invent a breach from nothing.
+    #
+    # Stamped SOFT deliberately (was HARD until b54bfd0): a keyword match on free text
+    # is weaker evidence than a violation the reviewer chose to register, and HARD
+    # blocks the draft. Measured cost of the old stamp: 22 chapters across huangliang /
+    # tunshi_xitong / tangshuting failed their first draft on a backstop-synthesized
+    # hard violation alone — tunshi_xitong's true first-pass yield is 98%, not 85%
+    # (`tools/fpy_prime.py`, which normalizes these when replaying old payloads).
     if contract_text_block and contract_text_block != "None":
         kw = ("越界", "模态", "听觉", "视觉", "白名单", "违背设定", "能力范围",
               "out of scope", "modality", "off-contract", "契约")
@@ -1424,7 +1431,7 @@ def review_chapter(
                     "type": "ability_modality_drift",
                     "severity": "soft",
                 })
-                log(paths, f"Contract backstop Ch{chapter_num}: lifted problem -> hard violation")
+                log(paths, f"Contract backstop Ch{chapter_num}: lifted problem -> SOFT violation")
         report["contract_violations"] = cv
     contract_hard = [c for c in cv if str(c.get("severity", "")).lower() == "hard"]
     contract_soft = [c for c in cv if str(c.get("severity", "")).lower() != "hard"]

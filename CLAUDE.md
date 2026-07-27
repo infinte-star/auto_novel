@@ -311,9 +311,17 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads 62%–94% (vs 12%–63% for "self-score ≥ 8.0")
-and names the failing gate for every miss; the leading first-draft killer is
-`hard_contract`, 54 misses spread across 8 novels.
+by one ruler. Library-wide it reads 62%–99% (vs 12%–63% for "self-score ≥ 8.0") and
+names the failing gate for every miss; the leading killers are `gate_rejects` (39,
+but 27 in tangshuting alone) and `hard_contract` (32, spread across 6 novels).
+
+**A retro-replay must normalize engine semantics that have since changed**, or it
+reports fixed bugs as live problems. `review.py`'s contract backstop stamped
+keyword-matched `problems` text as a HARD violation until `b54bfd0` downgraded it to
+SOFT; 22 archived chapters fail their first draft on that alone, which is the whole
+difference between "`hard_contract` is the #1 killer at 54" (wrong) and "32, second
+to gate_rejects" (right) — and between tunshi_xitong at 85% and its true 98%.
+`fpy_prime._normalize` re-stamps it by default; `--raw` replays payloads verbatim.
 
 **Offline tools must not log into the novel they measure.** `call_llm` appends
 every call to `paths.logs_dir/llm_calls.jsonl`, which is exactly the file

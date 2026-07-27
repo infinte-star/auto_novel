@@ -643,26 +643,54 @@ P4 窗口重新结算（`python tools/fpy_prime.py p4_score p4_det --from 47 --t
 臂 FPY′ 仍高于 score 臂而成本更低，那才是 P4 真通过；若 FPY′ 跟着掉回去，说明确定性
 触发器的收益本来就只是「省了 revise」，两边打平，代码继续默认关闭。
 
-FPY′ 的全库读数（顺手拿到的额外结论）：
+#### 回放旧 payload 必须先归一化引擎语义（这一步抓到一个已修 bug 在冒充头号病因）
+
+FPY′ 的第一版读数把 `hard_contract`（54 次）报成全库头号首稿杀手。查下去，44 次的
+`rule` 字段写着同一句话：**「能力白名单/模态（由 problems 文本回填）」**——那是
+`review.py` 的契约兜底，评审把能力越界写进自由文本 `problems` 而没写进结构化字段时，
+它按关键词命中合成一条违约。这条兜底**曾经**盖 `severity: "hard"`，而
+`_hard_block_reasons` 只拦 hard；commit `b54bfd0` 已把它降成 `soft`。
+
+也就是说：**归档 payload 编码的是它被写下那天的引擎语义，直接回放会把已修的 bug
+报成活着的病因。** 实测 22 章的首稿失败**只**由这条被废弃的 hard 构成，按今天的代码
+它们全都通过。
+
+`fpy_prime._normalize` 因此默认把这条兜底重新盖成 soft（`--raw` 保留逐字回放）。
+归一化后两本书的读数完全变样，头号病因也换了：
+
+| | 归一化后（今天的语义） | `--raw`（历史 payload） |
+|---|---|---|
+| tunshi_xitong | 51/52 **98%** | 44/52 85% |
+| huangliang | 99/100 **99%** | 94/100 94% |
+| tangshuting_v1_backup | 161/200 **80%** | 157/200 78% |
+| 首稿失败原因 #1 | `gate_rejects` **39** | `hard_contract` 54 |
+| `hard_contract` | **32** | 54 |
+
+顺带修了 `review.py` 里那行早就对不上代码的日志（`lifted problem -> hard violation`
+写的其实是 soft），并把「为什么是 soft」和这 22 章的实测代价写进了那段注释——
+不然下一个人看到 soft 只会以为是漏改。
+
+FPY′ 全库读数（归一化后）：
 
 ```
-huangliang     94/100  94% | tunshi_xitong 44/52 85% | tangshuting_v1_backup 157/200 78%
-yeban_guize    20/26   77% | tangshuting  151/199 76% | guize_guaitan  9/13  69%
-tangshuting_e2e 28/45  62%
-首稿失败原因合计：hard_contract 54 · gate_rejects 39 · replanned:initial 28 ·
+huangliang 99% · tunshi_xitong 98% · ab_arc 80% · tangshuting_v1_backup 80% ·
+yeban_guize 77% · tangshuting 76% · huangliang__ablate 75% · guize_guaitan 69% ·
+tangshuting_e2e 62%
+首稿失败原因合计：gate_rejects 39 · hard_contract 32 · replanned:initial 28 ·
               style_collapse 25 · hard_contradictions 11 · replanned:critical 2
 ```
 
-对比同一批章的「自评 ≥8.0」比例（12%–63%），FPY′ 的区分度更高（62%–94%）**且
-每一次失败都指得出具体门**。两个头号杀手的分布很不一样，别混着读：
+对比同一批章的「自评 ≥8.0」比例（12%–63%），FPY′ 的区分度更高（62%–99%）**且
+每一次失败都指得出具体门**。三条主因的分布很不一样，别混着读：
 
-- `hard_contract` 54 次，**摊在 8 本里**（20/16/7/5/2/2/1/1）——这是全库性的，
-  首稿最常栽在硬契约上，而不是栽在文体或重复上。
-- `gate_rejects` 39 次里有 **27 次是 tangshuting 一本**，`replanned:initial` 28 次
-  里有 15 次是 `tangshuting_e2e` 一本。这两条是单本病灶，不是全库结论。
+- `gate_rejects` 39 次里 **27 次是 tangshuting 一本**；`replanned:initial` 28 次里
+  **15 次是 tangshuting_e2e 一本**。这两条是单本病灶，不是全库结论。
+- `hard_contract` 32 次摊在 6 本里（16/10/2/2/1/1）——这一条是全库性的，也是归一化
+  之后仍然站得住的那部分。
 
-所以下一刀的落点是硬契约的首稿合规率，而不是继续调门槛——与
-`docs/REDESIGN_V2.md` §0 的判断一致。
+所以下一刀的落点仍然是硬契约的首稿合规率（与 `docs/REDESIGN_V2.md` §0 一致），但
+量级要按 32 而不是 54 来估——**并且 huangliang / tunshi_xitong 这两本的首过率本来
+就在 98–99%，它们身上没有可捡的收益，别拿它们当改进对象。**
 
 ---
 

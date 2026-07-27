@@ -82,11 +82,43 @@ COUNTED_REPLANS = ("plan_initial_attempt[1-9]*_candidates.json",
                    "plan_critical_attempt*_candidates.json",
                    "plan_fossil_catastrophe_attempt*_candidates.json")
 
+# Archived payloads encode the engine semantics of the day they were written, so a
+# retroactive replay reports fixed bugs as live problems unless it normalizes.
+#
+# `review.py`'s contract backstop synthesizes a violation when the reviewer describes
+# an ability/modality breach in free-text `problems` instead of the structured field.
+# It originally stamped those `severity: "hard"`, which `_hard_block_reasons` blocks
+# on; commit b54bfd0 downgraded them to `soft`. 22 archived chapters fail FPY' on a
+# backstop-synthesized hard violation ALONE and would pass under current code — which
+# is the difference between "hard_contract is the library's #1 first-draft killer, 54
+# misses" (wrong) and "32 misses, second to gate_rejects" (right). Normalized by
+# default; `--raw` replays the payloads verbatim.
+SUPERSEDED_CONTRACT_RULE = "由 problems 文本回填"
 
-def chapter_verdict(ch_dir: Path) -> dict:
+
+def _normalize(review: dict) -> dict:
+    """Re-stamp verdicts whose severity the engine has since changed."""
+    cvs = review.get("contract_violations")
+    if not isinstance(cvs, list):
+        return review
+    fixed, changed = [], False
+    for c in cvs:
+        if (isinstance(c, dict)
+                and str(c.get("severity", "")).lower() == "hard"
+                and SUPERSEDED_CONTRACT_RULE in str(c.get("rule", ""))):
+            c, changed = {**c, "severity": "soft"}, True
+        fixed.append(c)
+    if not changed:
+        return review
+    return {**review, "contract_violations": fixed}
+
+
+def chapter_verdict(ch_dir: Path, *, raw: bool = False) -> dict:
     """Decide one chapter. Returns {ch, ok, reasons, score, replans, missing}."""
     ch = int(re.sub(r"\D", "", ch_dir.name) or 0)
     r0 = _payload(ch_dir / "review_round0.json")
+    if r0 is not None and not raw:
+        r0 = _normalize(r0)
     labels = []
     for pat in COUNTED_REPLANS:
         labels += [p.name.split("_attempt")[0] for p in ch_dir.glob(pat)]
@@ -102,7 +134,7 @@ def chapter_verdict(ch_dir: Path) -> dict:
             "replans": replans, "missing": False}
 
 
-def novel_verdicts(name: str, lo: int, hi: int) -> list[dict]:
+def novel_verdicts(name: str, lo: int, hi: int, *, raw: bool = False) -> list[dict]:
     base = ROOT / "novels" / name / "logs" / "checkpoints"
     if not base.is_dir():
         return []
@@ -110,7 +142,7 @@ def novel_verdicts(name: str, lo: int, hi: int) -> list[dict]:
     for d in sorted(base.glob("ch*")):
         if not d.is_dir():
             continue
-        v = chapter_verdict(d)
+        v = chapter_verdict(d, raw=raw)
         if lo <= v["ch"] <= hi:
             out.append(v)
     return out
@@ -131,6 +163,9 @@ def main() -> int:
     ap.add_argument("--bands", type=int, default=0,
                     help="also print FPY' per band of N chapters (mid-book drift)")
     ap.add_argument("--reasons", action="store_true", help="per-chapter detail")
+    ap.add_argument("--raw", action="store_true",
+                    help="replay payloads verbatim, without normalizing verdicts whose "
+                         "severity the engine has since changed (SUPERSEDED_CONTRACT_RULE)")
     args = ap.parse_args()
 
     names = args.novels or sorted(
@@ -145,7 +180,7 @@ def main() -> int:
     head = "FPY'"
     print(f"{'novel':<{width}}  {head:>12}  {'score>=8.0':>17}  {'self-score':>10}")
     for name in names:
-        vs = novel_verdicts(name, args.lo, args.hi)
+        vs = novel_verdicts(name, args.lo, args.hi, raw=args.raw)
         if not vs:
             print(f"{name:<{width}}  {'no chapters in range':>12}")
             continue

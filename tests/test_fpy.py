@@ -189,6 +189,35 @@ class TestFpyPrime(unittest.TestCase):
                 json.dumps({"score": 6.1, "accepted": False}), encoding="utf-8")
             self.assertEqual(fpy_prime.chapter_verdict(d)["score"], 6.1)
 
+    def test_superseded_backstop_severity_is_normalized(self):
+        """A retro-replay must not report an already-fixed engine bug as live.
+
+        review.py's contract backstop stamped keyword-matched `problems` text as a
+        HARD violation until b54bfd0. 22 archived chapters fail on that alone.
+        """
+        review = {"score": 9.0, "accepted": True, "contract_violations": [
+            {"severity": "hard", "rule": "能力白名单/模态（由 problems 文本回填）"}]}
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(fpy_prime.chapter_verdict(self._dir(td, review))["ok"])
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, review), raw=True)
+            self.assertFalse(v["ok"])
+            self.assertIn("hard_contract", v["reasons"][0])
+
+    def test_a_registered_hard_contract_violation_still_fails(self):
+        """Normalization is narrow: only the backstop's own synthesized rule."""
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, {
+                "score": 9.0, "accepted": True, "contract_violations": [
+                    {"severity": "hard", "rule": "能力白名单：只允许错字食谱暗码解密"}]}))
+            self.assertFalse(v["ok"])
+
+    def test_normalize_does_not_mutate_the_input(self):
+        review = {"contract_violations": [
+            {"severity": "hard", "rule": "x（由 problems 文本回填）"}]}
+        fpy_prime._normalize(review)
+        self.assertEqual(review["contract_violations"][0]["severity"], "hard")
+
     def test_thresholds_are_pinned_not_read_from_the_novel_config(self):
         """Two arms with different configs must still be judged by one ruler."""
         self.assertEqual(fpy_prime.PINNED["novel"]["style_penalty_block"], 2.0)
