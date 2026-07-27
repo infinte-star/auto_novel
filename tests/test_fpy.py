@@ -1,17 +1,28 @@
-"""Unit tests for novel._fpy_stats (First-Pass Yield, the north-star metric).
+"""Unit tests for the two First-Pass Yield definitions.
 
-FPY is derived from checkpoint artifacts rather than llm_calls.jsonl because
-the call log has no chapter field — an earlier `write == 1` proxy misreported
-huangliang as 0% when its real FPY is 58% (candidate_chapters: 2 makes two
-write calls structural, not rework). These tests pin the checkpoint-artifact
-contract so that regression can't come back.
+`novel._fpy_stats` (FPY) counts a chapter dirty when any rework artifact exists.
+It is derived from checkpoint artifacts rather than llm_calls.jsonl because the
+call log has no chapter field — an earlier `write == 1` proxy misreported
+huangliang as 0% when its real FPY is 58% (candidate_chapters: 2 makes two write
+calls structural, not rework). These tests pin the checkpoint-artifact contract
+so that regression can't come back.
+
+`tools/fpy_prime.chapter_verdict` (FPY') asks the narrower question FPY cannot
+answer — did the first draft carry a *measured* defect — because every rework
+artifact FPY looks for is produced by a rule keyed on `quality_threshold`, so an
+experiment that moves that rule moves FPY mechanically in both arms. The tests
+below pin the one judgment FPY' makes on its own: which replan labels count.
 """
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from novel import _fpy_stats, _reasoning_coverage
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import fpy_prime  # noqa: E402
 
 
 def _chapter(root: Path, num: int, *, completed: bool = True, artifacts: tuple[str, ...] = ()) -> None:
@@ -99,6 +110,92 @@ class TestFpyStats(unittest.TestCase):
             self.assertEqual(got["reasons"]["debt"], 1)
             self.assertEqual(got["reasons"]["revise"], 1)
             self.assertEqual(got["dirty_chapters"], [1])
+
+
+class TestFpyPrime(unittest.TestCase):
+    """FPY' must judge only on evidence the release rule cannot manufacture."""
+
+    def _dir(self, td: str, review: dict | None, *artifacts: str) -> Path:
+        d = Path(td) / "ch0007"
+        d.mkdir(parents=True, exist_ok=True)
+        if review is not None:
+            (d / "review_round0.json").write_text(
+                json.dumps({"payload": review}), encoding="utf-8")
+        for a in artifacts:
+            (d / a).write_text("{}", encoding="utf-8")
+        return d
+
+    def test_clean_first_draft_passes_regardless_of_score(self):
+        """A 6.8 with no measured defect is a pass — that is the entire point."""
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, {"score": 6.8, "accepted": True}))
+            self.assertTrue(v["ok"])
+            self.assertEqual(v["reasons"], [])
+            self.assertEqual((v["ch"], v["score"]), (7, 6.8))
+
+    def test_high_score_with_a_gate_reject_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(
+                td, {"score": 9.0, "accepted": True,
+                     "gate_rejects": [{"gate": "cross_chapter_repetition"}]}))
+            self.assertFalse(v["ok"])
+            self.assertIn("cross_chapter_repetition", v["reasons"][0])
+
+    def test_pre_write_replans_count_as_failures(self):
+        for label in ("plan_initial_attempt1_candidates.json",
+                      "plan_critical_attempt0_candidates.json",
+                      "plan_fossil_catastrophe_attempt0_candidates.json"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                v = fpy_prime.chapter_verdict(
+                    self._dir(td, {"score": 9.0, "accepted": True}, label))
+                self.assertFalse(v["ok"], label)
+                self.assertEqual(len(v["replans"]), 1)
+
+    def test_score_driven_replans_are_excluded(self):
+        """`quality_replan`/`hard_floor` are consequences of the release rule.
+
+        Counting them would put `quality_threshold` back into the criterion, which
+        is the circularity FPY' exists to remove.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(
+                td, {"score": 9.0, "accepted": True},
+                "plan_quality_replan_attempt0_candidates.json",
+                "plan_hard_floor_attempt0_candidates.json"))
+            self.assertTrue(v["ok"])
+            self.assertEqual(v["replans"], [])
+
+    def test_attempt0_alone_is_not_a_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(
+                td, {"score": 9.0, "accepted": True},
+                "plan_initial_attempt0_candidates.json"))
+            self.assertTrue(v["ok"])
+
+    def test_missing_round0_review_is_na_not_a_pass(self):
+        """Silence must not be counted as success in either direction."""
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, None))
+            self.assertIsNone(v["ok"])
+            self.assertTrue(v["missing"])
+            self.assertEqual(v["reasons"], ["no_round0_review"])
+
+    def test_bare_review_payload_is_accepted(self):
+        """Older checkpoints stored the review dict without a `payload` wrapper."""
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "ch0007"
+            d.mkdir(parents=True)
+            (d / "review_round0.json").write_text(
+                json.dumps({"score": 6.1, "accepted": False}), encoding="utf-8")
+            self.assertEqual(fpy_prime.chapter_verdict(d)["score"], 6.1)
+
+    def test_thresholds_are_pinned_not_read_from_the_novel_config(self):
+        """Two arms with different configs must still be judged by one ruler."""
+        self.assertEqual(fpy_prime.PINNED["novel"]["style_penalty_block"], 2.0)
+        with tempfile.TemporaryDirectory() as td:
+            d = self._dir(td, {"score": 9.0, "accepted": True,
+                               "style_health": {"penalty": 2.5}})
+            self.assertFalse(fpy_prime.chapter_verdict(d)["ok"])
 
 
 class TestReasoningCoverage(unittest.TestCase):

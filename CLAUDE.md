@@ -261,12 +261,14 @@ exists, why `RevisionTracker` cannot deliver it, and the `_accept_without_debt`
 ledger-hygiene requirement: LESSONS §2.
 
 `deterministic` **did not pass its A/B and is not the default** — it came out
-*more* expensive (16.25 vs 14.75 calls/chapter), because releasing the 7.x band
-trips RISK UPSHIFT on the next chapter and 2 extra draft+review pairs cost more
-than the revise round skipped. `planning._risk_score_floor` now lowers the risk
-floor to `rework_score_floor` in this mode so the two rules stop fighting over the
-same undiscriminating score; that fix is itself **unmeasured** and inert in `score`
-mode. Full numbers and the re-run precondition: REDESIGN §7 "P4 A/B 结论".
+*more* expensive (16.25 vs 14.25 calls/chapter). Releasing the 7.x band trips RISK
+UPSHIFT on the next chapter, and because a single plan candidate skips fused plan
+review entirely, widening 1→3 candidates is not "2 more calls" but "0 reviews → 3
+reviews": `plan_candidate`+`plan_review_fused` went 11→25 while `revise` fell 4→2.
+`planning._risk_score_floor` now lowers the risk floor to `rework_score_floor` in
+this mode so the two rules stop fighting over the same undiscriminating score; that
+fix is itself **unmeasured** and inert in `score` mode. Full numbers, the FPY′
+re-settlement, and the re-run precondition: REDESIGN §7 "P4 A/B 结论".
 
 `fix.py` is the repair ladder that catches what no longer triggers rework. Layer
 membership is declared ON the gate
@@ -297,6 +299,33 @@ Gate calibration is measured, not guessed: `python tools/gate_census.py` and
 `python tools/replay_l0.py`. **A silent gate is a bug report, not a deletion
 candidate** — read LESSONS §4, including the `fire%` vs `advise%` distinction,
 before deleting or re-thresholding one.
+
+**`python tools/fpy_prime.py [novel…] [--from N --to N]` is the acceptance metric
+to settle engine A/Bs with** (zero LLM, read-only). The FPY in `novel.py stats`
+counts any rework artifact, and every one of those is produced by a rule keyed on
+`quality_threshold` — so it cannot settle an experiment that *changes* that rule
+(P4 moved the release line and FPY moved with it in both arms, for free). FPY′
+replays `pipeline._hard_block_reasons` over archived `review_round0.json` payloads
+with `score` excluded entirely, and counts only pre-write deterministic plan
+retries (`plan_initial_attempt[1-9]`, `plan_critical`,
+`plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
+because they are downstream of the release rule. Thresholds are pinned at engine
+defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
+by one ruler. Library-wide it reads 62%–94% (vs 12%–63% for "self-score ≥ 8.0")
+and names the failing gate for every miss; the leading first-draft killer is
+`hard_contract`, 54 misses spread across 8 novels.
+
+**Offline tools must not log into the novel they measure.** `call_llm` appends
+every call to `paths.logs_dir/llm_calls.jsonl`, which is exactly the file
+`compare._llm_totals` reads for calls/chapter — so `tools/pairwise_ab.py` borrowing
+an arm's config for its API keys charged that arm 10 calls for the cost of being
+measured, inflating its own P4 report from 14.25 to 14.75 calls/chapter. The judge
+now redirects to `experiments/pairwise_logs/` via
+`dataclasses.replace(paths, logs_dir=…)`, and `compare.OFFLINE_TOOL_TAGS` filters
+such rows out of already-written logs, printing the excluded count so a filtered
+log is never silently indistinguishable from a clean one. `compare.py` also flags
+its own score lines as **circular** when the flipped key is in
+`RELEASE_RULE_KEYS`, and points at `fpy_prime`/`pairwise_ab` instead.
 
 ### Adaptive cost control (`planning.py`)
 Inverted cost model: the DEFAULT is cheap (`candidate_plans: 1`,

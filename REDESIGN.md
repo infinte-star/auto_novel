@@ -531,11 +531,19 @@ A/B 的假设。P2 现在是收益最大的一步，而且 §0 的实测（返�
 | Ch47–50 | p4_score | p4_det |
 |---|---|---|
 | 自评 47/48/49/50 | 8.2 / 8.0 / 8.2 / 6.2 | 6.9 / 7.4 / 6.8 / 7.4 |
-| LLM 调用（4 章） | **59** | 65 |
-| 调用/章 | **14.75** | 16.25 |
-| LLM 分钟/章 | **23.06** | 28.73 |
+| LLM 调用（4 章） | **57** | 65 |
+| 调用/章 | **14.25** | 16.25 |
+| LLM 分钟/章 | **22.91** | 28.73 |
 | 规划占 LLM 时间 | **0.33** | 0.49 |
 | force-accept | **1** | 2 |
+
+> **上表的调用数修正过一次（2026-07-28）。** 初版写的是 59 / 14.75，多算了 10 行：
+> `tools/pairwise_ab.py` 借 A 臂的 config 拿 API key，`call_llm` 于是把评委自己的
+> `pairwise_ab` 调用写进了 `novels/p4_score/logs/llm_calls.jsonl`——而那正是
+> `compare._llm_totals` 读的文件。**被测臂因为「被测量」而被记了成本。** 两处都修了：
+> 评委改写到 `experiments/pairwise_logs/`（`dataclasses.replace(paths, logs_dir=…)`），
+> `compare.py` 增 `OFFLINE_TOOL_TAGS` 过滤并在报告里显式打印被排除的行数（旧日志里
+> 的行还在，所以读侧的过滤是必需的，不是冗余）。修正后成本差距**变大**，结论方向不变。
 
 **判据第一半（调用数/章下降）不成立，方向还是反的 ⇒ 不通过 ⇒ `rework_trigger`
 保持默认 `score`。** 判据第二半按预案跑了（`tools/pairwise_ab.py`，双序去位置偏、
@@ -564,9 +572,26 @@ p4_score: Risk upshift 只在 Ch51（窗口外）触发                         
 `_effective_candidate_count` 的 RISK UPSHIFT 用 `risk_upshift_score_floor: 7.0`
 读 `chapter_metrics.score`；而 `rework_trigger: deterministic` 的全部意义是
 **不再把 7.x 当缺陷**、直接放行。于是 det 臂放行 6.8 → 下一章被判「塌缩中」→
-扩宽到 3 份草稿（3 write + 3 review）。**它省掉的 1 轮 revise，远便宜于它买来的
-2 对额外 draft+review。**这不是「确定性返工不好」，是两条规则在同一根无判别力的
-自评轴上朝相反方向拉。
+扩宽候选。**它省掉的 1 轮 revise，远便宜于它买来的规划宽度。**这不是「确定性返工
+不好」，是两条规则在同一根无判别力的自评轴上朝相反方向拉。
+
+按标签数的实测（`llm_calls.jsonl`，Ch47–50，已排除 `pairwise_ab`）说明贵在哪里——
+**不在写作，在规划**：
+
+| tag | p4_score | p4_det |
+|---|---|---|
+| `plan_candidate` | 8 | **13** |
+| `plan_review_fused` | 3 | **12** |
+| `write` | 8 | 7 |
+| `revise` | **4** | 2 |
+| `review` | **14** | 9 |
+
+det 臂确实少写少评了（revise 4→2，review 14→9，正是触发器想要的），但
+`plan_candidate + plan_review_fused` 从 11 涨到 25。原因是升宽只加**计划**候选
+（`planning.py:1747`，`_effective_candidate_count` 唯一的调用点，不动
+`candidate_chapters`），而单候选会**整段跳过**融合计划评审
+（`Skipping fused plan-review Ch48: single candidate`）——所以 1→3 个候选不是
+「多 2 次」，是「从 0 次评审变成 3 次评审」。规划占比 0.33→0.49 就是这一条。
 
 修复（`planning._risk_score_floor`，`tests/test_fix.py:RiskUpshiftFloorTest`）：
 `deterministic` 模式下风险地板取 `min(risk_upshift_score_floor, rework_score_floor)`
@@ -575,9 +600,69 @@ p4_score: Risk upshift 只在 Ch51（窗口外）触发                         
 
 未结算的部分要说清楚：这次修复**没有重测**。它把 P4 的下一次重跑从
 「测触发器 + 测触发器与扩宽的耦合」变成「只测触发器」，但它本身仍是一个未经 A/B 的
-一致性修正（默认模式下完全惰性，所以入库风险为零）。而且按 `docs/REDESIGN_V2.md` §0，
-重跑之前应当先把判据从自评换成可判定量——否则第二半仍然只能得到本次这种
-「两序全翻」的空读数。
+一致性修正（默认模式下完全惰性，所以入库风险为零）。
+
+#### 判据换成可判定量：FPY′（`tools/fpy_prime.py`，零 LLM）
+
+上一段说「重跑之前先把判据从自评换成可判定量」，这一步已经做完了。
+
+`novel.py stats` 的 FPY 数任何返工痕迹（revise / replan / debt / hook 重写），
+而这些痕迹**全部**由 `score < quality_threshold` 产出——所以 P4 一改释放规则，
+FPY 在两臂都机械地动，它结构上无法结算 P4。FPY′ 换一个自评碰不到的问题：
+
+> **第一稿、第一份计划，有没有携带一条「被测量到」的缺陷？**
+
+- 「被测量到」= `pipeline._hard_block_reasons`，引擎自己那张「这稿作废」清单
+  （gate_rejects / 文体塌缩 / 硬矛盾 / 硬契约 / length_band·opening_hook 拦截 /
+  邻章复读拦截 / 未满足约束堆积）。**其中没有一条读 `score`。**
+- 判据阈值**钉死在引擎默认值**（`fpy_prime.PINNED`），不读各臂自己的 config——
+  否则两臂配置一分叉，尺子就跟着分叉。
+- 只读 `review_round0.json`（第一稿的评审）。`final_review.json` 描述的是修完之后
+  的文本，回答不了「首过」。
+- 计划重试只认**写前且确定性**的三个 label：`plan_initial_attempt[1-9]`、
+  `plan_critical`（连续性 CRITICAL）、`plan_fossil_catastrophe`（全候选被化石门拦）。
+  `plan_quality_replan` / `plan_hard_floor` **明确排除**——它们是返工决策的下游，
+  算进来就把释放规则又塞回判据里，正是 FPY′ 要拆掉的那个循环。
+- 缺 round-0 评审的章报 `n/a`，不当成通过。
+
+P4 窗口重新结算（`python tools/fpy_prime.py p4_score p4_det --from 47 --to 50`）：
+
+| Ch47–50 | FPY′ | 自评 ≥8.0 | 首稿失败原因 |
+|---|---|---|---|
+| p4_score | 2/4 **50%** | 0/4 | Ch48 `style_collapse(penalty=3.0)`、Ch50 `gate_rejects=book_wide_fossils_ratio` |
+| p4_det | 3/4 **75%** | 0/4 | Ch50 `gate_rejects=book_wide_fossils_ratio`（同一条） |
+
+**但这 25 个点是买来的，不是白得的。** 唯一分叉的是 Ch48：score 臂 1 个计划候选
+（跳过计划评审）出的首稿文体罚分 3.0，det 臂在 Ch48 恰好被升宽到 3 个候选、过了
+3 次融合评审，首稿罚分 0.8。FPY′ 的全部差距落在那一章，而那一章正是成本反向的来源。
+所以结论没有变：**判据第一半不成立，第二半的收益与第一半的超支是同一笔钱。**
+`rework_trigger` 保持默认 `score`。
+
+顺带得到一个可检验的预测：`_risk_score_floor` 的修复会取消 Ch48 的升宽，因此重跑
+应当看到 det 臂**成本降到 score 臂以下、FPY′ 回落到与 score 臂持平**。若重跑后 det
+臂 FPY′ 仍高于 score 臂而成本更低，那才是 P4 真通过；若 FPY′ 跟着掉回去，说明确定性
+触发器的收益本来就只是「省了 revise」，两边打平，代码继续默认关闭。
+
+FPY′ 的全库读数（顺手拿到的额外结论）：
+
+```
+huangliang     94/100  94% | tunshi_xitong 44/52 85% | tangshuting_v1_backup 157/200 78%
+yeban_guize    20/26   77% | tangshuting  151/199 76% | guize_guaitan  9/13  69%
+tangshuting_e2e 28/45  62%
+首稿失败原因合计：hard_contract 54 · gate_rejects 39 · replanned:initial 28 ·
+              style_collapse 25 · hard_contradictions 11 · replanned:critical 2
+```
+
+对比同一批章的「自评 ≥8.0」比例（12%–63%），FPY′ 的区分度更高（62%–94%）**且
+每一次失败都指得出具体门**。两个头号杀手的分布很不一样，别混着读：
+
+- `hard_contract` 54 次，**摊在 8 本里**（20/16/7/5/2/2/1/1）——这是全库性的，
+  首稿最常栽在硬契约上，而不是栽在文体或重复上。
+- `gate_rejects` 39 次里有 **27 次是 tangshuting 一本**，`replanned:initial` 28 次
+  里有 15 次是 `tangshuting_e2e` 一本。这两条是单本病灶，不是全库结论。
+
+所以下一刀的落点是硬契约的首稿合规率，而不是继续调门槛——与
+`docs/REDESIGN_V2.md` §0 的判断一致。
 
 ---
 

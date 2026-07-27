@@ -26,6 +26,7 @@ Exit code is 0 on a readable verdict, 2 if there is nothing comparable.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -120,6 +121,16 @@ def main() -> int:
 
     cfg = _config.load_config()
     paths = _config.get_paths(cfg)
+
+    # The judge borrows arm A's config for its API keys, but it must NOT log into
+    # arm A's directory: `call_llm` appends every call to `paths.logs_dir/
+    # llm_calls.jsonl`, which is the same file `compare.py` reads to compute
+    # calls/chapter. Measured 2026-07-28: 10 `pairwise_ab` rows landed in
+    # novels/p4_score/logs and inflated that arm's measured cost by ~0.5 calls/ch
+    # in the very report the judge existed to complete. Redirect to a scratch dir.
+    judge_logs = ROOT / "experiments" / "pairwise_logs"
+    judge_logs.mkdir(parents=True, exist_ok=True)
+    paths = dataclasses.replace(paths, logs_dir=judge_logs)
 
     pairs: list[tuple[int, str, str, dict, dict]] = []
     skipped: list[str] = []

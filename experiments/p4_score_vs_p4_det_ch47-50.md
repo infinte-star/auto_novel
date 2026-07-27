@@ -1,6 +1,6 @@
 # Compare: p4_score vs p4_det
 Chapter range: 47..50 (chapter metrics only; log/jsonl totals cover the whole run)
-Generated 2026-07-28T01:06:42
+Generated 2026-07-28T01:27:27
 
 | metric | p4_score | p4_det |
 |---|---|---|
@@ -20,10 +20,12 @@ Generated 2026-07-28T01:06:42
 | max fossils in one hit | 0 | 1 |
 | scene-dedupe WARN | 0 | 0 |
 | scene-dedupe BLOCK | 0 | 0 |
-| LLM calls | 59 | 65 |
-| LLM total minutes | 92.25 | 114.94 |
+| LLM calls | 57 | 65 |
+| LLM calls / scored chapter | 14.25 | 16.25 |
+| offline-tool rows excluded | 10 | 0 |
+| LLM total minutes | 91.65 | 114.94 |
 | planning share of LLM time | 0.33 | 0.49 |
-| LLM minutes / scored chapter | 23.06 | 28.73 |
+| LLM minutes / scored chapter | 22.91 | 28.73 |
 
 ## Per-chapter scores and rework
 | ch | p4_score score | pen | rework | p4_det score | pen | rework |
@@ -39,6 +41,8 @@ Generated 2026-07-28T01:06:42
 | novel.rework_trigger | score | deterministic |
 
 ## Heuristic verdict
+> **Score lines below are circular for this pair**: novel.rework_trigger changes the release rule the score is produced by. Settle it with `python tools/fpy_prime.py p4_score p4_det` (self-score excluded) plus `python tools/pairwise_ab.py --a p4_score --b p4_det`.
+
 - avg score favors **p4_score** by 0.53
 - fewer sub-7.0 chapters: **p4_score** (1 vs 2)
 - fewer force-accepts: **p4_score**

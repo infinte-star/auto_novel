@@ -106,10 +106,33 @@ def _scan_run_log(nd: Path) -> dict[str, Any]:
     return out
 
 
+# Tags emitted by offline `tools/` scripts, not by the pipeline. They land in the
+# novel's own llm_calls.jsonl because those tools borrow an arm's config for its API
+# keys, and counting them would charge an arm for the cost of being *measured*.
+# Measured 2026-07-28: 10 `pairwise_ab` rows in novels/p4_score/logs inflated that
+# arm's calls/chapter from 14.25 to 14.75 in its own P4 report. `pairwise_ab.py` no
+# longer writes here, but existing logs still carry the rows.
+OFFLINE_TOOL_TAGS = ("pairwise_ab",)
+
+# Config keys that decide when a draft is released. Flipping one of these makes the
+# self-score a measurement of the flip rather than of the prose, so the report says so
+# instead of ranking the arms by it. See the verdict section.
+RELEASE_RULE_KEYS = frozenset({
+    "rework_trigger", "rework_score_floor", "quality_threshold",
+    "max_revision_rounds", "consecutive_force_accept_limit",
+    "circuit_breaker_score_floor",
+})
+
+
 def _llm_totals(nd: Path) -> dict[str, float]:
-    """Total calls / seconds / output chars, plus the planning-stage share."""
+    """Total calls / seconds / output chars, plus the planning-stage share.
+
+    `excluded` counts offline-tool rows skipped (see OFFLINE_TOOL_TAGS); the report
+    prints it so a filtered log is never silently indistinguishable from a clean one.
+    """
     path = nd / "logs" / "llm_calls.jsonl"
-    tot = {"calls": 0.0, "elapsed": 0.0, "output": 0.0, "plan_elapsed": 0.0, "fail": 0.0}
+    tot = {"calls": 0.0, "elapsed": 0.0, "output": 0.0, "plan_elapsed": 0.0,
+           "fail": 0.0, "excluded": 0.0}
     if not path.exists():
         return tot
     plan_tags = ("plan_candidate", "plan_review_fused", "plan_arbitrate", "plan_screen")
@@ -121,6 +144,9 @@ def _llm_totals(nd: Path) -> dict[str, float]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if str(row.get("tag") or "") in OFFLINE_TOOL_TAGS:
+                tot["excluded"] += 1
                 continue
             el = float(row.get("elapsed") or 0.0)
             tot["calls"] += 1
@@ -292,6 +318,12 @@ def compare_novels(name_a: str, name_b: str,
     lines.append(row("scene-dedupe WARN", log_a["scene_dedupe_warn"], log_b["scene_dedupe_warn"]))
     lines.append(row("scene-dedupe BLOCK", log_a["scene_dedupe_block"], log_b["scene_dedupe_block"]))
     lines.append(row("LLM calls", int(llm_a["calls"]), int(llm_b["calls"])))
+    lines.append(row("LLM calls / scored chapter",
+                     (llm_a["calls"] / len(s_a)) if s_a else None,
+                     (llm_b["calls"] / len(s_b)) if s_b else None))
+    if llm_a["excluded"] or llm_b["excluded"]:
+        lines.append(row("offline-tool rows excluded",
+                         int(llm_a["excluded"]), int(llm_b["excluded"])))
     lines.append(row("LLM total minutes", llm_a["elapsed"] / 60, llm_b["elapsed"] / 60))
     lines.append(row("planning share of LLM time",
                      (llm_a["plan_elapsed"] / llm_a["elapsed"]) if llm_a["elapsed"] else None,
@@ -340,10 +372,13 @@ def compare_novels(name_a: str, name_b: str,
     # --- config diff (non-secret, non-path keys) ---
     cfg_a, cfg_b = _read_config_lines(nd_a), _read_config_lines(nd_b)
     diffs = []
+    circular = []
     for key in sorted(set(cfg_a) | set(cfg_b)):
         va, vb = cfg_a.get(key, "<absent>"), cfg_b.get(key, "<absent>")
         if va != vb:
             diffs.append(f"| {key} | {va} | {vb} |")
+            if key.split(".")[-1] in RELEASE_RULE_KEYS:
+                circular.append(key)
     lines.append("## Config differences")
     if diffs:
         lines.append(f"| key | {name_a} | {name_b} |")
@@ -356,6 +391,18 @@ def compare_novels(name_a: str, name_b: str,
     # --- verdict heuristics ---
     lines.append("## Heuristic verdict")
     verdict: list[str] = []
+    if circular:
+        # The self-score is the release rule's own output: `accepted` is derived from
+        # `quality_threshold` (review.py) and every score below it is revised until it
+        # rises. So when the flipped key IS the release rule, "avg score" and
+        # "sub-7.0 chapters" measure the flip, not the prose — that is how the P4 A/B
+        # produced a 0.53 score gap that meant nothing (REDESIGN §7).
+        lines.append(
+            f"> **Score lines below are circular for this pair**: {', '.join(circular)} "
+            f"changes the release rule the score is produced by. Settle it with "
+            f"`python tools/fpy_prime.py {name_a} {name_b}` (self-score excluded) plus "
+            f"`python tools/pairwise_ab.py --a {name_a} --b {name_b}`.")
+        lines.append("")
     if s_a and s_b:
         avg_a, avg_b = sum(s_a) / len(s_a), sum(s_b) / len(s_b)
         d = avg_a - avg_b

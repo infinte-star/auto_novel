@@ -91,6 +91,11 @@ scripts/
 check_token_plan_keys.py
 repair_stub_chapters.py
 
+# Offline A/B judge call log. `tools/pairwise_ab.py` redirects `paths.logs_dir` here
+# so its own calls never land in the arm it is judging (compare.py reads that file
+# for calls/chapter). Pure scratch counters — the reports in experiments/ are tracked.
+experiments/pairwise_logs/
+
 # Scratch / debugging artifacts
 *.broken
 screenplay_head.txt
