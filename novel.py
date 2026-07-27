@@ -946,6 +946,37 @@ def _read_price_table(nd: Path) -> list[tuple[str, float, float]]:
     return []
 
 
+def _iter_llm_rows(nd: Path):
+    """Yield decoded rows of novels/<name>/logs/llm_calls.jsonl, or None if absent.
+
+    Three stats readers (`_llm_call_stats`, `_llm_tag_breakdown`,
+    `_reasoning_coverage`) each carried their own copy of this open/strip/
+    json-decode/skip-garbage loop. Returning None (not an empty iterator) keeps
+    the callers' "file missing -> print nothing" contract distinguishable from
+    "file present but empty", which is the difference between "not measured" and
+    "measured zero".
+    """
+    path = nd / "logs" / "llm_calls.jsonl"
+    if not path.exists():
+        return None
+
+    def rows():
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        yield json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return
+
+    return rows()
+
+
 def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
     """Read novels/<name>/logs/llm_calls.jsonl and return (ok_calls, prompt_chars, output_chars, cost).
 
@@ -954,8 +985,8 @@ def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
     (prefix match) when configured, else flat $3/$15 per Mtok. Prompt-cache
     discounts are NOT modeled — treat the figure as an upper-bound estimate.
     """
-    metrics_path = nd / "logs" / "llm_calls.jsonl"
-    if not metrics_path.exists():
+    rows = _iter_llm_rows(nd)
+    if rows is None:
         return None
     price_table = _read_price_table(nd)
 
@@ -972,25 +1003,14 @@ def _llm_call_stats(nd: Path) -> tuple[int, int, int, float] | None:
     total_prompt = 0
     total_output = 0
     cost = 0.0
-    try:
-        with metrics_path.open(encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    row = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("ok") is True:
-                    ok_calls += 1
-                p = int(row.get("prompt_chars") or 0)
-                o = int(row.get("output_chars") or 0)
-                total_prompt += p
-                total_output += o
-                cost += _row_cost(str(row.get("model") or ""), p, o)
-    except OSError:
-        return None
+    for row in rows:
+        if row.get("ok") is True:
+            ok_calls += 1
+        p = int(row.get("prompt_chars") or 0)
+        o = int(row.get("output_chars") or 0)
+        total_prompt += p
+        total_output += o
+        cost += _row_cost(str(row.get("model") or ""), p, o)
     return ok_calls, total_prompt, total_output, cost
 
 
@@ -1137,23 +1157,13 @@ def _llm_tag_breakdown(nd: Path) -> list[tuple[str, int]] | None:
 
     Returns None if the file doesn't exist.
     """
-    metrics_path = nd / "logs" / "llm_calls.jsonl"
-    if not metrics_path.exists():
+    rows = _iter_llm_rows(nd)
+    if rows is None:
         return None
     tag_counts: dict[str, int] = {}
-    try:
-        for raw in metrics_path.open(encoding="utf-8", errors="replace"):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                row = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            tag = str(row.get("tag") or "(untagged)")
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
-    except OSError:
-        return None
+    for row in rows:
+        tag = str(row.get("tag") or "(untagged)")
+        tag_counts[tag] = tag_counts.get(tag, 0) + 1
     return sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
 
 
@@ -1253,30 +1263,19 @@ def _reasoning_coverage(nd: Path) -> list[tuple[str, int, int]] | None:
     Print it next to FPY so a run can't be compared against another without seeing
     whether the writer was thinking in both. Returns None when nothing is logged.
     """
-    metrics_path = nd / "logs" / "llm_calls.jsonl"
-    if not metrics_path.exists():
+    rows = _iter_llm_rows(nd)
+    if rows is None:
         return None
     counts: dict[str, list[int]] = {}
-    try:
-        with metrics_path.open(encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    row = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("ok") is not True:
-                    continue
-                slot = counts.setdefault(str(row.get("tag") or "?"), [0, 0])
-                slot[0] += 1
-                if int(row.get("reasoning_chars") or 0) > 0:
-                    slot[1] += 1
-    except OSError:
-        return None
-    rows = [(tag, *counts[tag]) for tag in _REASONING_TAGS if tag in counts]
-    return rows or None
+    for row in rows:
+        if row.get("ok") is not True:
+            continue
+        slot = counts.setdefault(str(row.get("tag") or "?"), [0, 0])
+        slot[0] += 1
+        if int(row.get("reasoning_chars") or 0) > 0:
+            slot[1] += 1
+    out = [(tag, *counts[tag]) for tag in _REASONING_TAGS if tag in counts]
+    return out or None
 
 
 def _print_reasoning_coverage(nd: Path) -> None:
@@ -1404,14 +1403,15 @@ def cmd_package(name: str) -> int:
     _validate_name(name)
     _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
     from config import get_paths, load_config, read_text  # noqa: E402
-    from package import build_package, _build_client  # noqa: E402
+    from llm import build_client  # noqa: E402
+    from package import build_package  # noqa: E402
 
     config = load_config()
     paths = get_paths(config)
     if not paths.book.exists() or not read_text(paths.book).strip():
         print(f"[novel] ERROR: no book.md content for '{name}'. Run/finish the novel first.")
         return 2
-    client = _build_client(config, paths)
+    client = build_client(config, paths)
     pkg = build_package(client, paths, config)
     if not pkg:
         print(f"[novel] package generation produced nothing for '{name}' (check logs).")
@@ -1429,7 +1429,7 @@ def cmd_refine(name: str) -> int:
     _validate_name(name)
     _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
     from config import get_paths, load_config, read_text  # noqa: E402
-    from package import _build_client  # noqa: E402
+    from llm import build_client  # noqa: E402
     from store import init_db  # noqa: E402
     from refine import refine_book  # noqa: E402
 
@@ -1456,7 +1456,7 @@ def cmd_refine(name: str) -> int:
         _api["thinking_mode"] = str(_api.get("refine_thinking_mode", _api.get("thinking_mode", "disabled"))).strip()
         print(f"[novel] refine using model={_api['model']} @ {_api.get('base_url')}")
     conn = init_db(paths)
-    client = _build_client(config, paths)
+    client = build_client(config, paths)
     refine_book(client, paths, conn, config)
     print(f"[novel] refine pass finished; see novels/{name}/book_refined.md")
     return 0

@@ -84,12 +84,6 @@ HOOK_SCORE_SYSTEM = """你是免费阅读平台（番茄为主）的爆款选品
 ranked_titles 必须覆盖每一个候选书名并按 ctr_score 从高到低排序；best_title 必须是其中分最高的一个。"""
 
 
-def _build_client(config: dict[str, Any], paths: Paths) -> Any:
-    """Reuse trial._build_client so `novel.py package` can run standalone."""
-    from trial import _build_client as _bc
-    return _bc(config, paths)
-
-
 def score_hook_package(
     client: Any,
     paths: Paths,

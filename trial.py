@@ -7,7 +7,6 @@ from typing import Any
 
 from config import (
     Paths,
-    configured_api_endpoints,
     ensure_project,
     get_paths,
     load_config,
@@ -16,7 +15,7 @@ from config import (
     read_text,
     write_text,
 )
-from llm import LLMClientPool, call_llm, json_prompt, load_json_with_repair
+from llm import build_client, call_llm, json_prompt, load_json_with_repair
 from memory import bootstrap, cacheable_prefix, memory_context
 from store import init_db
 
@@ -108,34 +107,6 @@ schema:
 - 按平台画像调整表达：免费平台更直给，起点男频可留更强设定悬念，女频更突出关系/情绪张力。"""
 
 
-def _build_client(config: dict[str, Any], paths: Paths) -> Any:
-    from openai import OpenAI
-    import httpx
-
-    api_endpoints, primary_endpoint_count = configured_api_endpoints(config)
-    if not api_endpoints:
-        raise RuntimeError("Missing API key: set api.api_key, api.api_keys, or api.api_key_groups in config.yaml")
-    connect_timeout = int(config["api"].get("client_connect_timeout", 15))
-    client_read_timeout = int(config["api"].get("client_read_timeout", 180))
-    httpx_timeout = httpx.Timeout(
-        connect=connect_timeout,
-        read=client_read_timeout,
-        write=connect_timeout,
-        pool=connect_timeout,
-    )
-    default_headers = {}
-    user_agent = str(config["api"].get("user_agent", "")).strip()
-    if user_agent:
-        default_headers["User-Agent"] = user_agent
-    clients = [
-        OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout, default_headers=default_headers or None)
-        for base_url, api_key in api_endpoints
-    ]
-    if len(clients) == 1:
-        return clients[0]
-    return LLMClientPool(clients, primary_endpoint_count, endpoints=api_endpoints, log_fn=lambda msg: log(paths, msg))
-
-
 def _trial_root(paths: Paths) -> Path:
     return paths.logs_dir / "opening_trials"
 
@@ -167,7 +138,7 @@ def run_opening_trial(variants: int | None = None, chapters: int | None = None) 
     paths = get_paths(config)
     ensure_project(paths)
     conn = init_db(paths)
-    client = _build_client(config, paths)
+    client = build_client(config, paths)
 
     if not paths.state.exists() or not read_text(paths.state).strip():
         bootstrap(client, paths, conn, config)

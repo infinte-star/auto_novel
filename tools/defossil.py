@@ -379,7 +379,7 @@ def main():
     _setup_env(args.novel)
     sys.path.insert(0, str(ROOT))
     from config import load_config, get_paths, configured_api_endpoints
-    from llm import call_llm as _call_llm, LLMClientPool
+    from llm import LLMClientPool
     from openai import OpenAI
 
     config = load_config()

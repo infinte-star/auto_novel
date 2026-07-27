@@ -1041,6 +1041,50 @@ def opening_route_text(paths: Paths, cap: int = 6000) -> str:
 # Context Profile: explicit mapping of which context builder each consumer uses.
 # ---------------------------------------------------------------------------
 
+def _pack_sections(sections: list[tuple[str, str, int]], budget: int,
+                   header: str | None = None) -> str:
+    """Render `(title, body, cap)` triples into `## title` blocks under a char budget.
+
+    Extracted from three byte-identical copies (`cacheable_prefix`,
+    `writing_memory_context`, `lite_memory_context`). The exact semantics are
+    load-bearing and must not be "improved":
+
+    - each body is capped INDEPENDENTLY at its own `cap`, then the budget is
+      applied to the assembled result, so a fat early section cannot silently
+      starve a later one of its own allowance;
+    - on overflow the section is retried at whatever budget is left, but only if
+      more than 400 chars remain — a 200-char fragment of a state dump is noise
+      the model has to read anyway;
+    - overflow BREAKS rather than continues: the `sections` order is a priority
+      order, so skipping ahead to a smaller later section would silently reorder
+      priorities.
+
+    `cacheable_prefix` passes `header`, and its bytes are a prompt-cache key —
+    any change to the assembly here invalidates the provider cache for every
+    chapter of every book. That is also why a known off-by-14 is left alone: the
+    overflow branch subtracts the `## title\n` header from `remaining` but not the
+    trailing `\n...[truncated]` it then appends, so a truncated tail can overshoot
+    `budget` by ~14 chars (measured: 26528 out of a 26513 budget). Harmless at
+    these scales, and correcting it would rewrite the cache key for every book.
+    """
+    parts: list[str] = [header] if header else []
+    used = len(header) if header else 0
+    for title, body, cap in sections:
+        body = body.strip()
+        if not body:
+            continue
+        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
+        block = f"## {title}\n{snippet}"
+        if used + len(block) + 2 > budget:
+            remaining = budget - used - len(f"## {title}\n") - 2
+            if remaining > 400:
+                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts)
+
+
 def memory_context(paths: Paths, conn: Any, config: dict[str, Any],
                    max_chars: int | None = None) -> str:
     budget = estimate_chars_budget(config)
@@ -1189,22 +1233,7 @@ def cacheable_prefix(
         ("世界设定", bible, 7000),
         ("人物", characters, 7000),
     ]
-    parts: list[str] = ["# 稳定参照（可缓存）"]
-    used = len(parts[0])
-    for title, body, cap in sections:
-        body = body.strip()
-        if not body:
-            continue
-        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
-        block = f"## {title}\n{snippet}"
-        if used + len(block) + 2 > budget:
-            remaining = budget - used - len(f"## {title}\n") - 2
-            if remaining > 400:
-                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
-            break
-        parts.append(block)
-        used += len(block) + 2
-    text = "\n\n".join(parts)
+    text = _pack_sections(sections, budget, header="# 稳定参照（可缓存）")
     _CACHEABLE_PREFIX_CACHE["active"] = (key, text)
     if log_fn is not None:
         try:
@@ -1277,22 +1306,7 @@ def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
         ("近期指标JSON", metrics_5, 2500),
         ("卷纲（本章相关节选）", volume_plan, vp_cap),
     ]
-    parts: list[str] = []
-    used = 0
-    for title, body, cap in sections:
-        body = body.strip()
-        if not body:
-            continue
-        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
-        block = f"## {title}\n{snippet}"
-        if used + len(block) + 2 > char_budget:
-            remaining = char_budget - used - len(f"## {title}\n") - 2
-            if remaining > 400:
-                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
-            break
-        parts.append(block)
-        used += len(block) + 2
-    return "\n\n".join(parts)
+    return _pack_sections(sections, char_budget)
 
 
 def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
@@ -1334,22 +1348,7 @@ def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
         ("人物", characters, 1500),
         ("世界设定", bible, 1200),
     ]
-    parts: list[str] = []
-    used = 0
-    for title, body, cap in sections:
-        body = body.strip()
-        if not body:
-            continue
-        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
-        block = f"## {title}\n{snippet}"
-        if used + len(block) + 2 > char_budget:
-            remaining = char_budget - used - len(f"## {title}\n") - 2
-            if remaining > 400:
-                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
-            break
-        parts.append(block)
-        used += len(block) + 2
-    return "\n\n".join(parts)
+    return _pack_sections(sections, char_budget)
 
 def _compressible_sections(content: str, keep_recent: int) -> int:
     """How many `## ChN` sections would actually be consolidated right now.

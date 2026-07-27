@@ -254,10 +254,18 @@ def _apply_genre_detection_profile(config: dict[str, Any]) -> None:
             novel[key] = value
 
 
-def load_config() -> dict[str, Any]:
+def parse_config_text(text: str) -> dict[str, Any]:
+    """THE YAML-subset reader: `section:` headers + `key: value` pairs, nothing else.
+
+    Kept as its own function because `telemetry.backfill_novel` needs the exact
+    same grammar for a novel it is NOT running as (`load_config` is hard-bound to
+    the NOVEL_CONFIG captured at import time). Two copies of this loop drifting
+    apart would make telemetry silently disagree with the engine about what a
+    config says.
+    """
     config: dict[str, Any] = {}
     section: str | None = None
-    for raw_line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.split("#", 1)[0].rstrip()
         if not line:
             continue
@@ -268,6 +276,11 @@ def load_config() -> dict[str, Any]:
         if section and ":" in line:
             key, value = line.strip().split(":", 1)
             config[section][key.strip()] = parse_scalar(value)
+    return config
+
+
+def load_config() -> dict[str, Any]:
+    config = parse_config_text(CONFIG_FILE.read_text(encoding="utf-8"))
 
     # Genre-aware detection defaults (爽文/悬疑/言情/…), filled by style_preset
     # BEFORE the required check so genre can supply chapter_words etc. Only fills

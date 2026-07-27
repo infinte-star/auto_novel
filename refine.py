@@ -36,15 +36,12 @@ from config import (
     log,
     normalize_chapter,
     read_text,
-    safe_score,
     write_text,
 )
 from llm import call_llm, json_prompt, load_json_with_repair
 from quality import text_similarity
 
 
-REFINED_DIR_NAME = "chapters_refined"
-REFINED_BOOK = "book_refined.md"
 REFINE_LOG_NAME = "refine.log.jsonl"
 
 GROUP_SIZE = 5

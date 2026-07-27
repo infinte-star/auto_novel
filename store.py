@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import Paths, read_text, safe_score, write_text
+from config import Paths, read_text, write_text
 
 import sqlite3
 

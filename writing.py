@@ -2671,7 +2671,7 @@ def _render_state_md_template(
     summaries (5), key entity states, active threads (open), and the LLM-only
     sections (protagonist_state, next_12_directions).
     """
-    from store import recent_events, recent_metrics
+    from store import recent_metrics
 
     total_chars = count_chars(paths.book)
     metrics = recent_metrics(conn, 5)

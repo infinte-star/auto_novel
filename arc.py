@@ -35,7 +35,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Any
 
-from checkpoint import load_checkpoint, save_checkpoint
+from checkpoint import save_checkpoint
 from config import Paths, log, read_text
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, memory_context, volume_plan_window

@@ -28,9 +28,7 @@ from config import (
     Paths,
     book_reached_target,
     chapter_path,
-    configured_api_endpoints,
     configured_api_endpoints_with_models,
-    configured_review_endpoints,
     configured_role_endpoints,
     count_chars,
     ensure_project,
@@ -49,7 +47,7 @@ from config import (
     write_text,
 )
 from llm import LLMClientPool
-from memory import bootstrap, cacheable_prefix, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
+from memory import bootstrap, cacheable_prefix_hit_rate, compress_all_memory, memory_context, should_compress_memory, writing_memory_context
 from planning import create_plan
 from review import adaptive_replan, anchor_completion_gate, horizon_review, review_chapter, should_replan, stage_review
 from store import db_event, init_db, validate_plan_continuity

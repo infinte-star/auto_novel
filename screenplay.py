@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from config import Paths, get_paths, load_config, log, normalize_text, safe_score
-from llm import call_llm, json_prompt, load_json_with_repair
+from llm import build_client, call_llm, json_prompt, load_json_with_repair
 
 ROOT = Path(__file__).resolve().parent
 
@@ -465,38 +465,6 @@ def _review_revise_segment(
     return best
 
 
-def _build_client(config: dict[str, Any], paths: Paths) -> Any:
-    """Construct an LLM client/pool from config (copied shape from trial.py)."""
-    from openai import OpenAI
-    import httpx
-
-    from config import configured_api_endpoints
-    from llm import LLMClientPool
-
-    api_endpoints, primary_endpoint_count = configured_api_endpoints(config)
-    if not api_endpoints:
-        raise RuntimeError("Missing API key: set api.api_key/api_keys/api_key_groups in config")
-    connect_timeout = int(config["api"].get("client_connect_timeout", 15))
-    client_read_timeout = int(config["api"].get("client_read_timeout", 180))
-    httpx_timeout = httpx.Timeout(
-        connect=connect_timeout,
-        read=client_read_timeout,
-        write=connect_timeout,
-        pool=connect_timeout,
-    )
-    default_headers = {}
-    user_agent = str(config["api"].get("user_agent", "")).strip()
-    if user_agent:
-        default_headers["User-Agent"] = user_agent
-    clients = [
-        OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout, default_headers=default_headers or None)
-        for base_url, api_key in api_endpoints
-    ]
-    if len(clients) == 1:
-        return clients[0]
-    return LLMClientPool(clients, primary_endpoint_count, endpoints=api_endpoints, log_fn=lambda msg: log(paths, msg))
-
-
 def _fallback_source_packet(segment: str) -> dict[str, Any]:
     preview = re.sub(r"\s+", " ", segment.strip())[:500]
     return {
@@ -727,7 +695,7 @@ def convert_text(
         paths = get_paths(config)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     if client is None:
-        client = _build_client(config, paths)
+        client = build_client(config, paths)
 
     seg_chars = int(seg_chars or config["novel"].get("script_seg_chars", 6000))
     seg_chars = max(1500, seg_chars)

@@ -1,6 +1,7 @@
 """Unit tests for the P2/P3 pure functions.
 
 - memory._compressible_sections (compress-ratchet fix)
+- memory._pack_sections (the one section-packer behind all four context builders)
 - novel._parse_price_table (model-aware cost reporting)
 - writing._hook_directives_block (吸量包 opening injection)
 
@@ -8,11 +9,77 @@ memory.memory_context/lite_memory_context need Paths+conn so their max_chars
 behavior is exercised indirectly via the budget helpers here plus the live
 replay/ablation harnesses.
 """
+import random
 import unittest
 
-from memory import _compressible_sections
+from memory import _compressible_sections, _pack_sections
 from novel import _parse_price_table
 from writing import _hook_directives_block
+
+
+def _pack_reference(sections, budget, header=None):
+    """The inline loop `_pack_sections` replaced, kept verbatim as the oracle.
+
+    `cacheable_prefix`'s output bytes are a provider prompt-cache key, so the
+    extraction had to be byte-exact, not merely equivalent-looking. Verified
+    against real books at 12 budgets (identical at every one); this oracle keeps
+    that guarantee enforceable after the live novels are gone.
+    """
+    parts = [header] if header else []
+    used = len(header) if header else 0
+    for title, body, cap in sections:
+        body = body.strip()
+        if not body:
+            continue
+        snippet = body if len(body) <= cap else body[:cap] + "\n...[truncated]"
+        block = f"## {title}\n{snippet}"
+        if used + len(block) + 2 > budget:
+            remaining = budget - used - len(f"## {title}\n") - 2
+            if remaining > 400:
+                parts.append(f"## {title}\n{body[:remaining]}\n...[truncated]")
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts)
+
+
+class TestPackSections(unittest.TestCase):
+    def test_matches_the_inline_loop_it_replaced(self):
+        rng = random.Random(20260728)
+        for trial in range(400):
+            n = rng.randrange(0, 6)
+            sections = [
+                (f"节{i}", "字" * rng.choice([0, 1, 50, 400, 401, 900, 5000]),
+                 rng.choice([1, 100, 400, 1000, 9999]))
+                for i in range(n)
+            ]
+            budget = rng.choice([0, 1, 100, 401, 405, 500, 1500, 6000, 100000])
+            header = rng.choice([None, "", "# 稳定参照（可缓存）"])
+            with self.subTest(trial=trial, budget=budget, header=header):
+                self.assertEqual(_pack_sections(sections, budget, header),
+                                 _pack_reference(sections, budget, header))
+
+    def test_empty_bodies_are_dropped_not_emitted_as_bare_headers(self):
+        got = _pack_sections([("空", "   ", 100), ("有", "内容", 100)], 10000)
+        self.assertEqual(got, "## 有\n内容")
+
+    def test_each_body_is_capped_by_its_own_cap_before_the_budget(self):
+        got = _pack_sections([("甲", "x" * 500, 10)], 10000)
+        self.assertEqual(got, "## 甲\n" + "x" * 10 + "\n...[truncated]")
+
+    def test_overflow_breaks_instead_of_skipping_to_a_smaller_section(self):
+        """`sections` order is a priority order — never reorder by fit."""
+        got = _pack_sections([("大", "x" * 5000, 5000), ("小", "y", 10)], 300)
+        self.assertNotIn("小", got)
+
+    def test_overflow_tail_needs_more_than_400_chars_to_be_worth_emitting(self):
+        self.assertEqual(_pack_sections([("甲", "x" * 5000, 5000)], 405), "")
+        self.assertTrue(_pack_sections([("甲", "x" * 5000, 5000)], 500))
+
+    def test_header_is_counted_against_the_budget(self):
+        head = "# H"
+        self.assertEqual(_pack_sections([], 10, head), head)
+        self.assertEqual(_pack_sections([("甲", "x", 10)], 10, head), head)
 
 
 def _mem_file(n_sections: int) -> str:

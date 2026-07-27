@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import ROOT, parse_scalar, safe_score
+from config import ROOT, parse_config_text, safe_score
 
 try:
     import sqlite3
@@ -274,27 +274,14 @@ def _read_novel_config(novel_dir: Path) -> dict[str, dict[str, Any]]:
     We cannot call config.load_config() here: it is hard-bound to the
     NOVEL_CONFIG env var captured at import time, while backfill iterates
     over MANY novels in one process."""
-    config: dict[str, dict[str, Any]] = {}
     path = novel_dir / "config.yaml"
     if not path.exists():
-        return config
-    section: str | None = None
+        return {}
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return config
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        if not line.startswith(" ") and line.endswith(":"):
-            section = line[:-1].strip()
-            config[section] = {}
-            continue
-        if section and ":" in line:
-            key, value = line.strip().split(":", 1)
-            config[section][key.strip()] = parse_scalar(value)
-    return config
+        return {}
+    return parse_config_text(text)
 
 
 def _unwrap_checkpoint(path: Path) -> Any:

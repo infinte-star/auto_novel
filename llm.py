@@ -406,6 +406,51 @@ class LLMClientPool:
             }
         return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
 
+
+def build_client(config: dict[str, Any], paths: Paths) -> Any:
+    """THE client/pool constructor for every entry point except `pipeline.main`.
+
+    `trial`, `screenplay` and `package` each grew their own byte-identical copy of
+    this (screenplay's even said "copied shape from trial.py"), so a timeout or
+    header fix landed in one and not the others. `pipeline.main` keeps its own
+    version on purpose: it is a superset that also resolves per-endpoint models via
+    `configured_api_endpoints_with_models`, which the standalone tools don't use.
+
+    Returns a bare `OpenAI` when there is exactly one endpoint — a pool of one adds
+    rotation bookkeeping that can never fire.
+    """
+    from openai import OpenAI
+    import httpx
+
+    from config import configured_api_endpoints
+
+    api_endpoints, primary_endpoint_count = configured_api_endpoints(config)
+    if not api_endpoints:
+        raise RuntimeError(
+            "Missing API key: set api.api_key, api.api_keys, or api.api_key_groups in config.yaml")
+    connect_timeout = int(config["api"].get("client_connect_timeout", 15))
+    client_read_timeout = int(config["api"].get("client_read_timeout", 180))
+    httpx_timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=client_read_timeout,
+        write=connect_timeout,
+        pool=connect_timeout,
+    )
+    default_headers = {}
+    user_agent = str(config["api"].get("user_agent", "")).strip()
+    if user_agent:
+        default_headers["User-Agent"] = user_agent
+    clients = [
+        OpenAI(base_url=base_url, api_key=api_key, timeout=httpx_timeout,
+               default_headers=default_headers or None)
+        for base_url, api_key in api_endpoints
+    ]
+    if len(clients) == 1:
+        return clients[0]
+    return LLMClientPool(clients, primary_endpoint_count, endpoints=api_endpoints,
+                         log_fn=lambda msg: log(paths, msg))
+
+
 def _resolve_thinking_param(
     api_section: dict[str, Any],
     *,

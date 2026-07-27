@@ -609,9 +609,7 @@ def structured_recall_block(
     """
     from store import (
         db_lock,
-        entity_state_as_of,
         get_active_constraints,
-        get_overdue_reader_promises,
         get_overdue_revelations,
         get_pending_revelations,
         get_relationships,

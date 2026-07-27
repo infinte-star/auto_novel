@@ -29,7 +29,7 @@ from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 from writing import _chapter_write_max_tokens  # noqa: E402
-from quality import cross_chapter_repetition, descriptor_frequency, genre_adherence, GENRE_KEYWORDS  # noqa: E402
+from quality import cross_chapter_repetition, descriptor_frequency, genre_adherence  # noqa: E402
 
 
 def _make_paths(root):

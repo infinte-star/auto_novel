@@ -12,8 +12,7 @@ companion docs carry the rest — follow the pointers instead of guessing:
 | `REDESIGN.md` | quality/FPY redesign roadmap v1 + P1–P4 execution record |
 | `docs/REDESIGN_V2.md` | first-principles redesign v2. **Read §0 before adding any quality gate or A/B judged by `score`** — the self-score has no discrimination and `quality_threshold: 8.0` sits exactly on the library's median, so an experiment that changes rework rules cannot be settled with it. |
 
-`README.md` is the user-facing quickstart; its `run.py`/`restart.py` section is
-stale — those files are gone.
+`README.md` is the user-facing quickstart.
 
 ## Overview
 
@@ -135,7 +134,7 @@ and why `api.stream: true` is mandatory for one of them: LESSONS §1. Check
 | `llm.py` | streaming, timeouts, salvage, JSON repair, refusal retry |
 | `config.py` | YAML-subset config, paths, endpoints, `is_final_chapter` |
 | `telemetry.py` | cross-book sink `telemetry/global.db` (write-only observer) |
-| `refine.py`, `fossil_fix.py`, `chapter_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
+| `refine.py`, `fossil_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
 | `compare.py` | `compare` / `ablate` / `fork` experiment harness |
 | `trial.py`, `benchmark.py` | opening trials, local sample library |
 | `tools/*.py` | zero/low-LLM analysis: `gate_census`, `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory` |

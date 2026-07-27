@@ -124,15 +124,6 @@ mappings. Reads from `chapters_refined/` when available, writes `chapters_fixed/
 Why the replacement bank is deliberately small (rotating book-specific proper nouns
 would be canon corruption): `docs/LESSONS.md` §4.
 
-## Targeted chapter fixes (`chapter_fix.py`)
-
-LLM-based per-chapter rewrites for finished books — low dialogue, short length,
-monotonous endings. Reads `chapters_fixed/` (or `chapters_refined/`) and writes back
-in place, one LLM call per chapter with problem-specific instructions. **Not wired
-to the `novel.py` CLI**; call it programmatically.
-
----
-
 ## Screenplay conversion (`screenplay.py`)
 
 Standalone novel-text → 短剧 (vertical-drama) converter, decoupled from the

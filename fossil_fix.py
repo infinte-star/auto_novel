@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -370,8 +369,6 @@ def cmd_fix_fossils(
     custom_replacements_path: str | None = None,
 ) -> int:
     """CLI entry point called from novel.py."""
-    from pathlib import Path as _P
-
     # Determine novel directory — import kept local to avoid config.py import-time env dependency
     project_dir = Path(__file__).resolve().parent
     novel_dir = project_dir / "novels" / name
