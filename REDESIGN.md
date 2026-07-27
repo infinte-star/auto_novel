@@ -411,7 +411,7 @@ A/B 纪律（沿用 `ab_short_chapter_score_inflation` 的教训）：
 | **P1** | L1：实测写作链路的推理档位阶梯 | FPY | 找到 504 之下的最高档 | ❌ **已证伪**：网关无视档位，11/11 次一律推理 ~6k 字符；无档位可换。副产物：推理覆盖率进 stats |
 | **P2** | L2：`arc.py` 弧级卡片替代五段委员会（L4 范例锚定拆出，见下） | FPY + 成本 | FPY 不降且成本 −53% 即通过 | ⚠️ **未通过判据；代码保留，默认关闭**（见下） |
 | P2b | L4：范例锚定（`exemplar_block` 已重写：改秩排名选择 + 对白/动作双范例 + 保留段落缩进） | 章评分 + 文风罚分 | 需自己的单变量 A/B | ⏸ 两臂均关闭，等 P2 结论后单独测 |
-| **P3** | L3：`canon.py` + `StoryState`，删 `memory_compress` 与 4 个构建器 | 中段 Ch30–50 的 FPY 与一致性错误数 | 中段曲线不再下滑 | 📐 **未动工；入口需按实测改到 `plan_candidate`**（见 L3 的实测修正：写作只占 prompt 的 17%，规划占 53.8%） |
+| **P3** | L3：`canon.py` + `StoryState`，删 `memory_compress` 与 4 个构建器 | 中段 Ch30–50 的 FPY 与一致性错误数 | 中段曲线不再下滑 | 🔄 **已开工，入口按实测改到 `plan_candidate`**：指纹库改聚合，Ch201 plan prompt **116,592 → 95,157（−18.4%）**，且该块由 O(书长) 变 O(1)。`StoryState` 本体未动工（见下） |
 | **P4** | L5 + L6：确定性返工触发器 + `fix.py` L0/L1 修复阶梯（整章重写按用户决定**保留**为 <6.5 的救援路径；门的删除已按 `gate_census` 数据单独做，见 §7 门校准） | FPY + 重来次数 | 调用数/章下降 **且** 匹配章 pairwise 胜率 ≥50% | 🔄 **代码已落地并入库；A/B 运行中**（`p4_score` vs `p4_det`，`tangshuting_e2e` @Ch46 分叉，各写 Ch47–54） |
 | **P5** | 删逐章 pointwise，接 pairwise | pairwise 胜率 vs 参考章 | 胜率 >55% | 📐 **未动工**。前置条件是 P4 的结论：pointwise 自评正是 P4 在拆的那条无判别力信号，先确认去掉它的返工权之后书还站得住，再谈换成 pairwise |
 
@@ -444,6 +444,30 @@ A/B 纪律（沿用 `ab_short_chapter_score_inflation` 的教训）：
 只有 `planning.create_plan` 里的一个接缝、`plan_from_arc` 永不抛异常、失败即回落委员会
 （见 CLAUDE.md「Arc planner」），留着不带运行时成本；而 n=3 也不足以支持删除。
 真要下结论，需要一次 Ch20–50、≥30 章、且两侧推理覆盖率可比的重跑。
+
+### P3 第一刀（2026-07-28）：先把 `plan_candidate` 拆开量，再动 `StoryState`
+
+按 L3 的实测修正，入口从写作改到了 `plan_candidate`。动手前先把一条**真实**的
+Ch201 plan prompt 抓下来按 `^##` 分节归因（patch `planning.call_llm`，让第一个候选抛
+异常，零 LLM 成本），结果见 `docs/LESSONS.md` §8。两条结论决定了先改什么：
+
+1. **`mem` 是被 cap 住的，动它一点都省不到。** 每本配置都写 `plan_memory_chars: 60000`，
+   在这个预算下只装得进 tier1 + 被截断的 tier2，`memory_context` 提前返回，
+   tier3/tier4 根本到不了这个 prompt。所以上一步做的 tier 去重（LESSONS §12）是
+   真的去重，但它落在 `extract` 和其它不设上限的消费者上，**没有落在最大的那个
+   prompt 上**——在 `mem` 内部瘦身只会让截断点往后挪，总量还是 60k。
+   这条要记住：`plan_candidate` 的可优化面积只有 `mem` 之后 planning.py 自己拼的那 35k。
+2. 那 35k 里最大的一块是 `fingerprint_block`，**22,813 字符 / 全 prompt 的 19.6%**，
+   而且每写一章长一行。它交付不了自己表头承诺的信号：全书 200 章有 194 条互不相同
+   的流程，整条流程级别的重复根本不存在。改为输出 move 词表层面的聚合
+   （高频 bigram/trigram + 类型频次）后 1,240 字符，对书长 O(1)。
+
+这一刀的性质与 §7「门校准」同类：**不是删功能，是把一个从未测过分布的口径对齐到
+实测分布上**。判别功能仍在 `check_plan_against_fingerprints`（按候选确定性比对全部
+指纹）手里，它一直是真正干活的那个。
+
+`canon.py` / `StoryState` 本体仍未动工，且不应急于动：它要付 `cacheable_prefix`
+全量失效的代价，而上面这类零代价的口径修正还没穷尽。
 
 ### P4 落地记录与对原设计的偏差（2026-07-27）
 
