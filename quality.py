@@ -3338,21 +3338,31 @@ _CHAPTER_MODE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _classify_chapter_mode(plan: dict[str, Any], baseline: str = "reasoning", margin: int = 3) -> str:
+def _classify_chapter_mode(plan: dict[str, Any], baseline: str = "auto", margin: int = 3) -> str:
     """Classify a plan into a coarse reader-facing chapter mode via keyword hits.
 
-    Deterministic, no LLM. BIASED toward *baseline* (the genre's core form, e.g.
-    "reasoning" for suspense/rule-horror): a non-baseline mode wins ONLY if its
-    keyword hits exceed the baseline's by more than *margin*. Rationale (learned
-    from yeban_guize): in a puzzle-genre almost every chapter carries incidental
-    emotional/advancement content (牺牲/协会/幕后), so a naive raw-max classifier
-    mislabels fundamentally-智斗 chapters as emotional/advancement and misses the
-    "every chapter is the same KIND of chapter" fatigue the reviewer actually
-    feels. The bias makes a genuine form-break (a chapter that CLEARLY departs
-    from the baseline) the only thing that escapes the baseline label.
+    Deterministic, no LLM. When *baseline* names a real mode (a genre with a single
+    core form, e.g. "reasoning" for suspense/rule-horror) the classifier is BIASED
+    toward it: a non-baseline mode wins ONLY if its keyword hits exceed the
+    baseline's by more than *margin*. Rationale (learned from yeban_guize): in a
+    puzzle-genre almost every chapter carries incidental emotional/advancement
+    content (牺牲/协会/幕后), so a naive raw-max classifier mislabels
+    fundamentally-智斗 chapters as emotional/advancement and misses the "every
+    chapter is the same KIND of chapter" fatigue the reviewer actually feels. The
+    bias makes a genuine form-break (a chapter that CLEARLY departs from the
+    baseline) the only thing that escapes the baseline label.
+
+    ``baseline="auto"`` (any value not in ``_CHAPTER_MODE_KEYWORDS``) disables the
+    bias and returns the raw argmax — correct for genres with no single core form.
+    Genre defaults come from ``config.genre_detection_profile``; the bias must NOT
+    be applied to a genre whose core form isn't in the taxonomy at all (it would
+    label every chapter with the baseline and turn the monotony gate into a
+    100%-false-positive blocker — see the romance_female profile note).
     """
+    biased = baseline in _CHAPTER_MODE_KEYWORDS
+    fallback = baseline if biased else "daily"
     if not isinstance(plan, dict):
-        return baseline
+        return fallback
     parts: list[str] = []
     for k in ("title", "goal", "conflict", "payoff", "pressure", "hook", "risk",
               "conflict_type", "payoff_type"):
@@ -3364,10 +3374,14 @@ def _classify_chapter_mode(plan: dict[str, Any], baseline: str = "reasoning", ma
         parts.extend(str(b) for b in beats)
     text = " ".join(parts)
     if not text.strip():
-        return baseline
+        return fallback
     scores: dict[str, int] = {}
     for mode, kws in _CHAPTER_MODE_KEYWORDS.items():
         scores[mode] = sum(text.count(kw) for kw in kws)
+    if not biased:
+        # No genre core form → raw argmax (insertion-ordered tie-break, deterministic).
+        top = max(scores, key=lambda m: scores[m])
+        return top if scores[top] > 0 else fallback
     base_score = scores.get(baseline, 0)
     others = {m: s for m, s in scores.items() if m != baseline and s > 0}
     if others:
@@ -3404,7 +3418,7 @@ def chapter_mode_monotony(
     }
     if not bool(cfg.get("chapter_mode_enabled", True)):
         return result
-    _baseline = str(cfg.get("chapter_mode_baseline", "reasoning"))
+    _baseline = str(cfg.get("chapter_mode_baseline", "auto"))
     _margin = int(cfg.get("chapter_mode_baseline_margin", 3))
     cur_mode = _classify_chapter_mode(plan, _baseline, _margin)
     result["mode"] = cur_mode

@@ -181,6 +181,81 @@ _SHUANG_PACING_VOLUME_PLAN_DELTA = """
 - **可见的跃迁刻度**：每个逆袭/暴富/涨粉类爽点都要有**读者一眼可见的数字或地位变化**（粉丝数、销量、排名、身份），不要只写"她成功了"这类抽象兑现。
 - **不许一次烧光**：全书**最大的爽点/反转严禁在开局一次性用尽**；爽点强度要逐章/逐阶段升级，卷末留更大的钩子和后手。"""
 
+def _extract_schedule_rows(vp_text: str, chapter_num: int) -> str:
+    """纯函数：从卷纲 markdown 里抽第 N 章的表行（章号 cell 精确匹配 N，排除 120/12-14）。"""
+    if not vp_text:
+        return ""
+    dig = str(int(chapter_num))
+    head_pat = re.compile(rf"^(?:Ch|第)?\s*{dig}(?![0-9\-])")  # 排除 120（多位）与 12-14（卷区间）
+    rows: list[str] = []
+    for line in vp_text.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or set(s) <= set("|-: "):  # 跳过表分隔行
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not cells:
+            continue
+        head = cells[0]
+        if len(head) <= 14 and head_pat.match(head):
+            rows.append(s)
+    return "\n".join(dict.fromkeys(rows))
+
+
+def _schedule_needs_extend(vp_text: str, chapter_num: int, lookahead: int) -> bool:
+    """纯函数：若 chapter_num+lookahead 那一章在卷纲里没有逐章排期行 → 需要扩写。"""
+    return not _extract_schedule_rows(vp_text, chapter_num + lookahead)
+
+
+def extend_volume_schedule(
+    client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any], chapter_num: int
+) -> bool:
+    """重设计「Blueprint 自动生长」：临近详细排期末尾时，为接下来一卷生成逐章排期表并追加进
+    volume_plan.md。根治"框架只在 bootstrap 详写前 2 卷、长书跑出详细卷纲后中段失去 escalation
+    路线图→tension_flat→熔断"的塌陷。
+
+    仅群像/爽点书（有逐章排期表）、gated(auto_extend_schedule_enabled)。任何异常/无需扩写 → 返回
+    False，绝不阻塞主流程（LLM 生成失败、文件问题都退化为"这章走原有规划"）。~每卷触发一次。
+    """
+    nov = config["novel"]
+    if not bool(nov.get("auto_extend_schedule_enabled", False)):
+        return False
+    if not (bool(nov.get("ensemble_cast")) or bool(nov.get("shuang_pacing"))):
+        return False  # 非群像/爽点书没有逐章排期表可扩
+    try:
+        lookahead = int(nov.get("schedule_lookahead", 3))
+        vp = read_text(paths.volume_plan)
+        if not _schedule_needs_extend(vp, chapter_num, lookahead):
+            return False  # 近未来已有排期，无需扩
+        start = chapter_num + lookahead
+        end = start + int(nov.get("schedule_extend_span", 24)) - 1
+        system = VOLUME_PLAN_CHAIN_SYSTEM
+        if bool(nov.get("ensemble_cast")):
+            system += _ENSEMBLE_VOLUME_PLAN_DELTA
+        if bool(nov.get("shuang_pacing")):
+            system += _SHUANG_PACING_VOLUME_PLAN_DELTA
+        user = (
+            f"## 世界观圣经\n{read_text(paths.bible)[:4000]}\n\n"
+            f"## 人物档案\n{read_text(paths.characters)[:4500]}\n\n"
+            f"## 已写到第{chapter_num}章的当前状态\n{read_text(paths.state)[:4000]}\n\n"
+            f"## 现有卷纲结尾（接续，不得推翻已发生剧情）\n{vp[-3500:]}\n\n## 任务\n"
+            f"本书已写到第{chapter_num}章，接下来的章缺「逐章排期」。只为 Ch{start}-{end} 逐章补出四张按"
+            f"章号排布的排期表（角色高光轮值表 / 爽点兑现节拍表 / 反转做成名场面排期 / 伏笔兑现节拍），"
+            f"接续已写剧情、与现有卷纲一致；**中段每章必须有一个明确的当章 payoff 与张力起伏，严禁平淡过渡章**；"
+            f"每章 2800-4000 字可写量。只输出这四张表(markdown)，表头 `### 逐章排期补全（Ch{start}-{end}）`。"
+        )
+        out = _gen_md_section(client, paths, config, system, user, tag="schedule_extend", max_tokens=16000)
+        if not out or len(out) < 300:
+            log(paths, f"Auto-extend schedule Ch{chapter_num}: 生成过短/失败，跳过（走原有规划）")
+            return False
+        with open(paths.volume_plan, "a", encoding="utf-8") as f:
+            f.write(f"\n\n---\n### 逐章排期补全（Ch{start}-{end}，自动扩写）\n{out.strip()}\n")
+        log(paths, f"Auto-extend schedule Ch{chapter_num}: 已追加 Ch{start}-{end} 逐章排期 ({len(out)}字)")
+        return True
+    except Exception as exc:
+        log(paths, f"Auto-extend schedule failed Ch{chapter_num} (non-fatal): {exc}")
+        return False
+
+
 FRAME_CHAIN_SYSTEM = """你是长篇小说引擎的开篇定稿器。基于下方世界观/人物/卷纲，产出本书启动所需的几个简短字段。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
 {
@@ -743,6 +818,191 @@ def _read_memory_file(path: Path, cap: int) -> str:
     return text
 
 
+_HEADER_RE = re.compile(r"^#{2,6}\s")
+# 「（第25-48章）」「（Ch31-48，修复中段塌陷追加）」「（Ch49-72）」都要能解析
+_RANGE_RE = re.compile(r"(?:第|Ch|ch|CH)\s*(\d{1,4})\s*[-–—~至到]\s*(?:第|Ch|ch|CH)?\s*(\d{1,4})")
+_ROW_CHAPTER_RE = re.compile(r"^\|\s*(?:第|Ch|ch|CH)?\s*(\d{1,4})\s*章?\s*\|")
+
+
+def _header_range(line: str) -> tuple[int, int] | None:
+    m = _RANGE_RE.search(line)
+    if not m:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
+def _filter_schedule_rows(body: str, lo: int, hi: int) -> str:
+    """Drop per-chapter table rows outside [lo, hi]. Table headers / separators /
+    rows without a chapter number are kept, so a filtered table stays readable."""
+    out: list[str] = []
+    for line in body.split("\n"):
+        s = line.lstrip()
+        if not s.startswith("|"):
+            out.append(line)
+            continue
+        m = _ROW_CHAPTER_RE.match(s)
+        if not m:  # 表头 / 分隔行 / 无章号的行
+            out.append(line)
+            continue
+        if lo <= int(m.group(1)) <= hi:
+            out.append(line)
+    return "\n".join(out)
+
+
+def volume_plan_window(text: str, chapter_num: int, cap: int, lookahead: int = 2) -> str:
+    """Chapter-relevant view of volume_plan.md, replacing naive head truncation.
+
+    Root cause it fixes: volume_plan grows per volume (and `extend_volume_schedule`
+    APPENDS more), so `text[:cap]` means a book at Ch41 shows the writer only
+    第一卷（Ch1-24）— the current volume's 角色高光轮值表 / 爽点兑现节拍表 /
+    反转排期 / 伏笔兑现表 all sit beyond the window and were never executed
+    (ensemble cast collapse, payoff_deferred, tension_flat).
+
+    Strategy: keep the preamble; keep in full every `##`/`###`/`####` block whose
+    header declares no chapter range OR whose range contains `chapter_num`; reduce
+    out-of-range blocks to their header line as a breadcrumb; inside kept blocks
+    keep only `| ChN |` schedule rows for chapters in
+    [chapter_num-1, chapter_num+lookahead]. Pure function — no IO.
+    """
+    text = (text or "").strip()
+    if not text or chapter_num <= 0:
+        return text if cap <= 0 or len(text) <= cap else text[:cap] + "\n...[truncated]"
+
+    lines = text.split("\n")
+    # (header_line | None, body_lines)
+    blocks: list[tuple[str | None, list[str]]] = []
+    preamble: list[str] = []
+    for line in lines:
+        if _HEADER_RE.match(line):
+            blocks.append((line, []))
+        elif blocks:
+            blocks[-1][1].append(line)
+        else:
+            preamble.append(line)
+
+    lo, hi = max(1, chapter_num - 1), chapter_num + max(0, lookahead)
+    ranges = [(_header_range(h or "")) for h, _ in blocks]
+    hit_any = any(r and r[0] <= chapter_num <= r[1] for r in ranges)
+    # Safety net: a plan that never reaches this chapter (e.g. 卷纲 stops at Ch24
+    # while the book runs to Ch41) must not collapse to headers only — keep the
+    # ranged block closest to the current chapter verbatim (rows included).
+    nearest = -1
+    if not hit_any:
+        best = None
+        for i, r in enumerate(ranges):
+            if not r:
+                continue
+            dist = min(abs(chapter_num - r[0]), abs(chapter_num - r[1]))
+            if best is None or dist < best:
+                best, nearest = dist, i
+
+    parts: list[str] = []
+    pre = "\n".join(preamble).strip()
+    if pre:
+        parts.append(pre)
+    # Rangeless sub-blocks (e.g. `#### **角色高光轮值表**`) inherit the keep
+    # decision of their nearest ranged ancestor, so a past volume's tables don't
+    # survive as empty skeletons.
+    ctx: list[tuple[int, bool]] = []
+    for i, (header, body) in enumerate(blocks):
+        head = str(header)
+        level = len(head) - len(head.lstrip("#"))
+        rng = ranges[i]
+        while ctx and ctx[-1][0] >= level:
+            ctx.pop()
+        if rng is not None:
+            keep_full = (rng[0] <= chapter_num <= rng[1]) or i == nearest
+            ctx.append((level, keep_full))
+        else:
+            keep_full = ctx[-1][1] if ctx else True
+        if not keep_full:
+            parts.append(head.rstrip() + "  （非本章区间，正文略）")
+            continue
+        raw = "\n".join(body)
+        kept = (raw if i == nearest else _filter_schedule_rows(raw, lo, hi)).strip("\n")
+        parts.append(head.rstrip() + ("\n" + kept if kept.strip() else ""))
+
+    out = "\n\n".join(p for p in parts if p.strip())
+    if cap > 0 and len(out) > cap:
+        out = out[:cap] + "\n...[truncated]"
+    return out
+
+
+def chapter_schedule_directive(volume_plan_text: str, chapter_num: int,
+                               config: dict[str, Any] | None = None) -> str:
+    """Quote THIS chapter's own schedule rows (角色高光轮值表 / 爽点兑现节拍表 /
+    反转排期 / 伏笔兑现) from volume_plan as a hard planner directive.
+
+    `volume_plan_window` only makes the rows visible; visibility alone doesn't
+    produce compliance — Ch43 was planned with the fixed window and still gave the
+    ⭐ to a character the table marked 无镜头 while the ▼-scheduled one stayed
+    absent. This turns the row into an explicit obligation. Pure parse+inject;
+    returns "" on any parse failure so planning degrades to prior behaviour.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("chapter_schedule_directive_enabled", True)):
+        return ""
+    text = (volume_plan_text or "").strip()
+    if not text or chapter_num < 1:
+        return ""
+    try:
+        caption = ""
+        found: list[tuple[str, str]] = []
+        for raw in text.split("\n"):
+            s = raw.strip()
+            if not s:
+                continue
+            if not s.startswith("|"):
+                # Remember the nearest table caption above the row (header or bold line).
+                cap_txt = re.sub(r"[#*`]+", "", s).strip()
+                if cap_txt and ("表" in cap_txt or "排期" in cap_txt or "节拍" in cap_txt):
+                    caption = cap_txt[:40]
+                continue
+            m = _ROW_CHAPTER_RE.match(s)
+            if not m or int(m.group(1)) != chapter_num:
+                continue
+            found.append((caption or "排期表", s[:900]))
+        if not found:
+            return ""
+        limit = int(cfg.get("chapter_schedule_directive_max_rows", 4))
+        lines = [
+            f"## 本章排期（卷纲第 {chapter_num} 章行，硬性：必须落实，不得改派）",
+            "以下是卷纲为本章预先排定的角色高光/爽点/反转/伏笔。大纲必须逐项对应落实：",
+            "标记含义 ⭐=当章主C位最高光 ★=重要输出 ▲=亮眼但不抢戏 ▼=有存在感但克制 无镜头=本章不得给该角色戏份。",
+        ]
+        for cap_txt, row in found[:limit]:
+            lines.append(f"- 【{cap_txt}】{row}")
+        lines.append(
+            "违规判定：把 ⭐ 给了排期标注「无镜头」的角色、或漏掉带 ★/▲/▼ 标记的角色，"
+            "都视为不合格大纲；确有剧情冲突必须在 risk 字段写明理由。"
+        )
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _read_volume_plan(paths: Paths, config: dict[str, Any], chapter_num: int, cap: int) -> str:
+    text = read_text(paths.volume_plan).strip()
+    if not bool(config["novel"].get("volume_plan_window_enabled", True)):
+        return _read_memory_file(paths.volume_plan, cap)
+    return volume_plan_window(
+        text, chapter_num, cap,
+        lookahead=int(config["novel"].get("volume_plan_window_lookahead", 2)),
+    )
+
+
+def _current_chapter_hint(conn: Any) -> int:
+    """Chapter the pipeline is working on = last recorded chapter + 1. Used by the
+    context builders, which have no chapter_num parameter. Any failure → 0, which
+    makes volume_plan_window fall back to plain head truncation."""
+    try:
+        rows = recent_metrics(conn, 1)
+        return int(rows[0].get("chapter", 0)) + 1 if rows else 0
+    except Exception:
+        return 0
+
+
 def _recency_aware_state(raw: str, config: dict[str, Any], max_chars: int = 12000) -> str:
     """Structured truncation of state.md for writing_memory_context.
 
@@ -854,7 +1114,10 @@ def memory_context(paths: Paths, conn: Any, config: dict[str, Any],
         style_block += "\n\n## 已采纳开篇路线（优先级高于临场发散）\n" + opening_route
     tier1 = "## 创作纲要\n" + creative_brief + "\n\n## 当前状态\n" + current_state + style_block
 
-    volume_plan = _read_memory_file(paths.volume_plan, int(config["novel"].get("memory_volume_plan_chars", 16000)))
+    volume_plan = _read_volume_plan(
+        paths, config, _current_chapter_hint(conn),
+        int(config["novel"].get("memory_volume_plan_chars", 16000)),
+    )
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
     threads_text = _read_memory_file(paths.threads, int(config["novel"].get("memory_threads_chars", 12000)))
     tier2 = "## 卷纲\n" + volume_plan + "\n\n## 关键指标JSON\n" + metrics_5 + "\n\n## 伏线\n" + threads_text
@@ -1043,14 +1306,19 @@ def writing_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
             if s not in kept:
                 kept.append(s)
         threads_text = "\n".join(kept)[:threads_cap]
-    volume_plan = _read_memory_file(paths.volume_plan, int(config["novel"].get("memory_volume_plan_chars", 16000)))
+    # 写作路径的卷纲窗口直接按最终额度裁（而不是先按 16000 建窗再头部截断，
+    # 否则本章排期行仍会被切掉——这正是中段选角/爽点排期从未被执行的根因）。
+    # 9000 是行过滤后一整套「本章相关」排期表的实测尺寸（约 8.9k），而 writing
+    # 总预算 50000、其余分节合计约 26k，抬这个额度不挤压任何其他分节。
+    vp_cap = int(config["novel"].get("memory_writing_volume_plan_chars", 9000))
+    volume_plan = _read_volume_plan(paths, config, _current_chapter_hint(conn), vp_cap)
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
 
     sections: list[tuple[str, str, int]] = [
         ("当前状态", current_state, 10000),
         ("伏线", threads_text, 8000),
         ("近期指标JSON", metrics_5, 2500),
-        ("卷纲（节选）", volume_plan, 6000),
+        ("卷纲（本章相关节选）", volume_plan, vp_cap),
     ]
     parts: list[str] = []
     used = 0
@@ -1098,10 +1366,15 @@ def lite_memory_context(paths: Paths, conn: Any, config: dict[str, Any],
     characters = _read_memory_file(paths.characters, 2500)
     threads_text = _read_memory_file(paths.threads, 2500)
     metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
+    # 计划评审/仲裁也要看到本章的排期行（轮值/爽点/伏笔），否则 required_constraints
+    # 无从校验"本章该兑现什么"。行过滤后这段很小，2000 字足够。
+    vp_lite_cap = int(config["novel"].get("memory_lite_volume_plan_chars", 2000))
+    volume_plan_lite = _read_volume_plan(paths, config, _current_chapter_hint(conn), vp_lite_cap)
 
     sections: list[tuple[str, str, int]] = [
         ("创作纲要", creative_brief, 1500),
         ("当前状态", current_state, 2500),
+        ("卷纲（本章相关节选）", volume_plan_lite, vp_lite_cap),
         ("已采纳开篇路线", opening_route, 2000),
         ("叙事声音锚", voice_anchor, 1200),
         ("近期指标JSON", metrics_5, 1200),

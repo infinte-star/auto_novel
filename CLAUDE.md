@@ -115,6 +115,20 @@ Multi-endpoint, multi-key API access is configured via three keys in `api:`:
 `LLMClientPool` rotates across primary keys round-robin and only falls back to
 secondary endpoints when all primaries are dead.
 
+Per-role routing keys (`{planning,writing,extraction,review}_*`) carry two
+independent reasoning knobs, because gateways honour one or the other:
+- `{role}_thinking_mode` — `disabled` / `auto` / `enabled` (+`{role}_thinking_budget_tokens`),
+  emitted as `extra_body["thinking"]` (Anthropic/豆包 style). `auto` omits it.
+- `{role}_reasoning_effort` — OpenAI style (`none`/`low`/`medium`/`high`), emitted
+  as a top-level body field via `extra_body`. Empty ⇒ never sent.
+
+Live case: `gemini-2.5-pro` behind an nginx-fronted reseller gateway (the
+template's writing role) reasons past nginx's ~70s proxy timeout and 504s before
+the first byte. Neither `thinking:{"type":"disabled"}` nor omitting the param
+helps — only `writing_reasoning_effort: none` does (first byte ~29s, 3.1k chars
+in ~170s at the default `max_tokens: 65536`). That endpoint also 504s on any
+non-stream request, so `api.stream: true` is mandatory for it.
+
 ## Architecture
 
 ### Top-level loop (`pipeline.py:main`)
@@ -270,6 +284,24 @@ Two distinct context builders feed different LLM calls:
 - `writing_memory_context` — small variable portion (state + threads + recent metrics + volume plan head) for write/revise/review hot path
 - `memory_context` — full layered context (4 tiers, char-budgeted) for plan generation and event extraction
 - `lite_memory_context` — heavily abbreviated for plan-review/screening
+
+`volume_plan.md` is the one memory file that grows linearly with the book (a new
+`## 第N卷` per volume, plus `extend_volume_schedule` APPENDING per-chapter schedule
+tables), so plain head truncation silently starves the mid-book: a novel at Ch41
+saw only 第一卷（Ch1-24）and none of the current volume's 角色高光轮值表 /
+爽点兑现节拍表 / 反转排期 / 伏笔兑现 tables — the schedules were never executed
+(ensemble cast collapsed to a two-hander, `payoff_deferred`, `tension_flat`).
+`memory.py:volume_plan_window(text, chapter_num, cap, lookahead)` replaces head
+truncation at all three read sites: it keeps blocks whose header declares no
+chapter range or a range containing `chapter_num`, reduces out-of-range volumes to
+a header breadcrumb, and inside kept blocks keeps only `| ChN |` rows for
+`[chapter_num-1, chapter_num+lookahead]`. Rangeless sub-blocks inherit their
+nearest ranged ancestor's decision; if no block covers the chapter, the nearest one
+is kept verbatim. Gated by `volume_plan_window_enabled`.
+Visibility alone doesn't produce compliance, so `memory.py:chapter_schedule_directive`
+quotes this chapter's own schedule rows as a hard obligation into BOTH
+`generate_candidate_plans` and `arbitrate_plan` (the arbiter must push the row into
+`required_constraints`). Gated by `chapter_schedule_directive_enabled`.
 
 Per-chapter state persistence is a SINGLE LLM call: `extract_events` returns the
 extraction JSON **including** `protagonist_state` + `next_12_directions`;

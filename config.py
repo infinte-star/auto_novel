@@ -96,6 +96,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "short_paragraph_warn": 45,
         "short_paragraph_severe": 30,
         "dialogue_pingpong_warn": 0.55,
+        # 章型单调闸：形态表(智斗/动作/情感/关系/推进/日常)对打斗-晋级型爽文够用，
+        # 但没有哪个形态是它的"核心形态"，故不加偏置（auto=纯 argmax）。
+        "chapter_mode_enabled": True,
+        "chapter_mode_baseline": "auto",
     }
     profiles: dict[str, dict[str, Any]] = {
         "xuanhuan_shuang": dict(shuang),
@@ -134,6 +138,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "short_paragraph_warn": 55,
             "short_paragraph_severe": 35,
             "dialogue_pingpong_warn": 0.45,
+            # 智斗解谜是本题材的核心形态 → 偏置到 reasoning，只有"明显脱离智斗"的章
+            # 才算换形态（否则满是协会/牺牲内容词的智斗章会被误判成别的形态而漏掉疲劳）。
+            "chapter_mode_enabled": True,
+            "chapter_mode_baseline": "reasoning",
         },
         # 历史厚重：慢热、长章、关闭连续平路闸门、厚重长句。
         "history": {
@@ -158,6 +166,8 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "short_paragraph_warn": 55,
             "short_paragraph_severe": 35,
             "dialogue_pingpong_warn": 0.45,
+            "chapter_mode_enabled": True,
+            "chapter_mode_baseline": "auto",
         },
         # 女频言情：情绪弧主导、关系开场、情绪变奏最严。
         "romance_female": {
@@ -179,6 +189,14 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "visual_payoff_blocks_plan": False,
             "emotional_cadence_max_same": 2,
             "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "心跳加速", "脸颊微红", "呼吸一滞"],
+            # 章型单调闸对言情族关闭。证据（tangshuting_e2e Ch1-36）：形态表没有言情形态
+            # 词汇，情感/关系章被题材词汇（线索/证据/真相=深伪调查主线）带成 reasoning，
+            # 57/57 命中、52 次 block，零真阳性；补上言情词汇后仍 38/40 判同一形态——因为
+            # "每章都是情感关系章"对言情是题材契约，不是形态疲劳。硬性"必须改成动作/追逐"
+            # 的重规划指令反而把言情书往错方向推。变奏在本题材由 payoff_type 单调闸
+            # （reversal/emotional/reveal/… 确有区分度）+ emotional_cadence_max_same=2 承担。
+            "chapter_mode_enabled": False,
+            "chapter_mode_baseline": "auto",
         },
         # 规则怪谈/民俗无限流：悬疑推理内核 + 抖音快节奏。线索开场、物证兑现门（规则/破法
         # 必须落到可见后果），节奏比纯悬疑快，保留怪谈冷叙事（不下沉）。
@@ -202,6 +220,9 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "emotional_cadence_max_same": 4,
             "fatigue_words": ["毛骨悚然", "不寒而栗", "头皮发麻", "仿佛", "不禁", "宛如",
                               "竟然", "一股寒意", "浑身发冷"],
+            # 与纯悬疑同源：智斗解谜是核心形态，偏置到 reasoning（本闸的原始设计场景）。
+            "chapter_mode_enabled": True,
+            "chapter_mode_baseline": "reasoning",
         },
     }
     # 别名：规则流 / 无限流 指向同一 profile。

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score, cost_savings_disabled
 from llm import call_llm, json_prompt, load_json_with_repair
-from memory import beat_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
+from memory import beat_directive, chapter_schedule_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
 from store import db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_events, recent_metrics, recent_quality_feedback
 
 if TYPE_CHECKING:
@@ -707,6 +707,16 @@ def generate_candidate_plans(
         )
     except Exception:
         beat_block = ""
+    # 本章排期硬指令：卷纲里为本章排定的角色高光/爽点/反转/伏笔行。窗口修复让这些行
+    # 可见，但可见 != 遵守（Ch43 仍把 ⭐ 给了排期标注"无镜头"的角色），所以把它抬成
+    # 显式义务。纯解析注入，失败降级为 ""。
+    schedule_block = ""
+    try:
+        schedule_block = chapter_schedule_directive(_vp_text, chapter_num, config)
+        if schedule_block:
+            log(paths, f"Chapter schedule directive Ch{chapter_num}: {schedule_block.count(chr(10)+'- ')} rows")
+    except Exception:
+        schedule_block = ""
     # Volume/arc boundary steer (治本 for arc overstay): auto-inject a hard
     # transition directive at a volume's opening window so the planner closes the
     # previous arc and switches form — the yeban_guize 城中村 overstay-to-collapse
@@ -905,6 +915,7 @@ def generate_candidate_plans(
 {f"## 情感节奏警告{chr(10)}{emotional_cadence_block}{chr(10)}" if emotional_cadence_block else ""}{chr(10).join(f"## 钩子生命周期警告{chr(10)}{d}" for d in hook_directives) + chr(10) if hook_directives else ""}
 {volume_block}
 {beat_block}
+{schedule_block}
 
 ## 上章结尾
 {tail[-2000:]}
@@ -1501,9 +1512,26 @@ def arbitrate_plan(
                 "或继续围绕同一物证演示同一结论），判定为后期重复风险，该候选 score 不得高于 7.0，"
                 "并在 cons 中点名。仲裁改写 merged_plan 时也必须避开上表已用项。\n"
             )
+    # 本章排期硬指令也要进仲裁：required_constraints 是最终下发给写手的硬约束，
+    # 只在候选生成侧提要求，仲裁改写 merged_plan 时仍可能把排定的角色改派掉。
+    sched_block = ""
+    try:
+        from config import read_text as _read_text
+
+        sched_block = chapter_schedule_directive(
+            _read_text(paths.volume_plan), chapter_num, config)
+        if sched_block:
+            sched_block = (
+                "\n" + sched_block
+                + "\n仲裁要求：merged_plan 必须落实上表；若某候选违背排期（把主高光给了"
+                "「无镜头」角色、或漏掉带标记的角色），在 cons 中点名并在 merged_plan 中改回，"
+                "同时把该排期项写进 required_constraints。\n"
+            )
+    except Exception:
+        sched_block = ""
     user = f"""## 记忆
 {mem}
-{calib_block}{ledger_block}
+{calib_block}{ledger_block}{sched_block}
 
 ## 节奏诊断JSON
 {json.dumps(rhythm_diagnostics(conn, config), ensure_ascii=False, indent=2)}
@@ -1673,131 +1701,6 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
     return base
 
 
-def _read_schedule_rows(paths: Paths, chapter_num: int) -> str:
-    """从 volume_plan.md 抽取第 N 章的排期行（角色高光轮值 / 爽点兑现节拍 / 反转排期 / 伏笔兑现表）。
-
-    这些表本会话已固化为「按章号排布」的 markdown 表——本身就是一份确定性的逐章计划。
-    抽不到（旧书无表 / 格式不符）返回 ""，调用方据此回退重型规划。章号匹配精确到 N（排除 120/12-14）。
-    """
-    try:
-        from config import read_text as _read_text
-        vp = _read_text(paths.volume_plan)
-    except Exception:
-        return ""
-    return _extract_schedule_rows(vp or "", chapter_num)
-
-
-def _extract_schedule_rows(vp_text: str, chapter_num: int) -> str:
-    """纯函数：从卷纲 markdown 里抽第 N 章的表行（章号 cell 精确匹配 N，排除 120/12-14）。"""
-    if not vp_text:
-        return ""
-    import re as _re
-    dig = str(int(chapter_num))
-    head_pat = _re.compile(rf"^(?:Ch|第)?\s*{dig}(?![0-9\-])")  # 排除 120（多位）与 12-14（卷区间）
-    rows: list[str] = []
-    for line in vp_text.splitlines():
-        s = line.strip()
-        if not s.startswith("|") or set(s) <= set("|-: "):  # 跳过表分隔行
-            continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
-        if not cells:
-            continue
-        head = cells[0]
-        if len(head) <= 14 and head_pat.match(head):
-            rows.append(s)
-    return "\n".join(dict.fromkeys(rows))
-
-
-def _schedule_plan_eligible(
-    paths: Paths, conn: Any, config: dict[str, Any], chapter_num: int,
-    checkpoint_label: str, replan_feedback: str | None,
-) -> bool:
-    """轻规划（plan_from_schedule）适用性闸：仅在低风险常态路径启用，否则回退重型规划。"""
-    if not bool(config["novel"].get("plan_from_schedule", False)):
-        return False
-    if checkpoint_label != "initial" or replan_feedback:
-        return False  # 重规划/结构性重做走重型路径（需要多候选+诊断）
-    if chapter_num <= int(config["novel"].get("opening_chapters", 3)):
-        return False  # 冷启动：steering 尚空，走重型
-    # 注：曾在此以"恢复期/近期低分→回退重型"为由禁用轻规划，但 A/B 证明轻规划(读排期少而深)
-    # 质量优于重型，且中段塌陷恰恰是因为重型规划失去卷纲路线图后走平——此时更需要"锚定排期"的
-    # 轻规划，而非多候选广度。失败仍由写手侧评审→结构性重规划(重型)兜底。故不再按低分/恢复期禁用。
-    # 可用 plan_from_schedule_only_when_safe=true 恢复旧的保守行为。
-    if bool(config["novel"].get("plan_from_schedule_only_when_safe", False)):
-        if _recovery_active(paths, chapter_num):
-            return False
-        try:
-            rows = recent_metrics(conn, int(config["novel"].get("risk_upshift_window", 3)))
-            floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
-            sc = [safe_score(r.get("score", 0)) for r in rows if r.get("score") is not None]
-            if sc and min(sc) < floor:
-                return False
-        except Exception:
-            pass
-    return True
-
-
-def plan_from_schedule(
-    client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any],
-    chapter_num: int, tail: str, cached_memory: str | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """轻规划：读卷纲第 N 章排期表 + 1 次 LLM 轻展开成计划 JSON，跳过 bandit/多候选/融合评审/仲裁。
-
-    一致性锚在「一次精心生成的卷纲排期」而非每章重新博弈。抽不到排期 / 展开失败 → 返回 None
-    让调用方回退重型规划。计划本身若不佳，由写手侧评审/确定性门→结构性重规划（重型）兜底。
-    """
-    schedule = _read_schedule_rows(paths, chapter_num)
-    if not schedule or len(schedule) < 20:
-        return None  # 卷纲无该章排期表 → 回退重型
-    try:
-        mem = cached_memory or lite_memory_context(
-            paths, conn, config,
-            max_chars=int(config["novel"].get("plan_arbitrate_memory_chars", 20000) or 0),
-        )
-    except Exception:
-        mem = cached_memory or ""
-    constraints = get_active_constraints(conn, chapter_num) or []
-    max_beats = int(config["novel"].get("chapter_max_beats", 5) or 5)
-    cons_block = ""
-    if constraints:
-        cons_block = "\n## 必须遵守的约束（required_constraints）\n" + "\n".join(f"- {c}" for c in constraints[:12])
-    user = (
-        f"## 本章（第{chapter_num}章）已排定排期（来自卷纲逐章表，不得推翻，只做落地展开与具体化）\n"
-        f"{schedule}\n\n"
-        f"## 承接（上一章结尾）\n{tail[-1500:]}\n\n"
-        f"## 记忆（事实与设定参照）\n{mem}\n"
-        f"{cons_block}\n\n"
-        f"## 任务\n严格依据上面「已排定排期」把第{chapter_num}章展开成一份可执行的章节计划 JSON："
-        f"把排期里的角色高光/主爽点/反转/伏笔兑现落成具体、可拍的 beats 与 payoff；"
-        f"不要另起炉灶或改变本章该发生的事。beats 少而深：1 个主 beat + 最多 {max_beats-1} 个副 beat，"
-        f"每个都写成'谁用具体动作操作具体物体、产生读者可见结果'的可拍句子。"
-        f"输出与候选大纲相同的 JSON schema。"
-    )
-    raw = call_llm(
-        client, paths, config, CANDIDATE_PLAN_SYSTEM, json_prompt(user),
-        temperature=float(config["novel"].get("plan_candidate_temp_base", 0.6)),
-        tag="plan_from_schedule",
-    )
-    plan = load_json_with_repair(client, paths, config, raw, fallback=None)
-    if not isinstance(plan, dict) or not plan.get("beats"):
-        return None  # 展开失败 → 回退重型
-    # beat 上限（与重型路径一致的生成减负）
-    _beats = plan.get("beats")
-    if isinstance(_beats, list) and len(_beats) > max_beats:
-        plan["beats"] = _beats[:max_beats]
-    pass_score = float(config["novel"].get("min_plan_score", 8.0))
-    decision = {
-        "selected_index": 0,
-        "scores": [{"index": 0, "score": pass_score}],
-        "required_constraints": list(constraints),
-        "merged_plan": plan,
-        "rationale": "plan_from_schedule 轻规划：读卷纲逐章排期表 + 轻展开（跳过多候选/融合评审/仲裁）；"
-                     "计划质量由写手侧评审+确定性门兜底，不佳则触发结构性重规划（重型）。",
-        "source": "schedule",
-    }
-    return plan, decision
-
-
 def create_plan(
     client: OpenAI,
     paths: Paths,
@@ -1813,23 +1716,6 @@ def create_plan(
     if isinstance(cached, dict) and cached.get("plan") and cached.get("decision"):
         log(paths, f"Resuming cached {checkpoint_label} plan Ch{chapter_num}")
         return cached["plan"], cached["decision"]
-
-    # ── 轻规划路径（plan_from_schedule，gated，默认 off）──────────────────────
-    # 读卷纲逐章排期表 + 1 次轻展开，跳过 bandit/多候选/筛选/融合评审/仲裁。仅低风险常态章启用；
-    # 冷启动/重规划/恢复期/近期低分 → 回退下方重型路径。抽不到排期或展开失败也回退。重型路径完全不动。
-    if _schedule_plan_eligible(paths, conn, config, chapter_num, checkpoint_label, replan_feedback):
-        try:
-            light = plan_from_schedule(client, paths, conn, config, chapter_num, tail, cached_memory=cached_memory)
-            if light is not None:
-                plan, decision = light
-                save_checkpoint(paths, chapter_num, f"plan_{checkpoint_label}_selected.json",
-                                {"plan": plan, "decision": decision})
-                log(paths, f"Light plan (plan_from_schedule) Ch{chapter_num}: score={plan_score(decision)} "
-                           f"beats={len(plan.get('beats') or [])} — 跳过重型规划")
-                return plan, decision
-            log(paths, f"plan_from_schedule Ch{chapter_num}: 无排期/展开失败 → 回退重型规划")
-        except Exception as exc:
-            log(paths, f"plan_from_schedule failed Ch{chapter_num} ({exc}) → 回退重型规划")
 
     mem = cached_memory or memory_context(
         paths, conn, config,

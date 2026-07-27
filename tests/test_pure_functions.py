@@ -26,7 +26,7 @@ from config import genre_detection_profile, _apply_genre_detection_profile  # no
 from memory import _recency_aware_state  # noqa: E402
 from memory import _contract_to_markdown  # noqa: E402
 from pipeline import _apply_force_accept_patches  # noqa: E402
-from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
+from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 from writing import _chapter_write_max_tokens  # noqa: E402
 from quality import cross_chapter_repetition, descriptor_frequency, genre_adherence, GENRE_KEYWORDS  # noqa: E402
@@ -210,7 +210,7 @@ class AiFlavorPivotTests(unittest.TestCase):
 
 
 class ScheduleRowExtractionTests(unittest.TestCase):
-    """_extract_schedule_rows: 轻规划(plan_from_schedule)从卷纲逐章表读第 N 章排期行。"""
+    """_extract_schedule_rows: 从卷纲逐章表读第 N 章排期行（自动扩写触发判定的底座）。"""
 
     VP = "\n".join([
         "## 第二卷（第25-48章）",
@@ -227,7 +227,7 @@ class ScheduleRowExtractionTests(unittest.TestCase):
     ])
 
     def test_extracts_exact_chapter_rows(self):
-        from planning import _extract_schedule_rows
+        from memory import _extract_schedule_rows
         out = _extract_schedule_rows(self.VP, 12)
         self.assertIn("陆时砚、谢观澜", out)      # 角色高光表 Ch12 行
         self.assertIn("打脸反杀", out)           # 爽点节拍表 Ch12 行
@@ -236,15 +236,39 @@ class ScheduleRowExtractionTests(unittest.TestCase):
         self.assertNotIn("白景昀", out)          # 第13章 不混入
 
     def test_other_chapter(self):
-        from planning import _extract_schedule_rows
+        from memory import _extract_schedule_rows
         out = _extract_schedule_rows(self.VP, 13)
         self.assertIn("白景昀认亲", out)
         self.assertNotIn("陆时砚", out)
 
     def test_missing_chapter_returns_empty(self):
-        from planning import _extract_schedule_rows
+        from memory import _extract_schedule_rows
         self.assertEqual(_extract_schedule_rows(self.VP, 99), "")
         self.assertEqual(_extract_schedule_rows("", 12), "")
+
+
+class ScheduleAutoExtendTests(unittest.TestCase):
+    """_schedule_needs_extend: 自动扩写卷纲的触发判定（临近详细排期末尾→需扩）。"""
+
+    VP = "\n".join([
+        "| 章号 | 高光 |", "| Ch23 | a |", "| Ch24 | b |",   # 卷一详到 Ch24
+        "| Ch31 | c |", "| Ch47 | d |", "| Ch48 | e |",       # 补写详到 Ch31-48
+    ])
+
+    def test_needs_extend_near_end_of_detail(self):
+        from memory import _schedule_needs_extend
+        # 写到 Ch46，lookahead=3 → 看 Ch49，无排期 → 需扩
+        self.assertTrue(_schedule_needs_extend(self.VP, 46, 3))
+
+    def test_no_extend_when_covered(self):
+        from memory import _schedule_needs_extend
+        # 写到 Ch33，lookahead=3 → 看 Ch36... Ch36 无行? 用 Ch44→Ch47(有) 应不扩
+        self.assertFalse(_schedule_needs_extend(self.VP, 44, 3))   # Ch47 有排期
+        self.assertFalse(_schedule_needs_extend(self.VP, 45, 3))   # Ch48 有排期
+
+    def test_extend_past_last_detailed(self):
+        from memory import _schedule_needs_extend
+        self.assertTrue(_schedule_needs_extend(self.VP, 50, 3))    # Ch53 早已无排期
 
 
 class SceneDraftSplitTests(unittest.TestCase):
@@ -958,6 +982,27 @@ class ResolveThinkingParamTests(unittest.TestCase):
     def test_budget_string_parsed(self):
         result = _resolve_thinking_param({"thinking_mode": "enabled", "thinking_budget_tokens": "16000"})
         self.assertEqual(result, {"type": "enabled", "budget_tokens": 16000})
+
+
+class ReasoningEffortTests(unittest.TestCase):
+    """Tests for _resolve_reasoning_effort (OpenAI-style reasoning_effort knob)."""
+
+    def test_absent_returns_none(self):
+        self.assertIsNone(_resolve_reasoning_effort({}))
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(_resolve_reasoning_effort({"reasoning_effort": "   "}))
+
+    def test_value_normalized(self):
+        self.assertEqual(_resolve_reasoning_effort({"reasoning_effort": " None "}), "none")
+
+    def test_role_prefixed_key(self):
+        api = {"writing_reasoning_effort": "none", "reasoning_effort": "high"}
+        self.assertEqual(_resolve_reasoning_effort(api, key="writing_reasoning_effort"), "none")
+        self.assertIsNone(_resolve_reasoning_effort(api, key="review_reasoning_effort"))
+
+    def test_unknown_tier_passed_through(self):
+        self.assertEqual(_resolve_reasoning_effort({"reasoning_effort": "ultra"}), "ultra")
 
 
 class RecencyAwareStateTests(unittest.TestCase):
@@ -2625,6 +2670,71 @@ class ReasoningMaxTokensTests(unittest.TestCase):
         self.assertEqual(received, [2000, 4000])
 
 
+class ReasoningEffortWiringTests(unittest.TestCase):
+    """call_llm must forward {role}_reasoning_effort into extra_body (top level).
+
+    Live evidence: littlesheep's gemini-2.5-pro 504s behind nginx unless the
+    request carries reasoning_effort: none, so this wiring is load-bearing for
+    the writing role, not cosmetic.
+    """
+
+    def _run(self, api_extra, *, tag="write", role=True):
+        import types
+        import tempfile
+        from pathlib import Path
+        import llm
+
+        seen = {}
+
+        class _Completions:
+            def create(self, **request):
+                seen.update(request)
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(
+                    message=types.SimpleNamespace(content="OK-CONTENT", reasoning_content=""),
+                    finish_reason="stop",
+                )])
+
+        class _Client:
+            def __init__(self):
+                self.chat = types.SimpleNamespace(completions=_Completions())
+
+        client = _Client()
+        if role:
+            client.writing_pool = client
+            client.writing_api = {"writing_model": "gemini-2.5-pro"}
+        api = {
+            "model": "primary", "temperature": 0.8, "max_tokens": 16000,
+            "max_attempts": 1, "stream": False, "metrics_enabled": False,
+            "reasoning_min_max_tokens": 0,
+        }
+        api.update(api_extra)
+        with tempfile.TemporaryDirectory() as td:
+            paths = types.SimpleNamespace(logs_dir=Path(td))
+            out = llm.call_llm(client, paths, {"api": api}, "sys", "user",
+                               max_tokens=4000, json_mode=False, tag=tag)
+        self.assertEqual(out, "OK-CONTENT")
+        return seen
+
+    def test_writing_effort_forwarded(self):
+        seen = self._run({"writing_reasoning_effort": "none", "writing_thinking_mode": "auto"})
+        self.assertEqual(seen["model"], "gemini-2.5-pro")
+        self.assertEqual(seen["extra_body"]["reasoning_effort"], "none")
+        # thinking_mode=auto must NOT also send a thinking param (both together 504'd).
+        self.assertNotIn("thinking", seen["extra_body"])
+
+    def test_absent_by_default(self):
+        seen = self._run({"writing_thinking_mode": "auto"})
+        self.assertNotIn("reasoning_effort", seen.get("extra_body", {}))
+
+    def test_other_roles_unaffected(self):
+        # A review-tagged call must not pick up the writing role's effort knob.
+        seen = self._run({"writing_reasoning_effort": "none", "thinking_mode": "auto"},
+                         tag="review", role=False)
+        self.assertEqual(seen["model"], "primary")
+        self.assertNotIn("reasoning_effort", seen.get("extra_body", {}))
+
+
+
 class ChapterModeMonotonyTests(unittest.TestCase):
     """Layer 1+2 治本: coarse chapter-mode classification + form-monotony gate.
 
@@ -2645,10 +2755,46 @@ class ChapterModeMonotonyTests(unittest.TestCase):
         self.assertEqual(_classify_chapter_mode({"goal": "信任结盟坦白摊牌"}), "relational")
         self.assertEqual(_classify_chapter_mode({"goal": "揭露幕后阵营布局阴谋"}), "advancement")
 
-    def test_empty_plan_defaults_reasoning(self):
+    def test_empty_plan_defaults_daily_when_unbiased(self):
+        # Default baseline is now "auto" (no genre core form) → an empty plan has no
+        # keyword evidence at all, so it falls back to the neutral "daily" label
+        # rather than silently asserting the suspense core form.
         from quality import _classify_chapter_mode
-        self.assertEqual(_classify_chapter_mode({}), "reasoning")
-        self.assertEqual(_classify_chapter_mode({"goal": ""}), "reasoning")
+        self.assertEqual(_classify_chapter_mode({}), "daily")
+        self.assertEqual(_classify_chapter_mode({"goal": ""}), "daily")
+        # With an explicit genre baseline the old bias behaviour is unchanged.
+        self.assertEqual(_classify_chapter_mode({}, "reasoning"), "reasoning")
+        self.assertEqual(_classify_chapter_mode({"goal": ""}, "reasoning"), "reasoning")
+
+    def test_auto_baseline_disables_bias(self):
+        """baseline="auto" → raw argmax; a real genre baseline → biased.
+
+        Regression for the romance false-positive: an emotional/relational chapter
+        whose SUBJECT matter is an investigation (线索/证据/真相) must not be forced
+        into "reasoning" just because the config carried a suspense baseline.
+        """
+        from quality import _classify_chapter_mode
+        plan = {"goal": "查线索核对证据逼近真相", "payoff": "两人摊牌坦白，信任重建，她选择和解"}
+        self.assertEqual(_classify_chapter_mode(plan, "reasoning", 3), "reasoning")
+        self.assertEqual(_classify_chapter_mode(plan, "auto", 3), "relational")
+        # Any non-taxonomy value behaves like "auto".
+        self.assertEqual(_classify_chapter_mode(plan, "", 3), "relational")
+
+    def test_genre_profile_scopes_the_gate(self):
+        """The gate is genre-scoped, not template-hardcoded (config.py profiles)."""
+        from config import genre_detection_profile
+        for preset in ("suspense", "rule_horror", "guize"):
+            prof = genre_detection_profile(preset)
+            self.assertTrue(prof["chapter_mode_enabled"], preset)
+            self.assertEqual(prof["chapter_mode_baseline"], "reasoning", preset)
+        # 言情：形态表无言情形态词汇，"每章都是情感关系章"是题材契约 → 关闸。
+        rom = genre_detection_profile("romance_female")
+        self.assertFalse(rom["chapter_mode_enabled"])
+        # 其余题材：开闸但不偏置。
+        for preset in ("system_stream", "xuanhuan_shuang", "history", "unknown_genre", ""):
+            prof = genre_detection_profile(preset)
+            self.assertTrue(prof["chapter_mode_enabled"], preset)
+            self.assertEqual(prof["chapter_mode_baseline"], "auto", preset)
 
     def test_block_on_all_same_mode(self):
         recent = [{"goal": "推理解谜线索"} for _ in range(5)]
@@ -2770,6 +2916,139 @@ class VolumeTransitionTests(unittest.TestCase):
         from planning import volume_transition_directive
         v = volume_transition_directive(21, "no volume headers here", {"novel": {}})
         self.assertEqual(v["level"], "ok")
+
+
+class VolumePlanWindowTests(unittest.TestCase):
+    """卷纲窗口：修 `text[:cap]` 头部截断——书写到 Ch41 时写手只看得到第一卷
+    （Ch1-24），第二卷的角色高光轮值表/爽点兑现节拍表全在窗口外，导致排期从
+    未被执行（群像塌缩为双人戏、payoff_deferred、tension_flat）。"""
+
+    PLAN = "\n".join([
+        "## 第一卷《雪窝子重新开火》（第1-24章）",
+        "",
+        "- 卷目标：从废墟站稳。",
+        "",
+        "#### **第一卷高光轮值表**",
+        "",
+        "| 章号 | 程叙 | 顾峥 |",
+        "|---|---|---|",
+        "| Ch1 | ⭐冷链 | 无镜头 |",
+        "| Ch24 | ▲收卷 | ★收卷 |",
+        "",
+        "## 第二卷《合作社与冰河》（第25-48章）",
+        "",
+        "- 卷目标：规模化硬仗。",
+        "",
+        "### 卷二逐章排期补全（Ch31-48）",
+        "",
+        "#### **角色高光轮值表**",
+        "",
+        "| 章号 | 程叙 | 江野 | 裴执 |",
+        "|---|---|---|---|",
+        "| Ch31 | ⭐切换通道 | 无镜头 | 无镜头 |",
+        "| Ch40 | ⭐扛住旺季 | ★奶奶平安 | 无镜头 |",
+        "| Ch41 | ★展台炸场 | ▲只说来看朋友 | ⭐灶火上线 |",
+        "| Ch43 | ★技术暗战 | 无镜头 | ▼拒绝签字 |",
+        "| Ch48 | ⭐二期售罄 | 无镜头 | ⭐全屯放映 |",
+        "",
+        "**注**：每章必须至少3位男主有独立高光瞬间。",
+        "",
+        "### 逐章排期补全（Ch49-72，自动扩写）",
+        "",
+        "| 章号 | 高光成员 |",
+        "|---|---|",
+        "| Ch50 | 顾峥、裴执 |",
+        "| Ch60 | 江野、程叙 |",
+    ])
+
+    def _win(self, ch, cap=16000, **kw):
+        from memory import volume_plan_window
+        return volume_plan_window(self.PLAN, ch, cap, **kw)
+
+    def test_current_volume_schedule_reaches_the_writer(self):
+        w = self._win(41)
+        self.assertIn("第二卷", w)
+        self.assertIn("| Ch41 |", w)          # 本章排期行
+        self.assertIn("| Ch40 |", w)          # 上一章（承接）
+        self.assertIn("| Ch43 |", w)          # lookahead
+        self.assertIn("每章必须至少3位男主", w)  # 轮值硬规则
+        self.assertIn("| 章号 | 程叙 | 江野 | 裴执 |", w)  # 表头保留可读性
+
+    def test_out_of_range_rows_and_volumes_are_dropped(self):
+        w = self._win(41)
+        self.assertNotIn("| Ch31 |", w)
+        self.assertNotIn("| Ch48 |", w)
+        self.assertNotIn("| Ch1 |", w)
+        self.assertNotIn("卷目标：从废墟站稳", w)   # 第一卷正文略
+        self.assertIn("第一卷", w)                  # 但保留标题面包屑
+        self.assertNotIn("| Ch50 |", w)             # Ch49-72 追加块此时不在区间
+
+    def test_appended_block_is_reachable(self):
+        # 头部截断时代，追加在文件末尾的排期永远进不了窗口。
+        w = self._win(50)
+        self.assertIn("| Ch50 |", w)
+        self.assertIn("Ch49-72", w)
+        self.assertNotIn("| Ch60 |", w)
+        self.assertNotIn("| Ch41 |", w)
+
+    def test_window_fits_cap_and_beats_head_truncation(self):
+        from memory import volume_plan_window
+        # 真实文件里第一卷单卷就 18350 字 > 16000 窗口，所以头部截断永远到不了第二卷。
+        bloated = self.PLAN.replace("- 卷目标：从废墟站稳。", "- 卷目标：" + "细节。" * 2000, 1)
+        w = volume_plan_window(bloated, 41, 2000)
+        self.assertLessEqual(len(w), 2000 + 20)
+        self.assertIn("| Ch41 |", w)
+        self.assertNotIn("| Ch41 |", bloated[:2000])   # 旧行为：同预算下彻底看不到
+
+    def test_chapter_beyond_all_ranges_keeps_nearest_volume(self):
+        w = self._win(99)
+        self.assertIn("Ch49-72", w)
+        self.assertIn("| Ch60 |", w)   # 最近区间整块保留，不塌成空壳
+
+    def test_unknown_chapter_falls_back_to_head_truncation(self):
+        w = self._win(0, cap=120)
+        self.assertTrue(w.startswith("## 第一卷"))
+        self.assertIn("...[truncated]", w)
+
+    def test_lookahead_is_configurable(self):
+        self.assertNotIn("| Ch43 |", self._win(41, lookahead=0))
+        self.assertIn("| Ch43 |", self._win(41, lookahead=2))
+
+
+class ChapterScheduleDirectiveTests(unittest.TestCase):
+    """可见 != 遵守：卷纲窗口修好后 Ch43 仍把 ⭐ 给了排期标注「无镜头」的角色，
+    所以本章排期行要抬成硬指令。"""
+
+    PLAN = VolumePlanWindowTests.PLAN
+
+    def _d(self, ch, **novel):
+        from memory import chapter_schedule_directive
+        return chapter_schedule_directive(self.PLAN, ch, {"novel": novel})
+
+    def test_quotes_this_chapters_row_with_caption(self):
+        d = self._d(41)
+        self.assertIn("第 41 章", d)
+        self.assertIn("角色高光轮值表", d)
+        self.assertIn("展台炸场", d)
+        self.assertIn("无镜头", d)      # 标记含义须解释，否则模型无从遵守
+        self.assertIn("risk", d)        # 允许有理由的偏离
+
+    def test_other_chapters_rows_are_not_quoted(self):
+        d = self._d(41)
+        self.assertNotIn("切换通道", d)   # Ch31
+        self.assertNotIn("二期售罄", d)   # Ch48
+
+    def test_no_row_for_this_chapter_is_silent(self):
+        self.assertEqual(self._d(99), "")
+        self.assertEqual(self._d(0), "")
+
+    def test_gate_can_be_disabled(self):
+        self.assertEqual(self._d(41, chapter_schedule_directive_enabled=False), "")
+
+    def test_malformed_plan_degrades_to_empty(self):
+        from memory import chapter_schedule_directive
+        self.assertEqual(chapter_schedule_directive("", 41, {"novel": {}}), "")
+        self.assertEqual(chapter_schedule_directive("no tables here", 41, {"novel": {}}), "")
 
 
 if __name__ == "__main__":

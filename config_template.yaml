@@ -10,7 +10,7 @@ api:
   base_url: "https://api.example.com/v1"
   api_key: "sk-YOUR-API-KEY-HERE"
   api_keys: ""
-  user_agent: ""
+  user_agent: "claude-cli/2.1.177 (external, cli)"
   # 注意：多篇小说并行运行时共享同一批 API key 的 RPM/TPM 配额，
   # 如需隔离请给不同小说分配不同的 api_key / api_key_groups。
   # 端点优先级：api_key_groups 里的端点全部是 primary（轮询顺序即列出顺序），
@@ -56,8 +56,8 @@ api:
   stream_salvage_min_chars: 600
   client_read_timeout: 180
   client_connect_timeout: 15
-  # 部分网关需要浏览器 UA 通过防爬
-  user_agent: ""
+  # 部分网关（Cloudflare 防爬）要求浏览器式 UA 才放行
+  user_agent: "claude-cli/2.1.177 (external, cli)"
   max_attempts: 6
   min_request_interval_secs: 0
   max_rpm: 20
@@ -72,11 +72,19 @@ api:
   # 精修 refine → doubao-seed-2-1-turbo @ xkool（生成用deepseek保结构，refine用doubao补网文味）
   # 注：ldapi 的 deepseek-v4-pro 是 OpenRouter 式网关，先吐 reasoning 再吐 content，
   #     需较大 max_tokens 才不被推理吃光（写作/规划默认 max_tokens 足够；tiny 调用会空）。
+  #     ↓ 治理该问题的两层闸（都只在“推理未禁用”即 thinking_mode=auto/enabled 的调用上生效）：
+  #     reasoning_min_max_tokens：推理开启时把过小的 max_tokens 抬到该地板，给 content 留出
+  #                               推理后的空间（如 structural_diagnose 的 2000→8000）。0=关闭。
+  #     length_empty_retry_*：若仍 finish=length 且 content 空，按 factor 倍扩 max_tokens 重试
+  #                           （而非原样重试必然再空），上限 length_empty_retry_cap（0=不封顶）。
+  reasoning_min_max_tokens: 8000
+  length_empty_retry_factor: 2.0
+  length_empty_retry_cap: 32000
   # 留空 *_base_url 即关闭该角色路由、走主力模型。
   review_base_url:
   review_api_key:
   review_keys:
-  review_model:
+  review_model: deepseek-v4-pro
   review_thinking_mode: auto
   review_thinking_budget_tokens: 0
   # —— 按角色路由（可选，留空 *_base_url 即关闭该角色路由，走主力模型）——
@@ -87,19 +95,24 @@ api:
   planning_model:
   planning_thinking_mode: auto
   planning_thinking_budget_tokens: 0
-  # 写作（write/revise/beat_repair）→ deepseek-v4-pro @ ldapi（强执行/密集情节稳；网文味由 refine 补）
-  # 注：与主力 model 同模型同端点，留空亦等效；显式写出便于按需改成 doubao。
+  # 写作（write/revise/beat_repair/refine_rewrite）→ gemini-2.5-pro（文学质感/长上下文）
+  # 注1：该端点非流式必 nginx 504，必须保持 api.stream: true（引擎默认流式）。
+  # 注2：gemini 默认思考链跑满 ~70s 才吐第一个字，超过网关 504 阈值。实测
+  #      thinking_mode=auto（不发参数）与 thinking:{type:disabled} 都 504，
+  #      只有 OpenAI 式 reasoning_effort: none 能压住（首字 ~29s / 3.1k 字约 170s）。
+  #      writing_reasoning_effort 由 llm.py 注入 extra_body 顶层；留空即不发该参数。
   writing_base_url:
   writing_api_key:
   writing_keys:
-  writing_model:
-  writing_thinking_mode: disabled
+  writing_model: gemini-2.5-pro
+  writing_thinking_mode: auto
   writing_thinking_budget_tokens: 0
+  writing_reasoning_effort: none
   # 提取（extract/state_update/memory_compress）→ deepseek-v4-flash @ littlesheep（便宜结构化）
   extraction_base_url:
   extraction_api_key:
   extraction_keys:
-  extraction_model:
+  extraction_model: deepseek-v4-flash
   extraction_thinking_mode: disabled
   extraction_thinking_budget_tokens: 0
   # 精修（python novel.py refine <name>，完本后手动步骤）→ doubao-seed-2-1-turbo @ xkool
@@ -107,7 +120,7 @@ api:
   # cmd_refine 读到 refine_model 即用下列端点跑整个精修 pass。
   refine_base_url:
   refine_api_key:
-  refine_model:
+  refine_model: doubao-seed-2-1-turbo
   refine_thinking_mode: disabled
 
 novel:
@@ -135,6 +148,29 @@ novel:
   plan_retry_score: 6.5
   plan_max_attempts: 2
   plan_skip_screen: true
+  # ①(a) 生成减负：每章 beat 数上限。密集章把过多 beat 挤进单次出稿会"名场面清单化"、写不透。
+  # planner 被要求少而深（1主+≤3-4副），此为安全网：确定性截断到该值（保主线顺序）。0=关闭。
+  chapter_max_beats: 5
+  # ②(a) 单候选时跳过融合6轴 plan 评审（rubber-stamp）——省 1 次 LLM 调用/章；arbitrate 仍靠
+  # 节奏诊断/已用元素台账/校准信号选定并合并约束，章成稿质量由写手侧确定性 gate 兜底。
+  # 多候选（风险上扬）路径不变、仍评审。对齐"1轮+外部校验"证据。
+  plan_skip_review_single: true
+  # 自动扩写卷纲排期（重设计「Blueprint 自动生长」，正交，默认 false）：框架只在 bootstrap 详写前 2 卷，
+  # 长书跑出详细卷纲后中段失去逐章 escalation 路线图 → tension_flat → 熔断。开启后，当写作临近详细排期
+  # 末尾(chapter+schedule_lookahead 那章无排期行)时，自动为接下来 schedule_extend_span 章生成逐章排期表
+  # 追加进 volume_plan.md，根治中段塌陷。仅群像/爽点书生效；失败不阻塞。
+  auto_extend_schedule_enabled: false
+  schedule_lookahead: 3
+  schedule_extend_span: 24
+  # ②(b) 评审温度（默认 0.2，低温=更挑剔）。真正的"生成≠评审"多样性来自把 api.review_base_url/
+  # review_model 设成与写作不同的模型——评审就不会与写手"同流合污"（style-audit 自报失真）。
+  review_temperature: 0.2
+  # ①(b) 密集章分场景顺序出稿（正交开关，默认 false=opt-in，不影响现有书）：beat 数≥min 时把该章
+  # 拆成 ≤max_segments 段、逐段只写少量 beat 并承接上段结尾，最后拼接。降低单次多目标挤压，让密集
+  # 章写透而非清单化。任一段失败自动回退单次出稿。群像/多线密集书建议开启。
+  scene_drafting_enabled: false
+  scene_draft_min_beats: 5
+  scene_draft_max_segments: 3
   # Temperature spread for parallel candidate-plan generation. Candidate i uses
   # temp_base + i*temp_step (clamped to 1.1). A wider spread is the cheapest
   # defense against the candidates converging into near-identical drafts: low-temp
@@ -262,14 +298,18 @@ novel:
   dialogue_char_ratio_min: 0.10
   dialogue_char_ratio_target: 0.20
   dialogue_penalty_cap: 1.5
-  # AI味确定性检测：套话/比喻堆砌/情感贴标签/程度副词/总结叙述/段落单一。
-  # 读者一眼能辨的AI生成痕迹，LLM自评完全失效，必须确定性检测+前移惩罚。
+  # AI味确定性检测：套话/比喻堆砌/情感贴标签/程度副词/总结叙述/段落单一/否定对仗/
+  # 模板对比pivot/机械排比。读者一眼能辨的AI生成痕迹，LLM自评完全失效，必须确定性检测+前移惩罚。
   ai_flavor_enabled: true
   ai_cliche_per_kchar_warn: 4.0
   ai_cliche_per_kchar_bad: 8.0
   metaphor_per_kchar_warn: 5.0
   tell_not_show_per_kchar_warn: 3.0
   adverb_inflation_per_kchar_warn: 4.0
+  # 模板对比pivot（"不是X，而是Y"/"与其说…不如说"/"不仅…更是"）——公认最顽固的AI结构指纹；
+  # 每千字命中数达该阈值即扣分。机械排比：≥anaphora_run_warn 连的同头句(或≥2处三连)即扣分。
+  template_pivot_per_kchar_warn: 1.2
+  anaphora_run_warn: 4
   ai_flavor_penalty_cap: 3.0
   # 章节字数下限：低于此值在评审中扣分，并在 writer prompt 中注入扩写要求。
   chapter_min_chars: 2800
@@ -402,6 +442,16 @@ novel:
   # 自动放宽 BLOCK 阈值（但不再整体关闭强制重规划）。
   scene_dedupe_short_novel_chapters: 8
   scene_dedupe_short_novel_block: 0.92
+  # 副本/场景入口显著性（治"进新讳地/新地点首稿崩"——无限流/规则怪谈的系统性崩点：
+  # yeban_guize 进自习室 Ch8=2.7/Ch9=4.0，因写手被新场景铺设压垮、漏了编号规则清单+退化电报体）。
+  # 确定性比对本章 plan.location 与近 scene_entry_lookback 章场景：字符 bigram 相似度 < 阈值
+  # 且无 >=scene_entry_min_shared_chars 的共同地名子串 ⇒ 判定换副本入口，在 writer prompt 尾部
+  # 注入"完整立场景+反电报体(+按本书契约补编号守则清单)"高显著性指令块。题材中性：只在真换地点时触发，
+  # 利好所有题材的场景建立；编号守则那条仅当本书契约要求列规则时才加(规则怪谈/无限流受益)。
+  scene_entry_salience_enabled: true
+  scene_entry_lookback: 3
+  scene_entry_sim_threshold: 0.3
+  scene_entry_min_shared_chars: 3
   # 叙事流程骨架去重（防"同一套流程换个取证对象"的审美疲劳——字面去重 scene_dedupe
   # 抓不到，因为换了取证对象后用词几乎不重叠，但抽象流程 enter→collect→compare→deduce
   # 仍然逐章雷同。这是 suspense_10ch Ch3→Ch8 分数单调下滑的实证元凶）。
@@ -416,6 +466,50 @@ novel:
   # 爽点形态单调：连续 N 章 payoff_type 相同（每章都"打脸"/每章都"reveal"）即 warn+指令换爽点类型。
   # 与流程骨架去重正交——治"换道具不换套路"的审美疲劳。
   payoff_type_monotony_max: 3
+  # payoff 轮换硬闸：连续 >= 该章数 payoff_type 相同时，从"只 warn 扣分"升级为 BLOCK，
+  # 在 create_plan 里强制重规划一次（换兑现类型），而非只在评审事后扣分（软门实测无效：
+  # yeban_guize 连 6 章 reveal，评审罚分+软指令每章都发却毫无作用）。默认 5=允许 reveal
+  # 主导型题材(悬疑/规则怪谈)连 4 章后才逼换，兼顾题材天性与防脱敏。
+  payoff_type_monotony_block: 5
+  # 张弛调节：近 6 章 tension（extraction 打的紧张度）标准差 < tension_flat_std_min 时，
+  # 在 create_plan 注入一条"制造张弛对比"的硬约束进 required_constraints（写手须遵、评审校验），
+  # 把"持续高压/持续平缓无呼吸"从事后评审罚分前移为生成时约束。tension 由 extraction 估、偏噪，
+  # 故只作 advisory 约束、不强制重规划。
+  tension_variation_directive_enabled: true
+  tension_flat_std_min: 1.0
+  # 章型/形态单调闸（Layer 1+2 治本 premise/formula 耗尽）：比 payoff_type 更粗的"读者
+  # 形态"维度（智斗解谜/动作/情感/关系/推进/日常）。近 chapter_mode_window(6) 章里同一形态
+  # 占比 >= warn_frac(0.6) → 建议换章型(advisory)；>= block_frac(0.8) 且窗口>=min_window(4)
+  # → 强制重规划为另一形态。治"reversal/reveal 标签在变但全是智斗解谜"的高层疲劳(yeban Ch28 崩因)。
+  # chapter_mode_enabled / chapter_mode_baseline 都由「题材profile」按 style_preset 分流
+  # （config.py:genre_detection_profile），此处不写死；显式写在本文件里会让 profile 永远
+  # 填不进来。证据：tangshuting_e2e（言情群像）在模板硬编码 baseline=reasoning 下
+  # 57/57 命中、52 次 block，全是假阳性——形态表(智斗/动作/情感/关系/推进/日常)没有言情
+  # 形态词汇，且"每章都是情感关系章"对言情是题材契约而非缺陷（补言情词后仍 38/40 同形态）。
+  # 言情族因此在 profile 里默认关闭本闸，变奏交给 payoff_type 单调闸 + emotional_cadence。
+  chapter_mode_window: 6
+  chapter_mode_warn_frac: 0.6
+  chapter_mode_block_frac: 0.8
+  chapter_mode_min_window: 4
+  chapter_mode_warn_penalty: 0.5
+  chapter_mode_block_penalty: 1.2
+  # 形态分类器基线偏置（治"纯关键词分类被偶发内容词带偏"）：在题材核心形态
+  # chapter_mode_baseline（悬疑/规则怪谈=reasoning智斗）上偏置——非基线形态只有当其
+  # 关键词命中超过基线 chapter_mode_baseline_margin 个才判为该形态，否则归基线。防止
+  # 满是"协会/牺牲"内容词的智斗章被误判成 advancement/emotional 而漏掉形态疲劳。
+  # 形态分类器基线偏置（治"纯关键词分类被偶发内容词带偏"）：在题材核心形态
+  # chapter_mode_baseline（悬疑/规则怪谈=reasoning智斗）上偏置——非基线形态只有当其
+  # 关键词命中超过基线 chapter_mode_baseline_margin 个才判为该形态，否则归基线。防止
+  # 满是"协会/牺牲"内容词的智斗章被误判成 advancement/emotional 而漏掉形态疲劳。
+  # baseline 由题材 profile 给（悬疑/规则怪谈=reasoning，其余=auto 即无偏置纯 argmax）；
+  # 只在确知某本书的核心形态时才在本节显式覆盖。
+  chapter_mode_baseline_margin: 3
+  # 卷/弧转场自动化（治本 premise 耗尽：单一弧久驻→套路耗尽崩章）。解析 volume_plan 的
+  # 「## 第N卷：名（第A-B章）」范围；当本章处于某卷开篇 volume_transition_grace(2) 章窗口内
+  # （首卷除外）→ 注入最高优先级"收束上一卷+切换场景/章型到本卷"硬转场指令，自动完成
+  # 原本要手动改卷纲才做的转场（yeban 城中村弧从 Ch21 该转卷二却磨到 Ch28 崩，即此闸缺位）。
+  volume_transition_enabled: true
+  volume_transition_grace: 2
   # 跨章化石句坍塌级阈值：单章命中 >= 该数量的多章复读化石句时，评审直接作废本稿
   # （gate_reject），强制走结构性重规划，而非仅扣分+下章提醒（v11 实证提醒无效）。
   style_cross_repeat_reject_count: 5
@@ -489,6 +583,19 @@ novel:
   memory_state_chars: 12000
   memory_opening_route_chars: 6000
   memory_volume_plan_chars: 16000
+  # 卷纲按章开窗（治本：卷纲是唯一会随卷数线性膨胀的记忆文件，头部截断会让书写到
+  # 中段时只看得见第一卷——本卷的角色高光轮值表/爽点兑现节拍表全在窗口外，排期从
+  # 未被执行 → 群像塌缩成双人戏、payoff_deferred、tension_flat）。
+  # 开窗后只保留：本章所在卷/排期块正文 + [本章-1, 本章+lookahead] 的 | ChN | 排期行，
+  # 其余卷只留标题面包屑。关掉即回到旧的头部截断。
+  volume_plan_window_enabled: true
+  volume_plan_window_lookahead: 2
+  memory_writing_volume_plan_chars: 9000
+  memory_lite_volume_plan_chars: 2000
+  # 把本章排期行抬成硬指令（可见 != 遵守：只开窗时仍会把主高光给排期标注「无镜头」
+  # 的角色）。同时注入候选生成与仲裁两处，仲裁需把排期项写进 required_constraints。
+  chapter_schedule_directive_enabled: true
+  chapter_schedule_directive_max_rows: 4
   memory_threads_chars: 12000
   memory_characters_chars: 16000
   memory_bible_chars: 16000
@@ -549,6 +656,15 @@ novel:
   # history / xuanhuan_shuang / system_stream / urban_ability / romance_female / wanzu_xuanhuan
   #   / suspense（悬疑慢烧）/ rule_horror（规则怪谈·民俗无限流，别名 guize/infinite_flow）
   style_preset: history
+  # 群像/多主角开关（正交，默认 false）：多男/多女追一人、团队群像等「多位分量相当的角色错峰争艳」
+  # 的书取消下一行注释设为 true。开启后 bootstrap 地基会为全部群像成员各出一档（含一句话声音辨识），
+  # 并让卷纲额外产出「角色高光轮值表 / 关系线争宠升级曲线 / 反转做成名场面排期 / 心动破防节拍表」。
+  # 单 CP/单主线书保持关闭。
+  # ensemble_cast: false
+  # 爽点节拍强化（正交开关，默认 false）：爽文/番茄免费流取消下一行注释设 true。开启后卷纲额外产出
+  # 「爽点兑现节拍表」——爽点类型错峰轮换 + 每章唯一主爽点写透（憋→炸→余韵）+ 憋屈不过夜即时兑现 +
+  # 最大爽点不许开局一次烧光。治"爽点多但爽不透 / 一章硬塞多个名场面导致过载崩章"。慢热悬疑/历史书保持关闭。
+  # shuang_pacing: false
   # 敏感词规避（正交开关，默认 false）：怪谈/悬疑/黑暗等题材正文多 尸/鬼/血/献祭 等词，
   # 部分中转网关会返回 sensitive_words_detected(500)；开启后在写作/规划层引导意象化表达绕过
   # 内容审核，不改暗黑基调。这类题材建议 true。

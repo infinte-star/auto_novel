@@ -1040,6 +1040,13 @@ def _stage_setup_barriers(state: ChapterState) -> None:
 
 def _stage_plan(state: ChapterState) -> None:
     """Create or resume the chapter plan, validate continuity, build writer context."""
+    # 重设计「Blueprint 自动生长」：临近详细卷纲排期末尾时，自动扩写下一卷逐章排期（gated，
+    # 失败不阻塞）。根治长书中段"卷纲耗尽→失去 escalation 路线图→塌陷"，并让轻规划全程可用。
+    try:
+        from memory import extend_volume_schedule
+        extend_volume_schedule(state.client, state.paths, state.conn, state.config, state.chapter_num)
+    except Exception as exc:
+        log(state.paths, f"extend_volume_schedule skipped Ch{state.chapter_num}: {exc}")
     state.tail = _build_writer_tail(state.paths, state.config, state.chapter_num)
     state.cached_memory = memory_context(
         state.paths, state.conn, state.config,

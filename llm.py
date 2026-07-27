@@ -448,6 +448,22 @@ def _resolve_thinking_param(
     return {"type": "disabled"} if disabled else None
 
 
+def _resolve_reasoning_effort(api_section: dict[str, Any], *, key: str = "reasoning_effort") -> str | None:
+    """Read the OpenAI-style ``reasoning_effort`` knob from config, or None to omit.
+
+    Separate from ``thinking`` (Anthropic/豆包 style): some gateways only honour
+    one of the two. Live evidence — littlesheep's gemini-2.5-pro reasons for well
+    past nginx's ~70s proxy timeout and 504s before the first byte; neither
+    ``thinking:{"type":"disabled"}`` nor omitting the param helps, only
+    ``reasoning_effort: none`` does.
+
+    Unknown values are passed through (providers keep adding tiers); empty/absent
+    returns None so the param is never sent by default.
+    """
+    raw = str(api_section.get(key, "") or "").strip().lower()
+    return raw or None
+
+
 REFUSAL_PATTERNS = (
     "request was rejected because it was considered high risk",
     "i cannot fulfill",
@@ -819,10 +835,19 @@ def call_llm(
                     budget_key=f"{_active_role_prefix}thinking_budget_tokens",
                     default_disabled=(_active_role_prefix != "review_"),
                 )
+                effort = _resolve_reasoning_effort(
+                    api, key=f"{_active_role_prefix}reasoning_effort"
+                )
             else:
                 thinking_param = _resolve_thinking_param(api)
+                effort = _resolve_reasoning_effort(api)
             if thinking_param is not None:
                 extra_body["thinking"] = thinking_param
+            if effort is not None:
+                # Goes through extra_body (not a named kwarg) so it works on SDK
+                # versions that predate the param; extra_body is merged into the
+                # request body at top level.
+                extra_body["reasoning_effort"] = effort
             # Reasoning-model max_tokens floor. Reasoning models spend part of the
             # token budget on a hidden chain of thought BEFORE any answer content,
             # so a tiny max_tokens (e.g. a 2000-token structural_diagnose) is
