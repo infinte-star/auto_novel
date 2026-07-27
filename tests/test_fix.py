@@ -18,6 +18,7 @@ import unittest
 
 import fix
 import pipeline
+import planning
 from quality import REGISTRY
 
 
@@ -298,6 +299,39 @@ class ReduceEmDashIfNeededTest(unittest.TestCase):
     def test_disabled_by_config(self):
         text = "他推开门——铁锈味——灯灭了。" * 20
         self.assertEqual(fix.reduce_em_dash_if_needed(text, _config(em_dash_reduce_enabled=False)), text)
+
+
+class RiskUpshiftFloorTest(unittest.TestCase):
+    """The rework trigger and the risk upshift must not fight over the same score.
+
+    Measured in the P4 A/B: the deterministic arm released Ch47-49 at 6.9/6.9/6.8,
+    which the 7.0 risk floor read as collapse, so it bought 3 candidate drafts on
+    3 of 4 chapters and ended up MORE expensive than the arm that reworked
+    (16.25 vs 14.75 calls/chapter). See `planning._risk_score_floor`.
+    """
+
+    def test_score_mode_uses_the_plain_floor(self):
+        self.assertEqual(planning._risk_score_floor(_config()), 7.0)
+        self.assertEqual(
+            planning._risk_score_floor(_config(risk_upshift_score_floor=7.5)), 7.5)
+
+    def test_deterministic_mode_drops_to_the_rework_floor(self):
+        cfg = _config(rework_trigger="deterministic")
+        self.assertEqual(planning._risk_score_floor(cfg), 6.5)
+        # A released 6.8 is normal in this mode, so it must not read as distress.
+        self.assertLess(6.8, planning._risk_score_floor(_config()))
+        self.assertGreater(6.8, planning._risk_score_floor(cfg))
+
+    def test_deterministic_mode_never_raises_the_floor(self):
+        """min(), not assignment: a config that already set a low floor keeps it."""
+        cfg = _config(rework_trigger="deterministic",
+                      risk_upshift_score_floor=6.0, rework_score_floor=6.5)
+        self.assertEqual(planning._risk_score_floor(cfg), 6.0)
+
+    def test_unknown_trigger_value_is_treated_as_score_mode(self):
+        self.assertEqual(
+            planning._risk_score_floor(_config(rework_trigger="  DETERMINISTIC ")), 6.5)
+        self.assertEqual(planning._risk_score_floor(_config(rework_trigger="typo")), 7.0)
 
 
 if __name__ == "__main__":

@@ -1576,6 +1576,35 @@ def _recovery_active(paths: Paths, chapter_num: int) -> bool:
         return False
 
 
+def _risk_score_floor(config: dict[str, Any]) -> float:
+    """The self-score below which recent chapters count as "the book is in trouble".
+
+    In the default `rework_trigger: score` mode this is plainly
+    `risk_upshift_score_floor` (7.0).
+
+    In `deterministic` mode it is lowered to `rework_score_floor` (6.5), because
+    otherwise the two rules read the same undiscriminating self-score with
+    opposite intents and fight each other. Deterministic rework *deliberately*
+    releases the 7.x noise band instead of revising it up to 8.0 (CLAUDE.md
+    "Rework trigger"); risk upshift then sees those released scores, calls 6.8 a
+    collapse signal, and widens the NEXT chapter to `risk_upshift_candidates`
+    drafts. Measured in the P4 A/B (REDESIGN §7): the deterministic arm released
+    Ch47-49 at 6.9/6.9/6.8 and paid an upshift on 3 of 4 chapters, while the score
+    arm released at 8.2/8.0/8.2 and paid none -- so the arm that skipped rework
+    came out MORE expensive (16.25 vs 14.75 calls/chapter). The extra draft+review
+    pairs cost far more than the revise round they replaced.
+
+    Aligning the floor with `rework_score_floor` is the same argument that already
+    aligns `rework_score_floor` with `circuit_breaker_score_floor`: a chapter the
+    trigger accepted as normal must not simultaneously be treated as distress by
+    a second rule. Inert in `score` mode -- that path is unchanged bit for bit.
+    """
+    floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
+    if str(config["novel"].get("rework_trigger", "score")).strip().lower() == "deterministic":
+        floor = min(floor, float(config["novel"].get("rework_score_floor", 6.5)))
+    return floor
+
+
 def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: int, paths: Paths) -> int:
     """Risk-adaptive candidate-plan count.
 
@@ -1613,7 +1642,7 @@ def _effective_candidate_count(conn: Any, config: dict[str, Any], chapter_num: i
     reasons: list[str] = []
     if recent:
         scores_recent = [safe_score(r.get("score", 0)) for r in recent if r.get("score") is not None]
-        risk_floor = float(config["novel"].get("risk_upshift_score_floor", 7.0))
+        risk_floor = _risk_score_floor(config)
         if scores_recent and min(scores_recent) < risk_floor:
             risky = True
             reasons.append(f"min_recent_score={min(scores_recent):.1f}<{risk_floor}")

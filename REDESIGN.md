@@ -418,7 +418,7 @@ A/B 纪律（沿用 `ab_short_chapter_score_inflation` 的教训）：
 | **P2** | L2：`arc.py` 弧级卡片替代五段委员会（L4 范例锚定拆出，见下） | FPY + 成本 | FPY 不降且成本 −53% 即通过 | ⚠️ **未通过判据；代码保留，默认关闭**（见下） |
 | P2b | L4：范例锚定（`exemplar_block` 已重写：改秩排名选择 + 对白/动作双范例 + 保留段落缩进） | 章评分 + 文风罚分 | 需自己的单变量 A/B | ⏸ 两臂均关闭，等 P2 结论后单独测 |
 | **P3** | L3：`canon.py` + `StoryState`，删 `memory_compress` 与 4 个构建器 | 中段 Ch30–50 的 FPY 与一致性错误数 | 中段曲线不再下滑 | 🔄 **已开工，入口按实测改到 `plan_candidate`**：指纹库改聚合，Ch201 plan prompt **116,592 → 95,157（−18.4%）**，且该块由 O(书长) 变 O(1)。`StoryState` 本体未动工（见下） |
-| **P4** | L5 + L6：确定性返工触发器 + `fix.py` L0/L1 修复阶梯（整章重写按用户决定**保留**为 <6.5 的救援路径；门的删除已按 `gate_census` 数据单独做，见 §7 门校准） | FPY + 重来次数 | 调用数/章下降 **且** 匹配章 pairwise 胜率 ≥50% | 🔄 **代码已落地并入库；A/B 运行中**（`p4_score` vs `p4_det`，`tangshuting_e2e` @Ch46 分叉，各写 Ch47–54） |
+| **P4** | L5 + L6：确定性返工触发器 + `fix.py` L0/L1 修复阶梯（整章重写按用户决定**保留**为 <6.5 的救援路径；门的删除已按 `gate_census` 数据单独做，见 §7 门校准） | FPY + 重来次数 | 调用数/章下降 **且** 匹配章 pairwise 胜率 ≥50% | ❌ **未通过：成本侧反向**（16.25 vs 14.75 调用/章）。代码保留，`rework_trigger` 保持默认 `score`。失败机理已定位并修复（见下） |
 | **P5** | 删逐章 pointwise，接 pairwise | pairwise 胜率 vs 参考章 | 胜率 >55% | 📐 **未动工**。前置条件是 P4 的结论：pointwise 自评正是 P4 在拆的那条无判别力信号，先确认去掉它的返工权之后书还站得住，再谈换成 pairwise |
 
 ### P2 A/B 结论（2026-07-28）：成本收益成立，质量收益未证实 ⇒ 保留代码，默认关闭
@@ -518,26 +518,66 @@ pairwise 胜率不低于 50%。任一不满足则回退。
 A/B 的假设。P2 现在是收益最大的一步，而且 §0 的实测（返工主因是 `replan`，不是写作）
 正好指着它。
 
-### P4 A/B 中期读数（2026-07-28，n=3，**不可结算**）
+### P4 A/B 结论（2026-07-28，n=4）：**未通过——成本侧反向**；机理已定位并修复
 
 `tangshuting_e2e` @Ch46 分叉，`p4_score` vs `p4_det`，唯一差异 `novel.rework_trigger`。
-`novel.py compare p4_score p4_det`（报告：`experiments/p4_score_vs_p4_det.md`）：
+两臂**都在 Ch50 停**：`p4_det` 先撞到 `target_words`（226,992/225,528 = 100.65%）自然
+`Book complete`，`p4_score` 随后手动停在同一章边界。所以可比窗口是 **Ch47–50，各 4 章**
+（前 46 章是继承的同一批文本，全书口径会被它们稀释成噪声——
+`experiments/p4_score_vs_p4_det.md` 那份全书报告的 46/50 行两臂逐字相同，
+它的 heuristic verdict 是在继承段上算的，不要读它）。
+窗口报告：`experiments/p4_score_vs_p4_det_ch47-50.md`。
 
-| | p4_score | p4_det |
+| Ch47–50 | p4_score | p4_det |
 |---|---|---|
-| Ch47/48/49 自评 | 8.2 / 8.0 / 8.2 | 6.9 / 7.4 / 6.8 |
-| LLM 调用 | 54（4 章） | 64（3 章） |
-| LLM 分钟 | 85.42 | **111.53** |
-| 规划占 LLM 时间 | 0.36 | **0.50** |
+| 自评 47/48/49/50 | 8.2 / 8.0 / 8.2 / 6.2 | 6.9 / 7.4 / 6.8 / 7.4 |
+| LLM 调用（4 章） | **59** | 65 |
+| 调用/章 | **14.75** | 16.25 |
+| LLM 分钟/章 | **23.06** | 28.73 |
+| 规划占 LLM 时间 | **0.33** | 0.49 |
+| force-accept | **1** | 2 |
 
-两点，都要按原样记：
+**判据第一半（调用数/章下降）不成立，方向还是反的 ⇒ 不通过 ⇒ `rework_trigger`
+保持默认 `score`。** 判据第二半按预案跑了（`tools/pairwise_ab.py`，双序去位置偏、
+不带 `cacheable_prefix`、盲标甲/乙）：
 
-1. **成本侧与预期相反**：det 臂本应更便宜，实测每章调用与时间都更高（n=3，det 臂第 3 章
-   走了 penalty=1.0 的路径）。不足以定论，但方向不支持「少返工 ⇒ 更便宜」。
-2. **质量侧这张表读不出东西**：score 臂 revise 到 ≥8.0 才放行，det 臂 6.8–7.4 就放行，
-   表里那 1.3 分**就是两臂放行规则本身**。用自评比较一次改变自评返工权的实验是循环论证。
-   判据里那条「匹配章 pairwise 胜率 ≥50%」（`tools/pairwise_ab.py`）是唯一有效的一半，
-   尚未运行。这条教训已升级为 `docs/REDESIGN_V2.md` §0 的立论。
+```
+Ch48: order1=a order2=b -> tie
+Ch49: order1=a order2=b -> tie
+A=0  B=0  tie=2   B 非劣 50%   position-flips 2/2   raw votes A=2 B=2
+```
+
+只有 2 章的返工真正分叉（Ch47 两臂同为 revise×1，Ch50 两臂同为 replan+debt），
+而这 2 章**两序全翻**——评委每次都选排在前面的那一个。技术上「非劣 ≥50%」达成，
+但 flip 2/2 说明这次测量**没有信息量**，不能拿它当第二半的通过证据。
+即：det 臂放行的 6.8–6.9 章，读起来既不比 score 臂差、也没被证明不差。
+
+#### 为什么「少返工」反而更贵：两条规则在抢同一个无判别力的分数
+
+日志给出的机理是干净的、可复现的，不是噪声：
+
+```
+p4_det  : Risk upshift Ch48/Ch49/Ch50 — min_recent_score=6.9/6.9/6.8 < 7.0   → 3 candidates ×3 章
+p4_score: Risk upshift 只在 Ch51（窗口外）触发                                → 窗口内 0 次
+```
+
+`_effective_candidate_count` 的 RISK UPSHIFT 用 `risk_upshift_score_floor: 7.0`
+读 `chapter_metrics.score`；而 `rework_trigger: deterministic` 的全部意义是
+**不再把 7.x 当缺陷**、直接放行。于是 det 臂放行 6.8 → 下一章被判「塌缩中」→
+扩宽到 3 份草稿（3 write + 3 review）。**它省掉的 1 轮 revise，远便宜于它买来的
+2 对额外 draft+review。**这不是「确定性返工不好」，是两条规则在同一根无判别力的
+自评轴上朝相反方向拉。
+
+修复（`planning._risk_score_floor`，`tests/test_fix.py:RiskUpshiftFloorTest`）：
+`deterministic` 模式下风险地板取 `min(risk_upshift_score_floor, rework_score_floor)`
+= 6.5，理由与「`rework_score_floor` 对齐 `circuit_breaker_score_floor`」完全同一条：
+**被触发器判为正常的章，不能同时被第二条规则判为险情。** `score` 模式逐位不变。
+
+未结算的部分要说清楚：这次修复**没有重测**。它把 P4 的下一次重跑从
+「测触发器 + 测触发器与扩宽的耦合」变成「只测触发器」，但它本身仍是一个未经 A/B 的
+一致性修正（默认模式下完全惰性，所以入库风险为零）。而且按 `docs/REDESIGN_V2.md` §0，
+重跑之前应当先把判据从自评换成可判定量——否则第二半仍然只能得到本次这种
+「两序全翻」的空读数。
 
 ---
 

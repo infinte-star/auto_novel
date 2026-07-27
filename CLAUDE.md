@@ -260,6 +260,14 @@ check in `generate_one_chapter`. Mode is `rework_trigger`:
 exists, why `RevisionTracker` cannot deliver it, and the `_accept_without_debt`
 ledger-hygiene requirement: LESSONS §2.
 
+`deterministic` **did not pass its A/B and is not the default** — it came out
+*more* expensive (16.25 vs 14.75 calls/chapter), because releasing the 7.x band
+trips RISK UPSHIFT on the next chapter and 2 extra draft+review pairs cost more
+than the revise round skipped. `planning._risk_score_floor` now lowers the risk
+floor to `rework_score_floor` in this mode so the two rules stop fighting over the
+same undiscriminating score; that fix is itself **unmeasured** and inert in `score`
+mode. Full numbers and the re-run precondition: REDESIGN §7 "P4 A/B 结论".
+
 `fix.py` is the repair ladder that catches what no longer triggers rework. Layer
 membership is declared ON the gate
 (`@REGISTRY.register(..., repair="L0"|"L1"|"L2"|"advisory")` in `quality.py`);
@@ -295,7 +303,9 @@ Inverted cost model: the DEFAULT is cheap (`candidate_plans: 1`,
 `candidate_chapters: 1`) and breadth is spent only on trouble.
 `_effective_candidate_count` RISK UPSHIFT (always on, from Ch3, no warmup) widens
 to `risk_upshift_candidates` (3) when the last `risk_upshift_window` chapters show a
-score below `risk_upshift_score_floor` or a style penalty ≥
+score below `planning._risk_score_floor` (`risk_upshift_score_floor`, lowered to
+`rework_score_floor` under `rework_trigger: deterministic` — see the Rework trigger
+section: an accepted chapter must not double as a distress signal) or a style penalty ≥
 `risk_upshift_style_penalty`, or when a degradation-recovery directive is active —
 collapse recovery is when plan diversity pays. STABLE DOWNSHIFT
 (`adaptive_downshift_enabled`, only meaningful for multi-candidate bases) drops one
