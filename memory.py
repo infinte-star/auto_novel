@@ -1068,19 +1068,37 @@ def memory_context(paths: Paths, conn: Any, config: dict[str, Any],
         paths, config, _current_chapter_hint(conn),
         int(config["novel"].get("memory_volume_plan_chars", 16000)),
     )
-    metrics_5 = json.dumps(recent_metrics(conn, 5), ensure_ascii=False, indent=2)
+    # tier4 carries the OLDER TAIL of these two series, not a second full copy.
+    # `recent_metrics`/`recent_events` are newest-first, so `recent_metrics(5)`
+    # is a prefix of `recent_metrics(fatigue_window)` and `recent_events(20)` is
+    # a prefix of `recent_events(40)`. Emitting both in full shipped the same
+    # rows twice in every plan/extract prompt -- measured on a live Ch49 novel
+    # that is 4,341 + 6,757 = 11.1k of the 121.6k context, ~9%, for zero
+    # information. Slicing the tail is safe because the tiers assemble in order
+    # and any short budget returns early: tier4 can only appear when tier2 and
+    # tier3 already went in whole.
+    metrics_recent = recent_metrics(conn, max(fatigue_window, 5))
+    events_recent = recent_events(conn, 40, event_types=PLOT_EVENT_TYPES)
+
+    metrics_5 = json.dumps(metrics_recent[:5], ensure_ascii=False, indent=2)
     threads_text = _read_memory_file(paths.threads, int(config["novel"].get("memory_threads_chars", 12000)))
     tier2 = "## 卷纲\n" + volume_plan + "\n\n## 关键指标JSON\n" + metrics_5 + "\n\n## 伏线\n" + threads_text
 
     characters = _read_memory_file(paths.characters, int(config["novel"].get("memory_characters_chars", 16000)))
     bible = _read_memory_file(paths.bible, int(config["novel"].get("memory_bible_chars", 16000)))
-    events_20 = json.dumps(recent_events(conn, 20, event_types=PLOT_EVENT_TYPES), ensure_ascii=False, indent=2)
+    events_20 = json.dumps(events_recent[:20], ensure_ascii=False, indent=2)
     tier3 = "## 人物\n" + characters + "\n\n## 世界设定\n" + bible + "\n\n## 近期事件JSON\n" + events_20
 
     timeline = _read_memory_file(paths.timeline, int(config["novel"].get("memory_timeline_chars", 10000)))
-    metrics_full = json.dumps(recent_metrics(conn, fatigue_window), ensure_ascii=False, indent=2)
-    events_full = json.dumps(recent_events(conn, 40, event_types=PLOT_EVENT_TYPES), ensure_ascii=False, indent=2)
-    tier4 = "## 时间线\n" + timeline + "\n\n## 完整指标JSON\n" + metrics_full + "\n\n## 完整事件JSON\n" + events_full
+    metrics_older = metrics_recent[5:]
+    events_older = events_recent[20:]
+    tier4 = "## 时间线\n" + timeline
+    if metrics_older:
+        tier4 += ("\n\n## 更早的指标JSON（承接上面的关键指标，更旧）\n"
+                  + json.dumps(metrics_older, ensure_ascii=False, indent=2))
+    if events_older:
+        tier4 += ("\n\n## 更早的事件JSON（承接上面的近期事件，更旧）\n"
+                  + json.dumps(events_older, ensure_ascii=False, indent=2))
 
     assembled = tier1
     remaining = budget - len(assembled)

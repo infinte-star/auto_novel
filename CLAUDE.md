@@ -493,6 +493,19 @@ Two distinct context builders feed different LLM calls:
 - `memory_context` — full layered context (4 tiers, char-budgeted) for plan generation and event extraction
 - `lite_memory_context` — heavily abbreviated for plan-review/screening
 
+`memory_context`'s four tiers must not overlap. `recent_metrics`/`recent_events`
+return newest-first, so tier2's `recent_metrics(5)` is a *prefix* of tier4's
+`recent_metrics(fatigue_window)` and tier3's `recent_events(20)` is a prefix of
+tier4's `recent_events(40)` — emitting both in full shipped the same rows twice
+in every plan/extract prompt (measured on a live Ch49 novel: 11,064 of 121,617
+chars, 9%, inside `plan_candidate`, the largest prompt the engine sends at a
+median 131,872 chars over 2,501 library calls). tier4 now emits only the older
+tail (`[5:]` / `[20:]`) under `## 更早的…JSON` headers, and omits the section
+entirely when the tail is empty (`fatigue_window <= 5`). Slicing is safe because
+the tiers assemble in order and any short budget returns early, so tier4 can only
+appear when tier2/tier3 went in whole. `tests/test_memory_tiers.py` holds the
+invariant in both directions — no row twice, and no gap between the tiers.
+
 `volume_plan.md` is the one memory file that grows linearly with the book (a new
 `## 第N卷` per volume, plus `extend_volume_schedule` APPENDING per-chapter schedule
 tables), so plain head truncation silently starves the mid-book: a novel at Ch41
