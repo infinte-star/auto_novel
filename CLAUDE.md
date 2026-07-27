@@ -2,14 +2,15 @@
 
 Guidance for Claude Code (claude.ai/code) when working in this repository.
 
-**This file holds the rules and the pipeline you must not break.** Three
+**This file holds the rules and the pipeline you must not break.** Four
 companion docs carry the rest — follow the pointers instead of guessing:
 
 | doc | contents |
 | --- | --- |
 | `docs/LESSONS.md` | the measurements and post-mortems **behind** these rules. Read the cited section before changing a threshold, deleting a gate, or running an A/B. |
 | `docs/INTERNALS.md` | mechanical reference: store schema, checkpoint layout, `llm.py` plumbing, shared prompt constants, refine / fossil-fix / screenplay tools, `tools/*` |
-| `REDESIGN.md` | quality/FPY redesign roadmap + P1–P4 execution record |
+| `REDESIGN.md` | quality/FPY redesign roadmap v1 + P1–P4 execution record |
+| `docs/REDESIGN_V2.md` | first-principles redesign v2. **Read §0 before adding any quality gate or A/B judged by `score`** — the self-score has no discrimination and `quality_threshold: 8.0` sits exactly on the library's median, so an experiment that changes rework rules cannot be settled with it. |
 
 `README.md` is the user-facing quickstart; its `run.py`/`restart.py` section is
 stale — those files are gone.
@@ -225,7 +226,7 @@ prose drifts telegraphic and the model rates it 9+. Incident record: LESSONS §3
 | `review.py:macro_progress_check` | `macro_progress_enabled`, `macro_progress_every`, `macro_progress_stall_threshold` | from Ch20, measures advancement against `volume_plan` anchors; persists acceleration directives into `final_review.json` when stalled |
 | `review.py:refresh_voice_anchors` | `voice_refresh_skip_penalty` | anchors to a frozen `voice_baseline.md` instead of re-deriving voice from recent prose, and skips the refresh entirely when recent prose shows collapse |
 | failure taxonomy | `failure_taxonomy_enabled` (true) | `review.py` tags each report with canonical `failure_codes` from `taxonomy.py`; `_classify_replan_failure` prefers `taxonomy.replan_kind`/`dominant_route` over free-text prefixes. Pure, additive, degrades to the legacy path on import failure |
-| `quality.fingerprint_avoidance_context` | `fingerprint_enabled`, `fingerprint_warn_threshold` | the 全书结构指纹 block in the plan prompt. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). LESSONS §8 |
+| `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block in the plan prompt. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. `fingerprint_warn_threshold` is now **dead** — its only reader, `check_plan_against_fingerprints`, was deleted as unreachable (max 0.448 measured vs 0.65). LESSONS §8 |
 
 Three routing rules inside that table are load-bearing:
 - **`style_health`'s penalty is subtracted from the LLM score.** `review.py:review_chapter`

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import normalize_chapter  # noqa: E402
 from quality import beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
-from quality import store_chapter_fingerprint, check_plan_against_fingerprints  # noqa: E402
+from quality import store_chapter_fingerprint  # noqa: E402
 from quality import prose_texture, emotional_cadence  # noqa: E402
 from quality import location_transition  # noqa: E402
 from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
@@ -1051,7 +1051,11 @@ class RecencyAwareStateTests(unittest.TestCase):
 
 
 class ChapterFingerprintTests(unittest.TestCase):
-    """Tests for store/check chapter fingerprints (Feature 3)."""
+    """Tests for the chapter-fingerprint WRITE path.
+
+    The read path lives in `tests/test_fingerprint_context.py`
+    (`fingerprint_avoidance_context`, the aggregate block fed to the planner).
+    """
 
     def setUp(self):
         import sqlite3
@@ -1082,7 +1086,16 @@ class ChapterFingerprintTests(unittest.TestCase):
             yield
         return _noop_lock
 
-    def test_store_and_check_identical(self):
+    def test_store_writes_both_projections(self):
+        """The row must carry skeleton tokens AND the move sequence.
+
+        `skeleton_tokens` has no in-engine reader since
+        `check_plan_against_fingerprints` was deleted (unreachable threshold: 0.65
+        vs a measured max of 0.448 over 437 chapters). It is kept because it is
+        what lets a future recalibration be replayed offline from the db, so a
+        write that silently stopped emitting it would be a real loss.
+        """
+        import json as _json
         import store
         orig_lock = store.db_lock
         store.db_lock = self._mock_db_lock()
@@ -1097,60 +1110,31 @@ class ChapterFingerprintTests(unittest.TestCase):
                 "conflict_type": "evidence_contradiction",
             }
             store_chapter_fingerprint(self.conn, 1, plan)
-            rows = self.conn.execute("SELECT * FROM chapter_fingerprints").fetchall()
+            rows = self.conn.execute(
+                "SELECT chapter, skeleton_tokens, narrative_moves, payoff_type,"
+                " conflict_type FROM chapter_fingerprints").fetchall()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0][0], 1)
-            result = check_plan_against_fingerprints(self.conn, plan, {"novel": {}})
-            self.assertGreater(result["max_sim"], 0.8)
-            self.assertEqual(result["most_similar_chapter"], 1)
+            ch, tok_json, mov_json, pt, ct = rows[0]
+            self.assertEqual(ch, 1)
+            self.assertTrue(_json.loads(tok_json))
+            self.assertIsInstance(_json.loads(mov_json), list)
+            self.assertEqual(pt, "reveal")
+            self.assertEqual(ct, "evidence_contradiction")
         finally:
             store.db_lock = orig_lock
 
-    def test_different_plan_low_similarity(self):
+    def test_store_is_idempotent_per_chapter(self):
+        """INSERT OR REPLACE: re-running a chapter must not double its row."""
         import store
         orig_lock = store.db_lock
         store.db_lock = self._mock_db_lock()
         try:
-            plan1 = {
-                "conflict": "发现密室中的血迹方向不对",
-                "payoff": "推翻原有的死亡时间结论",
-                "goal": "锁定真正的死亡时间",
-                "beats": ["进入密室检查", "发现血迹异常", "对比法医报告"],
-            }
-            plan2 = {
-                "conflict": "公司财务报表出现异常",
-                "payoff": "揭露内部贪腐网络",
-                "goal": "追踪资金流向",
-                "beats": ["调取银行记录", "发现关联账户", "约谈知情人"],
-            }
-            store_chapter_fingerprint(self.conn, 1, plan1)
-            result = check_plan_against_fingerprints(self.conn, plan2, {"novel": {}})
-            self.assertLess(result["max_sim"], 0.5)
-        finally:
-            store.db_lock = orig_lock
-
-    def test_empty_db_returns_zero(self):
-        result = check_plan_against_fingerprints(self.conn, {"conflict": "test"}, {"novel": {}})
-        self.assertEqual(result["max_sim"], 0.0)
-        self.assertIsNone(result["most_similar_chapter"])
-        self.assertEqual(result["directives"], [])
-
-    def test_directives_generated_above_threshold(self):
-        import store
-        orig_lock = store.db_lock
-        store.db_lock = self._mock_db_lock()
-        try:
-            plan = {
-                "conflict": "调查古墓里的线索",
-                "payoff": "发现古墓的秘密",
-                "goal": "解开古墓谜题",
-                "beats": ["进入古墓", "发现壁画", "解读符号", "找到密室"],
-            }
-            store_chapter_fingerprint(self.conn, 1, plan)
-            result = check_plan_against_fingerprints(
-                self.conn, plan, {"novel": {"fingerprint_warn_threshold": "0.5"}}
-            )
-            self.assertTrue(len(result["directives"]) > 0)
+            plan = {"conflict": "c", "payoff": "p", "goal": "g", "beats": ["b1"]}
+            store_chapter_fingerprint(self.conn, 3, plan)
+            store_chapter_fingerprint(self.conn, 3, plan)
+            n = self.conn.execute(
+                "SELECT COUNT(*) FROM chapter_fingerprints").fetchone()[0]
+            self.assertEqual(n, 1)
         finally:
             store.db_lock = orig_lock
 

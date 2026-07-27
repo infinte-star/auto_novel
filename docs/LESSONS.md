@@ -305,11 +305,37 @@ Ch201  22,701 -> 1,240 chars      whole plan prompt 116,592 -> 95,157  (-18.4%)
 Ch50    5,710 ->   908
 ```
 
-Nothing was lost that was ever used: `check_plan_against_fingerprints` scores a
-concrete candidate against every stored fingerprint deterministically and injects
-`Ch{n}已用流程: …` for the top-3 matches, and the recent chapters are quoted
-verbatim by `narrative_pattern_block`. Held by `tests/test_fingerprint_context.py`
-(including a 20-vs-400-chapter size test, so the linear growth cannot come back).
+Nothing was lost that was ever used. The recent chapters are still quoted verbatim
+by `narrative_pattern_block`, and plan-skeleton duplication is judged by
+`scene_similarity`, which fires.
+
+**Correction to the first version of this section and to commit `adfb545`'s
+message:** both claimed the discriminating job was still done by
+`check_plan_against_fingerprints` ("按候选确定性比对全部指纹"). That was wrong on two
+counts, and grepping instead of asserting is what found it — the function was
+referenced only by `quality.py` and its own tests, **never called in production**.
+Replayed over 437 real chapters in 6 novels, its composite similarity peaked at
+**0.448** against `fingerprint_warn_threshold: 0.65`:
+
+```
+tangshuting  n=199 median=0.273 p90=0.340 max=0.448   >=0.65: 0
+huangliang   n= 99 median=0.278 p90=0.325 max=0.434   >=0.65: 0
+tunshi_xitong n=51 median=0.310 p90=0.368 max=0.386   >=0.65: 0
+p4_score     n= 49 median=0.224 p90=0.271 max=0.299   >=0.65: 0
+yeban_guize  n= 24 median=0.230 p90=0.277 max=0.312   >=0.65: 0
+guize_guaitan n=15 median=0.221 p90=0.298 max=0.308   >=0.65: 0
+```
+
+Unreachable by construction — the same defect as the deleted `dialogue_pingpong` /
+`chapter_ending_quality` gates (§ the silent-gate rule). The only test that ever
+saw it exceed 0.65 compared a plan **to itself**. So it was deleted, together with
+its `fingerprint_warn_threshold` config key's last reader. `store_chapter_fingerprint`
+still writes `skeleton_tokens` — that column is what made the replay above possible
+offline, so keep it (`tests/test_pure_functions.py:ChapterFingerprintTests` now
+guards the write path for exactly that reason).
+
+The read path is held by `tests/test_fingerprint_context.py`, including a
+20-vs-400-chapter size test, so the linear growth cannot come back.
 
 `dedupe_block` was left alone deliberately: its fields must match
 `_plan_skeleton_tokens` exactly or the generator is steered on one set of

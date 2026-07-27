@@ -2559,68 +2559,6 @@ def store_chapter_fingerprint(conn: Any, chapter_num: int, plan: dict[str, Any])
         pass
 
 
-def check_plan_against_fingerprints(
-    conn: Any, plan: dict[str, Any], config: dict[str, Any]
-) -> dict[str, Any]:
-    """Check a candidate plan against ALL stored chapter fingerprints.
-
-    Returns {"max_sim", "most_similar_chapter", "top_similar", "directives"}.
-    """
-    if conn is None:
-        return {"max_sim": 0.0, "most_similar_chapter": None, "top_similar": [], "directives": []}
-    threshold = float(config["novel"].get("fingerprint_warn_threshold", 0.65))
-    cur_tokens = _plan_skeleton_tokens(plan)
-    cur_moves = _narrative_pattern_sequence(plan)
-    try:
-        rows = conn.execute(
-            "SELECT chapter, skeleton_tokens, narrative_moves FROM chapter_fingerprints"
-        ).fetchall()
-    except Exception:
-        return {"max_sim": 0.0, "most_similar_chapter": None, "top_similar": [], "directives": []}
-    best_sim = 0.0
-    best_ch: int | None = None
-    top: list[tuple[int, float]] = []
-    for ch, tok_json, mov_json in rows:
-        try:
-            stored_tokens = set(json.loads(tok_json))
-            stored_moves = json.loads(mov_json)
-        except Exception:
-            continue
-        skel_sim = _jaccard(cur_tokens, stored_tokens)
-        narr_sim = _sequence_similarity(cur_moves, stored_moves)
-        composite = 0.6 * skel_sim + 0.4 * narr_sim
-        if composite > 0.3:
-            top.append((ch, round(composite, 3)))
-        if composite > best_sim:
-            best_sim = composite
-            best_ch = ch
-    top.sort(key=lambda x: x[1], reverse=True)
-    top = top[:5]
-    directives: list[str] = []
-    if best_sim >= threshold and top:
-        avoid_chapters = [f"Ch{ch}(sim={s})" for ch, s in top[:3]]
-        directives.append(
-            f"全书结构指纹检测：当前大纲与 {', '.join(avoid_chapters)} 结构高度相似(max={best_sim:.2f})。"
-            "必须改变叙事驱动力和信息揭示顺序，避免重复同样的章节骨架。"
-        )
-        for ch, s in top[:3]:
-            for row in rows:
-                if row[0] == ch:
-                    try:
-                        moves = json.loads(row[2])
-                        if moves:
-                            directives.append(f"Ch{ch}已用流程: {'→'.join(moves)}")
-                    except Exception:
-                        pass
-                    break
-    return {
-        "max_sim": round(best_sim, 3),
-        "most_similar_chapter": best_ch,
-        "top_similar": top,
-        "directives": directives,
-    }
-
-
 # How the fingerprint library is summarized for the planner. Constants rather
 # than config keys: these are properties of the move vocabulary (11 tokens), not
 # something a user tunes per novel (Code over Config, REDESIGN §5).
@@ -2648,10 +2586,16 @@ def fingerprint_avoidance_context(conn: Any, config: dict[str, Any]) -> str:
     book.
 
     What was lost: the planner can no longer read Ch137's flow off this block.
-    That was never how the check worked. `check_plan_against_fingerprints` scores
-    a concrete candidate against every stored fingerprint deterministically and
-    injects `Ch{n}已用流程: …` for the top-3 matches, and the recent chapters are
-    quoted verbatim by planning.py's `narrative_pattern_block`.
+    Nothing consumed it that way. The recent chapters are quoted verbatim by
+    planning.py's `narrative_pattern_block`, and plan-skeleton duplication is
+    judged by `scene_similarity`, which fires. The one function that did compare a
+    candidate against the whole library, `check_plan_against_fingerprints`, was
+    deleted alongside this rewrite: it was never called outside tests, and
+    replayed over 437 real chapters in 6 novels its composite similarity peaked at
+    **0.448** against a `fingerprint_warn_threshold` of **0.65** -- unreachable by
+    construction, the same defect as the deleted `dialogue_pingpong` /
+    `chapter_ending_quality` gates. `store_chapter_fingerprint` still writes
+    `skeleton_tokens`, which is what made that replay possible offline; keep it.
     """
     if conn is None:
         return "None"
