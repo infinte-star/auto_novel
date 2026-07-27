@@ -312,14 +312,22 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads **81.8% → 85.8%** after the latching-gate fixes
-(vs 12%–63% for "self-score ≥ 8.0"), every book with ≥25 chapters is ≥80%, and it
-names the failing gate for every miss; the leading remaining killers are
-`hard_contract` (31) and `style_collapse` (24). **Read those two as concentrated,
-not library-wide**: a census of every archived HARD contract violation puts 30 of
-35 in the tangshuting family (one book plus its `_v1_backup`/`_e2e` copies) and one
-single bootstrap contradiction, so `hard_contract` is one book counted several
-times, not a common cause. LESSONS §13.
+by one ruler. Library-wide it reads **82.5% → 88.5%** after the latching-gate fixes
+(vs 12%–63% for "self-score ≥ 8.0"), and it names the failing gate for every miss;
+the leading remaining killers are `gate_rejects` (20) and `hard_contract` (13).
+
+**The aggregate excludes derivative novel dirs, and that changes answers.**
+`fpy_prime.discover_novels` (shared with `replay_gates`) drops provable
+derivatives — `__ablate_` names, dirs with `experiments/{fork,ablate}_<name>.json`,
+and dirs whose Ch1 is byte-identical to another book's — prints each drop with its
+reason, and takes `--all` to include them. Explicit novel names on the command line
+are never filtered, so an A/B still reads its own arms. This is not cosmetic: with
+`tangshuting_v1_backup` in the pool (200 chapters, Ch1 identical to `tangshuting`,
+only 76/200 chapters shared) the same gate fixes measured **+4.0pt instead of
++6.0pt**, and `style_collapse` ranked #2 at 24 misses when 17 of those sat in that
+one copy. Two independent runs never produce a byte-identical Ch1 even from the same
+brief — `tangshuting_e2e` is the control and is deliberately KEPT — so identical Ch1
+is proof of a copy, not a heuristic. LESSONS §13.
 
 **`fpy_prime` cannot settle a change to a gate's LOGIC** — it replays archived
 payloads, so a verdict already baked into them is frozen and the tool reports the

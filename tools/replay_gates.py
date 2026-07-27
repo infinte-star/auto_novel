@@ -48,7 +48,8 @@ sys.path.insert(0, str(ROOT))
 
 import config as config_mod  # noqa: E402
 from pipeline import _hard_block_reasons  # noqa: E402
-from tools.fpy_prime import COUNTED_REPLANS, PINNED, _normalize, _payload  # noqa: E402
+from tools.fpy_prime import (COUNTED_REPLANS, PINNED, _normalize,  # noqa: E402
+                             _payload, discover_novels, print_exclusions)
 
 # `plan_initial` is the only replan label produced by the pre-write gate chain;
 # plan_critical / plan_fossil_catastrophe come from other code paths and are left
@@ -260,15 +261,19 @@ def main() -> int:
     ap.add_argument("--to", dest="hi", type=int, default=10 ** 9)
     ap.add_argument("--fix", default="A,B", help="comma-separated subset of A,B")
     ap.add_argument("--detail", action="store_true")
+    ap.add_argument("--all", action="store_true",
+                    help="include derivative dirs excluded from the aggregate by default")
     args = ap.parse_args()
 
     fixes = {f.strip().upper() for f in args.fix.split(",") if f.strip()}
-    names = args.novels or sorted(
-        p.name for p in (ROOT / "novels").iterdir()
-        if (p / "logs" / "checkpoints").is_dir())
+    names, dropped = discover_novels(args.novels, include_all=args.all)
+    if not names:
+        print("no novels with checkpoints found")
+        return 2
 
     w = max(len(x) for x in names)
     print(f"fixes active: {','.join(sorted(fixes)) or 'none'}\n")
+    print_exclusions(dropped)
     print(f"{'novel':<{w}}  {'FPY before':>13}  {'FPY after':>13}   delta")
     t_old = t_new = t_n = 0
     still_all: dict[str, int] = {}

@@ -33,6 +33,7 @@ rather than silently counted as passes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -55,6 +56,103 @@ PINNED = {
         "constraint_violation_block_count": 3,
     }
 }
+
+
+def _chapter_files(novel: Path) -> list[Path]:
+    return sorted((novel / "chapters").glob("[0-9][0-9][0-9][0-9].md"))
+
+
+def _sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def discover_novels(explicit: list[str], *, include_all: bool = False,
+                    root: Path | None = None
+                    ) -> tuple[list[str], list[tuple[str, str]]]:
+    """Novels to aggregate, plus the derivatives dropped and why.
+
+    A library aggregate over every dir under `novels/` counts derivative runs as
+    independent books. Measured on the current corpus: `tangshuting` and
+    `tangshuting_v1_backup` share 76 byte-identical chapters, and together with
+    `tangshuting_e2e` they are 446 of the library's 643 chapters -- so "LIBRARY
+    85.8%" was largely one book weighted three times, and every "the library's #1
+    killer is X" claim inherited that weighting. Same measurement-pollution class
+    as `pairwise_ab` charging an arm for being measured (CLAUDE.md).
+
+    Only PROVABLE derivatives are dropped, each by evidence rather than by a name
+    guess:
+
+      * `__ablate_` in the dir name, or `experiments/ablate_<name>.json` -- the
+        engine's own naming for an ablation copy.
+      * `experiments/fork_<name>.json` -- the engine's own fork metadata.
+      * Ch1 byte-identical to another novel's Ch1. Two independent runs never
+        produce the same first chapter even from the same brief (`tangshuting_e2e`
+        is the control: same story concept, different Ch1, so it is NOT dropped),
+        which makes an identical Ch1 proof of a copy/fork at genesis. Of the pair
+        the longer book is canonical; ties break alphabetically.
+
+    Explicit names are NEVER filtered -- naming two arms is how an A/B is read.
+    Callers must print the returned drop list: a silently narrowed corpus reads
+    exactly like a clean one.
+
+    `root` overrides the project root (tests only).
+    """
+    base = root or ROOT
+    novels = base / "novels"
+    all_names = sorted(p.name for p in novels.iterdir()
+                       if (p / "logs" / "checkpoints").is_dir())
+    if explicit:
+        return list(explicit), []
+    if include_all:
+        return all_names, []
+
+    dropped: list[tuple[str, str]] = []
+    kept: list[str] = []
+    ch1: dict[str, str] = {}
+    for name in all_names:
+        files = _chapter_files(novels / name)
+        h = _sha(files[0]) if files else None
+        if h:
+            ch1[name] = h
+    # Longer books win the canonical slot; sorted() already fixes the tie order.
+    order = sorted(all_names, key=lambda n: (-len(_chapter_files(novels / n)), n))
+    canonical: dict[str, str] = {}
+    for name in order:
+        h = ch1.get(name)
+        if h and h not in canonical:
+            canonical[h] = name
+
+    for name in all_names:
+        if "__ablate_" in name or (base / "experiments" / f"ablate_{name}.json").exists():
+            dropped.append((name, "ablation copy (engine-generated)"))
+            continue
+        if (base / "experiments" / f"fork_{name}.json").exists():
+            dropped.append((name, "fork copy (engine-generated)"))
+            continue
+        h = ch1.get(name)
+        src = canonical.get(h or "")
+        if src and src != name:
+            mine = {p.stem: _sha(p) for p in _chapter_files(novels / name)}
+            theirs = {p.stem: _sha(p) for p in _chapter_files(novels / src)}
+            common = set(mine) & set(theirs)
+            same = sum(1 for k in common if mine[k] == theirs[k])
+            dropped.append((name, f"Ch1 identical to {src}"
+                                  f" ({same}/{len(common)} chapters byte-identical)"))
+            continue
+        kept.append(name)
+    return kept, dropped
+
+
+def print_exclusions(dropped: list[tuple[str, str]], flag: str = "--all") -> None:
+    if not dropped:
+        return
+    print(f"excluded from the aggregate ({len(dropped)}; pass {flag} to include):")
+    for name, why in dropped:
+        print(f"   - {name}: {why}")
+    print()
 
 
 def _payload(path: Path) -> dict | None:
@@ -166,17 +264,20 @@ def main() -> int:
     ap.add_argument("--raw", action="store_true",
                     help="replay payloads verbatim, without normalizing verdicts whose "
                          "severity the engine has since changed (SUPERSEDED_CONTRACT_RULE)")
+    ap.add_argument("--all", action="store_true",
+                    help="include derivative dirs (ablations / forks / copies) that are "
+                         "excluded from the aggregate by default")
     args = ap.parse_args()
 
-    names = args.novels or sorted(
-        p.name for p in (ROOT / "novels").iterdir()
-        if (p / "logs" / "checkpoints").is_dir())
+    names, dropped = discover_novels(args.novels, include_all=args.all)
     if not names:
         print("no novels with checkpoints found")
         return 2
+    print_exclusions(dropped)
 
     width = max(len(n) for n in names)
     tally: dict[str, int] = {}
+    t_ok = t_n = 0
     head = "FPY'"
     print(f"{'novel':<{width}}  {head:>12}  {'score>=8.0':>17}  {'self-score':>10}")
     for name in names:
@@ -185,6 +286,7 @@ def main() -> int:
             print(f"{name:<{width}}  {'no chapters in range':>12}")
             continue
         ok, n, pct = _rate(vs)
+        t_ok, t_n = t_ok + ok, t_n + n
         scores = [v["score"] for v in vs if v["score"] is not None]
         # The score-based comparison point, computed on the SAME chapters:
         # how many would a 8.0 threshold have called clean?
@@ -213,6 +315,8 @@ def main() -> int:
                 if v["ok"] is not True:
                     print(f"{'':<{width}}    Ch{v['ch']}: {', '.join(v['reasons'])}")
 
+    if t_n:
+        print(f"\n{'LIBRARY':<{width}}  {t_ok:>4}/{t_n:<3} {100.0 * t_ok / t_n:>4.0f}%")
     if tally:
         print("\nwhy first drafts failed (all chapters in range):")
         for k, c in sorted(tally.items(), key=lambda kv: -kv[1]):

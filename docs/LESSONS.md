@@ -561,18 +561,63 @@ Two traps it exists to avoid, both of which produced a wrong answer first:
   *whole* chain in engine order and reports a survivor histogram (11 survived:
   8 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
 
-Measured, `--fix` isolating each arm over 643 archived chapters:
+Measured, `--fix` isolating each arm over the 435 archived chapters of the six
+non-derivative books (see "第三次测量污染" below — the first run of this table said
+81.8% → 85.8% (+4.0) over 643 chapters, and was diluted by a 200-chapter copy):
 
 | arm | library FPY′ | notes |
 | --- | --- | --- |
-| baseline | 526/643 = **81.8%** | 4 books < 80% |
-| fossil `in_current` only | 539/643 = 83.8% (+2.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
-| chapter_mode frac only | 537/643 = 83.5% (+1.7) | tangshuting_e2e 62.2→86.7 |
-| **both** | 552/643 = **85.8%** (+4.0) | e2e →91.1 (+28.9, super-additive) |
+| baseline | 359/435 = **82.5%** | 4 books < 80% |
+| fossil `in_current` only | 372/435 = 85.5% (+3.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
+| chapter_mode frac only | 370/435 = 85.1% (+2.5) | tangshuting_e2e 62.2→86.7 |
+| **both** | 385/435 = **88.5%** (+6.0) | e2e →91.1 (+28.9, super-additive) |
 
 Super-additive because both gates were blocking the *same* chapters: fixing one
 leaves the chapter failing on the other, so neither arm alone can show the full
 gain. **Isolate arms to attribute, but decide on the combined number.**
+
+### 第三次测量污染：派生书目稀释了每一个「全库」数字
+
+CLAUDE.md already records two instances of a measurement charging the thing it
+measures (`pairwise_ab` billing an arm 10 calls for being judged; `compare.py`'s
+circular score lines). This is the third, and it was found by trying to act on a
+library aggregate: every top remaining killer pointed at the same book family, so
+I claimed `tangshuting_v1_backup` was "a copy, counted twice". **It isn't a pure
+copy** — only 76 of its 200 chapters are byte-identical to `tangshuting`. Measuring
+that before designing the fix is what kept the fix honest.
+
+What both replay tools were doing: `sorted(p.name for p in (ROOT/"novels").iterdir()
+if (p/"logs"/"checkpoints").is_dir())` — one vote per *directory*. Three of the
+eight dirs were derivatives, and they were 208 of 643 chapters (32%). Consequences,
+all measured:
+
+- the gate fixes above read **+4.0pt instead of +6.0pt** — the 200-chapter copy
+  contributed +0.0pt and diluted the mean;
+- `style_collapse` ranked as the #2 remaining first-draft killer at **24 misses**;
+  **17 of those 24 were inside the excluded copy**, leaving 7 library-wide. It had
+  already been written down as the next engine target on that basis;
+- `hard_contract` read 27–31 and now reads 13.
+
+Detection must be evidence, not a name guess (`_v1_backup` / `_e2e` are ad-hoc human
+names; the next one will be spelled differently):
+
+1. `__ablate_` in the dir name, or `experiments/{ablate,fork}_<name>.json` — the
+   engine's OWN conventions, so they cannot drift out of sync with a rename.
+2. **Ch1 byte-identical to another book's Ch1.** Two independent runs never produce
+   the same first chapter even from the same brief; `tangshuting_e2e` is the control
+   (same story concept, 46 chapters, different Ch1 → kept). Of a copy pair the longer
+   book is canonical, ties alphabetical.
+
+Two design decisions worth keeping: **`prompt.md` hashing was tried first and
+rejected** — grouping by brief sounds obviously right, but all eight briefs hash
+differently (tangshuting 56974 bytes vs `_v1_backup` 55277 vs `_e2e` 24020), because
+the brief keeps being edited between runs. It would have grouped nothing. And an
+ablation's Ch1 is NOT identical to its parent's (ablate restarts at Ch1 and
+regenerates), so signal 1 is not redundant with signal 2 — each catches a case the
+other misses. `discover_novels` prints every drop with its reason and takes `--all`,
+per "No silent caps": a silently narrowed corpus reads exactly like a clean one.
+Explicit names on the command line bypass the filter entirely, or an A/B could no
+longer read its own forked arms. `tests/test_corpus_discovery.py` pins all of it.
 
 ### Two fixes measured and rejected before writing code
 
