@@ -235,5 +235,61 @@ class EmptyAbilityWhitelistTest(unittest.TestCase):
         self.assertIn("味觉共情", md)
 
 
+class ReplayPlanScoreFidelityTest(unittest.TestCase):
+    """`replay_gates.plan_chain_block` must mirror the ENGINE's retry condition.
+
+    The engine (`planning.create_plan`) accepts a plan in
+    `[plan_retry_score, min_plan_score)` *without* a retry to save tokens, and only
+    the 收尾 zone takes that shortcut away. An earlier version of the tool read a
+    key that does not exist (`plan_retry_score_threshold`), fell back to
+    `min_plan_score`, and therefore reported `low_plan_score` for every plan under
+    8.0 — 41.3% of the library, since the plan self-score's median IS 8.00 —
+    against a true retry rate of 4.0%. A measurement tool that silently disagrees
+    with the engine is worse than no tool.
+    """
+
+    PLAN = {"conflict": "x", "payoff": "y", "beats": ["a", "b"], "goal": "g"}
+
+    def _cfg(self, **extra):
+        nv = {"min_plan_score": 8.0, "plan_retry_score": 6.5,
+              # Silence every earlier gate in the chain so the score is what speaks.
+              "scene_dedupe_enabled": False, "narrative_pattern_enabled": False,
+              "chapter_mode_enabled": False, "visual_payoff_check_enabled": False}
+        nv.update(extra)
+        return {"novel": nv, "api": {}}
+
+    def _block(self, score, ch=5, **extra):
+        from tools.replay_gates import plan_chain_block
+        return plan_chain_block(self.PLAN, [], score, self._cfg(**extra), ch)
+
+    def test_mid_band_plan_is_accepted_without_retry(self):
+        # 7.0 and 7.5 are the two most common plan scores in the library (146 of
+        # 426 plans). Calling them retries fabricated the whole `low_plan_score`
+        # bucket.
+        self.assertIsNone(self._block(7.0))
+        self.assertIsNone(self._block(7.5))
+        self.assertIsNone(self._block(7.9))
+
+    def test_below_retry_floor_blocks(self):
+        self.assertEqual(self._block(6.0), "low_plan_score")
+        self.assertEqual(self._block(6.4), "low_plan_score")
+
+    def test_at_or_above_min_never_blocks(self):
+        self.assertIsNone(self._block(8.0))
+        self.assertIsNone(self._block(9.5))
+
+    def test_ending_zone_removes_the_token_saving_shortcut(self):
+        # `cost_savings_disabled` is what makes the mid band block, and it needs a
+        # deterministic finale to exist at all (max_chapters set).
+        self.assertEqual(
+            self._block(7.5, ch=20, max_chapters=20, ending_aware=True),
+            "low_plan_score")
+        # Pure char-target mode has no finale, so the shortcut stays.
+        self.assertIsNone(self._block(7.5, ch=20, ending_aware=True))
+
+    def test_missing_score_is_not_a_block(self):
+        self.assertIsNone(self._block(None))
+
+
 if __name__ == "__main__":
     unittest.main()

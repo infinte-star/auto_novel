@@ -76,6 +76,40 @@ Two load-bearing details of that mode:
 historical `score < quality_threshold or not accepted` expression over a
 (score × accepted × gate_rejects) grid, so the default config cannot drift.
 
+### The plan self-score has the same shape — and the engine already knows it (2026-07-28)
+
+`min_plan_score` is also 8.0, and the plan self-score is the same kind of number:
+426 archived attempt0 plans, **median exactly 8.00**, mean 7.899, and only **20
+distinct values** — 90 plans at exactly 7.0, 103 at 8.5, i.e. a coarse 0.5-step
+rating, not a measurement. 41.3% sit below 8.0.
+
+The engine does **not** retry those. `planning.create_plan` retries only below
+`plan_retry_score` (default `min_plan_score - 1.5` = 6.5, 4.0% of plans), accepting
+the whole 6.5–8.0 band "to save tokens" unless `cost_savings_disabled` (the 收尾
+zone) takes the shortcut away. Measured retry rate: **24 of 431 chapters**. So the
+token-saving shortcut is the thing keeping the plan side off the median — which
+means **do not "tighten" it**; that would recreate §2's defect one stage earlier.
+
+And a retry buys nothing on the score it is judged by: excluding the 4 gate-driven
+retries (attempt0 score absent), the 19 score-driven retries move the plan
+self-score by **+0.07 mean** (deltas: 5×+0.5, 2×0.0, 2×−0.5, and a scatter of
+±0.2–1.0). The chapters that got a retried plan score *worse* (6.66 vs 7.33 mean),
+which is confounded — they were the troubled ones — but there is no direction in
+which this rule pays.
+
+**Fifth measurement pollution, in the tool that had just been hardened against the
+fourth.** `replay_gates.plan_chain_block` read `plan_retry_score_threshold`, a key
+that **does not exist**, so it fell back to `min_plan_score` and reported
+`low_plan_score` for every plan under 8.0 — the tool was applying the very
+threshold rule the engine avoids, and it also ignored `cost_savings_disabled`.
+Fixed to mirror the engine (and the corrected combined gate-fix number is +6.2pt,
+not +6.0pt: one more `tangshuting_e2e` chapter clears). `tests/test_latching_gates.py::ReplayPlanScoreFidelityTest`
+pins the mid-band-accept, below-floor-block, and ending-zone cases so the tool
+cannot silently disagree with the engine again. Lesson generalized: **a replay tool
+must read the same config key the engine reads, and a `.get(k, default)` on a
+misspelled key is indistinguishable from a working one** — that is why the tool
+now has fidelity tests rather than only output tests.
+
 ---
 
 ## 3. Style collapse is the pipeline's biggest failure mode
@@ -558,8 +592,8 @@ Two traps it exists to avoid, both of which produced a wrong answer first:
   blocking, `visual_payoff` / `executability` / plan-score downstream of it never
   ran. Dropping a replan because one gate went quiet, without giving the rest
   their first chance to speak, fabricates a gain — so the replay re-runs the
-  *whole* chain in engine order and reports a survivor histogram (11 survived:
-  8 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
+  *whole* chain in engine order and reports a survivor histogram (8 survived:
+  5 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
 
 Measured, `--fix` isolating each arm over the 435 archived chapters of the six
 non-derivative books (see "第三次测量污染" below — the first run of this table said
@@ -570,7 +604,7 @@ non-derivative books (see "第三次测量污染" below — the first run of thi
 | baseline | 359/435 = **82.5%** | 4 books < 80% |
 | fossil `in_current` only | 372/435 = 85.5% (+3.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
 | chapter_mode frac only | 370/435 = 85.1% (+2.5) | tangshuting_e2e 62.2→86.7 |
-| **both** | 385/435 = **88.5%** (+6.0) | e2e →91.1 (+28.9, super-additive) |
+| **both** | 386/435 = **88.7%** (+6.2) | e2e →93.3 (+31.1, super-additive) |
 
 Super-additive because both gates were blocking the *same* chapters: fixing one
 leaves the chapter failing on the other, so neither arm alone can show the full
@@ -669,7 +703,7 @@ prompt **末尾**把硬化石禁令复述一遍（hard-only、上限 5 条——
 **测量污染第四例：`--fix` 未知 token 被当成「什么都不修」。** `tools/replay_gates.py`
 默认全开，我手敲 `--fix book_wide_fossils,chapter_mode_monotony`（当时只认 `A`/`B`），两个
 token 都没匹配上，工具照样打了一份表头回显着这两个名字、结论写着 `+0.0pt` 的报告——而实
-测是 **+6.0pt**（82.5% → 88.5%）。一个测量工具的默认行为绝不能是「静默降级成 no-op 再输出
+测是 **+6.2pt**（82.5% → 88.7%）。一个测量工具的默认行为绝不能是「静默降级成 no-op 再输出
 一个看起来权威的数字」：现在描述性门名是合法别名，未知 token 直接 `return 2`。同类前三例
 见本节与 §5（`pairwise_ab` 给被测臂记账、`compare` 的循环判据、`fpy_prime` 未归一化旧语义）。
 

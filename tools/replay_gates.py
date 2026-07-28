@@ -144,7 +144,7 @@ def _plan_score(novel: Path, ch: int) -> float | None:
 
 
 def plan_chain_block(plan: dict, recent: list[dict], score: float | None,
-                     config: dict) -> str | None:
+                     config: dict, chapter_num: int = 0) -> str | None:
     """Re-run the pre-write plan-gate chain in ENGINE ORDER; return the first blocker.
 
     Order matters and is copied from `planning.create_plan`: duplicate gates
@@ -199,9 +199,17 @@ def plan_chain_block(plan: dict, recent: list[dict], score: float | None,
     except Exception:
         pass
     if score is not None:
+        # Mirror `planning.create_plan`'s real condition, which is NOT "below
+        # min_plan_score". A plan in [plan_retry_score, min_plan_score) is accepted
+        # WITHOUT a retry to save tokens; only the 收尾 zone (`cost_savings_disabled`)
+        # takes that shortcut away. An earlier version of this tool read a key that
+        # does not exist (`plan_retry_score_threshold`), so it fell back to
+        # min_score and reported `low_plan_score` for every plan under 8.0 -- 41.3%
+        # of the library by self-score median, against a true retry rate of 4.0%.
         min_score = float(nv.get("min_plan_score", 8.0))
-        retry_score = float(nv.get("plan_retry_score_threshold", min_score))
-        if score < min_score and score < retry_score:
+        retry_score = float(nv.get("plan_retry_score", min_score - 1.5))
+        if score < min_score and (score < retry_score
+                                  or config_mod.cost_savings_disabled(config, chapter_num)):
             return "low_plan_score"
     return None
 
@@ -268,7 +276,7 @@ def replay_novel(name: str, lo: int, hi: int, fixes: set[str], detail: bool):
             if plan:
                 recent = [plans[c] for c in
                           sorted((c for c in plans if c < ch), reverse=True)[:window]]
-                blocker = plan_chain_block(plan, recent, _plan_score(novel, ch), cfg)
+                blocker = plan_chain_block(plan, recent, _plan_score(novel, ch), cfg, ch)
                 if blocker is None:
                     new_replans.discard(GATED_REPLAN)
                     why.append("B:plan_chain_clear")
