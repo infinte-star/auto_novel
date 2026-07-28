@@ -1,8 +1,9 @@
 # 通用 AI 写小说框架
 
 一个内容无关的长篇中文网文自动生成流水线。给定一份「创作纲要」（`prompt.md`），
-框架自动循环执行 **规划 → 写作 → 评审 → 修订 → 抽取记忆**，直到达到目标字数，
-并可选地做一遍分组精修（refine）。
+框架用一条**确定性流水线**自动循环：每 10 章规划一段弧、一次调用写完一章正文和状态、
+确定性验收、能修就修，直到达到目标字数，并可选地做一遍分组精修（refine）。
+路由分支全部是纯函数，没有自评分参与发布判定。
 
 支持**同时写多篇小说**：每篇小说有独立目录、独立配置、独立进程，互不干扰。
 
@@ -67,9 +68,11 @@ prompt_template.md       # 创作纲要骨架模板
 novel.py                 # 多小说统一 CLI 入口
 
 # 核心引擎（内容无关，所有小说共用）
-pipeline.py  config.py  memory.py  planning.py  writing.py
-review.py    refine.py  store.py   checkpoint.py  llm.py
-quality.py   retrieval.py            # 质量护栏：规则文体检测 / 场景去重 / 检索式记忆
+v2/run.py    v2/beat.py     v2/write.py   v2/accept.py   # 决策表 / 弧规划 / 写作 / 验收
+v2/repair.py v2/canon.py    v2/anchor.py                 # 修复 / 状态投影 / 外部盲判
+config.py    memory.py      writing.py    store.py       # 配置 / 记忆与 bootstrap / 写作教条 / 持久化
+quality.py   fix.py         retrieval.py  checkpoint.py  llm.py
+refine.py    package.py     screenplay.py                # 完稿后工具
 
 ```
 
@@ -77,51 +80,74 @@ quality.py   retrieval.py            # 质量护栏：规则文体检测 / 场�
 
 ## 工作原理
 
-1. **bootstrap**（首次运行）：读 `prompt.md`，用一次 LLM 调用生成
-   `state.md` 和 `memory/{bible,characters,timeline,threads,volume_plan}.md`。
-2. **主循环**：`find_last_chapter()` → `generate_one_chapter()`，直到字数达标。
-3. **每章流程**：
-   `规划候选方案(多策略 bandit) → 连续性校验 → 写作(可多候选) →
-    评审/修订循环 → 弱结尾 hook 微调 → 保存 → 抽取事件 → 更新结构化状态/state.md`。
-4. **质量护栏**（防文风塌缩 / 防自评分虚高，详见下节）：规则文体检测、
-   独立冷读者、宏观推进度量、检索式记忆、场景去重、固定文风基线。
-5. **后台任务**：事件抽取、阶段评审、记忆压缩、自适应重规划、下一章方案预取
-   都在后台线程池跑，不阻塞关键路径。
-6. **断点续写**：每个阶段都写 checkpoint 到 `logs/checkpoints/chNNNN/`，
-   中断后重新 `run` 会从断点继续，不重复消耗 token。
-7. **精修（可选）**：`refine_after_complete: true` 时，完成后按 5 章一组
-   重写，输出到 `chapters_refined/` 和 `book_refined.md`，原文不动。
+一条**确定性流水线**：每章的分支全部由纯函数决定，只有四类动作会调用模型
+（规划一段弧、写一章、查设定、修复）。平均约 2.5 次调用/章。
+
+1. **bootstrap**（首次运行）：读 `prompt.md`，生成 `state.md` 和
+   `memory/{bible,characters,timeline,threads,volume_plan}.md`。
+2. **主循环**：`find_last_chapter()` → `run_chapter()`，直到字数达标或到 `max_chapters`。
+3. **每章流程**由 `v2/run.py` 的决策表驱动，每做完一个动作**从表头重新判一遍**：
+
+   ```
+   need_card   → 需要卡片？每 arc_span(10) 章一次弧规划，一次性产出整段的 ChapterCard
+   card_invalid→ 卡片有硬伤？确定性校验，CRITICAL 才修
+   need_draft  → 没有正文？一次调用同时产出正文和状态增量（无独立抽取调用）
+   need_report → 没有验收报告？零 LLM，跑确定性门
+   l0_pending  → L0 能修的（零 LLM：破折号/碎句/化石轮换/景物开场降级）
+   l1_pending  → L1 能修的（有限次定点重写：扩写到字数带、补对白）
+   canon_pending→ 查设定冲突，结论必须能在正文里字符串命中，否则丢弃
+   next_card_patch → 用本章实际发生的事修补下一章卡片
+   rescue      → 仍有硬阻塞才重写（修复永远排在它前面）
+   commit      → 落盘：chapters/、book.md、结构化状态、state.md
+   ```
+
+4. **一把尺子**：能否发布只由 `quality.hard_block_reasons` 判定，没有自评分参与。
+   `review_round0.json` 记录的是**未经任何修复的首稿**，这正是 `tools/fpy_prime.py`
+   离线复算首过率时读的文件。
+5. **不闩锁**：验收集里每一项都是「本章正文改一改就能变绿」的量；书级累计量只告警、
+   永不阻塞（`GATE_SCOPES`）。
+6. **断点续写**：每步都写 checkpoint 到 `logs/checkpoints/chNNNN/`，中断后重新 `run`
+   会从断点继续，不重复消耗 token。
+7. **熔断**：连续 `quality_breaker_consecutive`（默认 2）章带着未解决的硬阻塞落盘就停机
+   交人判断——这种失败模式不是多花 token 能修的。
+8. **精修（可选）**：`refine_after_complete: true` 时，完成后按 5 章一组重写，
+   输出到 `chapters_refined/` 和 `book_refined.md`，原文不动。
 
 ---
 
 ## 质量护栏（防塌缩）
 
 最大的失败模式是**文风塌缩**：正文逐渐退化成「句子——状态——状态」式的破折号碎句，
-而模型自评因为自身文风也跟着漂移，反而给这种碎句打 9+ 分。下面这些层就是专门
-针对「LLM 自评不可信」设计的客观锚点（核心在 `quality.py` / `retrieval.py`，
-并接入 `review.py` / `planning.py`）：
+而模型自评因为自身文风也跟着漂移，反而给这种碎句打 9+ 分。所以引擎的发布判据里
+**完全不含自评分**，全部是确定性的客观锚点（`quality.py` / `retrieval.py`，
+由 `v2/accept.py` 组装成验收集）：
 
 - **规则文体检测** `quality.py:style_health`：非 LLM 的确定性指标——破折号密度、
-  平均句长、碎句行占比、对话有无。算出 `penalty` 直接从评审分里扣，超过
-  `style_penalty_block` 直接拦截通过，并把整改指令注入下一章写作提示。
-- **场景语义去重** `quality.py:scene_similarity`：新方案骨架与近期已选方案的
-  Jaccard 相似度超过 `scene_dedupe_sim_warn` 时告警并追加硬约束，阻止「无限切片
-  同一场景」。
+  平均句长、碎句行占比、对话有无。算出 `penalty`，超过 `style_penalty_block`
+  直接拦截，并把整改指令注入下一章写作提示。
+- **契约兑现校验（CCC）** `v2/accept.py:contract_fulfilment`：卡片承诺的地点/人物/
+  转折关键物/结尾钩子/禁忌逐项在正文里核对。卡片字段按设计就是具体的，所以
+  「有没有写到」是零 LLM 可判定的。
+- **引用即丢弃（cite-or-drop）** `v2/accept.py:citation_check`：任何指不出正文原文
+  片段的评审结论一律丢弃，而不是打个折扣计入——这是防评审凭空编造违规的唯一手段。
+- **场景语义去重** `quality.py:scene_similarity`：新卡片骨架与近期卡片的 Jaccard
+  相似度超过 `scene_dedupe_sim_warn` 时告警并追加硬约束，阻止「无限切片同一场景」。
+- **全书化石** `quality.py:book_wide_fossils`：跨全书复现的 6 字 CJK n-gram
+  （6 章窗口的重复检测结构性看不到的那一类）。
 - **检索式记忆 (RAG)** `retrieval.py`：零额外依赖的 TF-IDF 字符二元组检索
   （不用 embedding，唯一依赖仍是 `openai`），把被摘要压缩掉的早期具体事实重新
   召回到写作上下文。索引在 `save_chapter` 时幂等写入 `logs/retrieval_index.json`。
-- **独立冷读者** `review.py:cold_reader_review`：每 `cold_reader_every` 章跑一次，
-  **故意不带 cacheable_prefix**，因此不会像主评审那样被漂移的上下文「同化」而放水。
-- **宏观推进度量** `review.py:macro_progress_check`：每 `macro_progress_every` 章
-  对照 `volume_plan` 大事件锚点检测剧情停滞，停滞超阈值就写入加速指令。
-- **固定文风基线** `review.py:refresh_voice_anchors`：锚定首次生成的
-  `memory/voice_baseline.md`，正文出现塌缩迹象时**直接跳过 voice 刷新**，
-  切断「劣化正文反过来成为新文风」的自投喂回路。
-- **自适应降档** `planning.py`：质量长期稳定（窗口内最低分 ≥ `adaptive_downshift_score`）
-  时自动减少候选方案数，省 token。
+- **固定文风基线** `memory/voice_baseline.md` 是**冻结**的：从漂移的正文里重新提炼
+  文风，正是造成塌缩的自投喂回路。
+- **外部盲判** `v2/anchor.py`：唯一读正文的指标。盲判（只标甲/乙）、双向判
+  （交换位置两次一致才计胜）、**不带 cacheable_prefix**——这是引擎唯一无法自己
+  颁给自己的分数。
 
 > 这些护栏由 `config.yaml` 的开关控制，默认开启；阈值见下节。
-> `logs/retrieval_index.json` 和 `memory/voice_baseline.md` 都可安全删除，会自动重建。
+> `logs/retrieval_index.json` 可安全删除，会自动重建。
+> `memory/voice.md` **不要删**：它只在 bootstrap 生成一次，而 bootstrap 只在
+> `state.md` 缺失时才重跑，所以删掉它不会重建——只会让之后每一章的提示词里
+> 静默少掉「叙事声音」这一节。
 
 ---
 
@@ -131,34 +157,35 @@ quality.py   retrieval.py            # 质量护栏：规则文体检测 / 场�
 不支持嵌套/列表/锚点）。常调的几个：
 
 **`novel:` 段**
+- `engine` — 引擎版本，只认 `v2`（不写等于 `v2`）。旧配置里写着 `v1` 会**直接报错退出**，
+  不会静默降级：两代引擎写的 checkpoint 标签和验收字段不同，猜错等于伪造测量。
 - `target_words` — 目标总字数（达到即停）
 - `chapter_words` — 单章目标字数
+- `chapter_min_chars` — 单章字数下限（低于此值会触发 L1 定点扩写）
 - `max_chapters` — 章节数硬上限（0 或不写 = 不限，仅按字数停）
-- `quality_threshold` — 章节质量分阈值（评审低于此分会触发修订）
-- `candidate_plans` / `candidate_chapters` — 并行候选方案/草稿数（择优）
+- `arc_span` — 每多少章做一次弧规划（默认 10）
+- `quality_breaker_consecutive` — 连续多少章带着未解决硬阻塞落盘就停机（默认 2）
 - `style_preset` — 题材预设，驱动写作/评审/精调的题材化提示词：`history`（历史厚重）/ `xuanhuan_shuang`（穿越爽文）/ `system_stream`（系统流）/ `urban_ability`（都市异能·重生）/ `romance_female`（女频言情·宠文）/ `wanzu_xuanhuan`（现代玄幻·万族）/ `suspense`（悬疑惊悚）/ `rule_horror`（规则怪谈·民俗无限流，别名 `guize`/`infinite_flow`）
 - `creative_boost_enabled` — bootstrap 阶段一次性 AI 创意增强（跨题材联想注入新颖金手指/人设梗/开篇钩子，默认开）
-- `opening_chapters` / `opening_hook_strength_min` / `opening_review_strict` — 开篇黄金三章特化（写作注入强钩子规则 + 更高 hook 阈值 + 更严评审）
+- `opening_chapters` — 开篇黄金三章特化章数（写作注入强钩子规则 + 开篇 hook 门更严）
 - `opening_trial_variants` / `opening_trial_chapters` — `trial` 命令的默认开篇试写数量与每条路线章数
-- `replan_on_low_quality` — 章节低于阈值时，先重做大纲并重写一次，而不是只补丁修到勉强通过
 - `platform_preset` — 平台/读者画像：`general` / `qidian_male` / `fanqie_free` / `jinjiang_female` / `qimao_free`
 - `benchmark_enabled` / `benchmark_dir` / `benchmark_top_k` — 本地爆款样本库召回，默认读取 `benchmarks/`
-- `pack_review_enabled` / `pack_review_every` — 10章包追读审校，检查承诺账本、爽点兑现、重复疲劳
-- `pack_review_barrier` / `stage_review_barrier` — 上一包/上一阶段审校未完成时，下一章规划前等待其完成
 - `memory_*_chars` — 各记忆层读取上限，避免长期文件膨胀污染上下文
-- `refine_after_complete` — 是否完成后自动精修
+- `package_after_complete` / `refine_after_complete` — 是否完成后自动出书籍包装 / 自动精修（默认都关）
 
 **质量护栏开关（`novel:` 段，默认开启）**
 - `style_health_enabled` + `style_em_dash_per_kchar_warn/_bad`、
   `style_min_avg_sentence_chars`、`style_fragment_line_ratio_max`、
   `style_penalty_cap`、`style_penalty_block` — 规则文体检测与扣分/拦截阈值
-- `cold_reader_enabled` / `cold_reader_every` — 独立冷读者频率
-- `macro_progress_enabled` / `macro_progress_every` / `macro_progress_stall_threshold` — 宏观推进度量
-- `scene_dedupe_enabled` / `scene_dedupe_sim_warn` — 场景去重相似度阈值
-- `scene_dedupe_sim_block` / `scene_dedupe_force_retry` — 场景骨架高度重复时硬性触发重规划
+- `scene_dedupe_enabled` / `scene_dedupe_sim_warn` / `_sim_block` / `_sim_identical` — 场景骨架去重的告警/重规划/绝对上限三档
+- `book_fossil_enabled` / `book_fossil_chapter_frac` / `book_fossil_hard_ratio` — 全书化石短语检测
+- `style_cross_repeat_reject_count` — 跨章原句复用的拒收计数
+- `descriptor_frequency_enabled` / `genre_drift_reject_enabled` / `opening_hook_gate_enabled` — 用词频次 / 题材漂移 / 开篇钩子门
+- `dialogue_health_enabled` / `dialogue_char_ratio_min` / `_target` — 对白占比门（由 L1 补对白应答）
 - `rag_enabled` / `rag_top_k` / `rag_exclude_recent` — 检索式记忆
-- `voice_refresh_skip_penalty` — 检出塌缩时跳过 voice 刷新的扣分阈值
-- `adaptive_downshift_enabled` / `_score` / `_window` / `_warmup` — 自适应降档
+- `fix_max_l1_calls` — L1 定点修复的调用上限
+- `fossil_tail_anchor_enabled` — 把硬化石禁令再钉一遍到写作提示词末尾
 
 **爆款样本库**
 - 样本放到 `benchmarks/<platform>/<style>/`，支持 `.md` / `.txt` / `.json`
@@ -167,14 +194,14 @@ quality.py   retrieval.py            # 质量护栏：规则文体检测 / 场�
 - 可用 `python novel.py benchmark add qidian_male history path/to/sample.json` 导入结构化样本
 
 **读者承诺账本**
-- 事件抽取会把 `thread_type: reader_promise` 同步到独立账本
-- 后续规划会看到活跃/逾期承诺，减少“只开钩子不兑现”
-- 每 `pack_review_every` 章会做一次包评审，输出到 `logs/pack_reviews.md`
+- 状态增量会把 `thread_type: reader_promise` 同步到独立账本
+- 后续弧规划会看到活跃/逾期承诺，减少“只开钩子不兑现”
 
 **开篇路线采纳**
 - `trial` 只试写，不污染正式正文
 - `adopt-trial` 会把最佳路线写到 `memory/opening_route.md`
-- 后续规划/写作会把该路线作为高优先级约束，并自动刷新 prompt cache
+- ⚠️ **当前 v2 引擎还没读这个文件**（它自己做上下文投影），所以 `adopt-trial` 暂时
+  只对 `trial` / `package` 这类走旧记忆层的命令生效。待修。
 
 **`api:` 段**
 - `base_url` / `model` — 端点与模型

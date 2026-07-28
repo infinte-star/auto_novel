@@ -8,8 +8,19 @@ Read the relevant section before you change a threshold, delete a gate, or run a
 A/B. Every claim here has a date and a sample size; if you re-measure and get
 something else, update the section rather than quietly acting on the new number.
 
-Related docs: `REDESIGN.md` (the quality/FPY-oriented redesign roadmap and its
-P1–P4 execution record), `README.md` (user-facing quickstart).
+> **Historical file names, live lessons.** Most of what follows was measured on the
+> v1 engine, deleted 2026-07-28 (`95361b9`, disposition in `docs/REDESIGN_V2.md`
+> §9.8). The *rules* still hold — they are why v2 is shaped the way it is — but the
+> modules many sections name (`pipeline.py`, `planning.py`, `review.py`,
+> `taxonomy.py`) no longer exist, and functions like `_hard_block_reasons` moved
+> (now `quality.hard_block_reasons`). Sections are **not** rewritten to pretend v1
+> never happened: a post-mortem edited to match today's code stops being evidence.
+> When a section names a file, check `CLAUDE.md`'s module map for where that
+> responsibility lives now.
+
+Related docs: `docs/REDESIGN_V2.md` (the live engine's design + the A/B that
+settled it), `REDESIGN.md` (the v1 quality/FPY roadmap and its P1–P4 execution
+record — historical, same caveat), `README.md` (user-facing quickstart).
 
 ---
 

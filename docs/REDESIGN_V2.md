@@ -692,3 +692,43 @@ v2 剩 1 次 = `card_replan`。也就是说这 10pt 差距**全部来自写前�
 （`pipeline.py` 2759 + `planning.py` 2307 + `review.py` 2317 + `taxonomy.py` 132），
 不是计划里写的 13,481 行——v2 复用 `arc` / `fix` / `memory` / `writing`。
 
+
+### 9.8 处置执行：切默认 + 删 v1（2026-07-28，`2bcfd51` / `95361b9` / 本次文档提交）
+
+9.7 结尾那句「处置不变：`engine` 默认仍是 v1，没有删除任何模块」**已作废**。
+用户在读完 9.7 的读数后决定执行处置，分三次提交：
+
+| 提交 | 内容 |
+|---|---|
+| `2bcfd51` | D1：把 v2 仍需的纯函数迁出 `planning.py` / `review.py`（删除前解耦） |
+| `95361b9` | D2+D3：`engine` 默认切 v2；删 `pipeline.py`(2759) / `planning.py`(2086) / `review.py`(2292) / `taxonomy.py`(132) = **7,344 行**，及其测试。805 个测试全绿 |
+| 本次 | D4：`CLAUDE.md` / `README.md` / `docs/INTERNALS.md` 改写成描述现役引擎 |
+
+**`engine: v1` 是报错，不是回退。** 两代引擎写不同的 checkpoint 标签和不同的
+`review_round0.json` 键，静默降级到 v2 就等于让半本书按一把尺子归档、半本按另一把——
+那是伪造测量，比行为变化更难发现。所以 `novel.py` 认 `v2`（或不写），
+见到 `v1` 打印去向并 `exit 2`，见到未知值拒绝猜测。
+
+**删除留下的坑，已量化并写进 `CLAUDE.md` 的「Known gaps left by the v1 deletion」：**
+
+- **12 个已注册的门现在没有调用点**。`GateRegistry` 从来不派发（`REGISTRY.get()` 只有测试在调），
+  v1 的 `review.py` 是按名字逐个调的，所以它一删，这些门就静默了：
+  8 个 advisory（`ai_flavor_health` / `paragraph_shape_health` / `prose_texture` /
+  `information_density` / `payoff_beat_density` / `shareable_line` / `flat_chapter_streak` /
+  `long_span_fatigue`）+ 4 个有修复层的（`intra_chapter_repetition` / `hook_tail_repetition` /
+  `beat_coverage` / `emotional_cadence`）。
+  **这是接线缺陷报告，不是删除清单**（LESSONS §4）。只有 `beat_coverage` 已结案——
+  被 `accept.contract_fulfilment` 从 `beats` 扩到整张卡片后取代。其余逐个用
+  `tools/gate_census.py` 测了再定接或删。
+- **约 2.2k 行其它孤儿定义** + 约 14 个无读者的配置键（`rework_trigger` / `candidate_plans` /
+  `cold_reader_enabled` / `macro_progress_enabled` / `adaptive_downshift_enabled` …）。
+- **两个能力缺口**（审计时新发现，不是死码）：
+  `memory/opening_route.md` v2 完全没读——`adopt-trial` 对写作侧已失效；
+  `voice_baseline.md` 不再有生产者（写它的是 `review.refresh_voice_anchors`），
+  v2 因为**根本没有 voice 刷新路径**而天然冻结，结论正确但文件消失了。
+
+**这一段的方法论收获**：一次大删除之后，「哪些函数变成了孤儿」不能用 token grep 回答——
+v2 的 docstring 里大量引用 v1 的函数名，正文里的散文会被计成引用，
+恰好把大删除孤立出来的那些函数藏起来。必须按 AST 收集引用
+（`ast.Name` / `ast.Attribute` / import 节点，且排除定义自身的行区间）：
+换成 AST 之后候选从 24 个 / ~860 行涨到 47 个 / 2,250 行。
