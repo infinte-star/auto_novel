@@ -52,6 +52,10 @@ def main() -> int:
     config = config_mod.load_config()
     ncfg = config.get("novel", {})
     window = int(ncfg.get("style_em_dash_trend_window", 5))
+    # The block line is this novel's own, not a literal: a genre whose config
+    # raises `style_penalty_block` would otherwise be reported as blocked at a
+    # threshold the engine never applies to it.
+    block = float(ncfg.get("style_penalty_block", 2.0))
 
     chap_dir = ROOT / "novels" / name / "chapters"
     files = sorted(chap_dir.glob("*.md"))
@@ -103,10 +107,10 @@ def main() -> int:
             if not band:
                 continue
             pens = [r[2]["penalty"] for r in band]
-            blocked = sum(1 for p in pens if p >= 2.0)
+            blocked = sum(1 for p in pens if p >= block)
             print(f"Ch{lo:>3}-{lo + 9:<3}  n={len(band):>2}  "
                   f"avg_pen={sum(pens) / len(pens):>4.2f}  "
-                  f"blocked(≥2.0)={blocked}/{len(band)}")
+                  f"blocked(≥{block:g})={blocked}/{len(band)}")
         flagged = sum(1 for r in rows if r[2]["flags"])
         print(f"\nchapters with any style flag: {flagged}/{len(rows)}")
     return 0

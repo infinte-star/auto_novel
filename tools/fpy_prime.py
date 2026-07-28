@@ -235,6 +235,13 @@ def _restamp_style_penalty(sh: dict) -> dict | None:
     if float(old_total) >= float(PINNED["novel"].get("style_penalty_cap", 4.0)):
         return None
     flags = [str(f) for f in (sh.get("flags") or [])]
+    # Decoding what the ARCHIVED flags were charged at write time. The static
+    # tiers below are literals rather than a call into `quality`, because they
+    # must describe the past: they happen to equal today's values only because
+    # the static tiers never changed, and the graduation touched the trend term
+    # alone. If a static tier is ever re-tuned, subtract the OLD number here (the
+    # `pen=` field is the durable fix — flags written since the graduation carry
+    # their own charge, so future re-tunings need no literal at all).
     old_em = 0.0
     for f in flags:
         if f.startswith("em_dash_overload"):
