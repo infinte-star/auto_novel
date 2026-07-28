@@ -50,7 +50,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import _hard_block_reasons  # noqa: E402
+# The ruler itself, not a copy of it. It lives in `quality.py` rather than
+# `pipeline.py` so this zero-LLM tool does not have to import the engine to
+# borrow the engine's own definition of "this draft is a write-off".
+from quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
 
 # `_hard_block_reasons` reads a handful of `config["novel"]` thresholds. Using each
 # novel's own config would make two arms incomparable the moment their configs
@@ -100,7 +103,12 @@ def discover_novels(explicit: list[str], *, include_all: bool = False,
         produce the same first chapter even from the same brief (`tangshuting_e2e`
         is the control: same story concept, different Ch1, so it is NOT dropped),
         which makes an identical Ch1 proof of a copy/fork at genesis. Of the pair
-        the longer book is canonical; ties break alphabetically.
+        the longer book is canonical; ties break alphabetically -- but a dir that
+        is ALREADY a provable derivative by its own metadata can never take the
+        canonical slot. Without that rule a fork could out-rank the book it was
+        forked from and then be dropped itself, deleting BOTH from the aggregate:
+        measured 2026-07-28, `p4b_det` (a 25-chapter fork) claimed the slot from
+        `yeban_guize` and the library silently lost that book entirely.
 
     Explicit names are NEVER filtered -- naming two arms is how an A/B is read.
     Callers must print the returned drop list: a silently narrowed corpus reads
@@ -125,8 +133,19 @@ def discover_novels(explicit: list[str], *, include_all: bool = False,
         h = _sha(files[0]) if files else None
         if h:
             ch1[name] = h
+
+    def _meta_derivative(name: str) -> str:
+        if "__ablate_" in name or (base / "experiments" / f"ablate_{name}.json").exists():
+            return "ablation copy (engine-generated)"
+        if (base / "experiments" / f"fork_{name}.json").exists():
+            return "fork copy (engine-generated)"
+        return ""
+
     # Longer books win the canonical slot; sorted() already fixes the tie order.
-    order = sorted(all_names, key=lambda n: (-len(_chapter_files(novels / n)), n))
+    # Dirs that are derivatives by their own metadata are excluded from the
+    # competition entirely -- see the docstring's yeban_guize case.
+    order = sorted((n for n in all_names if not _meta_derivative(n)),
+                   key=lambda n: (-len(_chapter_files(novels / n)), n))
     canonical: dict[str, str] = {}
     for name in order:
         h = ch1.get(name)
@@ -134,11 +153,9 @@ def discover_novels(explicit: list[str], *, include_all: bool = False,
             canonical[h] = name
 
     for name in all_names:
-        if "__ablate_" in name or (base / "experiments" / f"ablate_{name}.json").exists():
-            dropped.append((name, "ablation copy (engine-generated)"))
-            continue
-        if (base / "experiments" / f"fork_{name}.json").exists():
-            dropped.append((name, "fork copy (engine-generated)"))
+        why = _meta_derivative(name)
+        if why:
+            dropped.append((name, why))
             continue
         h = ch1.get(name)
         src = canonical.get(h or "")
@@ -184,9 +201,18 @@ def _payload(path: Path) -> dict | None:
 # EXCLUDED — `plan_quality_replan` and `plan_hard_floor` are downstream of the rework
 # decision itself (pipeline.py:1537 / 1679). Counting them would put the release rule
 # back into the criterion, which is exactly the circularity FPY' exists to remove.
+#   card_replan                v2's beat planner had to repair or re-plan the card
+#
+# The v2 row is the same kind of event as the three above it: `beat.ensure_card`
+# only spends it when `validate_card` reported a CRITICAL problem, which is a
+# deterministic pre-write verdict with no score anywhere in it. Without it, v2
+# would get its degraded cards for free while v1 pays for its plan retries, and
+# the A/B would be comparing two different definitions of "first pass". The glob
+# matches zero v1 artifacts, so no v1 number moves.
 COUNTED_REPLANS = ("plan_initial_attempt[1-9]*_candidates.json",
                    "plan_critical_attempt*_candidates.json",
-                   "plan_fossil_catastrophe_attempt*_candidates.json")
+                   "plan_fossil_catastrophe_attempt*_candidates.json",
+                   "card_replan_attempt*.json")
 
 # Archived payloads encode the engine semantics of the day they were written, so a
 # retroactive replay reports fixed bugs as live problems unless it normalizes.
@@ -200,6 +226,27 @@ COUNTED_REPLANS = ("plan_initial_attempt[1-9]*_candidates.json",
 # misses" (wrong) and "32 misses, second to gate_rejects" (right). Normalized by
 # default; `--raw` replays the payloads verbatim.
 SUPERSEDED_CONTRACT_RULE = "由 problems 文本回填"
+
+# Two engines write `review_round0.json`, and a bucket the payload cannot express
+# reads as a PASS rather than as "not measured" — `_hard_block_reasons` fires off
+# `review.get(key)`, so an absent key is silently clean. Almost all of the
+# vocabulary is genuinely shared, which is deliberate: `v2/accept.py` calls the same
+# `quality.hard_block_reasons`, writes `gate_rejects` / `style_health` /
+# `length_band` / `opening_hook_gate` / `adjacent_repetition` under v1's own key
+# spellings, routes a CCR hard miss INTO `gate_rejects` so the one ruler sees it, and
+# fills `contract_violations` from cited canon findings via `fold_citations`.
+#
+# One bucket is not shared, measured on tangshuting Ch171-200 vs ts_v2match: v1's
+# LLM factcheck writes `contradictions`, and v2 has no key that lands in that bucket
+# (its canon findings arrive as `contract_violations` instead). v1 lost exactly one
+# chapter there in that window — Ch179, a TRUE positive, quotable verbatim and
+# contradicting Ch141 — so the bucket is not noise and its absence is not free.
+# Printed, not corrected: which arm that favours depends on the question being asked,
+# and the reader has to decide.
+ENGINE_ONLY_BUCKETS = {
+    "v1": ("hard_contradictions (from `contradictions`; v2 files canon findings "
+           "under contract_violations instead)",),
+}
 
 # Second superseded semantic, same class. `style_health`'s em-dash TREND term used to
 # charge a flat +1.0; it is now graduated by ratio (0.3 / 0.5 / 0.8 / 1.0), because a
@@ -302,13 +349,15 @@ def chapter_verdict(ch_dir: Path, *, raw: bool = False) -> dict:
     replans = sorted(set(labels))
     if r0 is None:
         return {"ch": ch, "ok": None, "reasons": ["no_round0_review"],
-                "score": None, "replans": replans, "missing": True}
+                "score": None, "replans": replans, "missing": True,
+                "engine": ""}
     reasons = _hard_block_reasons(r0, PINNED)
     reasons = [f"replanned:{lbl.replace('plan_', '')}" for lbl in replans] + reasons
     score = r0.get("score")
     return {"ch": ch, "ok": not reasons, "reasons": reasons,
             "score": float(score) if isinstance(score, (int, float)) else None,
-            "replans": replans, "missing": False}
+            "replans": replans, "missing": False,
+            "engine": str(r0.get("engine") or "v1")}
 
 
 def novel_verdicts(name: str, lo: int, hi: int, *, raw: bool = False) -> list[dict]:
@@ -357,6 +406,7 @@ def main() -> int:
 
     width = max(len(n) for n in names)
     tally: dict[str, int] = {}
+    engines: dict[str, set[str]] = {}
     t_ok = t_n = 0
     head = "FPY'"
     print(f"{'novel':<{width}}  {head:>12}  {'score>=8.0':>17}  {'self-score':>10}")
@@ -367,6 +417,7 @@ def main() -> int:
             continue
         ok, n, pct = _rate(vs)
         t_ok, t_n = t_ok + ok, t_n + n
+        engines[name] = {v["engine"] for v in vs if v["engine"]}
         scores = [v["score"] for v in vs if v["score"] is not None]
         # The score-based comparison point, computed on the SAME chapters:
         # how many would a 8.0 threshold have called clean?
@@ -401,7 +452,24 @@ def main() -> int:
         print("\nwhy first drafts failed (all chapters in range):")
         for k, c in sorted(tally.items(), key=lambda kv: -kv[1]):
             print(f"  {k:<28} {c}")
+    _print_engine_mix(engines)
     return 0
+
+
+def _print_engine_mix(engines: dict[str, set[str]]) -> None:
+    """Name the payload-vocabulary asymmetry when more than one engine is in scope."""
+    seen = sorted({e for es in engines.values() for e in es})
+    if len(seen) < 2:
+        return
+    print(f"\nENGINE MIX: {', '.join(seen)} — the arms do not write the same payload "
+          f"keys, and a bucket a payload cannot express reads as a PASS, not as "
+          f"'not measured'.")
+    for name, es in engines.items():
+        print(f"  {name}: {', '.join(sorted(es)) or '?'}")
+    for eng, buckets in ENGINE_ONLY_BUCKETS.items():
+        if eng in seen:
+            for b in buckets:
+                print(f"  only {eng} can fail: {b}")
 
 
 if __name__ == "__main__":

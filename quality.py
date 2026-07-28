@@ -35,6 +35,21 @@ from typing import Any
 # tuple is also the execution order of the repair ladder in `fix.py`.
 REPAIR_LAYERS = ("L0", "L1", "L2", "advisory")
 
+# What the gate's measured quantity is a property OF (REDESIGN_V2 §3.4 ③).
+#
+#   chapter — the text/plan of THIS attempt. Only this scope may block.
+#   card    — the ChapterCard / plan, fixable before a word is written.
+#   book    — a whole-book cumulative quantity. **Never blocks a single chapter.**
+#
+# `book` is the actionability invariant made structural. A book-cumulative ratio
+# has a numerator frozen in already-written chapters, so no rewrite of the
+# current chapter can lower it: the block latches on and every forced retry it
+# buys is a guaranteed first-pass failure. Three measured instances of exactly
+# that cost 4.0pt of library FPY' (LESSONS §13, REDESIGN_V2 §8). A book-scope
+# gate may still carry a repair layer and still emit directives — it just may
+# not reject.
+GATE_SCOPES = ("chapter", "card", "book")
+
 
 class GateRegistry:
     """Lightweight registry for deterministic quality gates."""
@@ -53,6 +68,8 @@ class GateRegistry:
         tag_prefix: str | None = None,
         phase: str = "review",
         repair: str = "advisory",
+        scope: str = "chapter",
+        proof: str = "",
     ):
         """Decorator: register gate metadata. Preserves function identity.
 
@@ -64,11 +81,30 @@ class GateRegistry:
         - ``"L2"``  plan-level: fix the plan / the NEXT card, never this prose
         - ``"advisory"`` directive only; must NOT trigger rework by itself
 
-        This is metadata, not behaviour: nothing in the review path reads it, so
-        annotating a gate cannot change its score.
+        *scope* declares whose property the gate measures (see ``GATE_SCOPES``).
+        *proof* is a one-line record of where the gate's threshold sits relative
+        to the MEASURED distribution, and it is **mandatory** — a threshold that
+        was never checked against real data is how this repo shipped two dead
+        keys (`fingerprint_warn_threshold` 0.65 against a measured max of 0.448,
+        never reachable, deleted; `book_fossil_hard_ratio` 0.20 below its own
+        candidacy floor of 0.30, always true). Both took an offline replay to
+        discover. Requiring the number at registration turns a post-mortem into
+        a compile-time obligation.
+
+        `repair`/`scope`/`proof` are metadata, not behaviour: nothing in the v1
+        review path reads them, so annotating a gate cannot change its score.
+        `v2/accept.py` is the first consumer that acts on them.
         """
         if repair not in REPAIR_LAYERS:
             raise ValueError(f"unknown repair layer {repair!r} for gate {name}")
+        if scope not in GATE_SCOPES:
+            raise ValueError(f"unknown scope {scope!r} for gate {name}")
+        if not str(proof).strip():
+            raise ValueError(
+                f"gate {name!r} must declare `proof=` — where its threshold sits "
+                f"against the measured distribution (tools/gate_census.py). "
+                f"See REDESIGN_V2 §3.4 ③."
+            )
 
         def wrapper(fn):
             self._gates[name] = {
@@ -78,6 +114,8 @@ class GateRegistry:
                 "tag_prefix": tag_prefix or name.replace("_health", "").replace("_quality", ""),
                 "phase": phase,
                 "repair": repair,
+                "scope": scope,
+                "proof": str(proof).strip(),
             }
             return fn
         return wrapper
@@ -104,6 +142,32 @@ class GateRegistry:
         spec = self._gates.get(name)
         return spec["repair"] if spec else "advisory"
 
+    def scope(self, name: str) -> str:
+        """Return the declared scope for gate *name* (unknown gates: ``"book"``).
+
+        Unknown defaults to the most restrictive scope on purpose — the same
+        reasoning as `repair()` defaulting to advisory. An unregistered signal
+        must not be able to reject a chapter.
+        """
+        spec = self._gates.get(name)
+        return spec["scope"] if spec else "book"
+
+    def proof(self, name: str) -> str:
+        spec = self._gates.get(name)
+        return spec["proof"] if spec else ""
+
+    def may_block(self, name: str) -> bool:
+        """Whether gate *name* is allowed to reject the chapter under review.
+
+        The actionability invariant: a gate may block only if the quantity it
+        measures is one THIS attempt can change. Book-cumulative quantities are
+        not, and advisory gates have no repair to offer, so neither may reject.
+        """
+        spec = self._gates.get(name)
+        if spec is None:
+            return False
+        return spec["scope"] != "book" and spec["repair"] != "advisory"
+
     def get(self, name: str):
         """Return the registered gate function, or None."""
         spec = self._gates.get(name)
@@ -113,13 +177,16 @@ class GateRegistry:
         self,
         phase: str | None = None,
         repair: str | None = None,
+        scope: str | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """List registered gates, optionally filtered by phase and/or repair layer."""
+        """List registered gates, optionally filtered by phase / repair / scope."""
         items = self._gates.items()
         if phase is not None:
             items = [(k, v) for k, v in items if v["phase"] == phase]
         if repair is not None:
             items = [(k, v) for k, v in items if v["repair"] == repair]
+        if scope is not None:
+            items = [(k, v) for k, v in items if v["scope"] == scope]
         return dict(items)
 
     @staticmethod
@@ -328,7 +395,12 @@ def em_dash_penalty(
     return penalty, flags, directives
 
 
-@REGISTRY.register("style_health", config_key="style_health_enabled", tag_prefix="style", repair="L0")
+@REGISTRY.register(
+    "style_health", config_key="style_health_enabled", tag_prefix="style", repair="L0",
+    scope="chapter",
+    proof="642-review census: ran 640, penalty>0 on 8.8%, advisory on 85.9%, "
+          "avg 0.080. The block line (style_penalty_block) sits far above the "
+          "advisory mass, so it selects a tail rather than the median.")
 def style_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -736,7 +808,11 @@ def _anaphora_runs(body: str, min_run: int = 3) -> list[int]:
     return runs
 
 
-@REGISTRY.register("ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor", repair="advisory")
+@REGISTRY.register(
+    "ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor",
+    repair="advisory", scope="chapter",
+    proof="642-review census: ran 71, fired 1.4% (1 review), avg 0.007. Rare by "
+          "design; advisory only, so the low rate is not a dead key.")
 def ai_flavor_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -951,7 +1027,12 @@ _HEDGE_WORDS = re.compile(
 )
 
 
-@REGISTRY.register("paragraph_shape_health", config_key="paragraph_shape_enabled", tag_prefix="paragraph", repair="advisory")
+@REGISTRY.register(
+    "paragraph_shape_health", config_key="paragraph_shape_enabled",
+    tag_prefix="paragraph", repair="advisory", scope="chapter",
+    proof="642-review census: never ran in the sample (config-disabled across "
+          "the corpus). Thresholds UNVALIDATED against a live distribution — "
+          "must not be given blocking power before a census shows it firing.")
 def paragraph_shape_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1094,7 +1175,12 @@ _OPENING_RELATIONSHIP_MARKERS = re.compile(
 )
 
 
-@REGISTRY.register("opening_hook_gate", config_key="opening_golden_gate_enabled", tag_prefix="opening", repair="L0")
+@REGISTRY.register(
+    "opening_hook_gate", config_key="opening_golden_gate_enabled",
+    tag_prefix="opening", repair="L0", scope="chapter",
+    proof="642-review census: never ran (gate is Ch1-scoped / config-disabled). "
+          "Its block IS chapter-actionable — `fix.promote_action_opening` "
+          "rewrites the offending opening deterministically.")
 def opening_hook_gate(
     text: str,
     chapter_num: int,
@@ -1194,7 +1280,12 @@ def opening_hook_gate(
 # ---------------------------------------------------------------------------
 
 
-@REGISTRY.register("length_band_check", config_key="length_band_penalty_enabled", config_default=False, tag_prefix="length", repair="L1")
+@REGISTRY.register(
+    "length_band_check", config_key="length_band_penalty_enabled",
+    config_default=False, tag_prefix="length", repair="L1", scope="chapter",
+    proof="642-review census: ran 640, out-of-band on 35.2%, avg pen 0.080. The "
+          "config key gates only the PENALTY -- the gate itself always runs, so "
+          "`REGISTRY.is_enabled` is not a 'did it run' test for this one.")
 def length_band_check(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1248,7 +1339,13 @@ _FLAT_STRONG_PAYOFF_TYPES = {
 }
 
 
-@REGISTRY.register("flat_chapter_streak", config_key="flat_streak_gate_enabled", tag_prefix="flat_streak", repair="advisory")
+@REGISTRY.register(
+    "flat_chapter_streak", config_key="flat_streak_gate_enabled",
+    tag_prefix="flat_streak", repair="advisory", scope="chapter",
+    proof="642-review census: never ran in the sample (config-disabled across the "
+          "corpus). Streak-over-window, but the current chapter's own flatness is "
+          "a conjunct, so a non-flat chapter breaks it -- window scope does not "
+          "make it a latching gate.")
 def flat_chapter_streak(
     recent_rows: list[dict[str, Any]] | None,
     config: dict[str, Any] | None = None,
@@ -1483,7 +1580,14 @@ def location_transition(
 # fed into both the draft loop (regenerate) and review (cap + reject).
 # ---------------------------------------------------------------------------
 
-@REGISTRY.register("adjacent_repetition", config_key="adjacent_repeat_enabled", tag_prefix="repeat", repair="L2")
+@REGISTRY.register(
+    "adjacent_repetition", config_key="adjacent_repeat_enabled",
+    tag_prefix="repeat", repair="L2", scope="chapter",
+    proof="642-review census: ran 632, fired 0.0% -- SILENT. Per LESSONS 4 a "
+          "silent gate is a bug report, not a deletion candidate: either the "
+          "threshold is unreachable (the fingerprint_warn_threshold defect) or "
+          "adjacent verbatim reuse really is absent. UNRESOLVED; must not be "
+          "given new blocking weight until a census tells them apart.")
 def adjacent_repetition(
     text: str,
     prev_text: str,
@@ -1538,7 +1642,13 @@ def adjacent_repetition(
     return result
 
 
-@REGISTRY.register("hook_tail_repetition", config_key="adjacent_repeat_enabled", tag_prefix="hook", repair="L1")
+@REGISTRY.register(
+    "hook_tail_repetition", config_key="adjacent_repeat_enabled",
+    tag_prefix="hook", repair="L1", scope="chapter",
+    proof="642-review census: never ran in the sample. Shares "
+          "`adjacent_repeat_enabled` with adjacent_repetition, so the two cannot "
+          "be enabled independently -- a config-shape wart, not a threshold "
+          "claim. Thresholds UNVALIDATED.")
 def hook_tail_repetition(
     text: str,
     prev_texts: list[str] | None,
@@ -1585,7 +1695,12 @@ def hook_tail_repetition(
 # this fine because each paragraph reads well in isolation. This deterministic
 # check measures how much the chapter's TAIL re-states its own EARLIER content.
 
-@REGISTRY.register("intra_chapter_repetition", config_key="intra_repeat_enabled", tag_prefix="repeat", repair="L1")
+@REGISTRY.register(
+    "intra_chapter_repetition", config_key="intra_repeat_enabled",
+    tag_prefix="repeat", repair="L1", scope="chapter",
+    proof="642-review census: ran 640, fired 0.2% (1 review), avg 0.001. Nearly "
+          "silent -- same UNRESOLVED question as adjacent_repetition, but the "
+          "single hit proves the threshold is at least reachable.")
 def intra_chapter_repetition(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1677,7 +1792,14 @@ def _normalize_clause(s: str) -> str:
     return re.sub(r"[0-9一二三四五六七八九十两零]+", "#", s)
 
 
-@REGISTRY.register("cross_chapter_repetition", config_key="style_cross_repeat_enabled", tag_prefix="repeat", repair="L0")
+@REGISTRY.register(
+    "cross_chapter_repetition", config_key="style_cross_repeat_enabled",
+    tag_prefix="repeat", repair="L0", scope="chapter",
+    proof="642-review census: ran 640, fired 72.5%, of which 23.0% advisory and "
+          "the rest reject-level; avg pen 0.130 -- the single largest penalty "
+          "source in the library. Six-chapter WINDOW, but the current chapter's "
+          "own use of the clause is a conjunct, so keep-1 rotation clears it: "
+          "chapter scope, not book.")
 def cross_chapter_repetition(
     text: str,
     prior_texts: list[str] | None,
@@ -1799,7 +1921,37 @@ def _overlaps_kept(phrase: str, kept: list[str], min_shared: int = 4) -> bool:
     return False
 
 
-@REGISTRY.register("book_wide_fossils", config_key="book_fossil_enabled", tag_prefix="fossil", repair="L0")
+def fossil_whitelist(config: dict[str, Any] | None = None,
+                     prompt_text: str = "") -> set[str]:
+    """Phrases `book_wide_fossils` must never indict: the configured list plus
+    every 《…》/「…」 proper noun in the creative brief.
+
+    Pure so both callers share one definition — `review.py` (the v1 arm) and
+    `v2/run.py`. A whitelist that differed between the arms would let one of them
+    be charged for a book's own title.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    out: set[str] = set()
+    for w in str(cfg.get("book_fossil_whitelist", "")).split(","):
+        w = w.strip()
+        if len(w) >= 2:
+            out.add(w)
+    for m in re.findall(r"[《「]([^》」]{2,10})[》」]", prompt_text or ""):
+        out.add(m)
+    return out
+
+
+@REGISTRY.register(
+    "book_wide_fossils", config_key="book_fossil_enabled", tag_prefix="fossil",
+    repair="L0", scope="chapter",
+    proof="642-review census: ran 118, fired 88.1%, avg pen 0.000 (advisory "
+          "directives, not score). THE gate this invariant was written for. Its "
+          "ratio is book-cumulative and frozen, so pre-fix it latched ON and "
+          "rejected chapters that did not contain the phrase -- scope would have "
+          "read `book` and `may_block` would have been False. The `in_current` "
+          "conjunct added in the latching sweep is what earns it `chapter`: "
+          "writing without the phrase now clears it. Worth +6.2pt library FPY' "
+          "(tools/replay_gates.py --fix A).")
 def book_wide_fossils(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
@@ -1941,7 +2093,12 @@ def book_wide_fossils(
 # toward narration/internal-monologue when unconstrained.
 # ---------------------------------------------------------------------------
 
-@REGISTRY.register("dialogue_health", config_key="dialogue_health_enabled", tag_prefix="dialogue", repair="L1")
+@REGISTRY.register(
+    "dialogue_health", config_key="dialogue_health_enabled",
+    tag_prefix="dialogue", repair="L1", scope="chapter",
+    proof="642-review census: ran 83, fired 31.3%, avg pen 0.128. Ran on only "
+          "13% of reviews because the key is per-novel; where it ran, the "
+          "0.10 floor selects a real minority rather than the median.")
 def dialogue_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -2114,7 +2271,13 @@ _STOPWORD_TRIGRAMS = frozenset({
 })
 
 
-@REGISTRY.register("descriptor_frequency", config_key="descriptor_freq_enabled", tag_prefix="descriptor", repair="L0")
+@REGISTRY.register(
+    "descriptor_frequency", config_key="descriptor_freq_enabled",
+    tag_prefix="descriptor", repair="L0", scope="chapter",
+    proof="642-review census: ran 22, fired 90.9%, avg pen 1.364 -- by far the "
+          "heaviest per-fire penalty in the library, on the smallest sample. "
+          "Firing on 20 of 22 means the threshold is at or below the typical "
+          "value where it runs; RECALIBRATION CANDIDATE, not a dead key.")
 def descriptor_frequency(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
@@ -2286,7 +2449,13 @@ GENRE_KEYWORDS: dict[str, dict[str, list[str]]] = {
 }
 
 
-@REGISTRY.register("genre_adherence", config_key="genre_adherence_enabled", tag_prefix="genre", repair="L2")
+@REGISTRY.register(
+    "genre_adherence", config_key="genre_adherence_enabled", tag_prefix="genre",
+    repair="L2", scope="chapter",
+    proof="642-review census: ran 206, fired 0.0% -- SILENT on a large sample. "
+          "Strongest dead-key suspect in the registry (fingerprint_warn_threshold "
+          "profile: 0 hits in 206 chances). Deletion still needs a distribution "
+          "read, not silence alone -- LESSONS 4.")
 def genre_adherence(
     text: str,
     recent_scores: list[float] | None = None,
@@ -2483,7 +2652,14 @@ def _fragment_hit(fragment: str, chapter_text: str, chapter_bigrams: set[str], m
     return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= min_bigram_cov
 
 
-@REGISTRY.register("beat_coverage", config_key="beat_coverage_enabled", tag_prefix="beat", phase="pipeline", repair="L1")
+@REGISTRY.register(
+    "beat_coverage", config_key="beat_coverage_enabled", tag_prefix="beat",
+    phase="pipeline", repair="L1", scope="chapter",
+    proof="642-review census does not reach it: the census samples review "
+          "payloads and this is a pipeline-phase gate. It is the direct ancestor "
+          "of v2's CCC (does the prose fulfil what the plan promised), so its "
+          "calibration is settled by CCR in tools/ccr_baseline.py, not by "
+          "gate_census.")
 def beat_coverage(
     chapter_text: str,
     plan: dict[str, Any],
@@ -2579,7 +2755,16 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-@REGISTRY.register("scene_similarity", config_key="scene_dedupe_enabled", tag_prefix="scene", phase="planning", repair="L2")
+@REGISTRY.register(
+    "scene_similarity", config_key="scene_dedupe_enabled", tag_prefix="scene",
+    phase="planning", repair="L2", scope="card",
+    proof="Planning-phase, so gate_census (review payloads) never sees it; "
+          "measured instead by tools/replay_gates.py, which replays real plans: "
+          "max_sim lands at 0.04-0.07 against a 0.82 block line on the 18 "
+          "tangshuting_e2e chapters where it was blamed. The block line is "
+          "therefore far above the observed mass -- NEAR-DEAD, and the "
+          "`scene_dedupe_retry` event that looked like its fire is the generic "
+          "duplicate_blocked marker shared with two other gates.")
 def scene_similarity(plan: dict[str, Any], recent_plans: list[dict[str, Any]]) -> dict[str, Any]:
     """Max Jaccard similarity of this plan's skeleton vs each recent plan.
 
@@ -2752,7 +2937,14 @@ _CONCRETE_ACTION_SIG = re.compile(
 )
 
 
-@REGISTRY.register("plan_executability_gate", config_key="plan_executability_gate_enabled", tag_prefix="plan", phase="planning", repair="L2")
+@REGISTRY.register(
+    "plan_executability_gate", config_key="plan_executability_gate_enabled",
+    tag_prefix="plan", phase="planning", repair="L2", scope="card",
+    proof="Planning-phase; invisible to gate_census. Sits LAST in "
+          "planning.create_plan's sequential gate chain, so every gate above it "
+          "steals its chances -- replay_gates had to re-run the whole chain to "
+          "give it its first look. Blocks a CARD, which is free to fix before a "
+          "word is written; that is why card scope may block.")
 def plan_executability_gate(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Deterministic check that the plan's payoff/climax is a shootable action.
 
@@ -2906,7 +3098,13 @@ def _sequence_similarity(a: list[str], b: list[str]) -> float:
     return 0.7 * set_sim + 0.3 * order_sim
 
 
-@REGISTRY.register("narrative_pattern_repetition", config_key="narrative_pattern_enabled", tag_prefix="pattern", phase="planning", repair="L2")
+@REGISTRY.register(
+    "narrative_pattern_repetition", config_key="narrative_pattern_enabled",
+    tag_prefix="pattern", phase="planning", repair="L2", scope="card",
+    proof="Planning-phase; invisible to gate_census. Shares the generic "
+          "`duplicate_blocked` retry marker with scene_similarity and "
+          "chapter_mode_monotony, so per-gate attribution needs "
+          "tools/replay_gates.py, never the event log.")
 def narrative_pattern_repetition(
     plan: dict[str, Any],
     recent_plans: list[dict[str, Any]],
@@ -3065,7 +3263,14 @@ _CONCRETE_VISUAL_NOUNS = (
 )
 
 
-@REGISTRY.register("plan_visual_payoff_check", config_key="plan_visual_payoff_enabled", config_default=True, tag_prefix="plan", phase="planning", repair="L2")
+@REGISTRY.register(
+    "plan_visual_payoff_check", config_key="plan_visual_payoff_enabled",
+    config_default=True, tag_prefix="plan", phase="planning", repair="L2",
+    scope="card",
+    proof="Planning-phase; invisible to gate_census. Its blocking half is "
+          "additionally gated by `visual_payoff_blocks_plan`, which defaults OFF "
+          "in serial narrative mode -- so 'it never fired' can mean the mode, not "
+          "the threshold. Measured only via tools/replay_gates.py.")
 def plan_visual_payoff_check(plan: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Detect abstract mystery payoffs before prose generation.
 
@@ -3173,7 +3378,13 @@ _PSEUDO_TECH_TERMS = re.compile(
 )
 
 
-@REGISTRY.register("prose_texture", config_key="prose_texture_enabled", tag_prefix="texture", repair="advisory")
+@REGISTRY.register(
+    "prose_texture", config_key="prose_texture_enabled", tag_prefix="texture",
+    repair="advisory", scope="chapter",
+    proof="642-review census: ran 640, fired 46.7%, avg pen 0.001. Fires on "
+          "roughly half of everything at a negligible penalty -- a descriptive "
+          "signal, correctly advisory. Giving it a block line at this rate would "
+          "reject half the library.")
 def prose_texture(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3251,7 +3462,13 @@ def prose_texture(
     }
 
 
-@REGISTRY.register("emotional_cadence", config_key="emotional_cadence_enabled", config_default=True, tag_prefix="cadence", phase="planning", repair="L2")
+@REGISTRY.register(
+    "emotional_cadence", config_key="emotional_cadence_enabled",
+    config_default=True, tag_prefix="cadence", phase="planning", repair="L2",
+    scope="card",
+    proof="Planning-phase; invisible to gate_census. Measures the tension "
+          "sequence across recent CARDS, and the current card's own value is a "
+          "conjunct, so a differently-pitched chapter escapes it.")
 def emotional_cadence(
     recent_tones: list[str],
     config: dict[str, Any] | None = None,
@@ -3489,7 +3706,14 @@ def chapter_mode_monotony(
     return result
 
 
-@REGISTRY.register("long_span_fatigue", config_key="long_span_fatigue_enabled", tag_prefix="fatigue", repair="advisory")
+@REGISTRY.register(
+    "long_span_fatigue", config_key="long_span_fatigue_enabled",
+    tag_prefix="fatigue", repair="advisory", scope="book",
+    proof="642-review census: ran 71, fired 62.0%, avg pen 0.352. THE clearest "
+          "book-scope quantity in the registry -- fatigue accumulated over a long "
+          "span of finished chapters, which the chapter under review cannot "
+          "lower. Advisory is the only correct layer for it; `may_block` returns "
+          "False on both counts.")
 def long_span_fatigue(
     conn: Any,
     chapter_num: int,
@@ -3607,7 +3831,11 @@ _PAYOFF_MARKERS = re.compile(
 )
 
 
-@REGISTRY.register("payoff_beat_density", config_key="payoff_density_enabled", tag_prefix="payoff", repair="advisory")
+@REGISTRY.register(
+    "payoff_beat_density", config_key="payoff_density_enabled",
+    tag_prefix="payoff", repair="advisory", scope="chapter",
+    proof="642-review census: never ran in the sample (config-disabled across "
+          "the corpus). Thresholds UNVALIDATED against a live distribution.")
 def payoff_beat_density(
     text: str,
     recent_payoff_types: list[str] | None = None,
@@ -3690,7 +3918,12 @@ def _quotable_score(line: str) -> float:
     return s
 
 
-@REGISTRY.register("shareable_line", config_key="shareable_line_enabled", tag_prefix="shareable", repair="advisory")
+@REGISTRY.register(
+    "shareable_line", config_key="shareable_line_enabled",
+    tag_prefix="shareable", repair="advisory", scope="chapter",
+    proof="642-review census: ran 640, fired 6.4%. A tail selector at a "
+          "negligible penalty -- reachable (so not a dead key) and rare enough "
+          "that the signal means something.")
 def shareable_line(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3745,7 +3978,11 @@ def shareable_line(
     return result
 
 
-@REGISTRY.register("information_density", config_key="info_density_enabled", tag_prefix="info", repair="advisory")
+@REGISTRY.register(
+    "information_density", config_key="info_density_enabled", tag_prefix="info",
+    repair="advisory", scope="chapter",
+    proof="642-review census: ran 640, fired 6.9%. Same tail-selector profile as "
+          "shareable_line: reachable, rare, correctly advisory.")
 def information_density(
     text: str,
     plan: dict[str, Any] | None = None,
@@ -3802,3 +4039,59 @@ def information_density(
             "本章必须至少做到其一并落到页面上：引入关键新信息、推进/兑现一条伏线、或制造一次冲突升级。"
         )
     return {"low_information": low_info, "signals": signals, "directives": directives}
+
+
+# ---------------------------------------------------------------------------
+# The release ruler.
+#
+# Moved here from `pipeline.py` so exactly ONE definition exists. It is the
+# acceptance rule that `tools/fpy_prime.py` replays to settle every engine A/B,
+# it is what `rework_trigger: deterministic` consults, and v2's `accept.py`
+# scores against it too. Two copies of a ruler is two different experiments.
+# Living in `quality.py` also means a zero-LLM offline tool can import it
+# without pulling in the whole engine.
+# ---------------------------------------------------------------------------
+
+
+def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[str]:
+    """Enumerate the DETERMINISTIC reasons this draft is a write-off.
+
+    These are the checks in `review.py` that set ``accepted = False`` on their own
+    evidence rather than by comparing the LLM's self-score against a threshold:
+    gate rejects, style collapse, hard factcheck contradictions, gross length,
+    hard blocks from the opening / adjacent-repetition gates, and a pile-up of
+    unmet arbiter constraints. Every one of them is measured, not judged.
+    """
+    cfg = config["novel"]
+    reasons: list[str] = []
+
+    grs = [g for g in (review.get("gate_rejects") or []) if isinstance(g, dict)]
+    if grs:
+        reasons.append("gate_rejects=" + ",".join(str(g.get("gate", "?")) for g in grs[:4]))
+
+    sh_pen = float((review.get("style_health") or {}).get("penalty", 0.0) or 0.0)
+    if sh_pen >= float(cfg.get("style_penalty_block", 2.0)):
+        reasons.append(f"style_collapse(penalty={sh_pen:.1f})")
+
+    if bool(cfg.get("factcheck_hard_blocks_accept", True)):
+        hard = [c for c in (review.get("contradictions") or [])
+                if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
+        if hard:
+            reasons.append(f"hard_contradictions={len(hard)}")
+
+    hard_contract = [c for c in (review.get("contract_violations") or [])
+                     if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
+    if hard_contract and bool(cfg.get("contract_blocks_accept", True)):
+        reasons.append(f"hard_contract={len(hard_contract)}")
+
+    for key, label in (("length_band", "length_band"), ("opening_hook_gate", "opening_gate")):
+        if (review.get(key) or {}).get("block"):
+            reasons.append(f"{label}_block")
+    if str((review.get("adjacent_repetition") or {}).get("level", "")) == "block":
+        reasons.append("adjacent_repeat_block")
+
+    failed = review.get("constraint_violations_structured") or []
+    if len(failed) >= int(cfg.get("constraint_violation_block_count", 3)):
+        reasons.append(f"constraints_unmet={len(failed)}")
+
+    return reasons

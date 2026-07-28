@@ -767,48 +767,15 @@ def _apply_force_accept_patches(
     return patched, new_review
 
 
-def _hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[str]:
-    """Enumerate the DETERMINISTIC reasons this draft is a write-off.
+# THE release ruler. Defined in `quality.py` so exactly one copy exists: both
+# engines and the three offline settlement tools (`fpy_prime`, `replay_gates`,
+# `pairwise_ab`) must judge by the same list, and importing `pipeline` to get it
+# would drag the whole v1 engine into a zero-LLM tool. The private alias keeps
+# every existing call site — and `pipeline._hard_block_reasons` in the docs —
+# working unchanged.
+from quality import hard_block_reasons  # noqa: E402
 
-    These are the checks in `review.py` that set ``accepted = False`` on their own
-    evidence rather than by comparing the LLM's self-score against a threshold:
-    gate rejects, style collapse, hard factcheck contradictions, gross length,
-    hard blocks from the opening / adjacent-repetition gates, and a pile-up of
-    unmet arbiter constraints. Every one of them is measured, not judged.
-    """
-    cfg = config["novel"]
-    reasons: list[str] = []
-
-    grs = [g for g in (review.get("gate_rejects") or []) if isinstance(g, dict)]
-    if grs:
-        reasons.append("gate_rejects=" + ",".join(str(g.get("gate", "?")) for g in grs[:4]))
-
-    sh_pen = float((review.get("style_health") or {}).get("penalty", 0.0) or 0.0)
-    if sh_pen >= float(cfg.get("style_penalty_block", 2.0)):
-        reasons.append(f"style_collapse(penalty={sh_pen:.1f})")
-
-    if bool(cfg.get("factcheck_hard_blocks_accept", True)):
-        hard = [c for c in (review.get("contradictions") or [])
-                if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
-        if hard:
-            reasons.append(f"hard_contradictions={len(hard)}")
-
-    hard_contract = [c for c in (review.get("contract_violations") or [])
-                     if isinstance(c, dict) and str(c.get("severity", "")).lower() == "hard"]
-    if hard_contract and bool(cfg.get("contract_blocks_accept", True)):
-        reasons.append(f"hard_contract={len(hard_contract)}")
-
-    for key, label in (("length_band", "length_band"), ("opening_hook_gate", "opening_gate")):
-        if (review.get(key) or {}).get("block"):
-            reasons.append(f"{label}_block")
-    if str((review.get("adjacent_repetition") or {}).get("level", "")) == "block":
-        reasons.append("adjacent_repeat_block")
-
-    failed = review.get("constraint_violations_structured") or []
-    if len(failed) >= int(cfg.get("constraint_violation_block_count", 3)):
-        reasons.append(f"constraints_unmet={len(failed)}")
-
-    return reasons
+_hard_block_reasons = hard_block_reasons
 
 
 def _rework_needed(

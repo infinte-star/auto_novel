@@ -115,6 +115,60 @@ class BookFossilNotLatchingTest(unittest.TestCase):
             book_wide_fossils(book, _cfg(book_fossil_enabled=False), current_chapter=3)["fossils"], [])
 
 
+class BookFossilFirstDraftCorpusTest(unittest.TestCase):
+    """What corpus the engines pass, and what that does to the hard reject.
+
+    Not a restatement of `in_current`: the fix above makes a hard reject require the
+    chapter under review to CONTAIN the phrase, and this pins the consequence of the
+    corpus the callers actually build. `review.py` iterates `range(1, chapter_num + 1)`
+    but guards each entry with `p.exists()`, and on a first draft the chapter has not
+    been saved yet (`save_chapter` runs after the review), so the corpus is Ch1..n-1
+    and `in_current` is False for every candidate. The hard reject therefore cannot
+    fire on a first draft in EITHER engine — it needs a resume, where the file is
+    already on disk.
+
+    This is why `tools/replay_gates.py` recomputes the gate instead of asking whether
+    the phrase appears in the chapter text: measured on tangshuting Ch171-200, the
+    text-presence proxy kept 3 rejects (Ch185/195/200) that the live engine cannot
+    produce, reading 80.0% where the faithful replay reads 86.7%.
+    """
+
+    def test_the_chapter_under_review_missing_from_the_corpus_means_no_hard_reject(self):
+        book = _book(range(1, 11), 10)          # every chapter uses the fossil
+        first_draft = {ch: t for ch, t in book.items() if ch != 10}
+        self.assertEqual(
+            book_wide_fossils(first_draft, _cfg(), current_chapter=10)["hard_fossils"], [],
+            "with Ch10 absent from the corpus the gate cannot see it use the phrase")
+        self.assertTrue(
+            book_wide_fossils(book, _cfg(), current_chapter=10)["hard_fossils"],
+            "including Ch10 is what makes the same phrase hard — the corpus is the "
+            "whole difference")
+
+    def test_avoidance_pressure_survives_as_advisory_on_the_first_draft_path(self):
+        # The gate going quiet must not mean the writer stops being warned.
+        res = book_wide_fossils({ch: t for ch, t in _book(range(1, 11), 10).items()
+                                 if ch != 10}, _cfg(), current_chapter=10)
+        self.assertIn(FOSSIL, res["phrases"])
+        self.assertTrue(res["directives"])
+
+    def test_both_engines_build_the_same_first_draft_corpus(self):
+        # A source assertion, because the equality is what makes the v1/v2 A/B one
+        # ruler. If either side starts feeding the draft in, its arm gets a strictly
+        # stricter gate than the other and the comparison silently tilts.
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        v1 = (root / "review.py").read_text(encoding="utf-8")
+        self.assertRegex(
+            v1, r"for num in range\(1, chapter_num \+ 1\):\s*\n\s*p = chapter_path",
+            "review.py's fossil corpus loop changed shape")
+        self.assertIn("if p.exists():", v1)
+        v2 = (root / "v2" / "run.py").read_text(encoding="utf-8")
+        self.assertTrue(
+            re.search(r"_chapter_texts\(paths, 1, chapter_num\)", v2),
+            "v2/run.py:load_corpus no longer passes the Ch1..n slice review.py does")
+
+
 REASONING = "推理"      # baseline form for suspense / rule-horror
 RELATIONAL = "结盟"
 ACTION = "追击"

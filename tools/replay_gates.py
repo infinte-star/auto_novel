@@ -20,8 +20,12 @@ is an ERROR, not a silent no-op: it used to print an authoritative `+0.0pt` for 
 fix that actually buys +6.0pt.
 
   A  book_wide_fossils_ratio now requires the chapter under review to actually
-     CONTAIN the entrenched phrase. Replayed by dropping archived gate_rejects
-     whose recorded phrases appear nowhere in the chapter text.
+     CONTAIN the entrenched phrase. Replayed by RECOMPUTING the gate against the
+     corpus the live engine passes on a first draft (Ch1..n-1 — the chapter under
+     review is not saved yet), and dropping the reject when that yields no hard
+     fossil. A text-presence proxy is the fallback for when the recompute is
+     unavailable; it is strictly weaker, because the corpus rule means a hard
+     reject cannot fire on a first draft AT ALL. See `_live_hard_fossils`.
 
   B  chapter_mode_monotony now measures the monotony FRACTION with the unbiased
      classifier. Replayed by re-running the WHOLE pre-write plan-gate chain on
@@ -61,7 +65,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import config as config_mod  # noqa: E402
-from pipeline import _hard_block_reasons  # noqa: E402
+from quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
 from tools.fpy_prime import (COUNTED_REPLANS, PINNED, _normalize,  # noqa: E402
                              _payload, discover_novels, print_exclusions)
 
@@ -135,6 +139,44 @@ def _chapter_text(novel: Path, ch: int) -> str:
             except Exception:
                 return ""
     return ""
+
+
+def _live_hard_fossils(novel: Path, ch: int, cfg: dict) -> list[str] | None:
+    """`book_wide_fossils`'s hard set as the LIVE engine would compute it at Ch`ch`.
+
+    The corpus is the load-bearing detail, and a text-presence proxy gets it wrong.
+    `review.py` builds `texts` over `range(1, chapter_num + 1)` but guards each entry
+    with `p.exists()`, and on a first draft the chapter under review has NOT been
+    saved yet (`save_chapter` runs after the review), so the corpus is Ch1..n-1.
+    `in_current` is therefore False for every candidate, and a hard reject cannot
+    fire on a first draft at all — it needs a resume, where the file is already on
+    disk. `v2/run.py:load_corpus` passes the same Ch1..n-1 slice on purpose, so the
+    two engines agree.
+
+    Measured on tangshuting Ch185/195/200: corpus Ch1..n-1 yields NO hard fossil,
+    while including the chapter yields 「声音压得很低」 at frac 0.41. All three carry an
+    archived `book_wide_fossils_ratio` reject, so the proxy — "is the phrase in this
+    chapter's text?" — keeps three rejects the current engine cannot produce.
+
+    Returns None when the answer cannot be computed (missing chapters, gate raised),
+    which the caller must treat as "keep the archived reject" rather than as a pass.
+    """
+    try:
+        import quality
+        texts: dict[int, str] = {}
+        for n in range(1, ch):
+            t = _chapter_text(novel, n)
+            if t:
+                texts[n] = t
+        if not texts:
+            return None
+        prompt = novel / "prompt.md"
+        wl = quality.fossil_whitelist(
+            cfg, prompt.read_text(encoding="utf-8") if prompt.exists() else "")
+        bf = quality.book_wide_fossils(texts, cfg, whitelist=wl, current_chapter=ch)
+        return [str(h.get("phrase")) for h in (bf.get("hard_fossils") or [])]
+    except Exception:
+        return None
 
 
 def _plans(novel: Path) -> dict[int, dict]:
@@ -292,12 +334,18 @@ def replay_novel(name: str, lo: int, hi: int, fixes: set[str], detail: bool):
         why: list[str] = []
 
         if "A" in fixes:
-            text = _chapter_text(novel, ch)
             keep = []
             for g in (r0.get("gate_rejects") or []):
                 if isinstance(g, dict) and g.get("gate") == "book_wide_fossils_ratio":
+                    live = _live_hard_fossils(novel, ch, cfg)
+                    if live is not None and not live:
+                        why.append("A:no_hard_fossil_live")
+                        continue
                     phrases = [str(p) for p in (g.get("phrases") or []) if p]
-                    # No recorded evidence -> cannot prove absence, keep the reject.
+                    # Recompute unavailable (or still hard): fall back to the weaker
+                    # proxy, which can only ever drop a subset of what the recompute
+                    # would. No recorded evidence -> cannot prove absence, keep it.
+                    text = _chapter_text(novel, ch)
                     if phrases and not any(p in text for p in phrases):
                         why.append("A:fossil_not_in_chapter")
                         continue

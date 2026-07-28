@@ -1,0 +1,373 @@
+"""v2 planning: the card contract, the two-layer roll, and the cost of failure.
+
+The thing that can go quietly wrong here is not a crash. It is a card that came
+from somewhere other than an arc plan — a repair, a solo re-plan, or worst, a
+fabrication — being reported as if the arc had produced it. Every CCR number in
+the A/B is measured against these cards, so provenance is a tested property, and
+so is the archive path the measurement tool reads.
+"""
+import json
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import store
+from checkpoint import load_checkpoint
+from config import Paths
+from v2 import beat, canon
+
+
+def _paths(root: Path) -> Paths:
+    p = Paths(
+        book=root / "book.md", state=root / "state.md", title=root / "title.txt",
+        bible=root / "b.md", characters=root / "c.md", timeline=root / "t.md",
+        threads=root / "th.md", volume_plan=root / "vp.md", compass=root / "cp.md",
+        voices=root / "vs.md", voice=root / "v.md", contract=root / "ct.md",
+        glossary=root / "g.md", chapters_dir=root / "chapters",
+        logs_dir=root / "logs", database=root / "story_state.db",
+    )
+    p.logs_dir.mkdir(parents=True, exist_ok=True)
+    p.bible.write_text("世界设定", encoding="utf-8")
+    p.characters.write_text("人物表", encoding="utf-8")
+    return p
+
+
+def _config(**over) -> dict:
+    novel = {"max_chapters": 0, "arc_span": 10, "scene_dedupe_enabled": False,
+             "plan_validate_deep": False}
+    novel.update(over)
+    return {"novel": novel, "api": {"metrics_enabled": False}}
+
+
+def _card(ch: int, **over) -> dict:
+    """A card an arc planner could plausibly have emitted.
+
+    `opening_type` / `payoff_type` / `where` rotate with the chapter number,
+    because a run of identical ones is precisely what `validate_card` rejects —
+    a fixture without rotation makes every test a repair-path test by accident.
+    """
+    from arc import OPENING_TYPES
+
+    card = {
+        "ch": ch, "title": f"第{ch}章", "where": f"县医院三楼旧档案室{ch}号房",
+        "who": ["汤舒婷", "顾峥"], "pov_character": "汤舒婷",
+        "wants": "拿到母亲的病历原件", "blocked_by": "档案室的铁柜被换了新锁",
+        "turn": "顾峥把钥匙拍在柜面上", "payoff": "病历第三页少了一张化验单",
+        "payoff_type": ("reveal", "reversal", "emotional")[ch % 3],
+        "conflict_type": "institution",
+        "beats": ["汤舒婷推开档案室的门", "顾峥把钥匙拍在柜面上", "两人翻到第三页"],
+        "exit_hook": "走廊尽头的灯忽然全灭了",
+        "opening_type": OPENING_TYPES[ch % len(OPENING_TYPES)],
+        "forbid": ["声音压得很低"],
+    }
+    card.update(over)
+    return card
+
+
+class FakeCall:
+    """Stands in for `llm.call_llm`. Records every call; answers by tag."""
+
+    def __init__(self, **by_tag):
+        self.by_tag = by_tag
+        self.calls: list[dict] = []
+
+    def __call__(self, client, paths, config, system, user, **kw):
+        self.calls.append({"system": system, "user": user, **kw})
+        payload = self.by_tag.get(kw.get("tag"), {})
+        if callable(payload):
+            payload = payload(len([c for c in self.calls if c["tag"] == kw["tag"]]))
+        return json.dumps(payload, ensure_ascii=False)
+
+    def tags(self) -> list[str]:
+        return [c["tag"] for c in self.calls]
+
+
+# ---------------------------------------------------------------------------
+
+
+class SystemPromptTest(unittest.TestCase):
+
+    def test_the_arc_rules_have_one_home(self):
+        # If this ever becomes a copy, the two engines drift and neither is wrong.
+        from arc import ARC_SYSTEM
+        self.assertIn(ARC_SYSTEM, beat.ARC_SYSTEM_V2)
+        self.assertIn("next_arc", beat.ARC_SYSTEM_V2)
+
+
+class CheckpointContractTest(unittest.TestCase):
+
+    def test_the_card_is_archived_where_the_ccr_tool_reads_it(self):
+        from tools.ccr_baseline import CARD_CHECKPOINT
+        self.assertEqual(beat.CARD_CHECKPOINT, CARD_CHECKPOINT)
+
+
+class SkeletonTest(unittest.TestCase):
+
+    def test_lines_outside_the_next_window_are_dropped_not_renumbered(self):
+        # A line the model pinned to the wrong chapter is a guess about the wrong
+        # chapter; sliding it into an empty slot would launder that into a plan.
+        skel = beat.normalize_skeleton(
+            {"intent": "收束", "chapters": [{"ch": 11, "line": "甲"},
+                                            {"ch": 99, "line": "乙"}]},
+            [11, 12])
+        self.assertEqual(skel["chapters"], {"11": "甲"})
+
+    def test_a_dict_shaped_skeleton_is_accepted_too(self):
+        skel = beat.normalize_skeleton({"chapters": {"11": "甲"}}, [11])
+        self.assertEqual(skel["chapters"], {"11": "甲"})
+
+    def test_junk_is_none_not_an_empty_promise(self):
+        self.assertIsNone(beat.normalize_skeleton(None, [1]))
+        self.assertIsNone(beat.normalize_skeleton("nope", [1]))
+        self.assertIsNone(beat.normalize_skeleton({"chapters": []}, [1]))
+
+    def test_an_intent_with_no_lines_still_counts(self):
+        self.assertEqual(beat.normalize_skeleton({"intent": "收束"}, [1])["intent"], "收束")
+
+    def test_the_block_renders_only_the_chapters_being_planned(self):
+        skel = {"intent": "推进", "chapters": {"11": "甲", "12": "乙"}}
+        block = beat.skeleton_block(skel, [11])
+        self.assertIn("Ch11: 甲", block)
+        self.assertNotIn("乙", block)
+
+    def test_no_skeleton_renders_to_nothing(self):
+        self.assertEqual(beat.skeleton_block(None, [1]), "")
+        self.assertEqual(beat.skeleton_block({"chapters": {}}, [1]), "")
+
+    def test_the_previous_arcs_skeleton_is_found_one_span_back(self):
+        store_data = {"arcs": {"1": {"next_skeleton": {"intent": "甲", "chapters": {}}}}}
+        self.assertEqual(beat._previous_skeleton(store_data, 11, 10)["intent"], "甲")
+        self.assertIsNone(beat._previous_skeleton(store_data, 21, 10))
+
+
+class PromptTest(unittest.TestCase):
+
+    def _state(self):
+        return canon.build(11, brief="纲要", bible="世界", voice="声音",
+                           open_threads=[{"id": "t", "description": "铜钥匙未收"}])
+
+    def test_the_request_pins_the_exact_chapter_numbers(self):
+        user = beat.arc_user_prompt(self._state(), [11, 12, 13])
+        self.assertIn("[11, 12, 13]", user)
+
+    def test_the_stable_half_is_not_in_the_user_message(self):
+        # It rides as `cacheable_prefix`; duplicating it would double the prompt
+        # and move the bytes the cache keys on.
+        user = beat.arc_user_prompt(self._state(), [11])
+        self.assertNotIn("世界", user)
+        self.assertIn("铜钥匙未收", user)
+
+    def test_absent_sections_emit_no_empty_headers(self):
+        user = beat.arc_user_prompt(self._state(), [11])
+        self.assertNotIn("卷纲", user)
+        self.assertNotIn("上一弧留下的骨架", user)
+
+    def test_a_prior_skeleton_is_carried_in(self):
+        user = beat.arc_user_prompt(self._state(), [11], prev_skeleton="- Ch11: 甲")
+        self.assertIn("上一弧留下的骨架", user)
+        self.assertIn("- Ch11: 甲", user)
+
+
+class GenerateArcTest(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = _paths(self.root)
+        self.conn = store.init_db(self.paths)
+        self.addCleanup(self.conn.close_current)
+
+    def _run(self, payload, *, start=1, end=3, config=None, state=None):
+        call = FakeCall(arc_plan=payload)
+        arc = beat.generate_arc(None, self.paths, self.conn, config or _config(),
+                                start, end, state=state, call=call)
+        return arc, call
+
+    def test_cards_are_keyed_by_their_declared_chapter(self):
+        arc, _ = self._run({"arc_intent": "推进",
+                            "cards": [_card(1), _card(2), _card(3)]})
+        self.assertEqual(sorted(arc["cards"]), [1, 2, 3])
+        self.assertEqual(arc["intent"], "推进")
+        self.assertEqual(arc["missing"], [])
+
+    def test_a_skipped_chapter_is_reported_not_backfilled(self):
+        arc, _ = self._run({"cards": [_card(1), _card(3)]})
+        self.assertEqual(arc["missing"], [2])
+        self.assertNotIn(2, arc["cards"])
+
+    def test_the_next_skeleton_covers_the_following_window(self):
+        arc, _ = self._run({"cards": [_card(1), _card(2), _card(3)],
+                            "next_arc": {"intent": "下一弧",
+                                         "chapters": [{"ch": 4, "line": "甲"},
+                                                      {"ch": 6, "line": "丙"},
+                                                      {"ch": 9, "line": "越界"}]}})
+        self.assertEqual(sorted(arc["next_skeleton"]["chapters"]), ["4", "6"])
+
+    def test_the_final_arc_leaves_no_skeleton(self):
+        arc, call = self._run({"cards": [_card(1), _card(2), _card(3)],
+                               "next_arc": {"chapters": [{"ch": 4, "line": "甲"}]}},
+                              config=_config(max_chapters=3))
+        self.assertIsNone(arc["next_skeleton"])
+        self.assertIn("终章", call.calls[0]["user"])
+
+    def test_the_stable_prefix_is_passed_as_the_cache_key_not_inlined(self):
+        state = canon.build(1, brief="纲要", bible="世界")
+        _, call = self._run({"cards": [_card(1)]}, start=1, end=1, state=state)
+        self.assertEqual(call.calls[0]["cacheable_prefix"], state.stable_prefix())
+        self.assertTrue(call.calls[0]["cacheable_prefix"])
+
+    def test_no_cards_raises_rather_than_returning_an_empty_plan(self):
+        with self.assertRaises(beat.BeatError):
+            self._run({"arc_intent": "推进", "cards": []})
+
+    def test_cards_that_all_fail_normalisation_raise(self):
+        with self.assertRaises(beat.BeatError):
+            self._run({"cards": [{"ch": 1, "title": "只有标题"}]})
+
+
+class EnsureCardTest(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = _paths(self.root)
+        self.conn = store.init_db(self.paths)
+        self.addCleanup(self.conn.close_current)
+
+    def _ensure(self, ch, call, config=None):
+        return beat.ensure_card(None, self.paths, self.conn, config or _config(),
+                                ch, call=call)
+
+    def _seed(self, *cards):
+        from arc import save_cards
+        save_cards(self.paths, {"cards": {str(c["ch"]): c for c in cards}, "arcs": {}})
+
+    def test_a_stored_card_costs_nothing(self):
+        self._seed(_card(7))
+        call = FakeCall()
+        res = self._ensure(7, call)
+        self.assertEqual(res.source, "stored")
+        self.assertEqual(call.calls, [])
+        self.assertFalse(res.degraded)
+
+    def test_a_missing_card_plans_the_whole_arc_in_one_call(self):
+        call = FakeCall(arc_plan={"arc_intent": "开局",
+                                  "cards": [_card(c) for c in range(1, 11)]})
+        res = self._ensure(1, call)
+        self.assertEqual(res.source, "arc")
+        self.assertEqual(call.tags(), ["arc_plan"])
+        # The other nine chapters are now free.
+        self.assertEqual(self._ensure(5, FakeCall()).source, "stored")
+
+    def test_the_arc_never_replans_chapters_already_written(self):
+        # Resuming mid-block (a fork): the window is Ch1-10 but Ch1-6 exist.
+        call = FakeCall(arc_plan={"cards": [_card(c) for c in range(7, 11)]})
+        self._ensure(7, call)
+        self.assertIn("[7, 8, 9, 10]", call.calls[0]["user"])
+
+    def test_the_card_is_archived_for_the_ccr_tool(self):
+        self._seed(_card(7))
+        self._ensure(7, FakeCall())
+        archived = load_checkpoint(self.paths, 7, beat.CARD_CHECKPOINT)
+        self.assertEqual(archived["turn"], _card(7)["turn"])
+
+    def test_the_contract_reaches_the_writer_as_required_constraints(self):
+        self._seed(_card(7))
+        res = self._ensure(7, FakeCall())
+        targets = [c["target"] for c in res.decision["required_constraints"]]
+        self.assertIn(_card(7)["turn"], targets)
+        self.assertIn(_card(7)["where"], targets)
+        self.assertEqual(res.decision["planner"], "v2_beat")
+        self.assertEqual(res.decision["card_source"], "stored")
+
+    # --- the failure ladder ------------------------------------------------
+
+    def _duplicate_of(self, prev, ch):
+        """A card that repeats the previous chapter's opening AND its location —
+        two of `validate_card`'s findings, neither of which the card can see."""
+        return _card(ch, where=prev["where"], opening_type=prev["opening_type"])
+
+    def test_a_repairable_card_costs_one_extra_call_and_says_so(self):
+        prev = _card(6)
+        self._seed(prev, self._duplicate_of(prev, 7))
+        call = FakeCall(arc_card_repair=_card(7, opening_type="dialogue",
+                                              where="停车场入口"))
+        res = self._ensure(7, call)
+        self.assertEqual(res.source, "repaired")
+        self.assertEqual(call.tags(), ["arc_card_repair"])
+        self.assertEqual(res.unresolved, ())
+        self.assertTrue(res.degraded)
+        self.assertEqual(res.card["where"], "停车场入口")
+
+    def test_a_failed_repair_replans_the_chapter_alone_rather_than_faking_one(self):
+        prev = _card(6)
+        self._seed(prev, self._duplicate_of(prev, 7))
+        call = FakeCall(arc_card_repair={"nonsense": True},
+                        arc_plan={"cards": [_card(7, opening_type="aftermath",
+                                                  where="值班室")]})
+        res = self._ensure(7, call)
+        self.assertEqual(res.source, "single")
+        self.assertEqual(call.tags(), ["arc_card_repair", "arc_plan"])
+        self.assertEqual(res.card["where"], "值班室")
+        self.assertEqual(res.unresolved, ())
+
+    def test_the_third_attempt_is_accepted_with_its_problems_carried_forward(self):
+        # Every remaining problem is measured against chapters this attempt
+        # cannot rewrite. A fourth try would be a latch, so the writer is told
+        # instead -- and the result admits it never cleared them.
+        prev = _card(6)
+        dup = self._duplicate_of(prev, 7)
+        self._seed(prev, dup)
+        call = FakeCall(arc_card_repair=dup, arc_plan={"cards": [dup]})
+        res = self._ensure(7, call)
+        self.assertEqual(res.source, "single")
+        self.assertTrue(res.unresolved)
+        self.assertEqual(len(call.calls), 2, "no fourth attempt")
+        joined = " ".join(str(c) for c in res.decision["required_constraints"])
+        self.assertIn("规划未消除", joined)
+
+    def test_a_chapter_the_arc_skipped_gets_its_own_call(self):
+        call = FakeCall(arc_plan=lambda n: (
+            {"cards": [_card(2)]} if n == 1 else {"cards": [_card(1)]}))
+        res = self._ensure(1, call)
+        self.assertEqual(res.source, "single")
+        self.assertEqual(call.tags(), ["arc_plan", "arc_plan"])
+
+    def test_a_chapter_that_cannot_be_planned_raises_instead_of_writing_blind(self):
+        # The arc skips Ch1, and the solo re-plan comes back empty. There is no
+        # committee under v2 to catch this, and a fabricated card would be scored
+        # by CCR as though someone had planned it -- so the chapter stops.
+        call = FakeCall(arc_plan=lambda n: (
+            {"cards": [_card(2)]} if n == 1 else {"cards": []}))
+        with self.assertRaises(beat.BeatError):
+            self._ensure(1, call)
+
+    def test_a_solo_replan_may_relabel_the_chapter_it_was_asked_for(self):
+        # Inherited from `arc.generate_arc`: for a one-chapter request, a card
+        # whose `ch` disagrees is still that chapter's card -- there is nowhere
+        # else it could belong. Documented rather than assumed.
+        call = FakeCall(arc_plan=lambda n: (
+            {"cards": [_card(2)]} if n == 1 else {"cards": [_card(99)]}))
+        res = self._ensure(1, call)
+        self.assertEqual(res.card["ch"], 1)
+        self.assertEqual(res.source, "single")
+
+    def test_the_skeleton_survives_to_the_next_arc_call(self):
+        from arc import load_cards
+
+        first = FakeCall(arc_plan={"cards": [_card(c) for c in range(1, 11)],
+                                   "next_arc": {"intent": "第二弧",
+                                                "chapters": [{"ch": 11, "line": "开庭"}]}})
+        self._ensure(1, first)
+        self.assertEqual(
+            load_cards(self.paths)["arcs"]["1"]["next_skeleton"]["chapters"]["11"],
+            "开庭")
+        second = FakeCall(arc_plan={"cards": [_card(c) for c in range(11, 21)]})
+        self._ensure(11, second)
+        self.assertIn("开庭", second.calls[0]["user"])
+
+
+if __name__ == "__main__":
+    unittest.main()

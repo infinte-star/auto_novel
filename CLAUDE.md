@@ -360,10 +360,21 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads **83.4% → 89.9%** after the latching-gate fixes
+by one ruler. Library-wide it reads **83.3% → 92.0%** after the latching-gate fixes
 plus the unmeasured-plan-score fix (vs 12%–63% for "self-score ≥ 8.0"), and it names
-the failing gate for every miss; the leading remaining killers are `gate_rejects`
-(20) and `hard_contract` (13).
+the failing gate for every miss; the leading remaining killers are `hard_contract`
+(14) and `gate_rejects` (9).
+
+**A payload cannot fail a bucket it has no key for, and that reads as a PASS.**
+`hard_block_reasons` fires off `review.get(key)`, so when two engines write
+`review_round0.json` the absent keys are silently clean. `v2/accept.py` calls the
+same `quality.hard_block_reasons` and writes v1's own key spellings on purpose —
+including routing a CCR hard miss into `gate_rejects` and cited canon findings into
+`contract_violations` — so exactly one bucket is unshared: v1's LLM factcheck writes
+`contradictions`, and v2 has nothing that lands there. `fpy_prime` prints an
+**ENGINE MIX** block naming it whenever the novels in scope disagree on
+`payload["engine"]`. It reports rather than corrects, because which arm the gap
+favours depends on the question.
 
 **The aggregate excludes derivative novel dirs, and that changes answers.**
 `fpy_prime.discover_novels` (shared with `replay_gates`) drops provable

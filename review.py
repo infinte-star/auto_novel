@@ -927,19 +927,20 @@ def review_chapter(
                     p = chapter_path(paths, num)
                     if p.exists():
                         texts[num] = read_text(p)
-                _wl: set[str] = set()
-                _wl_str = str(config["novel"].get("book_fossil_whitelist", "")).strip()
-                for _w in _wl_str.split(","):
-                    _w = _w.strip()
-                    if len(_w) >= 2:
-                        _wl.add(_w)
+                # The brief's proper nouns used to be read off `paths.prompt_file`,
+                # a field `Paths` does not have -- the AttributeError went into a
+                # bare `except` on every call, so 《…》/「…」 names were eligible as
+                # fossils all along. The module-level PROMPT_FILE is the real
+                # handle (`memory.py` captures the same one at import), and the
+                # whitelist itself now lives in `quality` so the v2 arm cannot
+                # drift to a different one.
+                from quality import fossil_whitelist as _fossil_whitelist
                 try:
-                    import re as _re
-                    _prompt_text = read_text(paths.prompt_file)
-                    for _m in _re.findall(r'[《「]([^》」]{2,10})[》」]', _prompt_text):
-                        _wl.add(_m)
+                    from config import PROMPT_FILE as _PROMPT_FILE
+                    _prompt_text = read_text(_PROMPT_FILE)
                 except Exception:
-                    pass
+                    _prompt_text = ""
+                _wl = _fossil_whitelist(config, _prompt_text)
                 bf = book_wide_fossils(texts, config, whitelist=_wl,
                                        current_chapter=chapter_num)
                 report["book_fossils"] = bf

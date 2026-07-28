@@ -124,6 +124,16 @@ api:
   refine_thinking_mode: disabled
 
 novel:
+  # ── 引擎选择（REDESIGN v2）──────────────────────────────────────────────────
+  # v1（默认）：pipeline.py 的五阶段委员会 —— plan→write→review→revise→extract。
+  # v2：v2/run.py 的确定性决策表 —— 每章 2 次模型调用（write 一次出正文+ChapterDelta，
+  #     canon 一次举证式核对），每 10 章一次 arc 规划，修复只走 L0/L1。
+  #     验收全部走 quality.hard_block_reasons，与 v1 同一把尺；自评分不参与任何门。
+  # 这是 A/B 的实验变量本身：`novel.py fork <书> --as <臂> --flip engine --set v2`
+  # 就是单变量、HEAD 分叉、两臂字节相同的对照。**不设为 required**：磁盘上已有的
+  # 每本书的 config.yaml 都没有这个键，把它设成必填会让所有存量书立刻加载失败，
+  # 而 v1 是一个完全正确的默认值。
+  engine: v1
   # ── 题材检测 profile（config.py:genre_detection_profile）───────────────────
   # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
   # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
@@ -155,6 +165,14 @@ novel:
   fix_ladder_enabled: true
   fix_l0_enabled: true
   fix_max_l1_calls: 2
+  # ── v2：写作调用漏交状态增量时的有界兜底 ─────────────────────────────────────
+  # v2 的 write 一次调用要同时交出正文和 ChapterDelta。合规与否是**模型属性**而非
+  # 提示词属性：同一份提示词下 gemini-2.5-pro 两次全交，deepseek-v4-pro 两次交一次
+  # （漏的那次 5015 字纯正文、ok=True、未截断）。
+  # 漏了就不管不是省钱：canon.load 的 facts/threads/recent 全部由 delta 写入的库投影
+  # 而来，连续漏会让书一章一章变瞎。所以补一次**便宜**调用（走 extraction 模型，
+  # tag=delta_backfill），并且让它出现在 llm_calls.jsonl 里被成本报表照常计入。
+  v2_delta_backfill_enabled: true
   # fix_merge_max_line_chars: 120  # 碎句合并后的单行长度上限
   # fix_fossil_max_keep: 1         # 化石短语每章保留次数
   # fix_expand_max_paragraphs: 4   # L1 定点扩写最多改写的段数

@@ -72,6 +72,12 @@ EXTRACT_TAGS = frozenset({
     "extract",
     "memory_compress",
     "json_repair",
+    # v2's bounded fallback: the writer was asked for prose AND a state delta in
+    # one call and returned only prose. Deriving the delta from a finished
+    # chapter is the same structured-extraction job `extract` does, so it routes
+    # to the same cheap model — the point of the fallback is that it costs a
+    # fraction of the write it is repairing, not another write.
+    "delta_backfill",
 })
 
 REVIEW_TAGS = frozenset({
@@ -83,6 +89,10 @@ REVIEW_TAGS = frozenset({
     "plan_review_fused",
     "plan_review_axis",
     "refine_diagnose",
+    # v2 call (3): the cite-or-drop canon check. It is a judging call, so it
+    # routes to the review model like every other judge — and, like them, must
+    # not be the model that wrote the chapter it is judging.
+    "canon_check",
 })
 
 # Ordered list of (pool_attr, api_attr, tag_set, model_key) for role routing.

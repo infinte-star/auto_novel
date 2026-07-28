@@ -154,8 +154,23 @@ def _run_inprocess(name: str) -> int:
     os.environ["NOVEL_PROMPT"] = str(prompt_path.relative_to(PROJECT_DIR))
 
     try:
-        from pipeline import main  # noqa: E402  (must import after env vars are set)
+        # Engine selection is a CONFIG key, not a CLI flag, because
+        # `compare.cmd_fork --flip` can only flip config keys — which is what
+        # makes the v1/v2 A/B a single-variable HEAD fork with two
+        # byte-identical arms instead of two hand-built runs.
+        from config import load_config  # noqa: E402  (after env vars, same as below)
 
+        engine = str(load_config()["novel"].get("engine", "v1")).strip().lower()
+        if engine in ("", "v1"):
+            from pipeline import main  # noqa: E402  (must import after env vars are set)
+        elif engine == "v2":
+            from v2.run import main  # noqa: E402
+        else:
+            print(f"[novel] ERROR: unknown novel.engine {engine!r} in {config_path} "
+                  f"(expected v1 or v2). Refusing to guess — picking the wrong "
+                  f"engine would silently write the chapter with the other one.")
+            return 2
+        print(f"[novel] engine={engine or 'v1'}")
         main()
         return 0
     finally:

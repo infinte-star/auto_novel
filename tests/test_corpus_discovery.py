@@ -85,6 +85,23 @@ class DiscoverNovelsTest(unittest.TestCase):
         _, dropped = self.names()
         self.assertIn("2/4 chapters byte-identical", dropped["book_fork"])
 
+    def test_a_fork_cannot_claim_the_canonical_slot_from_its_source(self):
+        """The real case, measured 2026-07-28: `p4b_det` was a 25-chapter fork of
+        `yeban_guize`, out-ranked it on chapter count, took the canonical slot,
+        and was then dropped itself as a fork -- so BOTH disappeared and the
+        library aggregate silently lost a whole book (26 chapters, FPY' 77%)."""
+        _novel(self.root, "source", {1: "shared", 2: "a"})
+        _novel(self.root, "armfork", {1: "shared", 2: "a", 3: "b"})  # longer!
+        (self.root / "experiments" / "fork_armfork.json").write_text("{}")
+        kept, dropped = self.names()
+        self.assertEqual(kept, ["source"])
+        self.assertIn("fork", dropped["armfork"])
+
+    def test_an_ablation_cannot_claim_the_canonical_slot_either(self):
+        _novel(self.root, "source", {1: "shared"})
+        _novel(self.root, "source__ablate_k", {1: "shared", 2: "extra"})
+        self.assertEqual(self.names()[0], ["source"])
+
     def test_same_brief_but_different_ch1_is_not_a_copy(self):
         """`tangshuting_e2e`'s role: an independent run of the same story concept
         shares no byte-identical prose, so it must survive the filter."""

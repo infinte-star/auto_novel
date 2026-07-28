@@ -121,6 +121,12 @@ RELEASE_RULE_KEYS = frozenset({
     "rework_trigger", "rework_score_floor", "quality_threshold",
     "max_revision_rounds", "consecutive_force_accept_limit",
     "circuit_breaker_score_floor",
+    # `engine` belongs here for a stronger reason than the others: v2 writes no
+    # self-score at all, so `chapter_metrics.score` is 0.0 for every v2 chapter
+    # and this report's score columns would show a catastrophic regression that
+    # is purely an absence of measurement. Flag it as circular and send the
+    # reader to `fpy_prime` / `pairwise_ab`, which is where the answer is.
+    "engine",
 })
 
 
@@ -403,7 +409,16 @@ def compare_novels(name_a: str, name_b: str,
             f"`python tools/fpy_prime.py {name_a} {name_b}` (self-score excluded) plus "
             f"`python tools/pairwise_ab.py --a {name_a} --b {name_b}`.")
         lines.append("")
-    if s_a and s_b:
+    # `engine` is not merely circular, it is UNMEASURED on one side: a v2 chapter
+    # has no self-score, so `chapter_metrics.score` is 0.0 and the two verdict
+    # lines below would announce a ~8-point win for the v1 arm with total
+    # confidence. A missing measurement is not a low one (LESSONS §13) — the
+    # honest output is silence on this axis, not a number.
+    engine_flip = any(k.split(".")[-1] == "engine" for k in circular)
+    if engine_flip:
+        verdict.append("- avg score / sub-7.0: **not comparable** (the v2 arm emits "
+                       "no self-score; 0.0 here means unmeasured, not bad)")
+    if s_a and s_b and not engine_flip:
         avg_a, avg_b = sum(s_a) / len(s_a), sum(s_b) / len(s_b)
         d = avg_a - avg_b
         if abs(d) >= 0.3:
