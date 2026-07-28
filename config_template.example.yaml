@@ -347,22 +347,25 @@ novel:
   genre: _default
   # telemetry_enabled：每章把 metrics/仲裁/修订对/冷读结果异步双写进全局库（失败静默，不影响生成）
   telemetry_enabled: true
-  # 章节级语义去重（阻止无限切片同一场景）
+  # 章节级语义去重（阻止无限切片同一场景）。**单级**：卡片骨架与近 window 章的
+  # Jaccard 相似度 >= scene_dedupe_sim_block 时，写作前退回重修一次卡片
+  # （v2/beat.py:_scene_sim，一次便宜调用，不是废稿）。
+  # v1 还有另外几级，已一并删除——不是被遗忘的接线，而是**测出来到不了**
+  # （experiments/replay_scene_dedupe.py，692 章真实数据：632 份 v1 归档 merged_plan
+  # + 60 张 v2 卡片，6 本书、两个引擎）：max_sim 中位 0.06、p90 0.13、全库最高 0.393，
+  # 连最低的那一级（WARN 0.6）都不到一半。删掉的是：
+  #   scene_dedupe_sim_warn 0.6        —— 高于实测最高值 1.5 倍，接上也永不说话
+  #   scene_dedupe_candidate_block 0.85 —— 筛的是"候选大纲"，v2 一章一张卡，无候选可筛
+  #   scene_dedupe_sim_identical 0.97   —— v2 的 block 是无条件的，>=0.97 早被 0.82 拦下
+  #   scene_dedupe_force_retry          —— 同上：v2 没有"命中也不重试"这种模式
+  #   scene_dedupe_short_novel_*        —— 短篇把 block 放宽到 0.92，而短篇实测最高 0.027
+  # 也**没有**把 0.82 下调到实测区间的依据：全库最高的四章
+  # （tangshuting Ch174 0.393 / Ch175 0.293 / Ch176 0.205 / Ch129 0.179）里 3 章首稿是过的，
+  # 唯一那次失手记在"写作前重规划 + 全书化石比率"上，都不是重复类判决——
+  # 也就是说区间顶端没有可对齐的正样本，下调只能是猜。
   scene_dedupe_enabled: true
   scene_dedupe_window: 8
-  scene_dedupe_sim_warn: 0.6
   scene_dedupe_sim_block: 0.82
-  scene_dedupe_force_retry: true
-  # 候选预过滤：生成的候选大纲若与近期已选大纲骨架相似度 >= 该值，直接淘汰（除非全灭），
-  # 不再浪费评审/仲裁调用，也防止仲裁者把"与全书一致"的复读候选选中。
-  scene_dedupe_candidate_block: 0.85
-  # 绝对天花板：与近期大纲近乎逐字相同（>=该值）在任何模式下都硬性重规划，
-  # 包括短篇模式（v11 Ch8 曾以 max_sim=1.0 通过——同场地可复用，同骨架不行）。
-  scene_dedupe_sim_identical: 0.97
-  # 短篇/限章模式（max_chapters <= 下列章数）天然复用同一场地与人物，
-  # 自动放宽 BLOCK 阈值（但不再整体关闭强制重规划）。
-  scene_dedupe_short_novel_chapters: 8
-  scene_dedupe_short_novel_block: 0.92
   # 副本/场景入口显著性（治"进新讳地/新地点首稿崩"——无限流/规则怪谈的系统性崩点：
   # yeban_guize 进自习室 Ch8=2.7/Ch9=4.0，因写手被新场景铺设压垮、漏了编号规则清单+退化电报体）。
   # 确定性比对本章 plan.location 与近 scene_entry_lookback 章场景：字符 bigram 相似度 < 阈值

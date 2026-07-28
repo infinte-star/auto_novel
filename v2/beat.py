@@ -463,7 +463,10 @@ def _problems(paths: Paths, conn: Any, config: dict[str, Any],
         recent_cards=_recent_cards(store, chapter_num),
         continuity_violations=critical,
         scene_sim=_scene_sim(paths, config, store, plan, chapter_num),
-        scene_sim_block=float(config["novel"].get("scene_dedupe_sim_block", 0.85)),
+        # 0.82, not 0.85: every shipped config says 0.82 and `tools/replay_gates.py`
+        # replays 0.82, so a book whose config predates the key would otherwise be
+        # judged by a stricter line than the tool that settles it.
+        scene_sim_block=float(config["novel"].get("scene_dedupe_sim_block", 0.82)),
     )
     return problems, advisories
 
@@ -546,10 +549,24 @@ def ensure_card(
         log(paths, f"beat: card Ch{chapter_num} failed pre-write validation: {problems}")
         db_event(conn, chapter_num, "card_repair", {"problems": problems, "source": source})
         fixed = repair_card(client, paths, config, card, problems, chapter_num, call=call)
-        still = validate_card(fixed, recent_cards=_recent_cards(store, chapter_num)) if fixed else ["修复调用未返回可用卡片"]
+        # Re-judged by the SAME ruler that rejected it. The three-argument
+        # `validate_card` that used to sit here runs a strictly SMALLER check than
+        # the one that fired: continuity CRITICALs and the scene-dedupe similarity
+        # are added by `_problems`, so a repair that ignored either came back with
+        # `still` empty and was filed as fixed — the omitted-argument defect, where
+        # "not measured" reads exactly like "clean". Zero LLM either way: both
+        # halves are pure functions over the card plus one DB read.
+        #
+        # The advisories are re-read too. They are handed to the writer as
+        # `required_constraints`, and the pre-repair card's advisories describe a
+        # card the writer will never see.
+        still, fixed_advisories = (
+            _problems(paths, conn, config, store, fixed, chapter_num) if fixed
+            else (["修复调用未返回可用卡片"], []))
         if fixed and not still:
             card, source = fixed, "repaired"
             problems = []
+            advisories = fixed_advisories
         else:
             log(paths, f"beat: card Ch{chapter_num} still invalid after repair ({still}); "
                        f"re-planning this chapter alone.")

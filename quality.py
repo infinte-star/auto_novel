@@ -2608,11 +2608,21 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 @REGISTRY.register(
     "scene_similarity", config_key="scene_dedupe_enabled", tag_prefix="scene",
     phase="planning", repair="L2", scope="card",
-    proof="Planning-phase, so gate_census (review payloads) never sees it; "
-          "measured instead by tools/replay_gates.py, which replays real plans: "
-          "max_sim lands at 0.04-0.07 against a 0.82 block line on the 18 "
-          "tangshuting_e2e chapters where it was blamed. The block line is "
-          "therefore far above the observed mass -- NEAR-DEAD, and the "
+    proof="Planning-phase, so gate_census (review payloads) never sees it. "
+          "Replayed on 692 real plans/cards -- 632 archived v1 merged_plans + 60 "
+          "v2 cards, six books, both engines (experiments/replay_scene_dedupe.py, "
+          "2026-07-28): median 0.06, p90 0.13, library max 0.393. NOTHING has ever "
+          "crossed the 0.82 block line, and nothing has reached even half of v1's "
+          "old 0.6 WARN line, which is why that tier and the 0.97 ceiling were "
+          "deleted rather than re-wired. Do NOT answer this by lowering the line: "
+          "of the library's four highest values (tangshuting Ch174 0.393, Ch175 "
+          "0.293, Ch176 0.205, Ch129 0.179) three PASSED their first draft and the "
+          "one miss is charged to a plan retry plus a book_wide_fossils ratio, so "
+          "the top of the observed range carries no repetition failure to "
+          "threshold against -- there is no positive set at all. The gate stays "
+          "because it is pre-write and free, not because it protects anything "
+          "measured; the failure it is blind to (same procedural flow, new "
+          "wording) belongs to narrative_pattern_repetition. The "
           "`scene_dedupe_retry` event that looked like its fire is the generic "
           "duplicate_blocked marker shared with two other gates.")
 def scene_similarity(plan: dict[str, Any], recent_plans: list[dict[str, Any]]) -> dict[str, Any]:

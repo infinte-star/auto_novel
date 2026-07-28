@@ -879,7 +879,7 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 | 键 | 为什么它是缺陷报告 |
 | --- | --- |
 | `style_em_dash_trend_window` | 没有任何调用点给 `style_health` 传 `em_history`（`v2/accept.py:608` 只传 text+config），于是 `recent_mean` 恒为 `None`，**破折号趋势项在 v2 里从不发火**。那正是抓到 gudai50_v2 Ch20-24 从 6.6 爬到 8.8、而静态档在 +1.0 上躺平的那一项。**已于 2026-07-28 接上，结算见 §9.11.2**——其中「尺子建模了一个引擎不执行的门」这句原判是错的，`_restamp_style_penalty` 的 `if not old_em` 让它碰不到 v2 载荷。 |
-| `scene_dedupe_sim_warn`、`scene_dedupe_candidate_block` | v1 的三级升级（WARN 追加 `required_constraints` / BLOCK 重试 / 0.97 绝对天花板）只剩 BLOCK 一级：`arc.validate_card` 只收一个 `scene_sim_block`。另两级住在被删的 `review.py`/`planning.py` 里。 |
+| `scene_dedupe_sim_warn`、`scene_dedupe_candidate_block` | v1 的三级升级（WARN 追加 `required_constraints` / BLOCK 重试 / 0.97 绝对天花板）只剩 BLOCK 一级：`arc.validate_card` 只收一个 `scene_sim_block`。另两级住在被删的 `review.py`/`planning.py` 里。**已于 2026-07-28 结算：判为死键并删除，结算见 §9.11.3**——它们不是断掉的接线，是高于实测区间的阈值。 |
 | `telemetry_enabled` | `telemetry.py` 根本不读它，遥测关不掉。无害（严格观察者），但配置文件许下了一个它不兑现的承诺。 |
 
 `compare.py` 的 `RELEASE_RULE_KEYS` 仍然点名若干已删的键，这是**故意的**：
@@ -982,3 +982,72 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 
 `fpy_prime` 仍是 **365/438 = 83%**（它回放归档载荷，看不见只向前生效的引擎改动），
 测试 778 → 785 全绿。
+
+### 9.11.3 场景去重缺的那几级：判为死键，而真正的缺陷在别处（2026-07-28）
+
+§9.11 的第二条待决接线。表面问题是「v1 有四级，v2 只剩一级，另三级的键没有读者」。
+**结论：那三级不接，键删掉；而这次排查真正找到的缺陷是另一件事，并且它才有牙。**
+
+**① 先量分布，再谈接线。** 一个高于指标实测区间的阈值不是断掉的接线，是死键——
+接上去它也永不说话。`experiments/replay_scene_dedupe.py`（零 LLM，只读）按引擎**完全相同**的
+算法（同 window、同 `card_to_plan` 投影、同 `quality.scene_similarity`）回放了
+**692 份真实计划/卡片**：632 份 v1 归档 `merged_plan` + 60 张 v2 卡片，6 本书、两个引擎。
+
+| 语料 | 中位 | p90 | 最高 | ≥0.60 | ≥0.82 |
+| --- | --- | --- | --- | --- | --- |
+| v2 卡片（60） | 0.057 | 0.094 | 0.188 | 0 | 0 |
+| v1 归档计划（632） | 0.069 | 0.130 | **0.393** | 0 | 0 |
+
+全库最高 0.393，**连最低的那一级（WARN 0.60）都不到一半**，离活着的阻塞线 0.82 更远。
+逐键处置：
+
+| 键 | 判定 |
+| --- | --- |
+| `scene_dedupe_sim_warn` 0.6 | 高于实测最高值 1.5 倍，接上永不发火 |
+| `scene_dedupe_candidate_block` 0.85 | 筛的是「候选大纲」；v2 一章一张卡，没有候选可筛 |
+| `scene_dedupe_sim_identical` 0.97 | v2 的 block 无条件重修，≥0.97 早被 0.82 拦下，天花板被包含 |
+| `scene_dedupe_force_retry` | 同上：v2 没有「命中也不重试」这种模式 |
+| `scene_dedupe_short_novel_*` | 短篇把线放宽到 0.92，而短篇实测最高 0.027 |
+
+**② 「门是不是哑的」的反问同样承载性：区间顶端有没有失败信号？**
+没有正样本就下调阈值等于猜。全库最高的四章——`tangshuting` Ch174 0.393 / Ch175 0.293 /
+Ch176 0.205 / Ch129 0.179——**3 章首稿是过的**，唯一那次失手（Ch175）记在
+`replanned:initial` + `book_wide_fossils_ratio` 上，都不是重复类判决。
+所以既不接那几级，**也不把 0.82 下调**。门保留的理由是它在写作前、且免费
+（一次 `arc_card_repair` 便宜调用，不是废稿），不是因为它保护了任何实测到的东西。
+
+**③ 这个指标看不见什么，要写进注册表。** 可达性探针：同一张卡与自己比 = **1.000**
+（指标没有结构性天花板，低是语料真的不重复），但把 `where` 换成完全不同的场地、
+再把 `turn` 也换掉，相似度**仍是 1.000**——`_plan_skeleton_tokens` 只读
+`conflict/payoff/pressure/goal` + 前 8 个 beats。`where`/`turn` 由 `validate_card`
+的邻章规则另管，而「同一套流程换个说法」属于 `narrative_pattern_repetition`。
+这条已写进 `scene_similarity` 的 `proof=`，免得下一个人把它当全能去重门。
+
+**④ 真正的缺陷：修复后的复判用了一把更小的尺子。** `v2/beat.py:ensure_card` 在
+`repair_card` 之后调 `validate_card`，但**只给三个参数**——而触发这次修复的 `_problems`
+给的是五个：连续性 CRITICAL 与场景相似度是它加进去的。于是一张只改了格式、
+连续性违规照旧的修复卡回来时 `still` 是空的，被记成 fixed。
+**「没测」和「干净」读起来一模一样**——与 §9.11.2 的 `em_history` 是同一个病
+（省参数缺陷，本轮第二例）。改成复判也走 `_problems`，零 LLM 代价（两半都是纯函数 + 一次 DB 读）。
+顺带同一处：advisories 也重读一遍，它们会作为 `required_constraints` 交给写手，
+而修复前那张卡的 advisories 描述的是一张写手永远见不到的卡。
+
+行为面：63 章 v2 语料里只发生过 4 次卡片修复，全是 `payoff_type` 三连——
+新旧两把尺子都看得见，所以这个修正**向前生效**，不改任何已归档判决。
+`v2/beat.py` 的 `scene_sim_block` 兜底默认顺手从 0.85 对齐到 0.82：
+每一份出厂配置都写 0.82，`tools/replay_gates.py` 也回放 0.82，
+留着 0.85 意味着缺这个键的老书会被一条比结算工具更严的线判。
+
+**尺子侧的化简是可证明输出中性的。** `tools/replay_gates.py` 原本回放 v1 的三级
+（0.92 短篇放宽、0.97 天花板、`force_retry` 逃生门）；实测最高 0.393，
+所以那些分支从来无一可达。删完 `LIBRARY 365/438 83.3% → 403/438 92.0% +8.7pt`
+逐字节复现，`scene_similarity` 也不在存活阻塞项里。
+`compare.py` 的两行报表同样跟着引擎走：`Scene-dedupe WARN` 的产出者已随 `review.py` 删除，
+`BLOCK` 那行找的是 ASCII 标记而 v2 用 `arc.validate_card` 的中文消息记日志——
+**一个产出者已被删除的报表行永远读 0，而 0 看起来像「没问题」**。
+WARN 行删掉，BLOCK 行改成同时认中文消息。
+
+反证过：把复判改回三参数，3 个测试挂——骨架未变的修复被记成 fixed、
+首过判决里该出现的相似度问题消失、写手拿到的是修复前那张卡的 advisories。
+第四个用例（改了场地的修复被接受，且只花一次修复调用）在两种写法下都过，
+它守的是「这个修正不会把每次修复的成本翻倍」。测试 785 → 789 全绿。

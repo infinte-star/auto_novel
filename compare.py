@@ -73,8 +73,12 @@ def _load_events(nd: Path, types: tuple[str, ...]) -> dict[str, int]:
 _LOG_PATTERNS = {
     "force_accept": re.compile(r"Accepting anyway to avoid pipeline halt"),
     "fossil_hits": re.compile(r"cross_chapter_fossils\((\d+)\)"),
-    "scene_dedupe_warn": re.compile(r"Scene-dedupe WARN"),
-    "scene_dedupe_block": re.compile(r"Scene-dedupe BLOCK"),
+    # v2 has no WARN tier (deleted 2026-07-28: 692 real plans, max_sim 0.393, so
+    # the 0.6 line was never reachable) and it logs the block in Chinese via
+    # `arc.validate_card`'s message, not with v1's ASCII marker. Both rows read a
+    # marker no live engine emits, which is a zero that means "not measured" while
+    # looking like "no repetition" -- so the pattern follows the engine.
+    "scene_dedupe_block": re.compile(r"Scene-dedupe BLOCK|场景骨架与近期已选章节相似度"),
     "adjacent_block": re.compile(r"Adjacent-(?:repeat|duplicate)"),
     "gate_reject": re.compile(r"GATE-REJECT"),
     "style_collapse": re.compile(r"prose-health collapse|Style-health .* penalty"),
@@ -321,8 +325,7 @@ def compare_novels(name_a: str, name_b: str,
     lines.append(row("gate_reject events", ev_a["gate_reject"], ev_b["gate_reject"]))
     lines.append(row("fossil warnings (log)", log_a["fossil_hits"], log_b["fossil_hits"]))
     lines.append(row("max fossils in one hit", log_a["max_fossils"], log_b["max_fossils"]))
-    lines.append(row("scene-dedupe WARN", log_a["scene_dedupe_warn"], log_b["scene_dedupe_warn"]))
-    lines.append(row("scene-dedupe BLOCK", log_a["scene_dedupe_block"], log_b["scene_dedupe_block"]))
+    lines.append(row("scene-dedupe blocks", log_a["scene_dedupe_block"], log_b["scene_dedupe_block"]))
     lines.append(row("LLM calls", int(llm_a["calls"]), int(llm_b["calls"])))
     lines.append(row("LLM calls / scored chapter",
                      (llm_a["calls"] / len(s_a)) if s_a else None,

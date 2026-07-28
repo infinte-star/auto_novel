@@ -264,7 +264,7 @@ decorators.
 | gate / layer | config | behaviour |
 | --- | --- | --- |
 | `quality.style_health(text, config, em_history=…)` | `style_health_enabled`, `style_em_dash_per_kchar_warn`/`_bad`, `style_em_dash_trend_window`, `style_min_avg_sentence_chars`, `style_fragment_line_ratio_max`, `style_penalty_cap`, `style_penalty_block` | deterministic prose metrics (em-dash density, avg sentence length, fragment-line ratio, dialogue presence) → `penalty`, `flags`, writer `directives`. Blocks at `style_penalty_block`. **`em_history` is not optional in practice** — without it the em-dash TREND term is silent and the gate is strictly smaller than this row describes; `v2/accept.py:_em_history` supplies it from `chapter_metrics` |
-| `quality.scene_similarity(plan, recent_plans)` | `scene_dedupe_enabled`, `scene_dedupe_sim_warn`/`_block`/`_identical`, `scene_dedupe_short_novel_block`, `scene_dedupe_candidate_block` | Jaccard similarity of a plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent cards projected through `card_to_plan` |
+| `quality.scene_similarity(plan, recent_plans)` | `scene_dedupe_enabled`, `scene_dedupe_window` (8), `scene_dedupe_sim_block` (0.82) | Jaccard similarity of a plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent cards projected through `card_to_plan`. **Blind to `where` and `turn`** — mutating either leaves the similarity at 1.000; those are `validate_card`'s neighbour rules. ONE tier, and the other four are deleted rather than dormant: see the escalation note below for the 692-plan reading |
 | `quality.cross_chapter_repetition` | `style_cross_repeat_reject_count` (8) | signature clauses reused verbatim across chapters → a `level` of `advise` or `reject` |
 | `quality.dialogue_health` | `dialogue_health_enabled`, `dialogue_char_ratio_min` (0.10), `dialogue_char_ratio_target` (0.20) | dialogue-ratio gate over text inside `"…"`; reached via `fix.py`'s L1 dialogue injection |
 | `quality.book_wide_fossils` | `book_fossil_enabled`, `book_fossil_chapter_frac` (0.30), `book_fossil_min_chapters` (6), `book_fossil_hard_ratio`, `book_fossil_struct_count` | 6-char CJK n-grams recurring across a large fraction of the WHOLE book (what `cross_chapter_repetition`'s 6-chapter window structurally misses). **A hard fossil requires `current_chapter` and only indicts a chapter that actually contains the phrase** — the ratio is book-cumulative, so without that the gate latches on and rejects compliant chapters forever. `book_fossil_hard_ratio` is floored at the candidacy fraction (below it, every candidate is automatically hard). LESSONS §13 |
@@ -279,7 +279,7 @@ decorators.
 | `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block, consumed by **`v2/beat.py:_fingerprints` — once per arc, not once per chapter**. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). Measured on a real 200-chapter library it is 1,231 chars, so at `arc_span` 10 it amortizes to ~123 chars/chapter and does not grow with the book. **It returns the literal string `"None"`, not `""`, when it has nothing to say** (a v1 template convention), which `_fingerprints` filters — a header promising overused patterns with the word "None" under it is worse than no header. `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. LESSONS §8 |
 
 Two routing rules inside that table are load-bearing:
-- **Scene dedupe escalated in three steps under v1; v2 kept only one.** `arc.validate_card` takes a single `scene_sim_block` (`v2/beat.py:429`, default 0.85) and files a CRITICAL above it. The WARN tier that appended `required_constraints`, the chapter-capped relaxation, and the `scene_dedupe_sim_identical` (0.97) absolute ceiling all lived in the deleted `review.py`/`planning.py` — their config keys (`scene_dedupe_sim_warn`, `scene_dedupe_candidate_block`) now have no reader. Found by `tools/orphan_defs.py --config`; it is a wiring gap to settle per tier, not a redesign that dropped them deliberately.
+- **Scene dedupe is ONE tier, and the missing tiers were settled as dead, not as a wiring gap.** `arc.validate_card` takes a single `scene_sim_block` (0.82) and files a CRITICAL above it, which costs one cheap `arc_card_repair` call before a word is written. v1's WARN / short-novel-relaxation / 0.97-ceiling / `force_retry` tiers were deleted on measurement, not restored: replayed over **692 real plans and cards** (632 archived v1 `merged_plan`s + 60 v2 cards, six books, both engines — `experiments/replay_scene_dedupe.py`) the similarity reads median 0.06, p90 0.13, **library max 0.393**, i.e. under half of the lowest missing tier. **Nor is lowering 0.82 into the observed range justified**: of the library's four highest values (`tangshuting` Ch174 0.393, Ch175 0.293, Ch176 0.205, Ch129 0.179) three PASSED their first draft, and the one miss is charged to a pre-write plan retry plus a `book_wide_fossils` ratio — neither a repetition finding. There is no labelled positive set to threshold against, so any lower line would be a guess. The gate stays because it is pre-write and free; the failure it is blind to (same procedural flow, new wording) belongs to `narrative_pattern_repetition`. REDESIGN_V2 §9.11.3.
 - **A `cross_chapter_repetition` reject is structural, not cosmetic** — it lands in `gate_rejects`, and the repair rows answer it before `rescue` can buy a rewrite.
 
 #### Wiring gap left by the v1 deletion — settled per gate, by measurement
@@ -358,8 +358,15 @@ report. One is now settled:
   toward zero. `tech_history` is deliberately still unsupplied: the data exists
   (`chapter_metrics.tech_per_kchar`, populated) but `quality.py:643` is `_ =
   tech_history`, so passing it would look like a capability and change no verdict.
-- `scene_dedupe_sim_warn`, `scene_dedupe_candidate_block` — see the escalation note
-  above: v2 kept only the BLOCK step.
+- ~~`scene_dedupe_sim_warn`, `scene_dedupe_candidate_block`~~ — **settled 2026-07-28
+  and deleted from both templates**, along with `_sim_identical`, `_force_retry` and
+  the `_short_novel_*` pair. They were thresholds above the metric's measured range,
+  not missing wiring; the escalation note above carries the reading. What the census
+  actually surfaced here was a different defect: the post-repair recheck in
+  `v2/beat.py:ensure_card` called `validate_card` with three of its five arguments,
+  so a repair that ignored a continuity CRITICAL or the scene similarity came back
+  with an empty `still` and was filed as fixed — the same omitted-argument shape as
+  `style_health`'s missing `em_history`, one row above.
 - `telemetry_enabled` — `telemetry.py` reads it nowhere, so telemetry cannot be
   turned off. Harmless (strict observer) but the config file makes a promise it
   does not keep.

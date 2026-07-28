@@ -237,13 +237,17 @@ def plan_chain_block(plan: dict, recent: list[dict], score: float | None,
 
     if bool(nv.get("scene_dedupe_enabled", True)):
         try:
-            sim = float(scene_similarity(plan, recent).get("max_sim", 0.0) or 0.0)
-            block = float(nv.get("scene_dedupe_sim_block", 0.82))
-            max_ch = nv.get("max_chapters")
-            if max_ch and int(max_ch) <= int(nv.get("scene_dedupe_short_novel_chapters", 8)):
-                block = max(block, float(nv.get("scene_dedupe_short_novel_block", 0.92)))
-            identical = float(nv.get("scene_dedupe_sim_identical", 0.97))
-            if (bool(nv.get("scene_dedupe_force_retry", True)) and sim >= block) or sim >= identical:
+            # ONE tier, matching the live engine (`v2/beat.py:_problems` ->
+            # `arc.validate_card`). This used to replay v1's three: a short-novel
+            # relaxation to 0.92, a 0.97 absolute ceiling, and a
+            # `scene_dedupe_force_retry` escape hatch. Dropping them is
+            # output-neutral on the archive and provably so -- the highest max_sim
+            # in 692 real plans/cards is 0.393, so no branch of either rule was
+            # ever reachable (experiments/replay_scene_dedupe.py). Keeping them
+            # would have left this tool answering "would TODAY's logic pass this"
+            # with yesterday's rule.
+            if float(scene_similarity(plan, recent).get("max_sim", 0.0) or 0.0) \
+                    >= float(nv.get("scene_dedupe_sim_block", 0.82)):
                 return "scene_similarity"
         except Exception:
             pass

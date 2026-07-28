@@ -355,6 +355,94 @@ class EnsureCardTest(unittest.TestCase):
         self.assertEqual(res.card["ch"], 1)
         self.assertEqual(res.source, "single")
 
+    # --- the repair is re-judged by the ruler that rejected it --------------
+
+    def _same_skeleton(self, prev, ch, **over):
+        """A card sharing every field `scene_similarity` reads, and nothing else.
+
+        The skeleton is `card_to_plan`'s conflict/payoff/pressure/goal + beats,
+        i.e. the card's `blocked_by`/`payoff`/`pressure`/`wants`/`beats`. `where`
+        and `opening_type` are deliberately changed so the neighbour checks stay
+        quiet and the ONLY finding is the similarity — otherwise the test would
+        pass on the strength of a check the old recheck could already see.
+        """
+        return _card(ch, where=f"另一处完全不同的场地{ch}",
+                     opening_type=prev["opening_type"], payoff_type="reversal",
+                     wants=prev["wants"], blocked_by=prev["blocked_by"],
+                     payoff=prev["payoff"], beats=list(prev["beats"]), **over)
+
+    def _dedupe_config(self):
+        return _config(scene_dedupe_enabled=True, scene_dedupe_sim_block=0.82)
+
+    def test_a_scene_dedupe_block_is_what_the_first_pass_reports(self):
+        # Fixture guard. If the similarity does not actually fire, every
+        # assertion below passes for the wrong reason.
+        prev = _card(6)
+        dup = self._same_skeleton(prev, 7)
+        dup["opening_type"] = _card(7)["opening_type"]  # keep the neighbour quiet
+        self._seed(prev, dup)
+        call = FakeCall(arc_card_repair=dup, arc_plan={"cards": [dup]})
+        res = self._ensure(7, call, self._dedupe_config())
+        self.assertTrue(any("相似度" in p for p in res.unresolved), res.unresolved)
+
+    def test_a_repair_that_kept_the_skeleton_is_not_filed_as_fixed(self):
+        # The omitted-argument defect: the old recheck called `validate_card`
+        # without `scene_sim`, so a repair that changed the label and kept the
+        # scene came back clean and shipped as "repaired".
+        prev = _card(6)
+        dup = self._same_skeleton(prev, 7)
+        dup["opening_type"] = _card(7)["opening_type"]
+        self._seed(prev, dup)
+        # The "repair" changes the title and nothing the gate reads.
+        still_dup = dict(dup, title="换个标题")
+        good = _card(7, wants="改问护士长要交接班记录",
+                     blocked_by="交接班记录被锁进院办",
+                     payoff="记录里少了两小时",
+                     beats=["汤舒婷截住护士长", "顾峥调出门禁记录", "两人比对时间"])
+        call = FakeCall(arc_card_repair=still_dup, arc_plan={"cards": [good]})
+        res = self._ensure(7, call, self._dedupe_config())
+        self.assertEqual(res.source, "single", "a kept skeleton was filed as fixed")
+        self.assertEqual(call.tags(), ["arc_card_repair", "arc_plan"])
+        self.assertEqual(res.unresolved, ())
+
+    def test_a_repair_that_changed_the_scene_is_accepted(self):
+        # The other direction: the fix must not make every repair fall through
+        # to a solo re-plan, which would double the cost of the repair path.
+        prev = _card(6)
+        dup = self._same_skeleton(prev, 7)
+        dup["opening_type"] = _card(7)["opening_type"]
+        self._seed(prev, dup)
+        fixed = _card(7, wants="改问护士长要交接班记录",
+                      blocked_by="交接班记录被锁进院办",
+                      payoff="记录里少了两小时",
+                      beats=["汤舒婷截住护士长", "顾峥调出门禁记录", "两人比对时间"])
+        call = FakeCall(arc_card_repair=fixed)
+        res = self._ensure(7, call, self._dedupe_config())
+        self.assertEqual(res.source, "repaired")
+        self.assertEqual(call.tags(), ["arc_card_repair"])
+
+    def test_the_writer_gets_the_repaired_cards_advisories_not_the_broken_ones(self):
+        # `advisories` become `required_constraints`, so carrying the pre-repair
+        # card's advisories describes a card the writer never sees.
+        prev = _card(6)
+        self._seed(prev, self._duplicate_of(prev, 7))
+        fixed = _card(7, opening_type="dialogue", where="停车场入口")
+        call = FakeCall(arc_card_repair=fixed)
+        seen: list[dict] = []
+
+        def fake_continuity(conn, plan, chapter_num, config=None):
+            seen.append(plan)
+            return [] if plan.get("location") == "停车场入口" else ["旧卡片的告警"]
+
+        import v2.beat as beat_mod
+        orig = beat_mod.validate_plan_continuity
+        beat_mod.validate_plan_continuity = fake_continuity
+        self.addCleanup(setattr, beat_mod, "validate_plan_continuity", orig)
+        res = self._ensure(7, call)
+        self.assertEqual(res.source, "repaired")
+        self.assertEqual(res.advisories, (), f"stale advisories carried: {res.advisories}")
+        self.assertEqual(len(seen), 2, "the repaired card was never re-checked")
+
     def test_the_skeleton_survives_to_the_next_arc_call(self):
         from arc import load_cards
 

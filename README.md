@@ -131,7 +131,8 @@ refine.py    package.py     screenplay.py                # 完稿后工具
 - **引用即丢弃（cite-or-drop）** `v2/accept.py:citation_check`：任何指不出正文原文
   片段的评审结论一律丢弃，而不是打个折扣计入——这是防评审凭空编造违规的唯一手段。
 - **场景语义去重** `quality.py:scene_similarity`：新卡片骨架与近期卡片的 Jaccard
-  相似度超过 `scene_dedupe_sim_warn` 时告警并追加硬约束，阻止「无限切片同一场景」。
+  相似度超过 `scene_dedupe_sim_block`（0.82）时，写作前退回重修一次卡片，
+  阻止「无限切片同一场景」。**单级**——v1 的另外几级已删除，见配置注释。
 - **全书化石** `quality.py:book_wide_fossils`：跨全书复现的 6 字 CJK n-gram
   （6 章窗口的重复检测结构性看不到的那一类）。
 - **检索式记忆 (RAG)** `retrieval.py`：零额外依赖的 TF-IDF 字符二元组检索
@@ -178,7 +179,7 @@ refine.py    package.py     screenplay.py                # 完稿后工具
 - `style_health_enabled` + `style_em_dash_per_kchar_warn/_bad`、
   `style_min_avg_sentence_chars`、`style_fragment_line_ratio_max`、
   `style_penalty_cap`、`style_penalty_block` — 规则文体检测与扣分/拦截阈值
-- `scene_dedupe_enabled` / `scene_dedupe_sim_warn` / `_sim_block` / `_sim_identical` — 场景骨架去重的告警/重规划/绝对上限三档
+- `scene_dedupe_enabled` / `_window` / `_sim_block` — 场景骨架去重（单级：超线退回重修卡片一次）
 - `book_fossil_enabled` / `book_fossil_chapter_frac` / `book_fossil_hard_ratio` — 全书化石短语检测
 - `style_cross_repeat_reject_count` — 跨章原句复用的拒收计数
 - `descriptor_frequency_enabled` / `genre_drift_reject_enabled` / `opening_hook_gate_enabled` — 用词频次 / 题材漂移 / 开篇钩子门
