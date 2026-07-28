@@ -817,13 +817,19 @@ def _preflight_negative_list(
     BEFORE the first draft is generated, rather than discovering them only
     after a low review score.
 
-    Returns {"items": [...], "fossils": [...], "style_warnings": [...]}
+    Returns {"items": [...], "fossils": [...], "style_warnings": [...],
+             "hard_fossils": [(phrase, frac), ...]}
+
+    `hard_fossils` is the book-cumulative subset that carries an outright ban, kept
+    separate so `write_chapter` can restate it as a tail anchor. Same cache read,
+    one source of truth.
     """
     if chapter_num <= 1:
-        return {"items": [], "fossils": [], "style_warnings": []}
+        return {"items": [], "fossils": [], "style_warnings": [], "hard_fossils": []}
 
     items: list[str] = []
     fossils: set[str] = set()
+    hard: list[tuple[str, float]] = []
     style_warnings: list[str] = []
     seen_gates: set[str] = set()
 
@@ -895,6 +901,7 @@ def _preflight_negative_list(
                     ph = str(f.get("phrase", "")).strip()
                     if ph:
                         fossils.add(ph)
+                        hard.append((ph, float(f.get("frac", 0) or 0)))
                         items.append(
                             "『%s』已出现在 %d 章 (%.0f%%)——硬化石，本章正文禁止出现。"
                             % (ph, f.get("chapter_count", 0), f.get("frac", 0) * 100)
@@ -928,7 +935,46 @@ def _preflight_negative_list(
         "items": items[:10],
         "fossils": sorted(fossils)[:20],
         "style_warnings": style_warnings[:4],
+        "hard_fossils": sorted(hard, key=lambda t: -t[1]),
     }
+
+
+FOSSIL_TAIL_ANCHOR_MAX = 5
+
+
+def fossil_tail_anchor(preflight_neg: dict[str, Any] | None,
+                       config: dict[str, Any]) -> str:
+    """Restate the HARD book-wide fossil ban as the writer prompt's tail anchor.
+
+    Measured, and the measurement is what justifies the duplication: of the 20
+    first-draft `gate_rejects` misses left in the library after the latching-gate
+    fixes, 12 are ONE entrenched bank phrase per book, and a fresh 1..N-1
+    avoid-list scan puts that phrase at **rank 0** of the mid-prompt list in every
+    case. So the writer had the ban in front of it and used the phrase anyway --
+    the same weak-instruction-following failure as the ability whitelist and the
+    degradation-recovery directive, and the same fix: position, not wording.
+
+    Hard-only and capped at FOSSIL_TAIL_ANCHOR_MAX on purpose; a long tail list
+    dilutes the very position this block exists to exploit. `fix.rotate_fossils`
+    still cleans up what slips through -- this is the half that keeps the phrase
+    out of the saved text in the first place.
+    """
+    if not bool(config["novel"].get("fossil_tail_anchor_enabled", True)):
+        return ""
+    hard = (preflight_neg or {}).get("hard_fossils") or []
+    if not hard:
+        return ""
+    lines = "\n".join(
+        f"{i}. 「{ph}」（已出现在全书 {frac * 100:.0f}% 的章节）"
+        for i, (ph, frac) in enumerate(hard[:FOSSIL_TAIL_ANCHOR_MAX], 1)
+    )
+    return (
+        "\n\n## ⚠ 写作前最后确认：僵化短语绝对禁令（最高优先级，出现即作废重写）\n"
+        "下列短语已在全书反复复读成机械口癖，本章正文**一次都不许出现**，"
+        "同义改写也不许沿用同一个动作落点与句式——换感官通道、换身体部位、换句式结构：\n"
+        f"{lines}\n"
+        "交稿前用这几个短语在正文里逐个搜一遍，确认为零。"
+    )
 
 
 ABSTRACT_BEAT_MARKERS = (
@@ -2031,6 +2077,9 @@ def write_chapter(
                 )
     except Exception:
         pass
+    # Recency anchor #3: hard book-wide fossils, restated at the tail because the
+    # mid-prompt ban was measurably ignored (rationale on `fossil_tail_anchor`).
+    user += fossil_tail_anchor(preflight_neg, config)
     # Recency anchor #2: the full contract sits high in the prompt where long context
     # dilutes it (v4 breached the ability whitelist/modality in 5/6 chapters). Re-
     # state ONLY the hard ability boundaries as the very last thing the writer

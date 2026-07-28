@@ -12,9 +12,12 @@ payload, so a gate fix is settled by the same ruler as everything else.
 
     python tools/replay_gates.py                      # all novels, all fixes on
     python tools/replay_gates.py --fix A               # isolate one fix
+    python tools/replay_gates.py --fix book_wide_fossils   # same, by name
     python tools/replay_gates.py tangshuting_e2e --detail
 
-Fixes (`--fix`, comma-separated, default all):
+Fixes (`--fix`, comma-separated, by id or gate name, default all). An unknown token
+is an ERROR, not a silent no-op: it used to print an authoritative `+0.0pt` for a
+fix that actually buys +6.0pt.
 
   A  book_wide_fossils_ratio now requires the chapter under review to actually
      CONTAIN the entrenched phrase. Replayed by dropping archived gate_rejects
@@ -50,6 +53,36 @@ import config as config_mod  # noqa: E402
 from pipeline import _hard_block_reasons  # noqa: E402
 from tools.fpy_prime import (COUNTED_REPLANS, PINNED, _normalize,  # noqa: E402
                              _payload, discover_novels, print_exclusions)
+
+# An unknown `--fix` token used to mean "apply nothing", and the report still
+# printed an authoritative-looking `+0.0pt` under a header echoing the bad token
+# back -- `--fix book_wide_fossils` read as "the fossil fix buys nothing" when it
+# actually buys +6.0pt. A measurement tool must fail loudly instead, so the ids
+# are declared here and the descriptive gate names are accepted as aliases.
+FIX_ALIASES: dict[str, str] = {
+    "A": "book_wide_fossils",
+    "B": "chapter_mode_monotony",
+}
+FIX_IDS = set(FIX_ALIASES)
+_BY_NAME = {v.upper(): k for k, v in FIX_ALIASES.items()}
+
+
+def parse_fixes(spec: str) -> set[str]:
+    """Parse a `--fix` spec into fix ids. Raises ValueError on an unknown token."""
+    out: set[str] = set()
+    for tok in (t.strip().upper() for t in str(spec).split(",")):
+        if not tok:
+            continue
+        if tok in FIX_IDS:
+            out.add(tok)
+        elif tok in _BY_NAME:
+            out.add(_BY_NAME[tok])
+        else:
+            raise ValueError(
+                f"unknown --fix token {tok!r}; known: "
+                + ", ".join(f"{k}/{v}" for k, v in sorted(FIX_ALIASES.items())))
+    return out
+
 
 # `plan_initial` is the only replan label produced by the pre-write gate chain;
 # plan_critical / plan_fossil_catastrophe come from other code paths and are left
@@ -259,20 +292,27 @@ def main() -> int:
     ap.add_argument("novels", nargs="*")
     ap.add_argument("--from", dest="lo", type=int, default=1)
     ap.add_argument("--to", dest="hi", type=int, default=10 ** 9)
-    ap.add_argument("--fix", default="A,B", help="comma-separated subset of A,B")
+    ap.add_argument("--fix", default=",".join(sorted(FIX_IDS)),
+                    help="comma-separated subset of " + ", ".join(
+                        f"{k} ({v})" for k, v in sorted(FIX_ALIASES.items())))
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--all", action="store_true",
                     help="include derivative dirs excluded from the aggregate by default")
     args = ap.parse_args()
 
-    fixes = {f.strip().upper() for f in args.fix.split(",") if f.strip()}
+    try:
+        fixes = parse_fixes(args.fix)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
     names, dropped = discover_novels(args.novels, include_all=args.all)
     if not names:
         print("no novels with checkpoints found")
         return 2
 
     w = max(len(x) for x in names)
-    print(f"fixes active: {','.join(sorted(fixes)) or 'none'}\n")
+    print("fixes active: " + (", ".join(f"{f}/{FIX_ALIASES[f]}" for f in sorted(fixes))
+                              or "none") + "\n")
     print_exclusions(dropped)
     print(f"{'novel':<{w}}  {'FPY before':>13}  {'FPY after':>13}   delta")
     t_old = t_new = t_n = 0

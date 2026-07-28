@@ -304,6 +304,15 @@ promise that a fixer exists.
   on the resume path, where a cached review meets an already-rotated chapter. It
   re-derives `failure_codes` (consulted *before* the gate list) and touches neither
   the archived `review_round{n}.json` nor `score`/`style_health`.
+- **Repair is the second half; the first is not writing the fossil at all.** 12 of the
+  library's 20 remaining first-draft `gate_rejects` are one entrenched bank phrase per
+  book, already at **rank 0** of that chapter's mid-prompt avoid list — writer
+  non-compliance, not a missing ban. `writing.fossil_tail_anchor`
+  (`fossil_tail_anchor_enabled`) restates the hard-fossil ban at the prompt tail, the
+  fourth such anchor for this weak instruction-following writer (ability capsule,
+  recovery directive, scene-entry salience). Hard-only and capped at
+  `FOSSIL_TAIL_ANCHOR_MAX` — a long tail dilutes the position it exploits. **Forward-only
+  and unmeasurable on the archive**, like the `bd577ba` bootstrap-order fix.
 - `_stage_fix` records `style_health_after_fix` rather than overwriting
   `style_health`: the latter is the measurement `score` was computed from, and
   overwriting it would leave score and penalty describing different texts.

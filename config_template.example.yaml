@@ -798,6 +798,10 @@ novel:
   book_fossil_hard_ratio: 0.20
   # 白名单：逗号分隔的地名/设定词汇，不被视为化石（自动追加 prompt.md 中《》「」内的词）
   book_fossil_whitelist: ""
+  # 硬化石在 writer prompt 末尾复述一遍（最高显著性锚点，同能力白名单/恢复指令的做法）。
+  # 实测：全库剩余 20 次首稿 gate_rejects 里 12 次是同一条 bank 短语，且它在中段避免清单里
+  # 已经排在 rank 0——写手看得到却照用，是弱指令跟随，靠位置而不是靠措辞修。
+  fossil_tail_anchor_enabled: true
   # P0-1b 短描述符频率检测：3-6字短语（低于ngram=6和clause min_len=7的双重下限）过度使用追踪
   descriptor_freq_enabled: true
   descriptor_freq_min_spread: 15

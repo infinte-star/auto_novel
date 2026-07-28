@@ -656,6 +656,23 @@ avoid-list 确认），所以这不是闸门锁死，是写手不合规——本
 `rework_trigger: deterministic` 下少一个硬闸——**不是**省调用。FPY′ 不动也是对的：首稿
 确实带着化石。
 
+**治本的那一半：位置，不是措辞（2026-07-28）。** 两个闸门修完后全库剩 20 次首稿
+`gate_rejects`，其中 **12 次是同一本书里同一条 bank 短语**。把每一章的 1..N-1 避免清单重新
+扫一遍，这条短语在中段清单里**每次都排 rank 0**——写手看得见禁令，照用。这不是「禁令写得
+不够狠」，是弱指令跟随，和能力白名单（v4 在 6 章里违约 5 章）、恢复指令（城中村段句长
+23→30.6 仍照写）完全同一个失效模式，所以用同一个修法：`writing.fossil_tail_anchor` 在
+prompt **末尾**把硬化石禁令复述一遍（hard-only、上限 5 条——长尾会稀释这个位置本身的价
+值），`fossil_tail_anchor_enabled` 可关。这是**前向措施，归档上无法测**（同
+`bd577ba` 的 bootstrap 顺序修复）：正文里出现过的化石不会因为改了 prompt 而消失。
+`fix.rotate_fossils` 负责漏网的收尾，这一半负责别写进去。
+
+**测量污染第四例：`--fix` 未知 token 被当成「什么都不修」。** `tools/replay_gates.py`
+默认全开，我手敲 `--fix book_wide_fossils,chapter_mode_monotony`（当时只认 `A`/`B`），两个
+token 都没匹配上，工具照样打了一份表头回显着这两个名字、结论写着 `+0.0pt` 的报告——而实
+测是 **+6.0pt**（82.5% → 88.5%）。一个测量工具的默认行为绝不能是「静默降级成 no-op 再输出
+一个看起来权威的数字」：现在描述性门名是合法别名，未知 token 直接 `return 2`。同类前三例
+见本节与 §5（`pairwise_ab` 给被测臂记账、`compare` 的循环判据、`fpy_prime` 未归一化旧语义）。
+
 ### Two fixes measured and rejected before writing code
 
 Per "无效的删除" — a candidate that cannot show a gain offline gets deleted at the

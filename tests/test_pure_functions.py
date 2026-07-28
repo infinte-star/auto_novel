@@ -3063,5 +3063,82 @@ class ChapterScheduleDirectiveTests(unittest.TestCase):
         self.assertEqual(chapter_schedule_directive("no tables here", 41, {"novel": {}}), "")
 
 
+class HardFossilTailAnchorTests(unittest.TestCase):
+    """The hard-fossil ban restated at the writer prompt's tail.
+
+    Two halves are tested separately because they fail separately: the
+    `_preflight_negative_list` passthrough (does the hard subset reach the
+    caller at all) and `fossil_tail_anchor` (does the tail block render only
+    that subset).
+    """
+
+    def _cache(self, root, fossils):
+        import json
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        (root / "logs" / "book_fossils.json").write_text(
+            json.dumps({"fossils": fossils, "phrases": []}), encoding="utf-8")
+
+    def test_preflight_exposes_the_hard_subset_only(self):
+        import tempfile
+        from pathlib import Path
+
+        from writing import _preflight_negative_list
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._cache(root, [
+                {"phrase": "声音压得很低", "frac": 0.42, "chapter_count": 84},
+                {"phrase": "深吸一口气", "frac": 0.25, "chapter_count": 50},
+                {"phrase": "偶尔出现", "frac": 0.05, "chapter_count": 10},
+            ])
+            neg = _preflight_negative_list(
+                _make_paths(root), None, {"novel": {}}, 30)
+        hard = neg["hard_fossils"]
+        # hard = frac >= 0.20, sorted by descending severity; soft stays out of
+        # `hard_fossils` but still reaches the mid-prompt avoid list.
+        self.assertEqual([p for p, _ in hard], ["声音压得很低", "深吸一口气"])
+        self.assertIn("偶尔出现", neg["fossils"])
+
+    def test_chapter_one_has_no_hard_fossils_key_missing(self):
+        import tempfile
+        from pathlib import Path
+
+        from writing import _preflight_negative_list
+        with tempfile.TemporaryDirectory() as td:
+            neg = _preflight_negative_list(
+                _make_paths(Path(td)), None, {"novel": {}}, 1)
+        self.assertEqual(neg["hard_fossils"], [])
+
+    def test_anchor_quotes_every_phrase_with_its_frequency(self):
+        from writing import fossil_tail_anchor
+        out = fossil_tail_anchor(
+            {"hard_fossils": [("声音压得很低", 0.42)]}, {"novel": {}})
+        self.assertIn("声音压得很低", out)
+        self.assertIn("42%", out)
+        self.assertIn("一次都不许出现", out)
+
+    def test_anchor_is_capped(self):
+        from writing import FOSSIL_TAIL_ANCHOR_MAX, fossil_tail_anchor
+        hard = [(f"化石{i}", 0.9 - i * 0.01) for i in range(12)]
+        out = fossil_tail_anchor({"hard_fossils": hard}, {"novel": {}})
+        # A long tail dilutes the position the block exists to exploit.
+        self.assertIn("化石0", out)
+        self.assertIn(f"化石{FOSSIL_TAIL_ANCHOR_MAX - 1}", out)
+        self.assertNotIn(f"化石{FOSSIL_TAIL_ANCHOR_MAX}", out)
+
+    def test_anchor_is_empty_without_hard_fossils(self):
+        from writing import fossil_tail_anchor
+        self.assertEqual(fossil_tail_anchor({}, {"novel": {}}), "")
+        self.assertEqual(fossil_tail_anchor(None, {"novel": {}}), "")
+        self.assertEqual(
+            fossil_tail_anchor({"hard_fossils": []}, {"novel": {}}), "")
+
+    def test_anchor_can_be_disabled(self):
+        from writing import fossil_tail_anchor
+        self.assertEqual(
+            fossil_tail_anchor({"hard_fossils": [("声音压得很低", 0.42)]},
+                               {"novel": {"fossil_tail_anchor_enabled": False}}),
+            "")
+
+
 if __name__ == "__main__":
     unittest.main()
