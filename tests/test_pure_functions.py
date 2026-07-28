@@ -19,9 +19,9 @@ from config import normalize_chapter  # noqa: E402
 from quality import beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
 from quality import store_chapter_fingerprint  # noqa: E402
-from quality import prose_texture, emotional_cadence  # noqa: E402
+from quality import prose_texture  # noqa: E402
 from quality import location_transition  # noqa: E402
-from quality import opening_hook_gate, length_band_check, flat_chapter_streak  # noqa: E402
+from quality import opening_hook_gate, length_band_check  # noqa: E402
 from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from memory import _recency_aware_state  # noqa: E402
 from memory import _contract_to_markdown  # noqa: E402
@@ -1236,6 +1236,27 @@ class ProseTextureTests(unittest.TestCase):
         self.assertGreater(result["penalty"], 0.0)
         self.assertLessEqual(result["penalty"], 1.5)
 
+    def test_ordinary_prose_is_not_over_poetic(self):
+        # The 2026-07-28 recalibration. The over_poetic DIRECTIVE branch used a
+        # hardcoded poetic_density line of 6.0 while the archive runs median 31.9
+        # and min 10.2 -- 0 of 638 chapters sat under it, so the conjunct was
+        # always true and the branch degenerated into "this chapter has few
+        # numbers". It fired on 44% of the library and 63% of v2's chapters.
+        #
+        # Ordinary narration with no numbers in it is the case that was wrong. It
+        # must come back balanced, and the directive line must now be the same
+        # calibrated 40.0 the penalty branch uses -- one threshold, one question.
+        plain = "他推开门，走进屋里，把手册放在桌上，又看了一眼窗外的街道。" * 25
+        res = prose_texture(plain)
+        self.assertEqual(res["balance"], "balanced", res["metrics"])
+        self.assertEqual(res["directives"], [])
+        self.assertGreater(res["metrics"]["poetic_density"], 6.0,
+                           "the old 6.0 line has to be inside this text's range "
+                           "for the regression to be pinned")
+        low = prose_texture(plain, {"novel": {"texture_poetic_penalty_threshold": "1.0"}})
+        self.assertEqual(low["balance"], "over_poetic",
+                         "the directive branch must read the configurable line")
+
     def test_balanced_prose_has_no_texture_penalty(self):
         text = "他推开门，走进屋里，看了看四周，把手册放在桌上。" * 30
         result = prose_texture(text)
@@ -1262,47 +1283,10 @@ class ProseTextureTests(unittest.TestCase):
         self.assertEqual(result_loose["balance"], "balanced")
 
 
-class EmotionalCadenceTests(unittest.TestCase):
-    """Tests for emotional_cadence: consecutive same-mood detection."""
-
-    def test_no_tones(self):
-        result = emotional_cadence([])
-        self.assertFalse(result["monotony"])
-        self.assertEqual(result["streak"], 0)
-
-    def test_single_tone(self):
-        result = emotional_cadence(["紧张"])
-        self.assertFalse(result["monotony"])
-
-    def test_varied_tones(self):
-        result = emotional_cadence(["紧张", "温情", "压抑", "兴奋"])
-        self.assertFalse(result["monotony"])
-        self.assertEqual(result["streak"], 1)
-
-    def test_monotony_detected(self):
-        result = emotional_cadence(["温情", "紧张", "紧张", "紧张"])
-        self.assertTrue(result["monotony"])
-        self.assertEqual(result["streak"], 3)
-        self.assertTrue(len(result["directives"]) > 0)
-        self.assertIn("紧张", result["directives"][0])
-
-    def test_configurable_max_same(self):
-        tones = ["紧张", "紧张"]
-        result_strict = emotional_cadence(tones, {"novel": {"emotional_cadence_max_same": "2"}})
-        result_loose = emotional_cadence(tones, {"novel": {"emotional_cadence_max_same": "5"}})
-        self.assertTrue(result_strict["monotony"])
-        self.assertFalse(result_loose["monotony"])
-
-    def test_alternatives_for_known_tones(self):
-        result = emotional_cadence(["悲伤", "悲伤", "悲伤"])
-        self.assertTrue(result["monotony"])
-        directive = result["directives"][0]
-        self.assertTrue("希望" in directive or "温情" in directive or "坚定" in directive)
-
-
 class LongSpanFatigueTests(unittest.TestCase):
-    """long_span_fatigue's tension-flatness must ignore the lazy-extraction
-    fingerprint (exactly-constant tension) but still catch a genuine flat arc."""
+    """long_span_fatigue after the 2026-07-28 trim: ONE term, payoff_type
+    monotony, over a window of finished chapters. Its other two terms read
+    columns v2 never fills."""
 
     def _db_with_tensions(self, tensions, payoff="reveal"):
         import shutil, tempfile
@@ -1332,17 +1316,43 @@ class LongSpanFatigueTests(unittest.TestCase):
         for r in self._roots:
             shutil.rmtree(r, ignore_errors=True)
 
-    def test_constant_tension_suppresses_flat_penalty(self):
-        from quality import long_span_fatigue
-        conn = self._db_with_tensions([9, 9, 9, 9, 9, 9])
-        res = long_span_fatigue(conn, 7, {"novel": {}})
-        self.assertFalse(any("tension_flat" in f for f in res["flags"]))
-
-    def test_genuine_low_variation_still_flags(self):
+    def test_only_payoff_monotony_survives(self):
+        # The tension-variance and emotional-diversity terms were REMOVED
+        # (2026-07-28). Both read columns that v2 leaves NULL — v2 has no
+        # self-score, so `tension` and `emotional_tone` are 0/30 on v2-written
+        # chapters — and `emotional_tone` holds free text anyway (382 distinct
+        # values in 565 archived rows), so a diversity count over it measured
+        # nothing on v1 either. This pins that neither term can come back
+        # silently: even the input that used to trip them produces no flag.
         from quality import long_span_fatigue
         conn = self._db_with_tensions([8, 9, 9, 8, 9, 8])
         res = long_span_fatigue(conn, 7, {"novel": {}})
-        self.assertTrue(any("tension_flat" in f for f in res["flags"]))
+        self.assertFalse(any("tension" in f for f in res["flags"]), res["flags"])
+        self.assertFalse(any("emotion" in f for f in res["flags"]), res["flags"])
+
+    def test_v2_shaped_rows_still_produce_the_payoff_term(self):
+        # A v2 row: payoff_type present (it comes from the ChapterCard), tension
+        # and emotional_tone NULL. The gate's one remaining term must still work,
+        # because that is the whole reason it was kept rather than deleted.
+        import tempfile
+        from pathlib import Path
+        import store
+        if store.sqlite3 is None:
+            self.skipTest("sqlite3 unavailable")
+        root = Path(tempfile.mkdtemp(prefix="lsf_v2_"))
+        self._roots.append(root)
+        paths = _make_paths(root)
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        conn = store.init_db(paths)
+        with store.db_lock():
+            for i in range(1, 7):
+                conn.execute(
+                    "INSERT INTO chapter_metrics(chapter, payoff_type, created_at) "
+                    "VALUES (?, ?, ?)", (i, "reveal", "2026-01-01T00:00:00"))
+        from quality import long_span_fatigue
+        res = long_span_fatigue(conn, 7, {"novel": {"payoff_type_monotony_max": 3}})
+        self.assertTrue(any("payoff_type_monotony" in f for f in res["flags"]),
+                        res["flags"])
 
     def test_payoff_monotony_uses_payoff_type_monotony_max_fallback(self):
         # config sets only payoff_type_monotony_max (not chapter_type_monotony_max);
@@ -1809,6 +1819,38 @@ class InformationDensityTests(unittest.TestCase):
         res = information_density("x", {}, {}, {"novel": {"info_density_enabled": False}})
         self.assertFalse(res["low_information"])
 
+    def test_only_two_signals_exist_and_both_are_required(self):
+        # The 2026-07-28 signal fix. `no_info_reveals` and `no_realized_beats` had
+        # no producer in the codebase, so counting them as agreement made the
+        # documented "3 of 4" bar really "2 of 2". Pin the surviving pair by name:
+        # a third signal reappearing silently would move the bar without moving the
+        # threshold, which is how this gate came to read 0/638 while looking enabled.
+        from quality import information_density
+        flat = "他在房间里来回踱步，回想着这些天发生的事，没有结论。" * 5
+        res = information_density(flat, {"payoff_type": "setup"}, None, {"novel": {}})
+        self.assertEqual(sorted(res["signals"]),
+                         ["no_payoff_markers", "payoff_type=setup"])
+        self.assertTrue(res["low_information"])
+
+    def test_one_signal_is_not_enough(self):
+        from quality import information_density
+        # A setup chapter that nonetheless lands a payoff marker: one signal only.
+        rich = "他当众揭穿了伪证，真相大白。" * 5
+        res = information_density(rich, {"payoff_type": "setup"}, None, {"novel": {}})
+        self.assertEqual(res["signals"], ["payoff_type=setup"])
+        self.assertFalse(res["low_information"])
+
+    def test_a_missing_review_no_longer_counts_as_a_vote(self):
+        # v2 has no `review["beats_audit"]`. Passing None must not make the gate
+        # stricter than passing a clean audit did -- absence read as assent is the
+        # inverse of the sentinel-as-verdict defect.
+        from quality import information_density
+        rich = "他当众揭穿了伪证，真相大白。" * 5
+        plan = {"payoff_type": "reveal"}
+        self.assertEqual(information_density(rich, plan, None, {"novel": {}}),
+                         information_density(rich, plan, {"beats_audit": []},
+                                             {"novel": {}}))
+
 
 class RecentDimensionScoreTests(unittest.TestCase):
     """Tests for store.recent_dimension_scores (dimension de-inflation input)."""
@@ -1927,35 +1969,6 @@ class LengthBandCheckTests(unittest.TestCase):
         res = length_band_check("字" * 9000, cfg)  # 2.5x over
         self.assertTrue(res["block"])
 
-
-class FlatChapterStreakTests(unittest.TestCase):
-    CFG = {"novel": {"flat_chapters_max_consecutive": 3, "flat_impact_floor": 5.0}}
-
-    def _flat(self, n):
-        return [{"payoff_type": "setup", "emotional_impact": 3.0} for _ in range(n)]
-
-    def test_flat_streak_penalized(self):
-        res = flat_chapter_streak(self._flat(3), self.CFG)
-        self.assertEqual(res["streak"], 3)
-        self.assertGreater(res["penalty"], 0.0)
-
-    def test_recent_strong_payoff_breaks_streak(self):
-        rows = [{"payoff_type": "reveal", "emotional_impact": 3.0}] + self._flat(3)
-        res = flat_chapter_streak(rows, self.CFG)
-        self.assertEqual(res["streak"], 0)
-        self.assertEqual(res["penalty"], 0.0)
-
-    def test_high_emotion_breaks_streak(self):
-        rows = [{"payoff_type": "setup", "emotional_impact": 8.0}] + self._flat(3)
-        res = flat_chapter_streak(rows, self.CFG)
-        self.assertEqual(res["streak"], 0)
-
-    def test_disabled(self):
-        cfg = {"novel": {"flat_streak_gate_enabled": False}}
-        res = flat_chapter_streak(self._flat(5), cfg)
-        self.assertEqual(res["penalty"], 0.0)
-
-
 class GenreDetectionProfileTests(unittest.TestCase):
     def test_shuangwen_vs_suspense_differ(self):
         s = genre_detection_profile("urban_ability")
@@ -1973,12 +1986,18 @@ class GenreDetectionProfileTests(unittest.TestCase):
         self.assertTrue(m["visual_payoff_blocks_plan"])
         self.assertFalse(s["visual_payoff_blocks_plan"])
 
-    def test_history_disables_flat_streak_and_romance_strict_cadence(self):
+    def test_romance_opening_gate_and_no_dead_gate_keys(self):
         h = genre_detection_profile("history")
         r = genre_detection_profile("romance_female")
-        self.assertFalse(h["flat_streak_gate_enabled"])
         self.assertEqual(r["opening_gate_mode"], "relationship")
-        self.assertEqual(r["emotional_cadence_max_same"], 2)
+        # The per-genre knobs of `flat_chapter_streak` / `emotional_cadence`, both
+        # deleted 2026-07-28. A profile key nothing reads is the dead-key defect,
+        # so the profiles must not grow them back.
+        for dead in ("flat_streak_gate_enabled", "flat_chapters_max_consecutive",
+                     "flat_impact_floor", "flat_streak_penalty",
+                     "emotional_cadence_enabled", "emotional_cadence_max_same"):
+            self.assertNotIn(dead, h)
+            self.assertNotIn(dead, r)
 
     def test_unknown_preset_is_neutral(self):
         d = genre_detection_profile("totally_unknown")

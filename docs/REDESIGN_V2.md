@@ -711,15 +711,8 @@ v2 剩 1 次 = `card_replan`。也就是说这 10pt 差距**全部来自写前�
 
 **删除留下的坑，已量化并写进 `CLAUDE.md` 的「Known gaps left by the v1 deletion」：**
 
-- **12 个已注册的门现在没有调用点**。`GateRegistry` 从来不派发（`REGISTRY.get()` 只有测试在调），
-  v1 的 `review.py` 是按名字逐个调的，所以它一删，这些门就静默了：
-  8 个 advisory（`ai_flavor_health` / `paragraph_shape_health` / `prose_texture` /
-  `information_density` / `payoff_beat_density` / `shareable_line` / `flat_chapter_streak` /
-  `long_span_fatigue`）+ 4 个有修复层的（`intra_chapter_repetition` / `hook_tail_repetition` /
-  `beat_coverage` / `emotional_cadence`）。
-  **这是接线缺陷报告，不是删除清单**（LESSONS §4）。只有 `beat_coverage` 已结案——
-  被 `accept.contract_fulfilment` 从 `beats` 扩到整张卡片后取代。其余逐个用
-  `tools/gate_census.py` 测了再定接或删。
+- **12 个已注册的门曾没有调用点**（`GateRegistry` 从来不派发，v1 的 `review.py` 是按名字逐个调的，
+  所以它一删这些门就静默了）。**2026-07-28 逐个结算完毕**，见 §9.9。
 - **约 2.2k 行其它孤儿定义** + 约 14 个无读者的配置键（`rework_trigger` / `candidate_plans` /
   `cold_reader_enabled` / `macro_progress_enabled` / `adaptive_downshift_enabled` …）。
 - **两个能力缺口**（审计时新发现，不是死码）：
@@ -732,3 +725,75 @@ v2 的 docstring 里大量引用 v1 的函数名，正文里的散文会被计�
 恰好把大删除孤立出来的那些函数藏起来。必须按 AST 收集引用
 （`ast.Name` / `ast.Attribute` / import 节点，且排除定义自身的行区间）：
 换成 AST 之后候选从 24 个 / ~860 行涨到 47 个 / 2,250 行。
+
+### 9.9 12 个孤儿门逐个结算（2026-07-28）
+
+**为什么 `gate_census` 结算不了这件事，必须先造第二把尺子。** 那 12 个门里有 8 个是
+advisory——advisory 的意思就是「只出 directives」，所以**没有任何东西会归档它们的判决**。
+`gate_census` 读归档 `final_review.json` 的键，于是它对这 8 个门永远报「从未运行」，
+而真相是「从未被测量」。这两件事在同一列数字里长得一模一样，且危险是**单向的**：
+被报成静默的门会进删除清单。
+
+`tools/orphan_gates.py` 供上 census 结构性给不了的两项测量，
+关系等同于 `replay_gates` 对 `fpy_prime`（一个回放冻结判决，一个从原始数据重算）：
+
+1. **在 v2 写的散文上重算发火率**——直接跑真章节文件（638 章语料 + `ts_v2match` Ch171-200 的 v2 窗口）。
+2. **输入可用性审计**——v2 没有 self-score，所以 v1 由 LLM 自评填的四列在 v2 章上**结构性为空**：
+   `tension` 0/30、`emotional_tone` 0/30、`emotional_impact` 0/30、`score` 0/30；
+   而来自 ChapterCard 的 `payoff_type` / `conflict_type` 是 30/30。
+   **判决挂在一列空数据上的门，在 v2 上要么永不发火，要么把空值读成最坏值而永远发火**——
+   这正是 CLAUDE.md 那条「你的门读的信号能不能区分『坏』和『没测』」，且无需 A/B 即可判定。
+
+**结算结果：9 接线 / 2 删除 / 1 早已结案。**
+
+| 处置 | 门 | 语料 fire% | v2 窗口 fire% |
+|---|---|---|---|
+| WIRED | `paragraph_shape_health` | 29.6% | 0.0% |
+| WIRED | `payoff_beat_density` | 7.4% | 10.0% |
+| WIRED | `information_density`(重设计) | 7.8%¹ | 13.3% |
+| WIRED | `shareable_line` | 5.8% | 0.0% |
+| WIRED | `prose_texture`(重设计) | 5.0%² | 0.0% |
+| WIRED | `ai_flavor_health` | 2.5% | 6.7% |
+| WIRED | `intra_chapter_repetition` | 0.2% (1/638) | 0.0% |
+| WIRED | `hook_tail_repetition` | 0.2% (1/638) | 0.0% |
+| WIRED | `long_span_fatigue`(重设计) | 59.2%³ | 40.0% |
+| **DELETED** | `emotional_cadence` | — | — |
+| **DELETED** | `flat_chapter_streak` | — | — |
+| 早已结案 | `beat_coverage` | — | — |
+
+¹ 重设计前 43.5% / v2 侧 **70.0%**：四个信号里两个没有生产者，
+却被无条件计入 agreement，于是文档写的「4 个信号里 ≥3 个同意」实际是「2 个里 ≥1 个」。
+现在只留两个纯文本信号；另外 176/638 章根本没有可恢复的 plan，那些章报 UNMEASURED 而非 clean
+（把「取不到」判成「低信息量」是同一个缺陷类的第三个实例）。
+² 重设计前 44.0% / v2 侧 63.3%：`over_poetic` 的 DIRECTIVE 分支硬编码 6.0，
+而语料 poetic_density 中位 31.9、最小 10.2——**0/638 章在这条线以下**，
+于是那个合取项恒为真，分支退化成「本章数字少」。改为共用惩罚分支已校准的 40.0。
+³ 三项里删掉两项（emotional 多样性、tension 平坦度）：都读上表那两列空数据。
+v1 归档上它们是响的大多数（tension_flat 328、emotional_monotony 9），在 v2 上是 0。
+
+**两个删除，同一个缺陷类（信号分不出「坏」和「没测」）：**
+- `emotional_cadence` 对 `emotional_tone` 做**相等**比较，但那列存的是自由文本
+  （中位 65 字、最长 264 字、`<=6` 字的只有 6/565、382/565 互不相同）。
+  它在**任何**书上都不可能发火，v1 v2 都一样——0% 是 schema 不匹配，不是「没有单调」。
+- `flat_chapter_streak` 在 638 章里只出 3 条结论，且**每一条都已由 `payoff_beat_density` 报过**
+  ——零独占覆盖；而它唯一的区分性输入 `emotional_impact` 在 v2 上是 0/30。
+
+**接线为什么不需要 A/B 结算，这是结构性的而非判断性的。** advisory 的定义就是
+「结果只贡献 `directives`，别的什么都不贡献」——9 个门没有一个会往 `gate_rejects` 里追加，
+所以 `hard_block_reasons` 不可能动，归档 FPY′ 读数前后可比。
+实测：接线前后 `tools/fpy_prime.py` 都是 **365/438 = 83%**，逐字节相同。
+`REGISTRY.may_block()` 把这条做成了结构约束（`repair="advisory"` 或 `scope="book"` 一律不可阻塞）。
+**发火率 0% 的可达 advisory 不是废物，是免费的回归探针**——它的成本是 prompt 字节，
+而字节只在它真发火时才产生。
+
+**顺手修掉 census 自己的盲点。** `gate_census._fired` 的 `VERDICT_BOOL_KEYS` 里没有 `repeat`，
+而 `hook_tail_repetition` 返回的正是 `{repeat, ratio, repeated_clauses}`——
+它唯一的判决对 census 不可见，报出结构性 0/638，而它其实响过一次。
+这跟 `emotional_cadence` 的 `monotony` 是同一个盲点，且危险单向：
+**这里少一个键，就可能把一个活着的门论证出代码库。** 修好后它读 1/638，
+且是走**子句计数**路径响的（ratio 侧最大 0.19 < 线 0.25），
+按 LESSONS §4 这是有实证正例的 KEEP，比原来「0 发火但余量 1.3x」更强。
+
+**留下的唯一真缺口**：三个卡片级门（`plan_executability_gate` / `plan_visual_payoff_check` /
+`narrative_pattern_repetition`）仍只有 `tools/replay_gates.py` 到达。
+在那里阻塞是廉价的——一个字都还没写。

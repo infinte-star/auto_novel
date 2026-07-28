@@ -1796,17 +1796,11 @@ def write_chapter(
             )
     except Exception:
         pass
-    # Emotional impact guidance: based on plan and emotional cadence
+    # Emotional impact guidance. The `emotional_cadence` directive that used to
+    # lead this block was deleted with the gate (quality.py, 2026-07-28): it keyed
+    # on `emotional_tone` equality streaks, and that column holds free-text, so it
+    # never fired on any book.
     try:
-        from quality import emotional_cadence as _ec
-        from store import recent_metrics as _rm
-        tone_rows = _rm(conn, 6)
-        tones = [str(r.get("emotional_tone", "")) for r in reversed(tone_rows) if r.get("emotional_tone")]
-        ec = _ec(tones, config)
-        if ec.get("directives"):
-            carryover_block += "\n## 情感节奏指导\n"
-            for d in ec["directives"]:
-                carryover_block += f"- {d}\n"
         carryover_block += (
             "\n## 情感冲击力要求\n"
             "本章必须包含至少一个让读者产生真实情感反应的时刻。写法要求：\n"

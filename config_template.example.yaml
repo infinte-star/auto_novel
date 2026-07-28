@@ -548,7 +548,7 @@ novel:
   # 填不进来。证据：tangshuting_e2e（言情群像）在模板硬编码 baseline=reasoning 下
   # 57/57 命中、52 次 block，全是假阳性——形态表(智斗/动作/情感/关系/推进/日常)没有言情
   # 形态词汇，且"每章都是情感关系章"对言情是题材契约而非缺陷（补言情词后仍 38/40 同形态）。
-  # 言情族因此在 profile 里默认关闭本闸，变奏交给 payoff_type 单调闸 + emotional_cadence。
+  # 言情族因此在 profile 里默认关闭本闸，变奏交给 payoff_type 单调闸（long_span_fatigue）承担。
   chapter_mode_window: 6
   chapter_mode_warn_frac: 0.6
   chapter_mode_block_frac: 0.8
@@ -802,8 +802,6 @@ novel:
   # 防线是相对尖峰门（style_health 的 em_dash_trend_rise 按 vs 近章均值判定、跨章化石检测）。
   texture_poetic_penalty_threshold: 40.0
   texture_poetic_penalty_cap: 1.5
-  # 情绪节律：连续 N 章同一情绪基调时注入变调指令
-  # emotional_cadence_max_same: 3        # 题材profile自动设定(言情=2情绪变奏更严);取消注释可手动覆盖
   # 记忆压缩保护：LLM 压缩后字符数低于阈值则保留原文
   memory_compress_min_chars: 500
   # 评分校准三层（Layer A 确定性地板 / Layer B prose 维度锚定 / Layer C 自评失真惩罚）
@@ -890,12 +888,6 @@ novel:
   write_token_char_ratio: 1.15
   write_token_margin: 300
   write_max_tokens: 12000
-  # 连续平路闸门：连续 N 章无强爽点且 emotional_impact 低于 flat_impact_floor → 扣分 + 强制本章给中爽点。
-  # 番茄追读率要求情绪高峰间隔 ≤2 章，故默认 3 章平路即触发。
-  # flat_streak_gate_enabled: true       # 题材profile自动设定(历史=false允许慢热);取消注释可手动覆盖
-  # flat_chapters_max_consecutive: 3     # 题材profile自动设定(悬疑=5);取消注释可手动覆盖
-  flat_impact_floor: 5.0
-  flat_streak_penalty: 1.0
   # P1-6 修复 ROI 断路器（近期 replan 无效且短缺轻微时停手）
   replan_roi_breaker_enabled: true
   replan_max_attempts: 2
@@ -907,7 +899,6 @@ novel:
   # payoff_density_min: 0.5              # 题材profile自动设定(爽文≤2章,悬疑≤4,历史≤5);取消注释可手动覆盖
   # P2-8 信息密度/过渡章检测
   info_density_enabled: true
-  info_density_min_signals: 3
   # Gap-9 可截图金句/传播性信号：本章无金句钩子时给下一章注入"埋金句"建议（advisory，不扣分）
   shareable_line_enabled: true
   shareable_min_score: 2.0

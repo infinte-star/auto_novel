@@ -282,27 +282,51 @@ Two routing rules inside that table are load-bearing:
 - **Scene dedupe escalates in three steps.** WARN appends `required_constraints`; BLOCK forces a card retry (relaxed to `scene_dedupe_short_novel_block` in chapter-capped mode, but **not** disabled there); `scene_dedupe_sim_identical` (0.97) is an absolute ceiling that forces retry in EVERY mode.
 - **A `cross_chapter_repetition` reject is structural, not cosmetic** — it lands in `gate_rejects`, and the repair rows answer it before `rescue` can buy a rewrite.
 
-#### Wiring gap left by the v1 deletion — read before "fixing" a silent gate
+#### Wiring gap left by the v1 deletion — settled per gate, by measurement
 
-`quality.py` registers 25 gates; the live engine reaches **13**. The other 12
-were invoked by name from the deleted `review.py`, so they are unreachable
-today:
+The deletion of `review.py` orphaned 12 registered gates: `GateRegistry` never
+dispatches, so a gate with no caller is simply silent. All 12 are now settled.
+`quality.py` registers **23**, of which the chapter loop reaches **19**.
 
-```
-advisory (directive-only; v1 injected their text into the next prompt):
-  ai_flavor_health  paragraph_shape_health  prose_texture  information_density
-  payoff_beat_density  shareable_line  flat_chapter_streak  long_span_fatigue(book)
-fixable but unwired:
-  intra_chapter_repetition(L1)  hook_tail_repetition(L1)  beat_coverage(L1)
-  emotional_cadence(L2, card)
-```
+**Nine were WIRED as advisories in `v2/accept.py`** — `ai_flavor_health`,
+`paragraph_shape_health`, `prose_texture`, `shareable_line`,
+`intra_chapter_repetition`, `hook_tail_repetition`, `payoff_beat_density`,
+`information_density`, `long_span_fatigue`. Three of them (`prose_texture`,
+`information_density`, `long_span_fatigue`) were **recalibrated first**: each had
+a term whose threshold sat outside the metric's measured distribution, so it was
+firing on ~44%/~60% of the corpus and carrying no signal. The wiring is safe to
+ship without an A/B for one structural reason — **advisory means the result
+contributes `directives` and NOTHING else.** No wired gate appends to
+`gate_rejects`, so `hard_block_reasons` cannot move and archived FPY′ readings
+stay comparable (verified: 365/438 = 83% before and after, byte-identical).
 
-**These are a wiring bug report, not a deletion list** (LESSONS §4, and the
-`fire%` vs `advise%` distinction there). One exception is already settled:
-`beat_coverage` is deliberately superseded by `accept.contract_fulfilment`, which
-widened it from `beats` to the whole card. For the rest, the decision is per gate
-and must be measured — `python tools/gate_census.py` says how often each one
-actually fired on the archive — not made by whether v2 happens to import it.
+**Two were DELETED**, both for the "can the signal distinguish bad from
+not-measured" defect: `emotional_cadence` compared consecutive `emotional_tone`
+values for equality, but that column holds free text (median 65 chars, 382/565
+distinct) so it could not fire on **any** book, v1 or v2; `flat_chapter_streak`
+produced 3 findings in 638 chapters, every one of them already reported by
+`payoff_beat_density`, and its one distinguishing input (`emotional_impact`) is
+structurally NULL on v2 — v2 has no self-score, so `tension`, `emotional_tone`,
+`emotional_impact` and `score` are all 0/30 on v2-written chapters while
+`payoff_type`/`conflict_type` are 30/30.
+
+`beat_coverage` remains deliberately unwired — superseded by
+`accept.contract_fulfilment`, which widened it from `beats` to the whole card.
+**The one real gap left** is the three card gates (`plan_executability_gate`,
+`plan_visual_payoff_check`, `narrative_pattern_repetition`): still reached only by
+`tools/replay_gates.py`, and blocking there would be cheap because nothing has
+been written yet.
+
+**A silent gate stays a bug report, not a deletion candidate** (LESSONS §4, and
+the `fire%` vs `advise%` distinction there). Two rulers, and the difference
+matters: `python tools/gate_census.py` replays archived verdicts, so it reports an
+advisory as permanently silent — nothing archives one. `python
+tools/orphan_gates.py` recomputes the nine from primary data (chapter texts,
+archived cards, metrics rows) and is what every wired gate's `proof=` string
+quotes. Run it after touching any of their thresholds. It also found the census's
+own blind spot: `_fired` recognized no key named `repeat`, which made
+`hook_tail_repetition`'s only verdict invisible and nearly argued a live gate out
+of the tree.
 
 Roughly 2.2k lines of other orphans came with the same deletion (`memory.py`'s
 `beat_directive`/`rhythm_diagnostics`/`structural_repetition_analysis`/

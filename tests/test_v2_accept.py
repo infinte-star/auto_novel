@@ -405,5 +405,73 @@ class AcceptanceReportTest(unittest.TestCase):
         self.assertEqual(self._report()["engine"], "v2")
 
 
+class AdvisoryWiringTest(unittest.TestCase):
+    """The nine gates the v1 deletion orphaned, wired 2026-07-28.
+
+    The entire safety argument for wiring them is that they are advisory: they
+    contribute `writer_directives_for_next_chapter` and nothing else, so
+    `quality.hard_block_reasons` — the ruler `tools/fpy_prime.py` replays to settle
+    every engine A/B — reads the same number before and after. If one of them ever
+    reaches `gate_rejects`, every archived FPY' figure in the docs becomes
+    incomparable to a fresh one, silently. That is what these tests exist to catch.
+    """
+
+    WIRED = ("ai_flavor_health", "paragraph_shape_health", "prose_texture",
+             "shareable_line", "intra_chapter_repetition", "hook_tail_repetition",
+             "payoff_beat_density", "information_density", "long_span_fatigue")
+
+    def _report(self, text=FULFILLED, **kw):
+        return accept.acceptance_report(10, text, CARD, _cfg(), **kw)
+
+    def test_none_of_them_may_block(self):
+        # Structural, not conventional: `REGISTRY.may_block` refuses on `repair=
+        # "advisory"` and on `scope="book"`, so a future edit that gave one of them
+        # a reject path would have to change its registration and fail here first.
+        for name in self.WIRED:
+            with self.subTest(gate=name):
+                self.assertFalse(quality.REGISTRY.may_block(name))
+
+    def test_they_are_reachable_from_the_report(self):
+        # A gate nothing calls by name is unreachable no matter what it registers
+        # (`GateRegistry` is metadata, not a dispatcher). Firing prose is not
+        # needed -- presence of the key is what proves the call site exists.
+        r = self._report(prior_texts=["第9章\n\n" + "她走进厨房。" * 40])
+        for name in self.WIRED:
+            if name == "long_span_fatigue":
+                continue        # needs a DB conn; covered in test_pure_functions
+            with self.subTest(gate=name):
+                self.assertIn(name, r)
+
+    def test_wiring_them_cannot_move_the_ruler(self):
+        # The one that matters. Strip every advisory key from the payload and the
+        # ruler must return exactly the same verdict.
+        r = self._report(prior_texts=["第9章\n\n" + "她走进厨房。" * 40])
+        stripped = {k: v for k, v in r.items() if k not in self.WIRED}
+        self.assertEqual(quality.hard_block_reasons(stripped, _cfg()),
+                         quality.hard_block_reasons(r, _cfg()))
+        self.assertEqual(r["block_reasons"], [])
+
+    def test_an_uncomputable_advisory_is_absent_rather_than_clean(self):
+        # `long_span_fatigue` needs a conn and `payoff_beat_density` needs history.
+        # With neither supplied, a "clean" result would be a lie: no history means
+        # unmeasured, not a healthy payoff cadence. Absent is the honest shape.
+        r = self._report()
+        self.assertNotIn("long_span_fatigue", r)
+        self.assertEqual(r["payoff_beat_density"]["flags"], [],
+                         "no history must not manufacture a drought")
+
+    def test_no_advisory_declares_a_repair_layer_without_a_fixer(self):
+        # `intra_chapter_repetition` and `hook_tail_repetition` declared repair="L1"
+        # for months with no `fix.ACTION_BY_GATE` entry. Declaring a layer is not a
+        # promise a fixer exists, and a false promise reads as coverage.
+        import fix
+        for name in self.WIRED:
+            with self.subTest(gate=name):
+                layer = quality.REGISTRY.repair(name)
+                if layer != "advisory":
+                    self.assertIn(name, fix.ACTION_BY_GATE,
+                                  f"{name} declares {layer} with no fixer")
+
+
 if __name__ == "__main__":
     unittest.main()

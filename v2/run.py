@@ -171,6 +171,45 @@ def _genre_scores(conn: Any, config: dict[str, Any], chapter_num: int) -> list[f
         return []
 
 
+def _payoff_types(conn: Any, config: dict[str, Any], chapter_num: int) -> list[str]:
+    """The recent `payoff_type` cadence, NEWEST-FIRST.
+
+    That order is not cosmetic: `quality.payoff_beat_density` counts its payoff
+    drought by walking the list from index 0 and stopping at the first strong type,
+    which is what `store.recent_metrics` hands every other metrics-reading gate.
+    Fed ascending it counts forward from chapter 1, breaks on the book's first
+    strong payoff, and reports a drought of 0 for every chapter after it.
+
+    On v2 this column is populated 30/30 (it comes from the ChapterCard through
+    `arc.card_to_plan`, not from a self-score), and it is MORE diverse than v1's
+    extraction-derived version over the same positions — 8 distinct values against
+    5. The gate reads a signal v2 made better, not one v2 lost.
+    """
+    try:
+        import store as _store
+
+        if conn is None or isinstance(conn, _store.JsonStoryStore):
+            return []
+        window = int(config["novel"].get("payoff_density_window", 0))
+        if window <= 0:
+            # Derived, not a new config key. The gate's drought threshold is
+            # `round(1 / payoff_density_min)` — 2 chapters for 爽文, 5 for 历史 — and
+            # a window shorter than that truncates the drought it is meant to
+            # detect, reporting a healthy cadence because we stopped counting.
+            # Two chapters of slack so the flag can exceed the line, not just reach it.
+            min_rate = float(config["novel"].get("payoff_density_min", 0.34))
+            window = (int(round(1.0 / min_rate)) if min_rate > 0 else 3) + 2
+        cursor = conn.execute(
+            "SELECT payoff_type FROM chapter_metrics "
+            "WHERE chapter < ? AND payoff_type IS NOT NULL "
+            "ORDER BY chapter DESC LIMIT ?",
+            (chapter_num, window),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
 @dataclasses.dataclass
 class Corpus:
     """Everything `accept.acceptance_report` needs besides the text itself.
@@ -186,6 +225,7 @@ class Corpus:
     book_texts: dict[int, str] = dataclasses.field(default_factory=dict)
     book_scans: tuple[str, ...] = ()
     genre_scores: list[float] = dataclasses.field(default_factory=list)
+    payoff_types: list[str] = dataclasses.field(default_factory=list)
     whitelist: set[str] = dataclasses.field(default_factory=set)
 
 
@@ -214,6 +254,7 @@ def load_corpus(paths: Paths, conn: Any, config: dict[str, Any],
         book_texts=book_texts,
         book_scans=scans,
         genre_scores=_genre_scores(conn, config, chapter_num),
+        payoff_types=_payoff_types(conn, config, chapter_num),
         whitelist=quality.fossil_whitelist(config, prompt_text),
     )
 
@@ -331,6 +372,8 @@ def build_report(ctx: Ctx, run: ChapterRun, text: str) -> dict[str, Any]:
         book_texts=corpus.book_texts,
         book_scans=corpus.book_scans,
         recent_genre_scores=corpus.genre_scores,
+        recent_payoff_types=corpus.payoff_types,
+        conn=ctx.conn,
         fossil_whitelist=corpus.whitelist,
         canon_claims=run.canon_claims or None,
     )

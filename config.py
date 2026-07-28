@@ -73,8 +73,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "narrative_mode": "serial",
         "opening_gate_mode": "crisis",
         "payoff_density_min": 0.5,            # ≤2 章一个强爽点
-        "flat_streak_gate_enabled": True,
-        "flat_chapters_max_consecutive": 3,
         "chapter_words": 2800,
         "chapter_min_chars": 2200,
         "chapter_max_chars": 3600,
@@ -89,7 +87,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "style_tech_jargon_per_kchar_warn": 8.0,
         "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
-        "emotional_cadence_max_same": 3,
         "fatigue_words": ["冷笑", "蝼蚁", "倒吸凉气", "瞳孔骤缩", "不可思议", "震惊",
                           "竟然", "仿佛", "宛如", "不禁", "微微一笑", "嘴角微扬", "眼中闪过一丝"],
         "paragraph_cv_min": 0.12,
@@ -117,8 +114,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "reasoning",
             "opening_gate_mode": "clue",
             "payoff_density_min": 0.25,        # ≤4 章
-            "flat_streak_gate_enabled": True,
-            "flat_chapters_max_consecutive": 5,
             "chapter_words": 3500,
             "chapter_min_chars": 2800,
             "chapter_max_chars": 6000,
@@ -130,7 +125,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_warn": 10.0,
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,
-            "emotional_cadence_max_same": 4,
             "fatigue_words": ["毛骨悚然", "不寒而栗", "头皮发麻", "鸡皮疙瘩", "心跳加速",
                               "仿佛", "不禁", "宛如", "竟然", "一股寒意"],
             "paragraph_cv_min": 0.18,
@@ -146,8 +140,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "balanced",
             "opening_gate_mode": "balanced",
             "payoff_density_min": 0.2,         # ≤5 章
-            "flat_streak_gate_enabled": False,
-            "flat_chapters_max_consecutive": 4,
             "chapter_words": 3500,
             "chapter_min_chars": 3000,
             "chapter_max_chars": 6000,
@@ -158,7 +150,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_dialogue_ratio_min": 0.02,
             "style_tech_jargon_per_kchar_warn": 8.0,
             "visual_payoff_blocks_plan": False,
-            "emotional_cadence_max_same": 4,
             "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "微微颔首", "眼中闪过一丝"],
             "paragraph_cv_min": 0.18,
             "short_paragraph_warn": 55,
@@ -171,8 +162,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "serial",
             "opening_gate_mode": "relationship",
             "payoff_density_min": 0.34,        # ≤3 章
-            "flat_streak_gate_enabled": True,
-            "flat_chapters_max_consecutive": 3,
             "chapter_words": 2800,
             "chapter_min_chars": 2200,
             "chapter_max_chars": 4000,
@@ -184,14 +173,16 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_warn": 6.0,
             "style_tech_jargon_per_kchar_bad": 10.0,
             "visual_payoff_blocks_plan": False,
-            "emotional_cadence_max_same": 2,
             "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "心跳加速", "脸颊微红", "呼吸一滞"],
             # 章型单调闸对言情族关闭。证据（tangshuting_e2e Ch1-36）：形态表没有言情形态
             # 词汇，情感/关系章被题材词汇（线索/证据/真相=深伪调查主线）带成 reasoning，
             # 57/57 命中、52 次 block，零真阳性；补上言情词汇后仍 38/40 判同一形态——因为
             # "每章都是情感关系章"对言情是题材契约，不是形态疲劳。硬性"必须改成动作/追逐"
-            # 的重规划指令反而把言情书往错方向推。变奏在本题材由 payoff_type 单调闸
-            # （reversal/emotional/reveal/… 确有区分度）+ emotional_cadence_max_same=2 承担。
+            # 的重规划指令反而把言情书往错方向推。变奏在本题材全部由 payoff_type 单调闸
+            # （long_span_fatigue，reversal/emotional/reveal/… 确有区分度）承担——
+            # emotional_cadence 曾是第二道，2026-07-28 删除：它对 emotional_tone 做相等
+            # 比较，而那一列存的是自由文本（565 行里 382 个互异值），在全库任何一本上都
+            # 不可达。
             "chapter_mode_enabled": False,
             "chapter_mode_baseline": "auto",
         },
@@ -201,8 +192,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "reasoning",
             "opening_gate_mode": "clue",
             "payoff_density_min": 0.4,          # ≤2.5 章（比纯悬疑 0.25 快，贴抖音爽感）
-            "flat_streak_gate_enabled": True,
-            "flat_chapters_max_consecutive": 4,
             "chapter_words": 3000,
             "chapter_min_chars": 2400,
             "chapter_max_chars": 5000,
@@ -214,7 +203,6 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_tech_jargon_per_kchar_warn": 10.0,
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,     # 规则怪谈命脉：规则真伪/破法要落到物证与可见后果
-            "emotional_cadence_max_same": 4,
             "fatigue_words": ["毛骨悚然", "不寒而栗", "头皮发麻", "仿佛", "不禁", "宛如",
                               "竟然", "一股寒意", "浑身发冷"],
             # 与纯悬疑同源：智斗解谜是核心形态，偏置到 reasoning（本闸的原始设计场景）。

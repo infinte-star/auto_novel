@@ -813,8 +813,9 @@ def _anaphora_runs(body: str, min_run: int = 3) -> list[int]:
 @REGISTRY.register(
     "ai_flavor_health", config_key="ai_flavor_enabled", tag_prefix="ai_flavor",
     repair="advisory", scope="chapter",
-    proof="642-review census: ran 71, fired 1.4% (1 review), avg 0.007. Rare by "
-          "design; advisory only, so the low rate is not a dead key.")
+    proof="Recomputed over 638 archived chapters (tools/orphan_gates.py): fires "
+          "2.5%, and 6.7% on the 30 v2-written ones. Rare by design and reachable "
+          "on both engines. WIRED into v2/accept.py as advisory.")
 def ai_flavor_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1032,9 +1033,13 @@ _HEDGE_WORDS = re.compile(
 @REGISTRY.register(
     "paragraph_shape_health", config_key="paragraph_shape_enabled",
     tag_prefix="paragraph", repair="advisory", scope="chapter",
-    proof="642-review census: never ran in the sample (config-disabled across "
-          "the corpus). Thresholds UNVALIDATED against a live distribution — "
-          "must not be given blocking power before a census shows it firing.")
+    proof="The census read 'never ran' because v1 never archived this key — that "
+          "is 'never measured', not 'measured silent'. Recomputed over 638 "
+          "chapters (tools/orphan_gates.py): fires 29.6%, but 0/30 on v2-written "
+          "prose, which shapes paragraphs cleanly. WIRED as advisory: at 0% it "
+          "costs no prompt bytes and buys a regression tripwire. Still must not "
+          "block — the thresholds have never been validated against a live "
+          "BLOCKING distribution.")
 def paragraph_shape_health(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1333,61 +1338,23 @@ def length_band_check(
 
 
 # ---------------------------------------------------------------------------
-# 连续平路闸门 (consecutive-flat-chapter gate): 番茄追读率要求情绪高峰间隔 ≤2 章。
+# What counts as a real reader payoff. ONE definition, read by
+# `payoff_beat_density` (drought of any strong type) and by `long_span_fatigue`
+# (monotony of one type). It used to be duplicated as a literal inside
+# `payoff_beat_density`, which is two rulers for one question.
+#
+# `flat_chapter_streak` was the third reader and was DELETED here (2026-07-28).
+# Measured over 638 archived chapters by `tools/orphan_gates.py`: it produced 3
+# findings, and all 3 were already reported by `payoff_beat_density` — zero
+# unique coverage. Its one distinguishing conjunct was `emotional_impact <
+# flat_impact_floor`, and that column is 0/30 on v2-written chapters (v2 has no
+# self-score), so on the live engine the conjunct is always true and the gate
+# degenerates into a strictly-worse duplicate of the drought check.
 # ---------------------------------------------------------------------------
-_FLAT_STRONG_PAYOFF_TYPES = {
+_STRONG_PAYOFF_TYPES = {
     "reveal", "reversal", "court_breakthrough", "military_victory",
     "policy_payoff", "personnel_payoff", "institutional_fix", "payoff",
 }
-
-
-@REGISTRY.register(
-    "flat_chapter_streak", config_key="flat_streak_gate_enabled",
-    tag_prefix="flat_streak", repair="advisory", scope="chapter",
-    proof="642-review census: never ran in the sample (config-disabled across the "
-          "corpus). Streak-over-window, but the current chapter's own flatness is "
-          "a conjunct, so a non-flat chapter breaks it -- window scope does not "
-          "make it a latching gate.")
-def flat_chapter_streak(
-    recent_rows: list[dict[str, Any]] | None,
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Count consecutive recent 'flat' chapters and penalize a too-long plateau.
-
-    A chapter is 'flat' when it has neither a strong payoff_type NOR a meaningful
-    emotional peak (emotional_impact below `flat_impact_floor`). `recent_rows` is
-    the newest-first chapter_metrics list. Complements payoff_beat_density by
-    counting an unbroken run of low-energy chapters (a chapter can lack a "strong
-    payoff type" yet still be a high-emotion peak — that breaks the streak).
-    """
-    cfg = (config or {}).get("novel", {}) if config else {}
-    result: dict[str, Any] = {"streak": 0, "penalty": 0.0, "flags": [], "directives": []}
-    if not bool(cfg.get("flat_streak_gate_enabled", True)):
-        return result
-    impact_floor = float(cfg.get("flat_impact_floor", 5.0))
-    streak = 0
-    for r in (recent_rows or []):  # newest-first
-        ptype = str(r.get("payoff_type", "")).strip()
-        try:
-            impact = float(r.get("emotional_impact", 0) or 0)
-        except (TypeError, ValueError):
-            impact = 0.0
-        is_flat = (ptype not in _FLAT_STRONG_PAYOFF_TYPES) and impact < impact_floor
-        if is_flat:
-            streak += 1
-        else:
-            break
-    result["streak"] = streak
-    max_flat = int(cfg.get("flat_chapters_max_consecutive", 3))
-    if streak >= max_flat:
-        result["flags"].append(f"flat_streak({streak})")
-        result["penalty"] = round(float(cfg.get("flat_streak_penalty", 1.0)), 2)
-        result["directives"].append(
-            f"已连续 {streak} 章「平路」（无强爽点且情绪冲击偏低）。番茄追读率要求情绪高峰间隔 ≤2 章——"
-            "本章必须给出一个明确的中爽点/情绪高峰（打脸/反转/揭晓/能力兑现/情感爆发），"
-            "落到具体可见的当众场面或对手的可见崩溃上，不要再写过渡铺垫。"
-        )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1646,11 +1613,20 @@ def adjacent_repetition(
 
 @REGISTRY.register(
     "hook_tail_repetition", config_key="adjacent_repeat_enabled",
-    tag_prefix="hook", repair="L1", scope="chapter",
-    proof="642-review census: never ran in the sample. Shares "
-          "`adjacent_repeat_enabled` with adjacent_repetition, so the two cannot "
-          "be enabled independently -- a config-shape wart, not a threshold "
-          "claim. Thresholds UNVALIDATED.")
+    tag_prefix="hook", repair="advisory", scope="chapter",
+    proof="Recomputed over 638 chapters (tools/orphan_gates.py): fires 1/638, "
+          "0/30 on v2. Reachable via the CLAUSE-COUNT path, not the ratio one: "
+          "tail_clause_overlap tops out at 0.19 against a 0.25 line, so judging "
+          "this gate on its ratio alone reports 1.3x headroom and no positives. "
+          "Either reading is LESSONS 4's KEEP zone (adjacent_repetition kept at "
+          "1.1x; dialogue_pingpong deleted at 3.6x), and one true positive is on "
+          "record. WIRED as advisory; at this rate it costs ~zero prompt bytes. "
+          "Relabelled from repair=L1, which promised a fixer fix.ACTION_BY_GATE "
+          "never had. Its `repeat` verdict was invisible to tools/gate_census.py "
+          "until the same date — a gate reported silent is a deletion candidate, "
+          "so that omission nearly argued a live gate out of the tree. Still "
+          "shares `adjacent_repeat_enabled` with adjacent_repetition, so the two "
+          "cannot be enabled independently — a config-shape wart.")
 def hook_tail_repetition(
     text: str,
     prev_texts: list[str] | None,
@@ -1662,10 +1638,16 @@ def hook_tail_repetition(
     (the LLM reviewer still rated such hooks 9/10 because it never sees the
     previous endings side by side). Compares the clause set of this chapter's
     final ~300 chars against the final ~800 chars of each recent chapter.
-    Returns {"repeat": bool, "repeated_clauses", "ratio"}.
+    Returns {"repeat": bool, "repeated_clauses", "ratio", "directives"}.
+
+    `directives` is part of the return shape rather than something the caller
+    phrases, so the advice lives next to the metric that earns it — `v2/accept.py`
+    folds every advisory gate's `directives` list by key and cannot special-case
+    one gate's wording without becoming a second author of it.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
-    result: dict[str, Any] = {"repeat": False, "repeated_clauses": [], "ratio": 0.0}
+    result: dict[str, Any] = {"repeat": False, "repeated_clauses": [], "ratio": 0.0,
+                              "directives": []}
     if not text or not prev_texts:
         return result
     tail_chars = int(cfg.get("hook_repeat_tail_chars", 300))
@@ -1684,6 +1666,13 @@ def hook_tail_repetition(
     min_clauses = int(cfg.get("hook_repeat_min_clauses", 2))
     min_ratio = float(cfg.get("hook_repeat_min_ratio", 0.25))
     result["repeat"] = len(repeated) >= min_clauses or ratio >= min_ratio
+    if result["repeat"]:
+        result["directives"].append(
+            "章末钩子与近几章的收尾重复（"
+            + "；".join(f"“{c}”" for c in result["repeated_clauses"][:2])
+            + "）。钩子的锐利度全在「新」上，复用过的收尾句一律换掉："
+            "换悬念对象、换提问角度，或把钩子从「预告」改成「当场发生」。"
+        )
     return result
 
 
@@ -1699,10 +1688,13 @@ def hook_tail_repetition(
 
 @REGISTRY.register(
     "intra_chapter_repetition", config_key="intra_repeat_enabled",
-    tag_prefix="repeat", repair="L1", scope="chapter",
-    proof="642-review census: ran 640, fired 0.2% (1 review), avg 0.001. Nearly "
-          "silent -- same UNRESOLVED question as adjacent_repetition, but the "
-          "single hit proves the threshold is at least reachable.")
+    tag_prefix="repeat", repair="advisory", scope="chapter",
+    proof="Recomputed over 638 chapters (tools/orphan_gates.py): fires 1/638, "
+          "0/30 on v2. Reachable rather than merely quiet — tail_recap_ratio "
+          "reaches 0.49 against a 0.25 line (p95 0.05). WIRED as advisory. It "
+          "declared repair=L1 with NO entry in fix.ACTION_BY_GATE; declaring a "
+          "layer is not a promise a fixer exists, so the label now matches "
+          "reality. A fixer for a 1-in-638 problem is not worth writing.")
 def intra_chapter_repetition(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3383,10 +3375,13 @@ _PSEUDO_TECH_TERMS = re.compile(
 @REGISTRY.register(
     "prose_texture", config_key="prose_texture_enabled", tag_prefix="texture",
     repair="advisory", scope="chapter",
-    proof="642-review census: ran 640, fired 46.7%, avg pen 0.001. Fires on "
-          "roughly half of everything at a negligible penalty -- a descriptive "
-          "signal, correctly advisory. Giving it a block line at this rate would "
-          "reject half the library.")
+    proof="Was 44.0% of 638 chapters / 63.3% of v2's, because the over_poetic "
+          "DIRECTIVE line was a hardcoded 6.0 while the corpus runs median 31.9 "
+          "(min 10.2): 0/638 chapters sat under it, so the conjunct was always "
+          "true and the branch degenerated into 'this chapter has few numbers'. "
+          "Now shares the penalty branch's calibrated 40.0 — 5.0% corpus, 0/30 "
+          "on v2. WIRED as advisory. Must never block: the poetic_density regex "
+          "systematically overcounts (see the docstring).")
 def prose_texture(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3413,6 +3408,16 @@ def prose_texture(
     cfg = (config or {}).get("novel", {})
     num_high = float(cfg.get("texture_num_high_per_kchar", 8.0))
     poetic_low = float(cfg.get("texture_poetic_low_per_kchar", 1.0))
+    # The over-poetic DIRECTIVE line. It used to be a hardcoded 6.0, which is
+    # below the entire library: measured over 638 archived chapters
+    # (`tools/orphan_gates.py`), poetic_density runs median 31.9, min 10.2, max
+    # 49.8 — 0/638 chapters sit at or under 6.0. So the conjunct was always true
+    # and the branch degenerated into a bare `num_per_kchar < 1.0` test ("this
+    # chapter contains few numbers"), firing on 44% of the library and 63% of
+    # v2's chapters while telling the writer to cut metaphors it had not
+    # miscounted. The penalty branch below already used the calibrated 40.0; this
+    # now shares it, so one function stops holding two answers to one question.
+    poetic_high = float(cfg.get("texture_poetic_penalty_threshold", 40.0))
 
     flags: list[str] = []
     directives: list[str] = []
@@ -3428,7 +3433,7 @@ def prose_texture(
                 num_per_kchar, poetic_density
             )
         )
-    elif num_per_kchar < 1.0 and poetic_density > 6.0:
+    elif num_per_kchar < 1.0 and poetic_density > poetic_high:
         balance = "over_poetic"
         flags.append("诗意过度缺少具体锚定")
         directives.append(
@@ -3445,10 +3450,11 @@ def prose_texture(
     # 跨章化石检测——它们按"相对基线的突变"判定漂移，比这个绝对阈值可靠。此惩罚只兜底极端塌缩。
     penalty = 0.0
     if balance == "over_poetic":
-        pen_thresh = float(cfg.get("texture_poetic_penalty_threshold", 40.0))
+        # `poetic_high` above IS `texture_poetic_penalty_threshold`, so reaching
+        # this branch already means the density cleared the line; the graduated
+        # penalty is what the threshold buys beyond the directive.
         pen_cap = float(cfg.get("texture_poetic_penalty_cap", 1.5))
-        if poetic_density > pen_thresh:
-            penalty = min(pen_cap, round((poetic_density - pen_thresh) * 0.1, 2))
+        penalty = min(pen_cap, round((poetic_density - poetic_high) * 0.1, 2))
 
     return {
         "metrics": {
@@ -3464,61 +3470,22 @@ def prose_texture(
     }
 
 
-@REGISTRY.register(
-    "emotional_cadence", config_key="emotional_cadence_enabled",
-    config_default=True, tag_prefix="cadence", phase="planning", repair="L2",
-    scope="card",
-    proof="Planning-phase; invisible to gate_census. Measures the tension "
-          "sequence across recent CARDS, and the current card's own value is a "
-          "conjunct, so a differently-pitched chapter escapes it.")
-def emotional_cadence(
-    recent_tones: list[str],
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Detect emotional monotony from recent chapters' emotional_tone values.
-
-    Returns warnings + a target mood suggestion when consecutive chapters
-    share the same emotional tone.
-    """
-    cfg = (config or {}).get("novel", {})
-    max_same = int(cfg.get("emotional_cadence_max_same", 3))
-
-    if not recent_tones or len(recent_tones) < 2:
-        return {"monotony": False, "streak": 0, "directives": []}
-
-    streak = 1
-    current = recent_tones[-1]
-    for tone in reversed(recent_tones[:-1]):
-        if tone and tone == current:
-            streak += 1
-        else:
-            break
-
-    _TONE_ALTERNATIVES = {
-        "紧张": ["舒缓", "温情", "反思"],
-        "压抑": ["释然", "温暖", "决绝"],
-        "悲伤": ["希望", "温情", "坚定"],
-        "愤怒": ["冷静", "释然", "温柔"],
-        "兴奋": ["沉思", "危机", "温情"],
-        "恐惧": ["坚定", "温暖", "释然"],
-    }
-
-    directives: list[str] = []
-    monotony = streak >= max_same
-    if monotony and current:
-        alts = _TONE_ALTERNATIVES.get(current, ["与前章不同的情感基调"])
-        directives.append(
-            f"近{streak}章连续「{current}」基调，情感疲劳风险。"
-            f"本章建议切换到：{'/'.join(alts[:2])}，打破单调。"
-        )
-
-    return {
-        "monotony": monotony,
-        "streak": streak,
-        "current_tone": current if recent_tones else "",
-        "directives": directives,
-    }
-
+# ---------------------------------------------------------------------------
+# `emotional_cadence` was DELETED here (2026-07-28). It compared consecutive
+# `emotional_tone` values for EQUALITY, and that column cannot hold the short
+# label the comparison needs. Measured by `tools/orphan_gates.py` over 565
+# archived rows: median length 65 chars, max 264, only 6/565 are <=6 chars, and
+# 382/565 are distinct — the column holds a free-text sentence
+# (「克制而深沉——三地遗言全部找到…」), so an equality streak was unreachable on
+# every book in the library. On v2 it is worse than unreachable: the column is
+# 0/30 on v2-written chapters, because v2 has no LLM self-review to fill it.
+#
+# This is the "can the signal distinguish bad from not-measured" defect class
+# (CLAUDE.md), and it is why a 0% firing rate is not by itself evidence that the
+# problem does not occur. Re-introducing emotional-cadence detection needs a
+# PRODUCER for a small enumerated tone label first; the gate was the second half
+# of a feature whose first half never existed.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 长跨度疲劳检测 (long-span fatigue: type/mood/tension monotony)
@@ -3711,21 +3678,31 @@ def chapter_mode_monotony(
 @REGISTRY.register(
     "long_span_fatigue", config_key="long_span_fatigue_enabled",
     tag_prefix="fatigue", repair="advisory", scope="book",
-    proof="642-review census: ran 71, fired 62.0%, avg pen 0.352. THE clearest "
-          "book-scope quantity in the registry -- fatigue accumulated over a long "
-          "span of finished chapters, which the chapter under review cannot "
-          "lower. Advisory is the only correct layer for it; `may_block` returns "
-          "False on both counts.")
+    proof="THE clearest book-scope quantity in the registry — fatigue accumulated "
+          "over a long span of finished chapters, which the chapter under review "
+          "cannot lower. Advisory is the only correct layer for it; `may_block` "
+          "returns False on both counts. Recomputed over 638 chapters "
+          "(tools/orphan_gates.py): 59.2% corpus / 40.0% on v2, now entirely the "
+          "payoff_type_monotony term — the emotional-diversity and tension-"
+          "variance terms read columns that are 0/30 on v2 and were removed. "
+          "WIRED as advisory; at 40% it is the loudest of the nine, tolerable "
+          "only because it can never reject.")
 def long_span_fatigue(
     conn: Any,
     chapter_num: int,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Cross-chapter monotony detection over longer spans than emotional_cadence.
+    """Payoff-type monotony across a 12-chapter span. Book scope, advisory only.
 
-    Checks payoff_type repetition, emotional diversity deficit, and tension
-    flatness using chapter_metrics DB data. Returns {metrics, penalty, flags,
+    Reads `chapter_metrics` via `store.recent_metrics` (NEWEST-FIRST — the streak
+    loop below counts backwards from `[-1]`, so feeding it ascending rows reports
+    the streak at chapter 1 forever). Returns {metrics, penalty, flags,
     directives}.
+
+    It had three terms until 2026-07-28; the other two are gone and the comment
+    where they used to be says why. `advise_only` by construction: the span is
+    book-cumulative, so no rewrite of the current chapter can shorten a streak
+    that already happened.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     if not bool(cfg.get("long_span_fatigue_enabled", True)):
@@ -3768,47 +3745,25 @@ def long_span_fatigue(
                 f"本章切换到不同的 payoff_type（如 reveal/reversal/emotional）。"
             )
 
-    # --- 2. Emotional diversity deficit ---
-    tones = [str(r.get("emotional_tone", "")).strip() for r in rows[:8] if r.get("emotional_tone")]
-    if len(tones) >= 4:
-        distinct = len(set(tones))
-        metrics["emotional_diversity"] = distinct
-        if distinct < 3:
-            penalty += 0.5
-            flags.append(f"emotional_monotony(distinct={distinct}<3)")
-            directives.append(
-                f"近 {len(tones)} 章仅有 {distinct} 种情绪基调，变化不足。"
-                f"本章需要引入截然不同的情感色彩。"
-            )
-
-    # --- 3. Tension flatness ---
-    tensions = []
-    for r in rows[:6]:
-        t = r.get("tension")
-        if t is not None:
-            try:
-                tensions.append(float(t))
-            except (ValueError, TypeError):
-                pass
-    if len(tensions) >= 4:
-        mean_t = sum(tensions) / len(tensions)
-        variance_t = sum((x - mean_t) ** 2 for x in tensions) / len(tensions)
-        std_t = variance_t ** 0.5
-        metrics["tension_std"] = round(std_t, 2)
-        # Lazy-extraction guard: a cheap extraction model often returns the SAME
-        # integer tension every chapter (yeban_guize: 9,9,9,9,9,9). That is a
-        # measurement artifact, not a real flat arc — a genuinely flat-but-measured
-        # arc still jitters (8,9,9,8,9). Exactly-constant values across all recent
-        # chapters mean the signal is unreliable, so suppress the penalty rather
-        # than fire a false positive that pushes chapters into needless replans.
-        _all_equal = len(set(tensions)) <= 1
-        if std_t < 1.0 and not _all_equal:
-            penalty += 0.5
-            flags.append(f"tension_flat(std={std_t:.2f}<1.0)")
-            directives.append(
-                f"近 {len(tensions)} 章紧张度几乎不变（std={std_t:.1f}），"
-                f"需要制造明显的张弛起伏——高压场景后给一段喘息，或在平静中突然加压。"
-            )
+    # --- terms 2 and 3 (emotional diversity, tension flatness) were REMOVED on
+    # 2026-07-28. Both read `chapter_metrics` columns that only v1's LLM
+    # self-review filled; on v2-written chapters `emotional_tone` and `tension`
+    # are 0/30, so both branches were unreachable on the live engine. Measured
+    # (`tools/orphan_gates.py`, 638 chapters): over the v2 window this gate emits
+    # ONLY `payoff_type_monotony` (12/30) — the two removed terms contributed
+    # nothing, while on v1 archives they were the loud majority (tension_flat 328,
+    # emotional_monotony 9, payoff_type_monotony 378).
+    #
+    # Two lessons worth keeping if a producer for these columns is ever added:
+    #   * `emotional_tone` holds FREE TEXT, not an enum label (median 65 chars,
+    #     382/565 distinct across the library), so a `distinct < 3` test over it is
+    #     near-unreachable for the same schema reason that killed
+    #     `emotional_cadence`. Enumerate the labels first.
+    #   * A cheap extraction model returns the SAME integer tension every chapter
+    #     (yeban_guize: 9,9,9,9,9,9). That is a measurement artifact, not a flat
+    #     arc — a genuinely flat but measured arc still jitters (8,9,9,8,9). Any
+    #     variance test needs to suppress exactly-constant runs, or it fires
+    #     hardest precisely where the signal is least trustworthy.
 
     cap = float(cfg.get("long_span_fatigue_penalty_cap", 1.5))
     penalty = round(min(penalty, cap), 2)
@@ -3836,8 +3791,13 @@ _PAYOFF_MARKERS = re.compile(
 @REGISTRY.register(
     "payoff_beat_density", config_key="payoff_density_enabled",
     tag_prefix="payoff", repair="advisory", scope="chapter",
-    proof="642-review census: never ran in the sample (config-disabled across "
-          "the corpus). Thresholds UNVALIDATED against a live distribution.")
+    proof="The census read 'never ran' because v1 never archived this key. "
+          "Recomputed over 638 chapters (tools/orphan_gates.py): fires 7.4%, and "
+          "10.0% on v2 — chapters_since_payoff reaches 10 against a 2.5 line (p95 "
+          "3.0), so the threshold sits well inside the distribution. Its input "
+          "(payoff_type) is 30/30 on v2 AND more diverse there than on v1 (8 "
+          "distinct values vs 5 over the same 30 positions), so this is a real "
+          "capability v2 had lost, not a v1 leftover. WIRED as advisory.")
 def payoff_beat_density(
     text: str,
     recent_payoff_types: list[str] | None = None,
@@ -3857,10 +3817,7 @@ def payoff_beat_density(
     hits = _PAYOFF_MARKERS.findall(body)
     hits_per_kchar = round(len(hits) / kchars, 2)
 
-    strong_types = {
-        "reveal", "reversal", "court_breakthrough", "military_victory",
-        "policy_payoff", "personnel_payoff", "institutional_fix", "payoff",
-    }
+    strong_types = _STRONG_PAYOFF_TYPES
     rt = recent_payoff_types or []
     # Chapters since the last STRONG payoff (newest-first list).
     chapters_since_payoff = 0
@@ -3923,9 +3880,12 @@ def _quotable_score(line: str) -> float:
 @REGISTRY.register(
     "shareable_line", config_key="shareable_line_enabled",
     tag_prefix="shareable", repair="advisory", scope="chapter",
-    proof="642-review census: ran 640, fired 6.4%. A tail selector at a "
-          "negligible penalty -- reachable (so not a dead key) and rare enough "
-          "that the signal means something.")
+    proof="Recomputed over 638 chapters (tools/orphan_gates.py): fires 5.8%, and "
+          "0/30 on v2. It fires on the LOW tail, so the deletion test runs against "
+          "the MINIMUM, not the max: best_quotable_score dips to 1.0 against a "
+          "line of 2.0, i.e. reachable with true positives on record. Comparing "
+          "its line to the observed max reports 0.5x and reads as unreachable — "
+          "the wrong tail. WIRED as advisory.")
 def shareable_line(
     text: str,
     config: dict[str, Any] | None = None,
@@ -3983,31 +3943,53 @@ def shareable_line(
 @REGISTRY.register(
     "information_density", config_key="info_density_enabled", tag_prefix="info",
     repair="advisory", scope="chapter",
-    proof="642-review census: ran 640, fired 6.9%. Same tail-selector profile as "
-          "shareable_line: reachable, rare, correctly advisory.")
+    proof="Was 43.5% of the 462 archived chapters with a recoverable plan and "
+          "70.0% of v2's 30, because two of its four signals had no producer yet "
+          "were counted as agreement — the documented '3 of 4 must agree' was "
+          "really '1 of 2' (see the docstring). After removing them: 7.8% corpus, "
+          "13.3% on v2 (tools/orphan_gates.py). The other 176/638 chapters have no "
+          "recoverable plan and are reported UNMEASURED rather than clean: an "
+          "absent payoff_type reads as a weak one, which would score every "
+          "unplanned chapter low-information. WIRED as advisory.")
 def information_density(
     text: str,
     plan: dict[str, Any] | None = None,
-    review: dict[str, Any] | None = None,
+    review: dict[str, Any] | None = None,  # noqa: ARG001 — see docstring; kept so
+                                           # existing positional callers still pass
+                                           # `config` as the 4th argument.
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Detect a 'pure transition chapter' that advances nothing: no payoff, no
-    realized beats, no new information. Heuristic and conservative — it only
-    flags when MULTIPLE signals agree, to avoid punishing a legitimately quiet
-    breather chapter.
+    new information. Heuristic and conservative — it only flags when MULTIPLE
+    signals agree, to avoid punishing a legitimately quiet breather chapter.
 
     Signals (all derived from already-computed data, no extra LLM call):
       - payoff_type is setup/emotional (not a concrete reader payoff)
       - the chapter's payoff markers are ~zero (no 爽点)
-      - the plan opened no new threads / info_reveals
-      - the review's beats_audit shows few/zero realized beats
+
+    Two more signals were removed on 2026-07-28 because neither had an input:
+    `no_info_reveals` read `plan["info_reveals"]`, a key **no producer in the
+    codebase writes** (`arc.card_to_plan` does not emit it), so on v2 it was
+    unconditionally true — a free third vote that turned the documented "3 of 4
+    must agree" into "2 of 2", i.e. no conservatism at all. `no_realized_beats`
+    read `review["beats_audit"]`, which only v1's LLM reviewer produced. Counting
+    an unavailable signal as agreement is the inverse of the sentinel-as-verdict
+    defect in CLAUDE.md: absence read as assent.
+
+    `low_information` now requires BOTH measurable signals (see below); the old
+    `info_density_min_signals` knob is gone. Measured effect
+    (`tools/orphan_gates.py`): 6.1% → 7.8% over the 462 archived chapters that
+    have a recoverable plan, and 13.3% → 13.3% over v2's window — v2 is unchanged
+    because there the removed third vote was always free, so the effective bar was
+    already 2-of-2. The archive moves because on v1 chapters `info_reveals`
+    sometimes DID exist (114 of 641 plans carried it), and those chapters were
+    being exempted by a signal the current engine cannot produce at all.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     if not bool(cfg.get("info_density_enabled", True)):
         return {"low_information": False, "signals": [], "directives": []}
 
     plan = plan or {}
-    review = review or {}
     signals: list[str] = []
 
     ptype = str(plan.get("payoff_type", "")).strip().lower()
@@ -4018,22 +4000,14 @@ def information_density(
     if len(_PAYOFF_MARKERS.findall(body)) == 0:
         signals.append("no_payoff_markers")
 
-    reveals = plan.get("info_reveals") or []
-    if not reveals:
-        signals.append("no_info_reveals")
-
-    # beats_audit: count realized beats if the reviewer provided it.
-    audit = review.get("beats_audit") or []
-    if isinstance(audit, list) and audit:
-        realized = sum(
-            1 for b in audit
-            if isinstance(b, dict) and str(b.get("status", "")).lower() in ("realized", "present")
-        )
-        if realized == 0:
-            signals.append("no_realized_beats")
-
-    # Require at least 3 agreeing signals before calling it a transition chapter.
-    low_info = len(signals) >= int(cfg.get("info_density_min_signals", 3))
+    # BOTH signals must agree — hardcoded, not configurable. There are exactly two
+    # of them, so the old `info_density_min_signals` knob could only take the
+    # meaningless value 1 or the unreachable value 3, and every config in the repo
+    # pinned it at 3 (the count from when two never-produced signals were still
+    # counted). Left tunable, this gate measured 0/638 after the signal fix while
+    # looking enabled — a threshold set above its own maximum achievable score,
+    # which is the exact defect class this pass exists to remove.
+    low_info = len(signals) >= 2
     directives: list[str] = []
     if low_info:
         directives.append(

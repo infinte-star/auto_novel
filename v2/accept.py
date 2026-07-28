@@ -42,6 +42,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Sequence
 
+import arc
 import quality
 from quality import REGISTRY, hard_block_reasons
 
@@ -77,16 +78,17 @@ NOT_IN_ACCEPTANCE: dict[str, str] = {
         "the ruler never reads it: its verdict is a penalty, and review.py "
         "never turns it into a gate_reject. Stays an L1 repair trigger.",
     "intra_chapter_repetition":
-        "same -- penalty only, no path into hard_block_reasons. L1 repair.",
+        "same -- penalty only, no path into hard_block_reasons. Advisory: it "
+        "declared repair=L1 for months with no fix.ACTION_BY_GATE entry, and at "
+        "1 firing in 638 archived chapters a fixer is not worth writing.",
     "hook_tail_repetition":
-        "penalty only, and its thresholds are UNVALIDATED (never ran in the "
-        "642-review census). Giving an unmeasured threshold blocking power is "
-        "the dead-key defect.",
+        "penalty only, and its thresholds have never been validated against a "
+        "live BLOCKING distribution. Giving an unmeasured threshold blocking "
+        "power is the dead-key defect. Advisory, same false-repair-layer story.",
     "scene_similarity": "card-phase; see CARD_GATES.",
     "narrative_pattern_repetition": "card-phase; see CARD_GATES.",
     "plan_visual_payoff_check": "card-phase; see CARD_GATES.",
     "plan_executability_gate": "card-phase; see CARD_GATES.",
-    "emotional_cadence": "card-phase; see CARD_GATES.",
 }
 
 # Gates that judge the CARD, before a word is written. Blocking here is nearly
@@ -97,7 +99,6 @@ CARD_GATES: tuple[str, ...] = (
     "narrative_pattern_repetition",
     "plan_visual_payoff_check",
     "plan_executability_gate",
-    "emotional_cadence",
 )
 
 
@@ -554,6 +555,8 @@ def acceptance_report(
     book_texts: dict[int, str] | None = None,
     book_scans: Sequence[str] | None = None,
     recent_genre_scores: list[float] | None = None,
+    recent_payoff_types: list[str] | None = None,
+    conn: Any = None,
     fossil_whitelist: set[str] | None = None,
     canon_claims: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -567,6 +570,12 @@ def acceptance_report(
 
     *canon_claims* are the cite-or-drop candidates from the canon check (the one
     low-reasoning LLM call). Uncited ones never reach the payload.
+
+    *recent_payoff_types* and *conn* feed the two advisory gates that read the
+    book's recent history rather than this chapter's text. Both are optional and
+    both default to skipping their gate: an advisory that cannot be computed must
+    stay ABSENT from the payload, not appear as a clean result. `payoff_beat_density`
+    with no history would report a payoff drought of zero and read as healthy.
 
     *book_scans* names which book-level gates may run this chapter; `None` runs
     every one whose config switch is on. It exists because `review.py` runs the
@@ -686,12 +695,69 @@ def acceptance_report(
              f"（出自 {c['target'][:40]}…），已豁免")
             for c in ccc["forbid_conflicts"]]
 
+    # --- advisory-only gates: directives, never a reject -------------------
+    # These nine were orphaned by the v1 deletion -- `review.py` called them by
+    # name and nothing replaced it, so `quality.py` registered them and the live
+    # engine never reached them. Each verdict here is a MEASUREMENT
+    # (`tools/orphan_gates.py`, 638 archived chapters + v2's 30), recorded in the
+    # gate's own `proof=` string; two more (`flat_chapter_streak`,
+    # `emotional_cadence`) were deleted at the same pass rather than wired.
+    #
+    # Advisory means exactly one thing: the result contributes `directives` and
+    # NOTHING ELSE. None of them appends to `gate_rejects`, so `hard_block_reasons`
+    # cannot move and the FPY' ruler reads the same number before and after this
+    # wiring -- which is what makes the change safe to ship without an A/B.
+    # `REGISTRY.may_block()` refuses any of them blocking power structurally.
+    #
+    # The cost of a reachable advisory gate is prompt bytes, and those only
+    # materialize when it fires. That is why a 0%-firing gate
+    # (`paragraph_shape_health`, `hook_tail_repetition`, `shareable_line` on v2)
+    # is worth wiring anyway: it is a free regression tripwire.
+    if enabled("ai_flavor_health"):
+        report["ai_flavor_health"] = quality.ai_flavor_health(body, config)
+    if enabled("paragraph_shape_health"):
+        report["paragraph_shape_health"] = quality.paragraph_shape_health(body, config)
+    if enabled("prose_texture"):
+        report["prose_texture"] = quality.prose_texture(body, config)
+    if enabled("shareable_line"):
+        report["shareable_line"] = quality.shareable_line(body, config)
+    if enabled("intra_chapter_repetition"):
+        report["intra_chapter_repetition"] = quality.intra_chapter_repetition(body, config)
+    if prior_texts and enabled("hook_tail_repetition"):
+        report["hook_tail_repetition"] = quality.hook_tail_repetition(
+            body, list(prior_texts), config)
+    if enabled("payoff_beat_density"):
+        # `recent_payoff_types` is NEWEST-FIRST, the order `store.recent_metrics`
+        # returns and the order the gate's drought loop is written against. Fed
+        # ascending it counts the streak forward from chapter 1 and reports 0 for
+        # every book (the bug `tools/orphan_gates.py` hit first).
+        report["payoff_beat_density"] = quality.payoff_beat_density(
+            body, list(recent_payoff_types or []), config)
+    if enabled("information_density"):
+        # The card projected through the plan schema, because that is the shape the
+        # gate reads. v2 has no `review["beats_audit"]`, and the gate no longer
+        # asks for one -- see its docstring on the two signals that had no producer.
+        plan = arc.card_to_plan(card)[0] if card else None
+        report["information_density"] = quality.information_density(
+            body, plan, None, config)
+    if conn is not None and enabled("long_span_fatigue"):
+        # scope="book": the loudest of the nine at 40% on v2, and structurally
+        # incapable of rejecting -- no rewrite of THIS chapter can lower a quantity
+        # accumulated over the last N finished ones.
+        report["long_span_fatigue"] = quality.long_span_fatigue(
+            conn, chapter_num, config)
+
     # --- directives -------------------------------------------------------
     wd = report["writer_directives_for_next_chapter"]
     for key in ("style_health", "length_band", "opening_hook_gate",
                 "adjacent_repetition", "cross_chapter_repetition",
                 "book_fossils", "descriptor_frequency", "genre_adherence",
-                "contract_fulfilment"):
+                "contract_fulfilment",
+                # the nine wired advisories
+                "ai_flavor_health", "paragraph_shape_health", "prose_texture",
+                "shareable_line", "intra_chapter_repetition",
+                "hook_tail_repetition", "payoff_beat_density",
+                "information_density", "long_span_fatigue"):
         for d in (report.get(key) or {}).get("directives", []):
             if d not in wd:
                 wd.append(d)

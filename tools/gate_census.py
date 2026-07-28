@@ -31,8 +31,16 @@ REPORT_KEY = {"book_wide_fossils": "book_fossils", "length_band_check": "length_
 # `information_density` returns {low_information, signals, directives} and would
 # score a structural 0/649 against a penalty-only test, which reads as "dead gate"
 # when it actually means "never measured". Cover every shape in use.
+#
+# `repeat` was MISSING until 2026-07-28, which made `hook_tail_repetition`'s only
+# verdict invisible: it returns {repeat, ratio, repeated_clauses} and read a
+# structural 0/638 while it had in fact fired once. That is the same blind spot
+# `emotional_cadence`'s `monotony` had, and it is dangerous in one direction only —
+# a gate reported silent is a deletion candidate, so a missing key here can argue a
+# live gate out of the codebase. When adding a gate, add its verdict key.
 VERDICT_LIST_KEYS = ("flags", "phrases", "fossils", "flagged", "repeats", "template_fossils")
-VERDICT_BOOL_KEYS = ("block", "blocked", "low_information", "stalled", "collapsed")
+VERDICT_BOOL_KEYS = ("block", "blocked", "low_information", "stalled", "collapsed",
+                     "repeat")
 VERDICT_LEVELS = ("advise", "reject", "warn", "block")
 
 

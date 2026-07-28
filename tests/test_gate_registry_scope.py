@@ -132,7 +132,14 @@ class LiveRegistryTest(unittest.TestCase):
         # A proof that names neither a measurement nor its absence is decoration.
         # The honest forms are: a census/replay number, or an explicit
         # "never ran / UNVALIDATED" admission.
-        TOKENS = ("census", "replay", "measured", "UNVALIDATED", "%")
+        #
+        # `Recomputed` is the third: `tools/orphan_gates.py` recomputes a gate from
+        # primary data (chapter texts + archived cards + metrics rows) rather than
+        # replaying an archived verdict, which is the only way to measure a gate the
+        # engine never stored a result for. Without it, a gate whose measured rate is
+        # a bare count ("0 firings", "1/638") would read as unevidenced — the exact
+        # opposite of the truth.
+        TOKENS = ("census", "replay", "Recomputed", "measured", "UNVALIDATED", "%")
         for name in REGISTRY.list_gates():
             with self.subTest(gate=name):
                 self.assertTrue(any(t in REGISTRY.proof(name) for t in TOKENS),
