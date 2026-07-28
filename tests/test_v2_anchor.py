@@ -5,7 +5,9 @@ covered without an API key. That is the point of `judge_pair(call=...)`: the par
 most likely to be silently wrong is the position-bias bookkeeping, and a
 component you can only test by spending money does not get tested.
 """
+import contextlib
 import dataclasses
+import io
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -286,17 +288,32 @@ class FlipDirectionTest(unittest.TestCase):
 
 
 class RubricPremiseTest(unittest.TestCase):
-    """Two premises, one scoring rubric."""
+    """Three premises, one scoring rubric."""
 
 
     def _criteria(self, system):
         return system.split("只回答一个问题")[1]
 
-    def test_both_premises_share_the_scoring_criteria_verbatim(self):
+    def test_all_premises_share_the_scoring_criteria_verbatim(self):
         # The premise may vary with what the texts actually are; the ruler may
         # not. Two arms judged by two rubrics are not comparable.
-        self.assertEqual(self._criteria(anchor.JUDGE_SYSTEM),
-                         self._criteria(anchor.JUDGE_SYSTEM_UNMATCHED))
+        for name, system in (("unmatched", anchor.JUDGE_SYSTEM_UNMATCHED),
+                             ("anchor", anchor.JUDGE_SYSTEM_ANCHOR)):
+            with self.subTest(premise=name):
+                self.assertEqual(self._criteria(anchor.JUDGE_SYSTEM),
+                                 self._criteria(system))
+
+    def test_the_anchor_premise_claims_neither_a_shared_book_nor_a_position(self):
+        # An anchor comes from a DIFFERENT book, so both other premises are
+        # statements the judge can check and find false — different characters,
+        # different world. Two facts get dropped rather than mis-stated.
+        s = anchor.JUDGE_SYSTEM_ANCHOR
+        self.assertIn("不同的书", s)
+        self.assertNotIn("同一部书", s)
+        self.assertNotIn("同一章号", s)
+        # And it still forbids scoring the outline, which is the reason the
+        # unmatched premise exists in the first place.
+        self.assertIn("不是写作质量", s)
 
     def test_the_default_system_still_claims_a_matched_pair(self):
         self.assertIn(anchor.PREMISE_MATCHED, anchor.JUDGE_SYSTEM)
@@ -467,6 +484,75 @@ class AnchorSetTest(unittest.TestCase):
             self.assertEqual(r["win_rate"], 100.0)
             self.assertEqual(r["anchors"], ["ref01"])
             self.assertTrue(r["anchor_fingerprint"])
+
+    def test_wr_judges_under_the_anchor_premise_not_the_matched_one(self):
+        # The default premise asserts same book / same chapter number, which is
+        # false of every anchor pair. Sending it would hand the judge a fact it
+        # can disprove from the text in front of it.
+        with TemporaryDirectory() as td:
+            d = Path(td) / anchor.DEFAULT_ANCHOR_DIR
+            d.mkdir(parents=True)
+            (d / "ref01.md").write_text("人类参考章。" * 400, encoding="utf-8")
+            j = _Judge()
+            anchor.wr_against_anchor([("ch1", "引擎章。" * 400)], call=j,
+                                     root=Path(td))
+            self.assertTrue(j.seen)
+            self.assertEqual({s for s, _ in j.seen}, {anchor.JUDGE_SYSTEM_ANCHOR},
+                             "both orders must be judged under the anchor premise")
+
+
+class AnchorModeCliTest(unittest.TestCase):
+    """`pairwise_ab.py --anchor`: the CLI over `wr_against_anchor`.
+
+    `benchmarks/anchor/` does not exist, so the mode's normal outcome today is to
+    refuse. That refusal is the tested behaviour: it must cost nothing (no client,
+    no call) and it must not degrade into an arm-vs-arm comparison, which would
+    report an internal A/B under the name of an external one.
+    """
+
+    def _mod(self):
+        import importlib.util
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "_pab_anchor", root / "tools" / "pairwise_ab.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_a_missing_anchor_set_refuses_before_building_a_client(self):
+        mod = self._mod()
+        args = dataclasses.make_dataclass(
+            "A", ["a", "ch_from", "ch_to", "out"])("arm", 1, 3, "")
+
+        def _boom(*a, **k):
+            raise AssertionError("built a client for a measurement it cannot make")
+
+        with TemporaryDirectory() as td:
+            rc = mod._anchor_mode(args, Path(td), {}, None, _boom)
+        self.assertEqual(rc, 2, "an unmeasured WR is a failure exit, not a 0%")
+
+    def test_the_flag_rejects_every_arm_vs_arm_switch(self):
+        # Silently ignoring --b would produce a report describing a run that
+        # never happened. Asserting on the MESSAGE, not just on SystemExit: the
+        # next statement in `main` is `_load_arm`, which exits too, so a bare
+        # assertRaises would pass even with the validation deleted.
+        mod = self._mod()
+        for extra in (["--b", "other"], ["--b-from", "5"], ["--probe", "2"],
+                      ["--all"]):
+            with self.subTest(extra=extra[0]):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    mod.main(["--a", "arm", "--from", "1", "--to", "3",
+                              "--anchor"] + extra)
+                self.assertIn("--anchor judges against", err.getvalue())
+                self.assertIn(extra[0], err.getvalue())
+
+    def test_b_is_still_required_without_the_flag(self):
+        mod = self._mod()
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            mod.main(["--a", "arm", "--from", "1", "--to", "3"])
+        self.assertIn("--b is required", err.getvalue())
 
 
 class OneRubricTest(unittest.TestCase):

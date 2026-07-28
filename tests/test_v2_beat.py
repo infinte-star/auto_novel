@@ -419,6 +419,84 @@ class ArcVolumeTransitionWiringTests(unittest.TestCase):
         self.assertIn("卷务转场", user)
 
 
+class ArcFingerprintWiringTests(unittest.TestCase):
+    """The 全书结构指纹 aggregate: does the READ side actually reach the prompt?
+
+    `v2/run.py:707` has written a fingerprint row every chapter since v2 shipped,
+    and until this wiring nothing read the table back — the one reader lost its
+    call site with `review.py`. So the property under test is not "does
+    `arc_user_prompt` render a string it was handed", which would pass just as
+    happily on an engine that never opens the table. **Every case here goes
+    through the real seam**: rows are written with the same
+    `quality.store_chapter_fingerprint(conn, ch, plan)` call the commit action
+    makes, from the same `card_to_plan` plans, and the assertion is on the user
+    prompt `generate_arc` actually built.
+
+    The `"None"` case is a separate test rather than a detail: the reader returns
+    the literal string when it has nothing to say (a v1 template convention), so
+    an unfiltered pass-through would print the word "None" under a header
+    promising overused patterns — a header that lies is worse than no header.
+    """
+
+    # Three moves, so both a bigram and a trigram form; the same beats in three
+    # chapters is what pushes them over `quality._FP_MIN_REPEAT` (3).
+    BEATS = ["汤舒婷推开门走进旧档案室", "顾峥翻找柜子里的病历", "两人核对页码"]
+    HEADER = "全书结构指纹"
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = _paths(self.root)
+        self.conn = store.init_db(self.paths)
+        self.addCleanup(self.conn.close_current)
+
+    def _seed(self, chapters):
+        """Write real fingerprint rows exactly the way the commit action does."""
+        from arc import card_to_plan
+        from quality import store_chapter_fingerprint
+
+        for ch in chapters:
+            plan, _ = card_to_plan(_card(ch, beats=list(self.BEATS)))
+            store_chapter_fingerprint(self.conn, ch, plan)
+
+    def _user(self, **cfg):
+        call = FakeCall(arc_plan={"cards": [_card(11)]})
+        beat.generate_arc(None, self.paths, self.conn, _config(**cfg), 11, 11,
+                          call=call)
+        return call.calls[0]["user"]
+
+    def test_the_aggregate_reaches_the_arc_prompt(self):
+        self._seed([1, 2, 3])
+        user = self._user()
+        self.assertIn(self.HEADER, user)
+        self.assertIn("enter_space→collect_evidence ×3", user)
+        self.assertIn("全书 3 章累积统计", user)
+
+    def test_an_empty_library_emits_no_header_and_never_the_word_None(self):
+        user = self._user()
+        self.assertNotIn(self.HEADER, user)
+        # The reader's own sentinel must not survive into the prompt anywhere.
+        self.assertNotIn("None", user)
+
+    def test_the_flag_turns_the_read_off_without_touching_the_write(self):
+        self._seed([1, 2, 3])
+        self.assertNotIn(self.HEADER, self._user(fingerprint_enabled=False))
+        # The rows are still there: `fingerprint_enabled` gates one prompt block,
+        # not the offline replayability the library exists for (LESSONS §8).
+        n = self.conn.execute("SELECT COUNT(*) FROM chapter_fingerprints").fetchone()
+        self.assertEqual(n[0], 3)
+
+    def test_the_block_sits_immediately_before_the_request(self):
+        # An avoid-list is actionable only next to the ask it constrains; if a
+        # later section is appended after it, this catches the drift.
+        self._seed([1, 2, 3])
+        user = self._user()
+        self.assertLess(user.index(self.HEADER), user.index("## 请求"))
+        between = user[user.index(self.HEADER):user.index("## 请求")]
+        self.assertNotIn("\n## ", between)
+
+
 class VolumeTransitionTests(unittest.TestCase):
     """Layer 二 治本: deterministic volume/arc boundary transition steer.
 

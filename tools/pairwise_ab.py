@@ -27,6 +27,18 @@ What stays in this file is what is specific to an ENGINE A/B — selecting the
 chapters where the arms actually diverged, and the report.
 
     python tools/pairwise_ab.py --a p4_score --b p4_det --from 47 --to 54
+    python tools/pairwise_ab.py --a ts_v2match --from 171 --to 180 --anchor
+
+`--anchor` swaps the reference: instead of the other arm, the chapters are judged
+against the frozen human reference set in `benchmarks/anchor/`. That is the only
+measurement in the project the engine cannot award itself — an arm-vs-arm WR of
+50% says the two engines are indistinguishable from each other, which a pair of
+equally bad engines also achieves. **There is no anchor set on disk yet**, so the
+mode's first job is to say so and spend nothing: it prints
+`anchor_chapters`'s reason and exits 2 before a client is built. A missing
+measurement is not a low one (CLAUDE.md), and the whole reason
+`wr_against_anchor` returns `available: False` instead of a number is to keep an
+absent WR out of a pass/fail table.
 
 Exit code is 0 on a readable verdict, 2 if there is nothing comparable.
 """
@@ -76,10 +88,88 @@ def _rework_cost(sig: dict) -> int:
             + sig["revise"] * 2 + sig["local_fix"] + int(sig["debt"]))
 
 
-def main() -> int:
+def _anchor_mode(args, nd_a: Path, cfg: dict, paths, build_client) -> int:
+    """WR of one arm's chapters against the frozen human reference set.
+
+    **The availability check comes before the client**, for the same reason
+    `--probe` sits before pair selection: with no anchor set on disk there is
+    nothing this run can measure, and spending calls (or requiring a live key) to
+    discover that would be pure cost. Today that is the expected path —
+    `benchmarks/anchor/` does not exist, and `benchmarks/` holds NOTES about 爆款
+    structure, which must never be handed to a prose judge.
+
+    The report states the anchor fingerprint, because two WR numbers measured
+    against different anchor sets are different measurements wearing one name.
+    """
+    anchors, why = anchor.anchor_chapters(cfg, ROOT)
+    if not anchors:
+        print(f"WR against a human anchor is UNMEASURED: {why}")
+        print("Nothing was judged and no LLM call was made. Put real chapter-length "
+              "reference prose in benchmarks/anchor/ and re-run; do NOT read an "
+              "arm-vs-arm WR as this number.")
+        return 2
+
+    chapters = [(str(ch), _chapter_text(nd_a, ch))
+                for ch in range(args.ch_from, args.ch_to + 1)]
+    missing = [k for k, t in chapters if not t]
+    chapters = [(k, t) for k, t in chapters if t]
+    if not chapters:
+        print(f"no chapter text in {args.a} for Ch{args.ch_from}-{args.ch_to}")
+        return 2
+
+    client = build_client(cfg, paths)
+    call = anchor.llm_caller(client, paths, cfg, tag="pairwise_anchor")
+    print(f"{len(chapters)} chapters x {len(anchors)} anchors x 2 orders = "
+          f"{len(chapters) * len(anchors) * 2} calls")
+    r = anchor.wr_against_anchor(
+        chapters, call=call, config=cfg, root=ROOT,
+        on_verdict=lambda v: print(f"{v.key}: order1={v.orders[0]} "
+                                   f"order2={v.orders[1]} -> {v.winner}"))
+
+    out = Path(args.out) if args.out else \
+        ROOT / "experiments" / f"anchor_wr_{args.a}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Anchor WR: {args.a} Ch{args.ch_from}-{args.ch_to}",
+        "",
+        f"参考集：{', '.join(r['anchors'])}（指纹 `{r['anchor_fingerprint']}`）。",
+        "每章对每个参考章判两次并交换甲乙位置，两次一致才计胜。"
+        "判官不知道任何一侧的来源，也不带 cacheable_prefix。",
+        "",
+        f"- **本书胜率（含平局折半）：{r['win_rate']:.0f}%**",
+        f"- 胜 {r['wins_a']} / 负 {r['wins_b']} / 平 {r['ties']}，n={r['n']}，"
+        f"决定性 n_decisive=**{r['n_decisive']}**，未测到 {r['unmeasured']}",
+        f"- 交换后翻转 {r['flips']}/{r['n']}（倒向先读 "
+        f"{r['flips_first_position']}、后读 {r['flips_second_position']}）",
+        f"- 可解读（interpretable）：**{r['interpretable']}**",
+        "",
+        "| 对 | 胜方 | 两次顺序 | 理由（首次） |",
+        "|---|---|---|---|",
+    ]
+    for v in r["verdicts"]:
+        reason = v.reasons[0][:70] if v.reasons else ""
+        if v.flipped:
+            reason = f"（翻转，说法不成立）{reason}"
+        lines.append(f"| {v.key} | {v.winner} | {v.orders[0]}/{v.orders[1]} "
+                     f"| {reason} |")
+    if missing:
+        lines += ["", f"未参评（无正文）：{', '.join('Ch' + m for m in missing)}"]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nWR {r['win_rate']:.0f}%  n={r['n']}  n_decisive={r['n_decisive']}"
+          f"  flips={r['flips']}  interpretable={r['interpretable']}")
+    print(f"report -> {out}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", required=True, help="arm whose rework we expect (e.g. the score arm)")
-    ap.add_argument("--b", required=True, help="arm we expect to skip it (e.g. the det arm)")
+    ap.add_argument("--b", default="", help="arm we expect to skip it (e.g. the det arm); "
+                                           "omitted in --anchor mode")
+    ap.add_argument("--anchor", action="store_true",
+                    help="judge --a's chapters against the frozen human reference "
+                         "set in benchmarks/anchor/ instead of against arm B. The "
+                         "only WR the engine cannot award itself")
     ap.add_argument("--from", dest="ch_from", type=int, required=True)
     ap.add_argument("--to", dest="ch_to", type=int, required=True)
     ap.add_argument("--all", action="store_true",
@@ -96,9 +186,25 @@ def main() -> int:
                          "is the judge's position preference, measured with no "
                          "reference to either arm. Costs N*4 calls, judges nothing")
     ap.add_argument("--out", default="", help="write the report here (default: experiments/pairwise_<a>_vs_<b>.md)")
-    args = ap.parse_args()
+    # `argv` is injected by the flag-validation tests: reaching the validation
+    # through the real parser is the only way to know the flags are actually
+    # rejected rather than merely documented as unsupported.
+    args = ap.parse_args(argv)
 
-    nd_a, nd_b = _load_arm(args.a), _load_arm(args.b)
+    if args.anchor:
+        # Every arm-vs-arm switch is meaningless here and would be silently
+        # ignored, which is how a report ends up describing a run that never
+        # happened. `--probe` self-compares arm B's chapters and there is no arm B.
+        bad = [f for f, v in (("--b", args.b), ("--b-from", args.b_from),
+                              ("--probe", args.probe), ("--all", args.all)) if v]
+        if bad:
+            ap.error(f"--anchor judges against benchmarks/anchor/, not another "
+                     f"arm; drop {', '.join(bad)}")
+    elif not args.b:
+        ap.error("--b is required unless --anchor is given")
+
+    nd_a = _load_arm(args.a)
+    nd_b = _load_arm(args.b) if args.b else nd_a
     # Unmatched mode exists because an A/B can end up with arms at different
     # positions: when the v1 side is a FINISHED book and the v2 side regenerates
     # the chapters after it, the matched set is however many chapters they happen
@@ -125,6 +231,9 @@ def main() -> int:
     # novels/p4_score/logs and inflated that arm's measured cost by ~0.5 calls/ch
     # in the very report the judge existed to complete.
     paths = anchor.judge_paths(_config.get_paths(cfg), ROOT)
+
+    if args.anchor:
+        return _anchor_mode(args, nd_a, cfg, paths, build_client)
 
     pairs: list[tuple[int, str, str, dict, dict]] = []
     skipped: list[str] = []

@@ -276,7 +276,7 @@ decorators.
 | `quality.plan_executability_gate`, `plan_visual_payoff_check`, `narrative_pattern_repetition` | card-scope | plan/card gates, fixable before a word is written. Currently reached only by `tools/replay_gates.py` — see the wiring gap below |
 | `retrieval.py` RAG | `rag_enabled`, `rag_top_k`, `rag_exclude_recent` | dependency-free TF-IDF char-bigram index (no embeddings). `index_chapter` is called idempotently from `save_chapter` → `logs/retrieval_index.json`; `retrieval_block` builds the "## 相关历史原文（检索…）" section; `backfill_index` indexes a finished book |
 | `retrieval.exemplar_block` | `exemplar_rag_enabled` (false), `exemplar_rag_top_k` | quotes the book's own strongest chapters back as style anchors. **Rank-based, not an absolute score threshold**; picks one dialogue-dense + one action-dense exemplar (LESSONS §7) |
-| `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. LESSONS §8 |
+| `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block, consumed by **`v2/beat.py:_fingerprints` — once per arc, not once per chapter**. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). Measured on a real 200-chapter library it is 1,231 chars, so at `arc_span` 10 it amortizes to ~123 chars/chapter and does not grow with the book. **It returns the literal string `"None"`, not `""`, when it has nothing to say** (a v1 template convention), which `_fingerprints` filters — a header promising overused patterns with the word "None" under it is worse than no header. `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. LESSONS §8 |
 
 Two routing rules inside that table are load-bearing:
 - **Scene dedupe escalated in three steps under v1; v2 kept only one.** `arc.validate_card` takes a single `scene_sim_block` (`v2/beat.py:429`, default 0.85) and files a CRITICAL above it. The WARN tier that appended `required_constraints`, the chapter-capped relaxation, and the `scene_dedupe_sim_identical` (0.97) absolute ceiling all lived in the deleted `review.py`/`planning.py` — their config keys (`scene_dedupe_sim_warn`, `scene_dedupe_candidate_block`) now have no reader. Found by `tools/orphan_defs.py --config`; it is a wiring gap to settle per tier, not a redesign that dropped them deliberately.
@@ -503,13 +503,27 @@ directory does not exist yet, and the only things under `benchmarks/` are patter
 NOTES about 爆款 structure — not prose, and they must never be fed to a prose
 judge. So `wr_against_anchor` returns `{"available": False}` with a reason rather
 than quietly substituting an arm-vs-arm comparison, which would report an
-internal A/B under the name of an external one.
+internal A/B under the name of an external one. Its CLI is
+`tools/pairwise_ab.py --a <arm> --from N --to N --anchor`, which checks
+availability **before building a client** — with no anchor set there is nothing to
+measure, so the run prints the reason and exits 2 having spent nothing.
+
+**There are three judge premises, not two, and the anchor case needs its own.**
+`JUDGE_SYSTEM_TEMPLATE` varies only the premise while the five scoring criteria
+stay byte-identical, because two arms judged by two rubrics are not comparable.
+`PREMISE_MATCHED` claims same book / same chapter number; `PREMISE_UNMATCHED`
+claims same book, different position; an anchor comes from a **different book**,
+so both are statements the judge can disprove from the text in front of it —
+different characters, different world — and inviting it to resolve that
+contradiction is the failure the premise split existed to stop. Hence
+`PREMISE_ANCHOR`, which drops both the shared book and the shared position while
+keeping the "don't score the outline" rule.
 
 ### Experiment harness (`compare.py`)
 - `compare <a> <b>` — deterministic zero-LLM report (per-chapter scores/style penalties, force-accepts, gate-reject events, fossil warnings, scene-dedupe hits, LLM cost + planning share, non-secret config diff, heuristic verdict) → `experiments/`.
 - `fork <name> --as <new>` — **the A/B tool to reach for on anything mid-book.** Branches at HEAD (copies `memory/`, `chapters/`, `book.md`, `state.md`, `story_state.db`, RAG index) so both arms start byte-identical; forks at HEAD **only**. Metadata → `experiments/fork_<new>.json`.
 - `ablate <name> --flip <key>` — chapter-capped copy with ONE key flipped, but it restarts at Ch1. Metadata → `experiments/ablate_*.json`.
-- `tools/pairwise_ab.py` — the CLI over `v2/anchor.py` for a two-arm engine A/B. Supports `--b-from` (offset pairing when the arms sit at different outline positions) and `--probe N` (judge chapters against themselves to calibrate position bias).
+- `tools/pairwise_ab.py` — the CLI over `v2/anchor.py` for a two-arm engine A/B. Supports `--b-from` (offset pairing when the arms sit at different outline positions), `--probe N` (judge chapters against themselves to calibrate position bias), and `--anchor` (judge ONE arm against `benchmarks/anchor/` instead of against arm B). `--anchor` **rejects** `--b`/`--b-from`/`--probe`/`--all` rather than ignoring them: silently accepting an arm-vs-arm switch would produce a report describing a run that never happened.
 
 **Short opening runs fabricate positive results.** The full protocol — one
 variable, mid-book fork, matching reasoning coverage, `logs/` deliberately not

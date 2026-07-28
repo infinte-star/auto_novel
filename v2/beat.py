@@ -236,9 +236,41 @@ def _volume_transition(paths: Paths, config: dict[str, Any], chapters: list[int]
     return "\n".join(blocks)
 
 
+def _fingerprints(conn: Any, config: dict[str, Any]) -> str:
+    """The 全书结构指纹 aggregate, or "" — the READ side of what v2 already writes.
+
+    `v2/run.py:705` has been calling `store_chapter_fingerprint` every chapter
+    since v2 shipped, and nothing read the table back: the one reader
+    (`quality.fingerprint_avoidance_context`) lost its call site with `review.py`.
+    A write-only fingerprint library is the most expensive kind of dead code,
+    because it looks like a working feature from the schema.
+
+    The arc call is the right consumer, and the only affordable one. v1 pasted
+    this into EVERY chapter's plan prompt at ~1.2k chars; here it is read once per
+    `arc_span` (10) chapters, so it amortizes to ~120 chars/chapter, and the
+    aggregate does not grow with the book (the per-chapter form was 19.6% of the
+    largest prompt and grew linearly — LESSONS §8).
+
+    **The function returns the literal string "None", not "", when there is
+    nothing to say** — a v1 template convention. Pasting that through would tell
+    the planner the word "None" under a header promising overused patterns, so it
+    is filtered here rather than trusted.
+    """
+    if not bool(config["novel"].get("fingerprint_enabled", True)):
+        return ""
+    try:
+        from quality import fingerprint_avoidance_context
+
+        text = (fingerprint_avoidance_context(conn, config) or "").strip()
+    except Exception:
+        return ""
+    return "" if text in ("", "None") else text
+
+
 def arc_user_prompt(state: canon.StoryState, chapters: list[int], *,
                     volume_plan: str = "", prev_skeleton: str = "",
-                    finale_note: str = "", volume_transition: str = "") -> str:
+                    finale_note: str = "", volume_transition: str = "",
+                    fingerprints: str = "") -> str:
     """The volatile half of the arc prompt. Pure, so its shape is testable."""
     parts = [state.volatile_block()]
     if volume_plan:
@@ -248,6 +280,10 @@ def arc_user_prompt(state: canon.StoryState, chapters: list[int], *,
     if prev_skeleton:
         parts.append("## 上一弧留下的骨架（默认延续，偏离必须在 arc_intent 里说明）\n"
                      + prev_skeleton)
+    if fingerprints:
+        # Immediately before the request: an avoid-list is actionable only next to
+        # the ask it constrains.
+        parts.append("## 全书结构指纹（已用滥的推进形状，本弧请避开）\n" + fingerprints)
     parts.append(
         f"## 请求\n为以下章节各生成一张 ChapterCard，共 {len(chapters)} 张，"
         f"`ch` 必须严格等于：{chapters}\n"
@@ -301,6 +337,7 @@ def generate_arc(
         prev_skeleton=skeleton_block(prev_skeleton, chapters),
         finale_note=finale_note,
         volume_transition=_volume_transition(paths, config, chapters),
+        fingerprints=_fingerprints(conn, config),
     )
 
     raw = call(

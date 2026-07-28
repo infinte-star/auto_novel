@@ -890,3 +890,46 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 （少的 46 个是随被测函数一起删的用例，其中 7 个类是 v1 计划委员会/记忆压缩/自动扩写卷纲的测试）。
 两个 TESTS-ONLY 孤儿**不删**，它们是下一次提交要接的线：
 `quality.fingerprint_avoidance_context`（14 本书上都有实质输出）与 `v2.anchor.wr_against_anchor`。
+
+### 9.11.1 接上那两条线：孤儿的另一半结局
+
+删除是 census 的一半答案，接线是另一半。两个 TESTS-ONLY 孤儿都不是 v1 的残骸，
+而是**能力缺口**——所以它们进的是接线提交，不是删除清单。
+
+**① 结构指纹：写了 200 章，没人读过一次。**
+`v2/run.py:707` 从 v2 上线那天起每章都在调 `store_chapter_fingerprint`，
+唯一的读者 `quality.fingerprint_avoidance_context` 随 `review.py` 一起失去了调用点。
+**只写不读的指纹库是最贵的一种死代码**：从 schema 上看它像一个正常工作的功能。
+接到 `v2/beat.py:_fingerprints`，喂进弧规划的 user prompt，紧贴「请求」节之前——
+避坑清单只有挨着它约束的那个请求才是可执行的。
+
+选弧调用而不是逐章，是唯一负担得起的接法。v1 把它贴进**每一章**的 plan prompt，
+实测 1,231 字（ts_v2match 的 200 章真实库）；按 `arc_span` 10 摊薄是 ~123 字/章，
+而且这个聚合**不随书长增长**（逐章形态曾占最大 prompt 的 19.6% 且线性增长，LESSONS §8）。
+
+一个必须过滤的返回值：**它没话说的时候返回字面量 `"None"` 而不是 `""`**（v1 的模板惯例）。
+原样透传会在一个承诺「已用滥的推进形状」的标题下面印上 `None` 一个词——
+**会撒谎的标题比没有标题更糟**。
+
+测试走**真实 DB 缝**：用 commit 动作同一个 `store_chapter_fingerprint(conn, ch, plan)`
+写行、同一个 `card_to_plan` 造 plan，断言在 `generate_arc` 真正构造出的 user prompt 上。
+拿 `fingerprints=` 当参数传进 `arc_user_prompt` 的测试，在一个从不打开那张表的引擎上
+也会照样通过——那正是 #25 里抓到的同一种自欺。反证过：拆掉调用点 2 挂，拆掉 `"None"` 过滤 1 挂。
+
+**② 锚点 WR：判官需要第三个前提。**
+`wr_against_anchor` 的 CLI 是 `tools/pairwise_ab.py --anchor`。两条纪律：
+- **可用性检查在建 client 之前**。今天 `benchmarks/anchor/` 不存在，所以这个模式的
+  正常结局就是拒绝执行——它必须**零成本**地拒绝，并且退 2 而不是报一个 0%。
+- `--anchor` **拒绝** `--b`/`--b-from`/`--probe`/`--all` 而不是无视它们。
+  默默无视一个 `--b` 会产出一份描述着从未发生过的运行的报告。
+
+顺带修掉一个只有接线时才看得见的缺陷：`wr_against_anchor` 原先用默认的
+`JUDGE_SYSTEM`，而那个前提声称「同一部书、同一章号、同一大纲位置」。
+锚点章来自**另一本书**，所以 `PREMISE_MATCHED` 和 `PREMISE_UNMATCHED`（仍声称同一部书）
+**都是判官能从眼前正文里当场推翻的事实**——人物不同、世界不同。
+让判官自己去消化这个矛盾，正是当初拆成两个前提要防的那件事。于是有了第三个
+`PREMISE_ANCHOR`：丢掉「同一部书」和「同一位置」两个事实，保留「不要给大纲打分」这条规则。
+五条评分标准三个前提逐字相同——两把尺子量出来的两个 WR 不可比。
+
+零指标变更（两条线都在弧规划/离线判官上，不动验收）：`fpy_prime` 仍是 **365/438 = 83%**，
+测试 769 → 778 全绿，`tools/orphan_defs.py --constants` 现在报 **0 孤儿、0 TESTS-ONLY**。

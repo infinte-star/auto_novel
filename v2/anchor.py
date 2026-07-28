@@ -72,6 +72,18 @@ PREMISE_UNMATCHED = (
     "你会看到同一部书里两段不同章节的正文（甲、乙），剧情位置不同。\n"
     "因此**不要**比较哪一段剧情更重要、更关键、更靠近高潮——那是大纲安排的，不是写作质量。\n"
     "只比较：把这一章单独递给一个陌生读者，哪一章更能让他读下去。")
+# The anchor premise is a THIRD case, not a reuse of the unmatched one: an anchor
+# chapter comes from a different BOOK, so "同一部书里两段不同章节" is as false as
+# the matched claim. Reusing either would hand the judge a fact it can see is
+# wrong (different characters, different world) and invite it to resolve the
+# contradiction however it likes — which is exactly the failure the two-premise
+# split was introduced to stop. Two facts have to be dropped rather than
+# mis-stated: the shared book and the shared outline position.
+PREMISE_ANCHOR = (
+    "你会看到两段互不相关的网文正文（甲、乙），出自不同的书，人物和世界都不同。\n"
+    "因此**不要**比较哪一段的设定更宏大、剧情更关键、更靠近高潮——那是各自大纲的安排，"
+    "不是写作质量。\n"
+    "只比较：把这一段单独递给一个陌生读者，哪一段更能让他读下去。")
 
 JUDGE_SYSTEM_TEMPLATE = """你是一位挑剔的网文读者，不是编辑，也不认识作者。
 {premise}
@@ -91,6 +103,7 @@ JUDGE_SYSTEM_TEMPLATE = """你是一位挑剔的网文读者，不是编辑，�
 
 JUDGE_SYSTEM = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_MATCHED)
 JUDGE_SYSTEM_UNMATCHED = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_UNMATCHED)
+JUDGE_SYSTEM_ANCHOR = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_ANCHOR)
 
 JUDGE_USER = """【甲】
 {first}
@@ -497,6 +510,10 @@ def wr_against_anchor(chapters: Sequence[tuple[str, str]], *, call: CallFn,
     Returns `{"available": False, "reason": ...}` when there is no anchor set.
     A missing measurement is not a low one (CLAUDE.md), and the caller must print
     the reason rather than fold an absent WR into a pass/fail table.
+
+    Judged under `JUDGE_SYSTEM_ANCHOR`: the two sides come from different books,
+    which makes both of the other premises false statements the judge can verify
+    for itself.
     """
     anchors, why = anchor_chapters(config, root)
     if not anchors:
@@ -505,7 +522,8 @@ def wr_against_anchor(chapters: Sequence[tuple[str, str]], *, call: CallFn,
     # The generated chapter is always arm "a"; the human anchor is "b". So the
     # headline number is stated on the ENGINE, not on the reference.
     pairs = [(f"{k}~{a.name}", text, a.text) for k, text in chapters for a in anchors]
-    verdicts = judge_series(pairs, call=call, on_verdict=on_verdict)
+    verdicts = judge_series(pairs, call=call, system=JUDGE_SYSTEM_ANCHOR,
+                            on_verdict=on_verdict)
     out = tally(verdicts, arm="a")
     out.update({
         "available": True,
