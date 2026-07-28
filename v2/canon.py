@@ -9,10 +9,10 @@ largest prompt in the engine shipped every row twice).
 
 v2 projects ONE state, and splits it by **mutability rather than by topic**:
 
-  stable   — brief / facts / voice.  Byte-identical for as long as the source
-             files are, so it is the provider prompt-cache prefix.  ~5k.
-  volatile — card / focus / threads / recent / ledger / rag.  Changes every
-             chapter. ~11k.
+  stable   — brief / facts / voice / route.  Byte-identical for as long as the
+             source files are, so it is the provider prompt-cache prefix.  ~5k.
+  volatile — card / focus / threads / recent / ledger / rag / opening.  Changes
+             every chapter. ~11k.
 
 `render()` always emits stable first. That ordering is the entire cache strategy:
 a prefix cache hits on a shared *prefix*, so a single volatile byte in the head
@@ -57,6 +57,7 @@ BUDGET: dict[str, int] = {
     "brief": 1500,
     "facts": 2000,
     "voice": 1500,
+    "route": 600,
     # volatile
     "card": 3000,
     "focus": 800,
@@ -64,23 +65,49 @@ BUDGET: dict[str, int] = {
     "recent": 1500,
     "ledger": 1000,
     "rag": 4000,
+    "opening": 500,
 }
 
-STABLE_SECTIONS: tuple[str, ...] = ("brief", "facts", "voice")
+STABLE_SECTIONS: tuple[str, ...] = ("brief", "facts", "voice", "route")
 VOLATILE_SECTIONS: tuple[str, ...] = ("card", "focus", "threads", "recent",
-                                      "ledger", "rag")
+                                      "ledger", "rag", "opening")
 
 TITLES: dict[str, str] = {
     "brief": "创作纲要",
     "facts": "世界与人物事实",
     "voice": "叙事声音",
+    "route": "作品定位（已采纳开篇路线）",
     "card": "本章卡片",
     "focus": "主角当前处境",
     "threads": "未结伏线",
     "recent": "最近发生",
     "ledger": "已用元素账",
     "rag": "相关历史原文",
+    "opening": "开篇执行指令",
 }
+
+# `memory/opening_route.md` carries SIX blocks (see `trial.py`'s `best_md`), and
+# they do not all belong in a writer prompt or at the same lifetime:
+#
+#   核心卖点 / 差异化 / 读者承诺   book-level positioning -> `route`, stable, forever
+#   正式连载前修改指令             opening-scoped          -> `opening`, volatile
+#   推荐书名 / 推荐简介            packaging, `package.py`'s job -> DROPPED
+#   trial_score / variant_path     bookkeeping             -> DROPPED
+#
+# v1's `memory.cacheable_prefix` pasted the whole file at a 5000-char cap into
+# every chapter's prompt, so a 200-chapter book shipped ten candidate titles and
+# five blurbs 200 times. That is the prompt-bloat defect class v2 exists to
+# remove, so this projects the file instead of pasting it.
+ROUTE_KEEP_STABLE: tuple[str, ...] = ("核心卖点", "差异化", "读者承诺")
+ROUTE_KEEP_OPENING: tuple[str, ...] = ("正式连载前修改指令",)
+
+# The opening directives say what to change BEFORE serialising, so they are true
+# for the first chapters and become a stale instruction after that — which is why
+# they must NOT live in the stable prefix. Emitting them there would either freeze
+# a wrong instruction into the cached head for 200 chapters, or make the head
+# chapter-dependent, and a volatile byte in the stable head costs the cache hit on
+# every remaining call. Three chapters is the span `trial.py` actually writes.
+OPENING_ROUTE_SPAN = 3
 
 STABLE_HEADER = "# 稳定参照（可缓存）"
 VOLATILE_HEADER = "# 本章上下文"
@@ -246,6 +273,65 @@ def project_voice(voice: str, voices: str = "", cap: int = 0) -> str:
     if t:
         parts.append("### 人物声音\n" + _clip(t, cap - len("\n".join(parts)) - 12))
     return "\n".join(parts).strip()
+
+
+def _route_blocks(text: str) -> dict[str, str]:
+    """Split an `opening_route.md` into `{heading: body}` by its `## ` lines.
+
+    Headings are matched by CONTAINMENT rather than equality (`項` in `heading`),
+    because `trial.py` writes them as prose labels and a future edit to that
+    module's wording must not silently empty this section. Anything before the
+    first `## ` — the title line and the `trial_score`/`variant_path` bookkeeping —
+    has no heading and is therefore dropped, which is the intent.
+    """
+    blocks: dict[str, str] = {}
+    head: str | None = None
+    buf: list[str] = []
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            if head is not None:
+                blocks[head] = "\n".join(buf).strip()
+            head, buf = line[3:].strip(), []
+        elif head is not None:
+            buf.append(line)
+    if head is not None:
+        blocks[head] = "\n".join(buf).strip()
+    return blocks
+
+
+def _route_pick(text: str, wanted: Sequence[str], cap: int) -> str:
+    """The `wanted` blocks of a route file, in `wanted` order, under `cap`."""
+    blocks = _route_blocks(text)
+    items = []
+    for want in wanted:
+        body = next((v for k, v in blocks.items() if want in k and v.strip()), "")
+        if body:
+            items.append(f"### {want}\n{body.strip()}")
+    return _clip_items(items, cap)
+
+
+def project_route(opening_route: str, cap: int = 0) -> str:
+    """The adopted route's book-level positioning. Stable for the whole book.
+
+    `adopt-trial` is how a user says "this is the variant I chose", and under v1
+    that choice reached the writer through `memory.cacheable_prefix`. v2 reads its
+    own projection, so until this section existed the command was inert on a v2
+    book: it wrote the file and nothing read it.
+    """
+    return _route_pick(opening_route, ROUTE_KEEP_STABLE, cap or BUDGET["route"])
+
+
+def project_opening(opening_route: str, chapter: int, span: int = OPENING_ROUTE_SPAN,
+                    cap: int = 0) -> str:
+    """The route's pre-serialisation revision directives — opening chapters only.
+
+    Empty past `span`, and empty is the honest answer there: these directives
+    describe what to fix about the OPENING, so at chapter 150 they are an
+    instruction about a chapter that shipped 147 chapters ago.
+    """
+    if chapter > max(0, span):
+        return ""
+    return _route_pick(opening_route, ROUTE_KEEP_OPENING, cap or BUDGET["opening"])
 
 
 def project_card(card: dict[str, Any] | None, arc_note: str = "",
@@ -428,18 +514,22 @@ def build(chapter: int, *, brief: str = "", bible: str = "", characters: str = "
           metrics: Iterable[dict[str, Any]] = (),
           used_elements: Iterable[str] = (),
           constraints: Iterable[dict[str, Any]] = (),
-          rag: str = "", stable_key: str = "") -> StoryState:
+          rag: str = "", opening_route: str = "",
+          opening_span: int = OPENING_ROUTE_SPAN,
+          stable_key: str = "") -> StoryState:
     """Assemble a StoryState from already-read data. Pure; `load` does the IO."""
     sections = (
         Section("brief", project_brief(brief), True),
         Section("facts", project_facts(bible, characters, contract), True),
         Section("voice", project_voice(voice, voices), True),
+        Section("route", project_route(opening_route), True),
         Section("card", project_card(card, arc_note), False),
         Section("focus", project_focus(protagonist), False),
         Section("threads", project_threads(open_threads, overdue), False),
         Section("recent", project_recent(events, metrics), False),
         Section("ledger", project_ledger(used_elements, constraints), False),
         Section("rag", project_rag(rag), False),
+        Section("opening", project_opening(opening_route, chapter, opening_span), False),
     )
     return StoryState(chapter=chapter, sections=sections, stable_key=stable_key)
 
@@ -454,17 +544,36 @@ def _read(path: Path | None, cap: int = 0) -> str:
     return text[:cap] if cap else text
 
 
+def opening_route_path(paths: Any) -> Path | None:
+    """`memory/opening_route.md`, derived the same way `memory.py` derives it.
+
+    `Paths` has no field for it — `novel.py adopt-trial` writes it straight into
+    the memory dir — so both readers locate it off `volume_plan`'s parent. Deriving
+    it in two places is already one too many; deriving it two DIFFERENT ways would
+    let `adopt-trial` land a file that one reader sees and the other does not.
+    """
+    vp = getattr(paths, "volume_plan", None)
+    return (Path(vp).parent / "opening_route.md") if vp else None
+
+
 def stable_key(paths: Any, prompt_file: Path | None = None) -> str:
     """sha1 over the files the stable prefix is built from.
 
     Same key discipline as `memory._files_hash`: a changed key means the prefix
     cache is cold for the rest of the book, so `run.py` logs it and a surprise
     invalidation is visible rather than merely expensive.
+
+    `opening_route.md` is in here because it feeds the `route` section, and that
+    is what makes `adopt-trial` mid-book HONEST rather than merely effective:
+    adopting a route rewrites the cached head, the key moves, and `run.py` prints
+    the miss. Without the file in this list the prefix would change while the key
+    claimed it had not — the one failure mode this function exists to prevent.
     """
     h = hashlib.sha1()
     for p in (prompt_file, getattr(paths, "bible", None),
               getattr(paths, "characters", None), getattr(paths, "voice", None),
-              getattr(paths, "voices", None), getattr(paths, "contract", None)):
+              getattr(paths, "voices", None), getattr(paths, "contract", None),
+              opening_route_path(paths)):
         if p is None:
             continue
         h.update(str(p).encode("utf-8"))
@@ -527,6 +636,11 @@ def load(paths: Any, conn: Any, config: dict[str, Any], chapter: int, *,
         metrics=_safe(lambda: store.recent_metrics(conn, 5), []),
         constraints=_safe(lambda: store.get_active_constraints(conn, chapter), []),
         rag=rag,
+        # Read generously and let the projection decide: the two sections keep
+        # named blocks, so a cap here would clip by BYTE POSITION and could cut
+        # 读者承诺 away because 推荐书名 happened to be long — dropping a kept block
+        # to make room for a dropped one.
+        opening_route=_read(opening_route_path(paths), 20000),
         stable_key=stable_key(paths, prompt_file),
     )
 

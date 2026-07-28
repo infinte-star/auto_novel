@@ -5,6 +5,7 @@ can be wrong is a pure function. The failure mode this file guards is not a
 crash — it is a projection that reads as complete and is not, which is how
 `volume_plan.md` starved the mid-book for 40 chapters (LESSONS §6).
 """
+import dataclasses
 import unittest
 
 from v2 import canon
@@ -118,7 +119,11 @@ class BudgetTest(unittest.TestCase):
         # the projection carried the protagonist's standing state. v1 carries it
         # in `state.md`, which canon never reads, so without this section every
         # chapter opened with a protagonist whose situation had been forgotten.
-        self.assertEqual(sum(canon.BUDGET.values()), 16300)
+        # 16300 -> 17400: `route` (600) + `opening` (500) wired
+        # `memory/opening_route.md`, which `adopt-trial` writes and v2 had never
+        # read. Both are empty on a book with no adopted route — the declared cap
+        # rises, the shipped bytes only rise where the user asked for them.
+        self.assertEqual(sum(canon.BUDGET.values()), 17400)
 
     def test_a_flood_of_input_still_lands_near_budget(self):
         st = canon.build(
@@ -304,6 +309,126 @@ class DeltaTest(unittest.TestCase):
         self.assertEqual(ex["protagonist_state"], {"hp": 1})
 
 
+ROUTE_MD = """# 开篇试写最佳路线：变体B·冷开场
+
+- trial_score: 8.7
+- variant_path: logs/opening_trials/t1/b
+
+## 核心卖点
+主角能听见死者最后一句话，但每听一次就忘掉一个活人。
+
+## 差异化
+同类作品把代价写成寿命，本作把代价写成关系。
+
+## 读者承诺
+每卷必有一次「他为了救人主动忘掉某人」的选择。
+
+## 推荐书名
+- 遗忘代价
+- 最后一句话
+- 我听见你死时说的话
+
+## 推荐简介
+- 他能听见死者的遗言，代价是忘记生者。
+
+## 正式连载前修改指令
+- 第一章开场删掉天气描写，直接从尸体旁的第一句遗言进。
+- 第三章之前不要解释规则来源。
+"""
+
+
+class OpeningRouteTest(unittest.TestCase):
+    """`adopt-trial`'s output, projected instead of pasted.
+
+    The gap this closes: `novel.py adopt-trial` wrote `memory/opening_route.md`
+    and v2 read nothing, so the command was inert on a v2 book. The reason it is
+    projected rather than pasted is that the file is a MIXTURE — v1's
+    `cacheable_prefix` shipped ten candidate titles and five blurbs in every
+    chapter prompt of the whole book.
+    """
+
+    def _state(self, chapter=1, route=ROUTE_MD):
+        return canon.build(chapter, brief="纲要", bible="世界", opening_route=route)
+
+    def test_positioning_reaches_the_cacheable_prefix(self):
+        head = self._state().stable_prefix()
+        for kept in ("核心卖点", "差异化", "读者承诺"):
+            self.assertIn(kept, head)
+        self.assertIn("每听一次就忘掉一个活人", head)
+
+    def test_packaging_and_bookkeeping_never_reach_the_prompt(self):
+        # Titles and blurbs are `package.py`'s job, and trial_score is a number
+        # about the trial, not about the story. Anything before the first `## `
+        # has no heading and is dropped with them.
+        whole = self._state().render()
+        for dropped in ("推荐书名", "推荐简介", "遗忘代价", "trial_score",
+                        "variant_path", "8.7"):
+            self.assertNotIn(dropped, whole)
+
+    def test_revision_directives_are_volatile_and_expire(self):
+        early = self._state(chapter=1)
+        self.assertIn("删掉天气描写", early.volatile_block())
+        self.assertNotIn("删掉天气描写", early.stable_prefix())
+        # Past the span they are an instruction about a chapter that already
+        # shipped. Empty, and by rule 2 that means no header either.
+        late = self._state(chapter=canon.OPENING_ROUTE_SPAN + 1)
+        self.assertEqual(late.section("opening"), "")
+        self.assertNotIn("开篇执行指令", late.render())
+
+    def test_the_expiry_does_not_touch_the_cached_head(self):
+        # The load-bearing one. If the directives had gone into `stable`, the head
+        # would differ between chapter 3 and chapter 4 while `stable_key` — a hash
+        # of FILES — still claimed it had not moved. That is the one failure mode
+        # the key exists to prevent, so the split is what keeps the key honest.
+        a = self._state(chapter=1).stable_prefix()
+        b = self._state(chapter=canon.OPENING_ROUTE_SPAN + 1).stable_prefix()
+        self.assertEqual(a, b)
+        self.assertNotEqual(self._state(chapter=1).volatile_block(),
+                            self._state(chapter=99).volatile_block())
+
+    def test_no_adopted_route_costs_exactly_zero_bytes(self):
+        # Most books never run `trial`. Wiring a capability must not tax them.
+        without = canon.build(1, brief="纲要", bible="世界")
+        self.assertEqual(without.section("route"), "")
+        self.assertEqual(without.section("opening"), "")
+        self.assertNotIn("作品定位", without.render())
+
+    def test_headings_match_by_containment_so_relabelling_cannot_empty_it(self):
+        # `trial.py` writes these as prose labels. Equality matching would let a
+        # one-word edit there silently empty this section, and an empty section
+        # emits no header — so the loss would be invisible.
+        route = ROUTE_MD.replace("## 核心卖点", "## 核心卖点（本作）")
+        self.assertIn("每听一次就忘掉一个活人",
+                      canon.build(1, opening_route=route).stable_prefix())
+
+    def test_a_long_route_drops_whole_blocks_and_says_so(self):
+        route = ROUTE_MD.replace("同类作品把代价写成寿命，本作把代价写成关系。",
+                                 "长" * 4000)
+        body = canon.build(1, opening_route=route).section("route")
+        self.assertLessEqual(len(body), canon.BUDGET["route"] + 40)
+        self.assertIn("未列出", body)
+
+    def test_load_picks_the_file_up_from_disk(self):
+        # The seam every other test in this class skips: `build` takes the route
+        # as an argument, so all of them would pass on an engine that never READS
+        # the file — which is exactly the bug being fixed. This one goes through
+        # `canon.load`, i.e. the path `adopt-trial` actually depends on.
+        # `conn=None` is fine: `load` wraps every store call in `_safe`.
+        import config
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "memory").mkdir()
+            p = config.Paths(**{f.name: d / "memory" / f"{f.name}.md"
+                                for f in dataclasses.fields(config.Paths)})
+            canon.opening_route_path(p).write_text(ROUTE_MD, encoding="utf-8")
+            state = canon.load(p, None, {}, 1)
+            self.assertIn("每听一次就忘掉一个活人", state.stable_prefix())
+            self.assertIn("删掉天气描写", state.volatile_block())
+            self.assertNotIn("推荐书名", state.render())
+
+
 class StableKeyTest(unittest.TestCase):
 
     class FakePaths:
@@ -313,6 +438,7 @@ class StableKeyTest(unittest.TestCase):
             self.voice = d / "voice.md"
             self.voices = d / "voices.md"
             self.contract = d / "contract.md"
+            self.volume_plan = d / "volume_plan.md"
 
     def test_key_changes_when_a_source_file_changes(self):
         from pathlib import Path
@@ -332,6 +458,38 @@ class StableKeyTest(unittest.TestCase):
         with TemporaryDirectory() as td:
             p = self.FakePaths(Path(td))
             self.assertEqual(canon.stable_key(p), canon.stable_key(p))
+
+    def test_adopting_a_route_moves_the_key(self):
+        # `adopt-trial` rewrites the cacheable head, so the key MUST move: `run.py`
+        # logs hit/miss off it, and a prefix that changed under an unchanged key is
+        # a silent cache miss reported as a hit.
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            p = self.FakePaths(Path(td))
+            p.bible.write_text("世界", encoding="utf-8")
+            before = canon.stable_key(p)
+            canon.opening_route_path(p).write_text(ROUTE_MD, encoding="utf-8")
+            after = canon.stable_key(p)
+            self.assertNotEqual(before, after)
+            self.assertEqual(after, canon.stable_key(p))
+
+    def test_the_route_path_is_where_memory_py_also_looks(self):
+        # Two readers, one location, asserted by BEHAVIOUR rather than by
+        # re-deriving the path here (a third derivation would be the bug). Write
+        # the file where canon says it lives; `memory.opening_route_text` — what
+        # `trial.py` / `package.py` still use — must find it there.
+        import memory
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            p = self.FakePaths(Path(td))
+            self.assertEqual(memory.opening_route_text(p), "")
+            canon.opening_route_path(p).write_text(ROUTE_MD, encoding="utf-8")
+            self.assertIn("核心卖点", memory.opening_route_text(p))
+
+    def test_a_paths_without_volume_plan_yields_no_route_rather_than_crashing(self):
+        self.assertIsNone(canon.opening_route_path(object()))
 
 
 if __name__ == "__main__":

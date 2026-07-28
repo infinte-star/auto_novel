@@ -716,7 +716,7 @@ v2 剩 1 次 = `card_replan`。也就是说这 10pt 差距**全部来自写前�
 - **约 2.2k 行其它孤儿定义** + 约 14 个无读者的配置键（`rework_trigger` / `candidate_plans` /
   `cold_reader_enabled` / `macro_progress_enabled` / `adaptive_downshift_enabled` …）。
 - **两个能力缺口**（审计时新发现，不是死码）：
-  `memory/opening_route.md` v2 完全没读——`adopt-trial` 对写作侧已失效；
+  `memory/opening_route.md` v2 完全没读——`adopt-trial` 对写作侧已失效，**2026-07-28 已接线**，见 §9.10；
   `voice_baseline.md` 不再有生产者（写它的是 `review.refresh_voice_anchors`），
   v2 因为**根本没有 voice 刷新路径**而天然冻结，结论正确但文件消失了。
 
@@ -797,3 +797,46 @@ v1 归档上它们是响的大多数（tension_flat 328、emotional_monotony 9�
 **留下的唯一真缺口**：三个卡片级门（`plan_executability_gate` / `plan_visual_payoff_check` /
 `narrative_pattern_repetition`）仍只有 `tools/replay_gates.py` 到达。
 在那里阻塞是廉价的——一个字都还没写。
+
+### 9.10 接 `opening_route.md`：投影，而不是粘贴（2026-07-28）
+
+§9.8 记的缺口是「v2 完全没读 `memory/opening_route.md`，`adopt-trial` 对写作侧已失效」，
+CLAUDE.md 当时给的修法是「把这个文件加进 `canon.build` 的 stable 源和 `stable_key`」。
+**照那个修法做会把 v1 的 prompt 膨胀缺陷原样搬进 v2**，所以实际做法多走了一步。
+
+读 `trial.py` 的 `best_md` 才看清：这个文件是**六个块的混合物，三种不同的生命期**——
+
+| 块 | 是什么 | 去处 |
+| --- | --- | --- |
+| 核心卖点 / 差异化 / 读者承诺 | 全书定位，整本书都成立 | **stable** 的 `route` 段，600 字预算 |
+| 正式连载前修改指令 | 只针对开篇，连载起来就过期 | **volatile** 的 `opening` 段，500 字预算 |
+| 推荐书名 / 推荐简介 | 是 `package.py` 的活 | **丢弃** |
+| trial_score / variant_path | 台账 | **丢弃** |
+
+v1 的 `memory.cacheable_prefix` 是把整个文件按 5000 字上限**整段粘贴**进每一章的 prompt，
+于是一本 200 章的书把十个候选书名和五段简介运了 200 遍。
+这正是 v2 存在的理由那一类缺陷，所以 `v2/canon.py` 投影它而不粘贴它。
+
+**真正载荷的那条是拆分，不是接线。** 开篇修改指令说的是「正式连载**前**要改什么」，
+它对前几章为真，之后就是一条过期指令。把它放进 stable 头会有两种死法，都很难看：
+要么把一条错指令冻进缓存头，剩下 197 章每次都读；
+要么让 stable 头随章号变化，**而 `stable_key` 是文件的哈希，它会继续声称头没动过**
+——那恰好是这个函数存在的唯一目的所要防的失效模式。
+所以 `project_opening` 在 `OPENING_ROUTE_SPAN`（3，`trial.py` 实际写的跨度）之后返回空串，
+`tests/test_v2_canon.py:test_the_expiry_does_not_touch_the_cached_head` 把这条双向钉住：
+Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `volatile_block()` 必须不同。
+
+反过来，`route` 段**必须**进 `stable_key`，这才是让 `adopt-trial` 中途采纳一条路线
+**诚实**而不只是**有效**的地方：采纳会重写缓存头，key 随之移动，`run.py` 把 miss 打出来。
+不进这个列表，前缀变了而 key 说没变——同一个失效模式的另一面。
+
+`load()` 读文件时故意**宽松**（20000 字上限，远超两段预算之和）：
+截断留给投影做。在读的时候设小上限是按**字节位置**截，
+可能因为「推荐书名」那块恰好很长而把「读者承诺」切掉——为一个要丢弃的块牺牲一个要保留的块。
+
+**测试里有一条容易漏的自欺**：`build()` 是把路线**当参数收**的，
+所以一整套只测 `build` 的用例，在「引擎压根不读那个文件」的世界里也会全绿
+——那恰好就是本次要修的 bug。所以另有一条 `test_load_picks_the_file_up_from_disk`
+走 `canon.load`，即 `adopt-trial` 真正依赖的那条路（`conn=None` 可行，`load` 把每个 store 调用都包在 `_safe` 里）。
+
+零 LLM 变更，`tools/fpy_prime.py` 接线前后同为 **365/438 = 83%**；测试 804 → 815 全绿。

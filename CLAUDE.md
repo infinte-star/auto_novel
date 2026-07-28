@@ -239,8 +239,8 @@ The two v2-native checks:
 
 ### StoryState (`v2/canon.py`)
 ONE projection, ~15k chars, split **by mutability rather than by topic**:
-- `stable` — brief / facts / voice. Byte-identical for as long as the source files are, so it is the provider prompt-cache prefix. ~5k.
-- `volatile` — card / focus / threads / recent / ledger / rag. Changes every chapter. ~11k.
+- `stable` — brief / facts / voice / route. Byte-identical for as long as the source files are, so it is the provider prompt-cache prefix. ~5.6k.
+- `volatile` — card / focus / threads / recent / ledger / rag / opening. Changes every chapter. ~11.5k.
 
 `render()` always emits stable first, and that ordering *is* the cache strategy:
 a prefix cache hits on a shared prefix, so one volatile byte in the head would
@@ -348,8 +348,8 @@ to tell the writer what score to aim for. Deleting it silently drops a number ou
 of the writer prompt; leaving it invites the belief that it still gates anything.
 It does not.
 
-**Two capability gaps, not dead code**, found while auditing the deletion:
-- **`memory/opening_route.md` is never read by v2.** `adopt-trial` still writes it and `memory.cacheable_prefix`/`memory_context` still consume it, but `v2/canon.py` builds its own projection from brief/bible/characters/voice/contract and does not include it. So on a v2 book, `novel.py adopt-trial` is inert as far as the writer is concerned. Fixing it means adding the file to `canon.build`'s stable sources and to `stable_key` — a prefix-bytes change, so it needs its own test and commit.
+**One capability gap left; the other is closed:**
+- **`memory/opening_route.md` reaches the v2 writer as of 2026-07-28** — but *projected*, not pasted. The file is a mixture of six blocks (see `trial.py`'s `best_md`) with three different lifetimes, so `canon.build` routes them: 核心卖点/差异化/读者承诺 are book-level positioning → the **stable** `route` section (in `stable_key`, so adopting a route mid-book moves the key and `run.py` prints the miss — that is what makes `adopt-trial` honest rather than merely effective); 正式连载前修改指令 is opening-scoped → the **volatile** `opening` section, empty past `OPENING_ROUTE_SPAN` (3) because at Ch150 it is an instruction about a chapter that shipped 147 chapters ago; 推荐书名/推荐简介 are `package.py`'s job and trial_score/variant_path are bookkeeping → **dropped**. v1 pasted all six at a 5000-char cap into every chapter prompt, so a 200-chapter book shipped ten candidate titles 200 times. **The opening directives must never move into the stable head** — that would either freeze a stale instruction into the cached prefix for the rest of the book, or make the head chapter-dependent while `stable_key` (a hash of *files*) still claimed it hadn't moved, which is the one failure mode that key exists to prevent. `tests/test_v2_canon.py:OpeningRouteTest` pins it.
 - **`voice_baseline.md` is no longer produced.** Its writer was `review.refresh_voice_anchors`. v2 has no voice-refresh path at all, so `memory/voice.md` is written once by `bootstrap` and never re-derived — which is the frozen-baseline outcome the rule wanted, reached by having no refresh rather than by skipping one. Nothing is broken; the *file* is simply gone, and `tools/rebuild_memory.py` still looks for it.
 
 ### Repair ladder (`v2/repair.py` → `fix.py`)
