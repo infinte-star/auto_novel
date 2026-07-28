@@ -213,6 +213,121 @@ def _strip_title_line(text: str) -> str:
     return text
 
 
+def em_dash_penalty(
+    em_per_kchar: float,
+    recent_mean: float | None,
+    config: dict[str, Any] | None = None,
+) -> tuple[float, list[str], list[str]]:
+    """The em-dash half of `style_health`, as a pure function of TWO numbers.
+
+    Extracted from `style_health` (zero behaviour change) so an offline replay can
+    recompute this term from archived `metrics` instead of re-deriving the
+    arithmetic in the tool. The graduated trend penalty below replaced a flat
+    +1.0, and 31 archived chapters were scored under the old flat rule — 5 of them
+    blocked at exactly 2.0 that today's engine charges 1.3–1.8. A replay tool that
+    re-implemented this would have to be re-tuned in lockstep forever; one that
+    calls it cannot silently disagree with the engine (the failure mode
+    `tests/test_latching_gates.py:ReplayPlanScoreFidelityTest` records).
+
+    `recent_mean` is `None` when there is no baseline (fewer than 2 prior
+    chapters), which suppresses both the trend and the sustained term.
+    Returns `(penalty, flags, directives)`.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    penalty = 0.0
+    flags: list[str] = []
+    directives: list[str] = []
+    em_warn = float(cfg.get("style_em_dash_per_kchar_warn", 6.0))
+    em_bad = float(cfg.get("style_em_dash_per_kchar_bad", 12.0))
+    if em_per_kchar >= em_bad:
+        penalty += 2.0
+        flags.append(f"em_dash_overload({em_per_kchar:.1f}/k≥{em_bad})")
+        directives.append(
+            "严重文体问题：上一章破折号（——）密度过高，整章读起来像电报/碎句堆叠。"
+            "本章必须用完整的主谓宾句子叙事，破折号每千字不超过 3 个。"
+        )
+    elif em_per_kchar >= em_warn:
+        penalty += 1.0
+        flags.append(f"em_dash_high({em_per_kchar:.1f}/k≥{em_warn})")
+        directives.append(
+            "上一章破折号偏多，本章请减少破折号，改用完整句子与正常标点叙事。"
+        )
+
+    # --- TREND term: rising em-dash density is itself a collapse signal ----
+    # Two failure modes this catches:
+    #  (a) Slow drift BELOW the absolute warn threshold (em creeps 0.94→4.15
+    #      monotonically while always < 6.0) — never trips the static tier.
+    #  (b) A sustained climb ABOVE warn (6.6→7.8→8.8) — the static tier flat-lines
+    #      at +1.0 and the acceleration is lost exactly when it matters most. This
+    #      check runs REGARDLESS of the static tier (it used to be the static
+    #      `else`, so it died once em crossed warn), so a rising-while-already-high
+    #      chapter compounds static(+1.0) + trend = block. Observed
+    #      gudai50_v2 Ch20-24: em 6.6→8.8 stuck at a flat +1.0 for 5 chapters.
+    if recent_mean is None:
+        return penalty, flags, directives
+    base = float(recent_mean)
+    # Absolute rise (per-kchar) and multiplicative rise vs the baseline.
+    rise_abs = float(cfg.get("style_em_dash_trend_rise", 1.0))
+    rise_mult = float(cfg.get("style_em_dash_trend_mult", 1.8))
+    # A tiny baseline (≈0) makes the multiplicative test trivially true,
+    # so require the absolute delta too. Only fire when the chapter is
+    # also above a small floor so we don't punish 0.1→0.3 noise.
+    floor = float(cfg.get("style_em_dash_trend_floor", 1.5))
+    delta = em_per_kchar - base
+    if (
+        em_per_kchar >= floor
+        and delta >= rise_abs
+        and em_per_kchar >= base * rise_mult
+    ):
+        # Graduated penalty: scale by how far above the baseline the
+        # chapter sits, instead of a flat +1.0 that blocks marginal cases.
+        ratio = em_per_kchar / base if base > 0 else 3.0
+        if ratio >= 3.0:
+            trend_penalty = 1.0
+        elif ratio >= 2.5:
+            trend_penalty = 0.8
+        elif ratio >= 2.0:
+            trend_penalty = 0.5
+        else:
+            trend_penalty = 0.3
+        penalty += trend_penalty
+        flags.append(
+            f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k, ratio={ratio:.1f}x, pen={trend_penalty:.1f})"
+        )
+        # Avoid a near-duplicate directive when the static tier already told
+        # the writer to cut em-dashes; the trend flag still surfaces for logs.
+        if em_per_kchar < em_warn:
+            directives.append(
+                f"文体趋势预警：破折号密度从近几章均值 {base:.1f}/千字升到 "
+                f"{em_per_kchar:.1f}/千字，正在向碎句化滑坡（即使尚未触顶阈值）。"
+                "本章必须主动收敛破折号，回到完整句叙事。"
+            )
+        else:
+            directives.append(
+                f"破折号密度仍在上升（{base:.1f}→{em_per_kchar:.1f}/千字）且已超阈值，"
+                "本章必须显著回收破折号，否则判定为文体塌缩。"
+            )
+
+    # Sustained-collapse escalation: once the collapse has run long enough that
+    # the recent MEAN is itself above warn, the multiplicative trend test goes
+    # quiet (each step is < rise_mult× a now-high baseline) — the boiling-frog
+    # gap. A plateau where BOTH the current chapter and its recent mean sit
+    # above warn is not noise, it is the new (collapsed) normal, so add the
+    # escalation that the trend term can no longer supply. This is what turns a
+    # sustained 6.6→8.8 stretch into a block instead of a flat +1.0 forever.
+    if (
+        bool(cfg.get("style_em_dash_sustained_block", True))
+        and em_per_kchar >= em_warn
+        and base >= em_warn
+    ):
+        penalty += 1.0
+        if not any(f.startswith("em_dash_sustained") for f in flags):
+            flags.append(
+                f"em_dash_sustained({em_per_kchar:.1f}/k, mean {base:.1f}/k≥{em_warn})"
+            )
+    return penalty, flags, directives
+
+
 @REGISTRY.register("style_health", config_key="style_health_enabled", tag_prefix="style", repair="L0")
 def style_health(
     text: str,
@@ -271,99 +386,21 @@ def style_health(
     em_per_kchar = em_dashes / (n / 1000.0)
     metrics["em_dash_count"] = em_dashes
     metrics["em_dash_per_kchar"] = round(em_per_kchar, 2)
-    em_warn = float(cfg.get("style_em_dash_per_kchar_warn", 6.0))
-    em_bad = float(cfg.get("style_em_dash_per_kchar_bad", 12.0))
-    if em_per_kchar >= em_bad:
-        penalty += 2.0
-        flags.append(f"em_dash_overload({em_per_kchar:.1f}/k≥{em_bad})")
-        directives.append(
-            "严重文体问题：上一章破折号（——）密度过高，整章读起来像电报/碎句堆叠。"
-            "本章必须用完整的主谓宾句子叙事，破折号每千字不超过 3 个。"
-        )
-    elif em_per_kchar >= em_warn:
-        penalty += 1.0
-        flags.append(f"em_dash_high({em_per_kchar:.1f}/k≥{em_warn})")
-        directives.append(
-            "上一章破折号偏多，本章请减少破折号，改用完整句子与正常标点叙事。"
-        )
-
-    # --- 1b. TREND term: rising em-dash density is itself a collapse signal ----
-    # Two failure modes this catches:
-    #  (a) Slow drift BELOW the absolute warn threshold (em creeps 0.94→4.15
-    #      monotonically while always < 6.0) — never trips the static tier.
-    #  (b) A sustained climb ABOVE warn (6.6→7.8→8.8) — the static tier flat-lines
-    #      at +1.0 and the acceleration is lost exactly when it matters most. This
-    #      check runs REGARDLESS of the static tier (it used to be the static
-    #      `else`, so it died once em crossed warn), so a rising-while-already-high
-    #      chapter compounds static(+1.0) + trend(+1.0) = block. Observed
-    #      gudai50_v2 Ch20-24: em 6.6→8.8 stuck at a flat +1.0 for 5 chapters.
+    # Static tier + trend + sustained escalation all live in `em_dash_penalty`,
+    # a pure function of (density, recent mean) so a replay can recompute it from
+    # archived metrics without re-implementing the arithmetic.
     hist = [
         float(h) for h in (em_history or [])
         if isinstance(h, (int, float)) and h >= 0
     ]
     # Need at least 2 prior points for a meaningful baseline.
-    if len(hist) >= 2:
-        base = sum(hist) / len(hist)
-        metrics["em_dash_recent_mean"] = round(base, 2)
-        # Absolute rise (per-kchar) and multiplicative rise vs the baseline.
-        rise_abs = float(cfg.get("style_em_dash_trend_rise", 1.0))
-        rise_mult = float(cfg.get("style_em_dash_trend_mult", 1.8))
-        # A tiny baseline (≈0) makes the multiplicative test trivially true,
-        # so require the absolute delta too. Only fire when the chapter is
-        # also above a small floor so we don't punish 0.1→0.3 noise.
-        floor = float(cfg.get("style_em_dash_trend_floor", 1.5))
-        delta = em_per_kchar - base
-        if (
-            em_per_kchar >= floor
-            and delta >= rise_abs
-            and em_per_kchar >= base * rise_mult
-        ):
-            # Graduated penalty: scale by how far above the baseline the
-            # chapter sits, instead of a flat +1.0 that blocks marginal cases.
-            ratio = em_per_kchar / base if base > 0 else 3.0
-            if ratio >= 3.0:
-                trend_penalty = 1.0
-            elif ratio >= 2.5:
-                trend_penalty = 0.8
-            elif ratio >= 2.0:
-                trend_penalty = 0.5
-            else:
-                trend_penalty = 0.3
-            penalty += trend_penalty
-            flags.append(
-                f"em_dash_trend_rise({em_per_kchar:.1f}/k vs mean {base:.1f}/k, ratio={ratio:.1f}x, pen={trend_penalty:.1f})"
-            )
-            # Avoid a near-duplicate directive when the static tier already told
-            # the writer to cut em-dashes; the trend flag still surfaces for logs.
-            if em_per_kchar < em_warn:
-                directives.append(
-                    f"文体趋势预警：破折号密度从近几章均值 {base:.1f}/千字升到 "
-                    f"{em_per_kchar:.1f}/千字，正在向碎句化滑坡（即使尚未触顶阈值）。"
-                    "本章必须主动收敛破折号，回到完整句叙事。"
-                )
-            else:
-                directives.append(
-                    f"破折号密度仍在上升（{base:.1f}→{em_per_kchar:.1f}/千字）且已超阈值，"
-                    "本章必须显著回收破折号，否则判定为文体塌缩。"
-                )
-
-        # Sustained-collapse escalation: once the collapse has run long enough that
-        # the recent MEAN is itself above warn, the multiplicative trend test goes
-        # quiet (each step is < rise_mult× a now-high baseline) — the boiling-frog
-        # gap. A plateau where BOTH the current chapter and its recent mean sit
-        # above warn is not noise, it is the new (collapsed) normal, so add the
-        # escalation that the trend term can no longer supply. This is what turns a
-        # sustained 6.6→8.8 stretch into a block instead of a flat +1.0 forever.
-        if (
-            bool(cfg.get("style_em_dash_sustained_block", True))
-            and em_per_kchar >= em_warn
-            and base >= em_warn
-        ):
-            penalty += 1.0
-            if not any(f.startswith("em_dash_sustained") for f in flags):
-                flags.append(
-                    f"em_dash_sustained({em_per_kchar:.1f}/k, mean {base:.1f}/k≥{em_warn})"
-                )
+    em_base = sum(hist) / len(hist) if len(hist) >= 2 else None
+    if em_base is not None:
+        metrics["em_dash_recent_mean"] = round(em_base, 2)
+    _em_pen, _em_flags, _em_dirs = em_dash_penalty(em_per_kchar, em_base, config)
+    penalty += _em_pen
+    flags.extend(_em_flags)
+    directives.extend(_em_dirs)
 
     # --- 2. Average sentence length (collapse → very short sentences) ------
     # Split on sentence enders; measure mean length of non-empty segments.
@@ -556,7 +593,7 @@ def style_health(
                 penalty == 0.0
                 and avg_ok
                 and quote_pairs >= 3
-                and em_per_kchar < em_warn
+                and em_per_kchar < float(cfg.get("style_em_dash_per_kchar_warn", 6.0))
             ):
                 directives.append(
                     "下沉语体执行良好：大白话短句成句、对话充足、无碎句堆叠。本章保持这一调性，"

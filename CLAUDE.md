@@ -360,7 +360,7 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads **82.5% → 89.0%** after the latching-gate fixes
+by one ruler. Library-wide it reads **83.4% → 89.9%** after the latching-gate fixes
 plus the unmeasured-plan-score fix (vs 12%–63% for "self-score ≥ 8.0"), and it names
 the failing gate for every miss; the leading remaining killers are `gate_rejects`
 (20) and `hard_contract` (13).
@@ -405,12 +405,29 @@ doubles as a verdict (`plan_score`'s 0.0 for an empty `scores` list) makes every
 parse failure look like the worst possible input. LESSONS §13.
 
 **A retro-replay must normalize engine semantics that have since changed**, or it
-reports fixed bugs as live problems. `review.py`'s contract backstop stamped
-keyword-matched `problems` text as a HARD violation until `b54bfd0` downgraded it to
-SOFT; 22 archived chapters fail their first draft on that alone, which is the whole
-difference between "`hard_contract` is the #1 killer at 54" (wrong) and "32, second
-to gate_rejects" (right) — and between tunshi_xitong at 85% and its true 98%.
-`fpy_prime._normalize` re-stamps it by default; `--raw` replays payloads verbatim.
+reports fixed bugs as live problems. `fpy_prime._normalize` re-stamps two by default
+(`--raw` replays payloads verbatim), and each one changes which bucket looks like the
+top killer:
+- `review.py`'s contract backstop stamped keyword-matched `problems` text as a HARD
+  violation until `b54bfd0` downgraded it to SOFT. 22 archived chapters fail their
+  first draft on that alone — the whole difference between "`hard_contract` is the #1
+  killer at 54" (wrong) and "32, second to gate_rejects" (right), and between
+  tunshi_xitong at 85% and its true 98%.
+- `style_health`'s em-dash TREND term charged a flat +1.0, which stacked onto the
+  static tier's +1.0 to hit `style_penalty_block` (2.0) *exactly*; it is now graduated
+  by ratio. 31 archived chapters were scored under the flat rule and 5 block on it
+  alone, so `style_collapse` reads as 7 live killers when only 2 are real. Two
+  execution rules: only the em-dash terms are recomputed (every other component's
+  input is the chapter text, which round0 no longer describes after revision), and a
+  penalty already at `style_penalty_cap` is skipped because it is no longer a sum of
+  its terms. `_restamp_style_penalty` calls `quality.em_dash_penalty` — the arithmetic
+  was extracted into that pure function precisely so the tool cannot drift from the
+  engine. LESSONS §13.
+
+Two failure buckets that survive both normalizations are **not** defects to fix:
+`hard_contradictions` (5 misses, one per book, each a concrete canon breach the
+chapter could have avoided) is a healthy gate, and the remaining `hard_contract`
+misses are the already-root-caused `ability_whitelist` fabrication (`bd577ba`).
 
 **Offline tools must not log into the novel they measure.** `call_llm` appends
 every call to `paths.logs_dir/llm_calls.jsonl`, which is exactly the file

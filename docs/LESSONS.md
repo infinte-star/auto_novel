@@ -601,12 +601,17 @@ non-derivative books (see "第三次测量污染" below — the first run of thi
 
 | arm | library FPY′ | notes |
 | --- | --- | --- |
-| baseline | 359/435 = **82.5%** | 4 books < 80% |
-| A fossil `in_current` only | 372/435 = 85.5% (+3.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
-| B chapter_mode frac only | 371/435 = 85.3% (+2.8) | tangshuting_e2e 62.2→88.9 |
-| A+B | 386/435 = 88.7% (+6.2) | e2e →93.3 (+31.1, super-additive) |
-| C unmeasured plan score | 372/435 = 85.5% (+3.0) | **= B + 1 chapter**; C cannot be replayed without B |
-| **A+B+C** | 387/435 = **89.0%** (+6.4) | guize_guaitan 69.2→76.9 is C's whole FPY′ effect |
+| baseline | 363/435 = **83.4%** | 4 books < 80%. Was 359 = 82.5% before the em-dash re-stamp (see 「扁平的趋势罚分」 below) |
+| A fossil `in_current` only | 376/435 = 86.4% (+3.0) | tangshuting 78.4→83.9, yeban 76.9→84.6 |
+| B chapter_mode frac only | 375/435 = 86.2% (+2.8) | tangshuting_e2e 62.2→88.9 |
+| A+B | 390/435 = 89.7% (+6.2) | e2e →93.3 (+31.1, super-additive) |
+| C unmeasured plan score | 376/435 = 86.4% (+3.0) | **= B + 1 chapter**; C cannot be replayed without B |
+| **A+B+C** | 391/435 = **89.9%** (+6.4) | guize_guaitan 69.2→76.9 is C's whole FPY′ effect |
+
+Every row moved +4 chapters when `fpy_prime._normalize` learned the second frozen
+semantic; the *deltas* are unchanged, because a normalization lifts both sides of
+each arm equally. A row copied forward from an earlier run is how a stale 85.1%
+survived here once already — re-run the whole table, never one row.
 
 A+B is super-additive because both gates were blocking the *same* chapters: fixing
 one leaves the chapter failing on the other, so neither arm alone can show the full
@@ -768,6 +773,53 @@ FPY′ 侧只 **+0.2pt（386→387）**，因为 FPY′ 按设计只计 `plan_in
 **`--fix C` 不能单独回放。** C 与 B 都靠重跑 plan-gate 链来结算，而链读的是**今天的**
 `quality.py`，所以 B 的修复无法被工具关掉。`parse_fixes` 因此在请求 C 时显式补上 B **并打印
 出来**——否则就是第四例测量污染（静默 no-op）的反向版本：把 B+C 的收益记在 C 名下。
+
+### 扁平的趋势罚分：两个视角对同一个指标各收一次费，和差 0.1 就等于塌缩（2026-07-28）
+
+把三个闸门修完后剩下的 12 次首稿失败里，`style_collapse` 有 7 次、`hard_contradictions`
+有 5 次。**逐一读证据之后，两个桶的结论完全相反**，而这正是「先诊断再动手」的价值：
+
+- **`hard_contradictions` 5 次全是真的**，而且分布在 5 本不同的书里，每本 1 次。证据具体到
+  可执行：「第七块砖」被写成「第三块砖」、副官遗言与第 76 章刻字不符、转诊记录 2008-01-15
+  被写成 01-14、林越左眼已失明却又用朱砂瞳看见了隐规则。这是一个**健康**的闸门——命中率
+  1.1%、跨书均匀、每一条本章都完全有办法改绿。**不动它。**
+- **`style_collapse` 7 次里 5 次是冻结的旧语义**，今天的引擎压根不会判它塌缩。
+
+第二条的机理值得写清楚，因为它是本节缺陷类的又一个变体：**同一个指标被两个视角各收一次费，
+两笔之和恰好压在阻断线上。** `style_health` 的破折号项有三段——静态档（≥6.0/千字 +1.0）、
+趋势档（相对近章均值上升）、平台档（章与均值双双超阈 +1.0）。趋势档曾经是**扁平的 +1.0**，
+而 `style_penalty_block` 正好是 **2.0**：于是一章只要密度刚过 6.0 且比自己的近章均值高
+1.9 倍，静态 1.0 + 趋势 1.0 = 2.0，判定「文体塌缩」、`accepted=False`、返工。趋势档后来改成
+按 ratio 分级（1.9x→0.3、2.1x→0.5、2.6x→0.8、≥3.0x→1.0），同一章今天只收 1.3。
+
+全库归档实测（93 章有风格罚分）：
+
+| | 章数 |
+| --- | --- |
+| 罚分在今天的算术下会变（全部**下降**，无一上升） | 31 |
+| ——其中 **仅靠这一笔** 就跨过 2.0 阻断线的 | **5** |
+| 真塌缩，修完仍然阻断 | 2 |
+
+5 章是 tangshuting Ch6/9/41/70/142（重算 1.3–1.8）。留下的 2 章是真的：tangshuting Ch37
+（2.5 = 静态 1.0 + 趋势 0.5 + `dialogue_starved` 1.0）与 yeban_guize Ch9（7.18/k vs 均值
+2.20/k = 3.3x，本来就是分级后的判决）。
+
+所以这是 CLAUDE.md 那条规矩的第二个实例——**回放必须归一化已经改过的引擎语义**，否则它把修好的
+bug 报成活的问题。落地方式与合约 HARD→SOFT 那一半同形，`fpy_prime._normalize` 里加
+`_restamp_style_penalty`，`--raw` 保留逐字回放。两个执行细节是必须的：
+
+- **只重算破折号那几项**，其余分项（句长/断行/对话）的输入是正文，而 round0 的正文在修订之后
+  已经不存在了；从归档总分里减掉旧的破折号项、加上新的，是唯一忠实的调整。
+- **罚分已经触到 `style_penalty_cap` 的章直接跳过**——那个数不再是各分项之和，按项调整会算错。
+
+**并且不许在工具里重写这套算术。** 把它从 `style_health` 里提成纯函数
+`quality.em_dash_penalty(密度, 近章均值, config)`（零行为变化，`tests/test_style_overwriting.py`
+逐点比对两者），回放工具调它。否则阈值一改，工具就开始和引擎静默不一致——就是
+`ReplayPlanScoreFidelityTest` 记下的那个失效模式。
+
+代价对比值得记：`style_collapse` 从「7 次活的首稿杀手」变成「2 次」，全库基线 FPY′
+82.5% → 83.4%，三闸全开 89.0% → **89.9%**。如果不做这一步，下一步就会去「修」一个五分之三
+是幻影的桶——那才是真正的浪费。
 
 ### Two fixes measured and rejected before writing code
 

@@ -226,6 +226,95 @@ class TestFpyPrime(unittest.TestCase):
                                "style_health": {"penalty": 2.5}})
             self.assertFalse(fpy_prime.chapter_verdict(d)["ok"])
 
+    # --- the second superseded semantic: the flat em-dash trend charge ---------
+    #
+    # tangshuting Ch6 verbatim. The trend term used to charge a flat +1.0, which
+    # stacked onto the static tier's +1.0 to hit `style_penalty_block` (2.0)
+    # exactly. It is now graduated by ratio, and 6.36/3.37 = 1.9x charges 0.3, so
+    # the same chapter scores 1.3 and is not a collapse. Archived flags written
+    # before the graduation carry no `pen=` field, which is how the old charge is
+    # recognized.
+    FLAT_TREND = {
+        "score": 7.5, "accepted": False,
+        "style_health": {
+            "penalty": 2.0,
+            "flags": ["em_dash_high(6.4/k≥6.0)",
+                      "em_dash_trend_rise(6.4/k vs mean 3.4/k)"],
+            "metrics": {"em_dash_per_kchar": 6.36, "em_dash_recent_mean": 3.37},
+        },
+    }
+
+    def test_flat_trend_charge_is_restamped(self):
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, self.FLAT_TREND))
+            self.assertTrue(v["ok"], v["reasons"])
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, self.FLAT_TREND), raw=True)
+            self.assertFalse(v["ok"])
+            self.assertIn("style_collapse", v["reasons"][0])
+
+    def test_a_genuine_collapse_survives_the_restamp(self):
+        """yeban_guize Ch9: 7.18/k vs a 2.20/k mean is a real 3.3x spike."""
+        review = {"score": 5.2, "accepted": False, "style_health": {
+            "penalty": 2.0,
+            "flags": ["em_dash_high(7.2/k≥6.0)",
+                      "em_dash_trend_rise(7.2/k vs mean 2.2/k, ratio=3.3x, pen=1.0)"],
+            "metrics": {"em_dash_per_kchar": 7.18, "em_dash_recent_mean": 2.20}}}
+        with tempfile.TemporaryDirectory() as td:
+            v = fpy_prime.chapter_verdict(self._dir(td, review))
+            self.assertFalse(v["ok"])
+            self.assertIn("style_collapse", v["reasons"][0])
+
+    def test_non_em_dash_penalty_components_are_preserved(self):
+        """Only the em-dash terms are recomputed; the rest of the total stands.
+
+        Their inputs are the chapter TEXT, which round0 no longer describes once
+        the draft was revised — so subtracting the em-dash terms from the archived
+        total is the only faithful adjustment available.
+        """
+        review = {"score": 7.0, "accepted": False, "style_health": {
+            "penalty": 3.0,   # 1.0 static + 1.0 flat trend + 1.0 dialogue_starved
+            "flags": ["em_dash_high(6.8/k≥6.0)",
+                      "em_dash_trend_rise(6.8/k vs mean 2.9/k)",
+                      "dialogue_starved(5.5%<8%)"],
+            "metrics": {"em_dash_per_kchar": 6.79, "em_dash_recent_mean": 2.93}}}
+        sh = fpy_prime._normalize(review)["style_health"]
+        self.assertAlmostEqual(sh["penalty"], 2.5)   # trend 1.0 -> 0.5
+        self.assertIn("dialogue_starved(5.5%<8%)", sh["flags"])
+        with tempfile.TemporaryDirectory() as td:
+            # tangshuting Ch37: still above the block line after the re-stamp.
+            self.assertFalse(fpy_prime.chapter_verdict(self._dir(td, review))["ok"])
+
+    def test_a_capped_penalty_is_left_alone(self):
+        """At the cap the archived total is not the sum of its terms."""
+        review = {"style_health": {
+            "penalty": 4.0,
+            "flags": ["em_dash_overload(13.0/k≥12.0)", "sentences_too_short(avg=9.0<12.0)",
+                      "fragment_lines(0.5)", "almost_no_dialogue"],
+            "metrics": {"em_dash_per_kchar": 13.0, "em_dash_recent_mean": 3.0}}}
+        self.assertEqual(fpy_prime._normalize(review)["style_health"]["penalty"], 4.0)
+
+    def test_missing_metrics_or_no_em_dash_flag_is_left_alone(self):
+        for sh in ({"penalty": 2.5},                                  # no metrics
+                   {"penalty": 2.5, "metrics": {}},                   # no density
+                   {"penalty": 2.5, "flags": ["almost_no_dialogue"],  # no em-dash term
+                    "metrics": {"em_dash_per_kchar": 1.0}}):
+            with self.subTest(sh=sh):
+                self.assertEqual(
+                    fpy_prime._normalize({"style_health": sh})["style_health"], sh)
+
+    def test_style_restamp_does_not_mutate_the_input(self):
+        review = {**self.FLAT_TREND}
+        before = json.dumps(review, sort_keys=True)
+        fpy_prime._normalize(review)
+        self.assertEqual(json.dumps(review, sort_keys=True), before)
+
+    def test_both_normalizations_can_apply_to_one_chapter(self):
+        review = {**self.FLAT_TREND, "contract_violations": [
+            {"severity": "hard", "rule": "x（由 problems 文本回填）"}]}
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(fpy_prime.chapter_verdict(self._dir(td, review))["ok"])
+
 
 class TestReasoningCoverage(unittest.TestCase):
     """Reasoning presence is a confounder, not a setting — see _reasoning_coverage."""

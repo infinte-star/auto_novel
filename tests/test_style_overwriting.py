@@ -128,5 +128,93 @@ class TestOverwritingAnchor(unittest.TestCase):
         self.assertEqual(sh["penalty"], 0.0)
 
 
+class TestEmDashPenaltyIsTheSameArithmetic(unittest.TestCase):
+    """`em_dash_penalty` was extracted from `style_health` so a REPLAY can call it.
+
+    `tools/fpy_prime._restamp_style_penalty` recomputes the em-dash terms of an
+    archived penalty under today's rule (31 archived chapters were scored under the
+    flat +1.0 trend charge that is now graduated). It must call this function rather
+    than re-implement it — a measurement tool that silently disagrees with the
+    engine is worse than no tool (`test_latching_gates.ReplayPlanScoreFidelityTest`).
+
+    These tests pin the two halves of that contract: the graduated ladder itself,
+    and that `style_health` still produces exactly what the helper says it should.
+    """
+
+    def _units(self, n: int, dashes: int) -> str:
+        """`n` filler sentences carrying `dashes` em-dashes, ~1000+ chars."""
+        body = "".join(f"他把碗放回灶台的边缘处并回头看了一眼门外的雨{i:02d}。" for i in range(n))
+        return "第7章 标题\n\n" + body + "——" * dashes
+
+    def test_graduated_ladder_by_ratio(self):
+        from quality import em_dash_penalty
+        # Below the static warn line, so only the trend term speaks. The ladder is
+        # what stopped a 1.9× rise from stacking to the 2.0 block line.
+        for base, em, want in ((2.0, 3.8, 0.3),    # 1.90x
+                               (2.0, 4.2, 0.5),    # 2.10x
+                               (2.0, 5.2, 0.8),    # 2.60x
+                               (1.5, 4.8, 1.0)):   # 3.20x
+            with self.subTest(ratio=round(em / base, 2)):
+                pen, flags, _ = em_dash_penalty(em, base, _cfg())
+                self.assertAlmostEqual(pen, want)
+                self.assertTrue(any("trend_rise" in f for f in flags))
+
+    def test_static_and_trend_stack_below_the_block_line(self):
+        # tangshuting Ch6 verbatim: 6.36/k against a 3.37/k mean. Under the old flat
+        # charge this was 1.0 + 1.0 = 2.0 = `style_penalty_block` exactly, i.e. a
+        # "collapse". Today it is 1.3 and the chapter is merely warned.
+        from quality import em_dash_penalty
+        pen, _, _ = em_dash_penalty(6.36, 3.37, _cfg())
+        self.assertAlmostEqual(pen, 1.3)
+        self.assertLess(pen, 2.0)
+
+    def test_a_real_collapse_still_reaches_the_block_line(self):
+        from quality import em_dash_penalty
+        # yeban_guize Ch9: 7.18/k vs 2.20/k = 3.3x -> 1.0 static + 1.0 trend.
+        self.assertAlmostEqual(em_dash_penalty(7.18, 2.20, _cfg())[0], 2.0)
+        # Overload alone blocks with no baseline at all.
+        self.assertAlmostEqual(em_dash_penalty(13.0, None, _cfg())[0], 2.0)
+        # Sustained plateau: both the chapter and its mean above warn.
+        pen, flags, _ = em_dash_penalty(8.8, 7.4, _cfg())
+        self.assertAlmostEqual(pen, 2.0)
+        self.assertTrue(any(f.startswith("em_dash_sustained") for f in flags))
+
+    def test_no_baseline_suppresses_trend_and_sustained(self):
+        from quality import em_dash_penalty
+        pen, flags, _ = em_dash_penalty(5.0, None, _cfg())
+        self.assertEqual(pen, 0.0)
+        self.assertEqual(flags, [])
+
+    def test_noise_floor_and_absolute_delta_still_guard_the_trend(self):
+        from quality import em_dash_penalty
+        # A 3x rise below the 1.5/k floor is noise, not drift.
+        self.assertEqual(em_dash_penalty(1.2, 0.4, _cfg())[0], 0.0)
+        # A big multiplicative rise with a sub-1.0/k absolute delta is too.
+        self.assertEqual(em_dash_penalty(1.8, 0.9, _cfg())[0], 0.0)
+
+    def test_style_health_charges_exactly_what_the_helper_says(self):
+        """The extraction must be behaviour-preserving, measured on real text."""
+        from quality import em_dash_penalty, style_health
+        cfg = _cfg()
+        for dashes, hist in ((0, None), (8, None), (8, [1.0, 1.2]),
+                             (20, [1.0, 1.2]), (20, [7.0, 8.0])):
+            with self.subTest(dashes=dashes, hist=hist):
+                text = self._units(30, dashes)
+                sh = style_health(text, cfg, em_history=hist)
+                base = sum(hist) / len(hist) if hist and len(hist) >= 2 else None
+                pen, flags, _ = em_dash_penalty(
+                    sh["metrics"]["em_dash_per_kchar"], base, cfg)
+                self.assertEqual([f for f in sh["flags"] if f.startswith("em_dash")],
+                                 flags)
+                # The helper's charge must be a component of the total, never more.
+                self.assertLessEqual(pen, sh["penalty"] + 1e-9)
+
+    def test_single_history_point_is_not_a_baseline(self):
+        # `style_health` needs >= 2 prior points; one chapter is not a trend.
+        sh = style_health(self._units(30, 20), _cfg(), em_history=[0.5])
+        self.assertNotIn("em_dash_recent_mean", sh["metrics"])
+        self.assertFalse(any("trend_rise" in f for f in sh["flags"]))
+
+
 if __name__ == "__main__":
     unittest.main()

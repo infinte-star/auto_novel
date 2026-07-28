@@ -26,6 +26,14 @@ The self-score is still printed, but only as an observable — it never decides
 anything here. Chapters whose round-0 review is missing are reported as `n/a`
 rather than silently counted as passes.
 
+Archived payloads freeze the engine semantics of the day they were written, so
+`_normalize` re-stamps the two verdicts whose severity has since changed — the
+contract backstop's HARD→SOFT downgrade (b54bfd0, 22 chapters) and the em-dash
+trend term's flat +1.0 → graduated charge (31 chapters, 5 of which blocked on the
+flat rule alone). Without them the tool reports fixed bugs as live problems: the
+same corpus reads `hard_contract` 54 vs 32 and `style_collapse` 7 vs 2. `--raw`
+replays the payloads verbatim.
+
     python tools/fpy_prime.py                       # every novel
     python tools/fpy_prime.py p4_score p4_det --from 47 --to 50
     python tools/fpy_prime.py tangshuting --bands 40   # FPY' vs chapter position
@@ -193,22 +201,86 @@ COUNTED_REPLANS = ("plan_initial_attempt[1-9]*_candidates.json",
 # default; `--raw` replays the payloads verbatim.
 SUPERSEDED_CONTRACT_RULE = "由 problems 文本回填"
 
+# Second superseded semantic, same class. `style_health`'s em-dash TREND term used to
+# charge a flat +1.0; it is now graduated by ratio (0.3 / 0.5 / 0.8 / 1.0), because a
+# flat charge stacked onto the static tier's +1.0 hits `style_penalty_block` (2.0)
+# exactly — so a chapter merely 1.9× above its own recent mean was called a collapse.
+# 31 archived chapters were penalized under the flat rule and 5 of them BLOCK on it
+# alone (tangshuting Ch6/9/41/70/142, recomputed 1.3-1.8 today). Left un-normalized,
+# `style_collapse` reads as 7 live first-draft killers when only 2 are real
+# (tangshuting Ch37 at 2.5, yeban_guize Ch9 at ratio 3.3×).
+#
+# The recompute calls `quality.em_dash_penalty` rather than re-implementing it: the
+# arithmetic must not be able to drift away from the engine's (the failure mode
+# `tests/test_latching_gates.py:ReplayPlanScoreFidelityTest` records). Only the
+# em-dash terms are re-stamped -- every other component of the penalty is taken from
+# the archived total, since its inputs are the chapter text, which round0 no longer
+# has once the draft was revised.
+
+
+def _restamp_style_penalty(sh: dict) -> dict | None:
+    """Recompute `style_health.penalty` under today's em-dash rule, or None.
+
+    Returns None when nothing changes, when the archived metrics are missing, or
+    when a `style_penalty_cap` may have clipped the total (in which case the
+    archived number is not a sum of its terms and cannot be adjusted term-wise).
+    """
+    metrics = sh.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    em = metrics.get("em_dash_per_kchar")
+    old_total = sh.get("penalty")
+    if not isinstance(em, (int, float)) or not isinstance(old_total, (int, float)):
+        return None
+    if float(old_total) >= float(PINNED["novel"].get("style_penalty_cap", 4.0)):
+        return None
+    flags = [str(f) for f in (sh.get("flags") or [])]
+    old_em = 0.0
+    for f in flags:
+        if f.startswith("em_dash_overload"):
+            old_em += 2.0
+        elif f.startswith(("em_dash_high", "em_dash_sustained")):
+            old_em += 1.0
+        elif f.startswith("em_dash_trend_rise"):
+            m = re.search(r"pen=([\d.]+)", f)
+            # No `pen=` in the flag ⇒ written before the graduation ⇒ flat +1.0.
+            old_em += float(m.group(1)) if m else 1.0
+    if not old_em:
+        return None
+    try:
+        from quality import em_dash_penalty
+    except Exception:
+        return None
+    base = metrics.get("em_dash_recent_mean")
+    new_em, new_flags, _ = em_dash_penalty(
+        float(em), float(base) if isinstance(base, (int, float)) else None, PINNED)
+    new_total = round(float(old_total) - old_em + new_em, 2)
+    if abs(new_total - float(old_total)) < 0.01:
+        return None
+    keep = [f for f in flags if not f.startswith("em_dash_")]
+    return {**sh, "penalty": new_total, "flags": keep + new_flags}
+
 
 def _normalize(review: dict) -> dict:
     """Re-stamp verdicts whose severity the engine has since changed."""
+    out, changed = review, False
     cvs = review.get("contract_violations")
-    if not isinstance(cvs, list):
-        return review
-    fixed, changed = [], False
-    for c in cvs:
-        if (isinstance(c, dict)
-                and str(c.get("severity", "")).lower() == "hard"
-                and SUPERSEDED_CONTRACT_RULE in str(c.get("rule", ""))):
-            c, changed = {**c, "severity": "soft"}, True
-        fixed.append(c)
-    if not changed:
-        return review
-    return {**review, "contract_violations": fixed}
+    if isinstance(cvs, list):
+        fixed = []
+        for c in cvs:
+            if (isinstance(c, dict)
+                    and str(c.get("severity", "")).lower() == "hard"
+                    and SUPERSEDED_CONTRACT_RULE in str(c.get("rule", ""))):
+                c, changed = {**c, "severity": "soft"}, True
+            fixed.append(c)
+        if changed:
+            out = {**out, "contract_violations": fixed}
+    sh = review.get("style_health")
+    if isinstance(sh, dict):
+        restamped = _restamp_style_penalty(sh)
+        if restamped is not None:
+            out = {**out, "style_health": restamped}
+    return out
 
 
 def chapter_verdict(ch_dir: Path, *, raw: bool = False) -> dict:
@@ -263,7 +335,8 @@ def main() -> int:
     ap.add_argument("--reasons", action="store_true", help="per-chapter detail")
     ap.add_argument("--raw", action="store_true",
                     help="replay payloads verbatim, without normalizing verdicts whose "
-                         "severity the engine has since changed (SUPERSEDED_CONTRACT_RULE)")
+                         "severity the engine has since changed (the contract backstop's "
+                         "HARD→SOFT downgrade and the flat em-dash trend charge)")
     ap.add_argument("--all", action="store_true",
                     help="include derivative dirs (ablations / forks / copies) that are "
                          "excluded from the aggregate by default")
