@@ -16,15 +16,19 @@ arbitrations carry keys mangled by `llm.load_json_with_repair`'s repair call
      (salvageable in 0 of guize_guaitan's 10 cases), so the chapter was written
      from an unarbitrated candidate with no hard constraints and nothing said so.
 
+These readers moved to `quality.py` with v1's deletion (D1) — they guard an
+untrusted payload with zero LLM calls, exactly like `hard_block_reasons`. Their
+live consumers are now `writing.py` (the writer's "当前大纲仲裁分" line and
+`chapter_metrics.plan_score`) and `tools/replay_gates.py` (which replays the 934
+archived v1 arbitrations the docstring above measures). The re-ask test that used
+to live here went with `planning.arbitrate_plan`.
+
 Zero LLM calls: every function under test is pure.
 """
-import json
 import unittest
-from unittest import mock
 
-import planning
-from planning import (_coerce_index, _decision_usable, _normalize_decision,
-                      decision_has_score, plan_score)
+from quality import (_coerce_index, _decision_usable, _normalize_decision,
+                     decision_has_score, plan_score)
 
 GOOD = {
     "selected_index": 1,
@@ -165,93 +169,6 @@ class DecisionHasScoreTests(unittest.TestCase):
 CANDIDATE = {"title": "候选0", "goal": "g", "beats": ["a"]}
 
 
-class ArbiterReaskTests(unittest.TestCase):
-    """The re-ask branch, stubbed. It fires on 1.7% of arbitrations (16/934), which
-    is exactly the frequency at which a typo would live in production unnoticed."""
-
-    def setUp(self):
-        self.calls: list[str] = []
-        patches = [
-            mock.patch.object(planning, "lite_memory_context", return_value="mem"),
-            mock.patch.object(planning, "plan_calibration_hint", return_value=""),
-            mock.patch.object(planning, "rhythm_diagnostics", return_value={}),
-            mock.patch.object(planning, "recent_quality_feedback", return_value=[]),
-            mock.patch.object(planning, "used_element_ledger", return_value={}),
-            mock.patch.object(planning, "chapter_schedule_directive", return_value=""),
-            mock.patch.object(planning, "cacheable_prefix", return_value="pfx"),
-            mock.patch.object(planning, "db_event", return_value=None),
-            mock.patch.object(planning, "log", return_value=None),
-        ]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
-
-    def _run(self, replies, config_novel=None):
-        """Drive arbitrate_plan with a canned sequence of raw LLM replies."""
-        def fake_call_llm(client, paths, config, system, user, **kw):
-            self.calls.append(kw.get("tag", "?"))
-            return replies[min(len(self.calls) - 1, len(replies) - 1)]
-
-        cfg = {"novel": {"telemetry_enabled": False,
-                         "used_element_ledger_enabled": False,
-                         **(config_novel or {})}, "api": {}}
-        with mock.patch.object(planning, "call_llm", side_effect=fake_call_llm), \
-             mock.patch.object(planning, "load_json_with_repair",
-                               side_effect=lambda c, p, cf, raw, fallback=None:
-                                   json.loads(raw) if raw.strip() else (fallback or {})):
-            return planning.arbitrate_plan(None, mock.MagicMock(), None, cfg, 7,
-                                           [CANDIDATE], [[]])
-
-    def test_a_good_arbitration_costs_exactly_one_call(self):
-        good = json.dumps({"selected_index": 0, "scores": [{"index": 0, "score": 8.0}],
-                           "merged_plan": {"title": "改写后"}})
-        plan, decision = self._run([good])
-        self.assertEqual(self.calls, ["plan_arbitrate"])
-        self.assertEqual(plan["title"], "改写后")
-        self.assertNotIn("arbitration_failed", decision)
-
-    def test_salvage_debris_triggers_exactly_one_reask(self):
-        recovered = json.dumps({"selected_index": 0,
-                                "scores": [{"index": 0, "score": 7.5}],
-                                "merged_plan": {"title": "重问后"}})
-        plan, decision = self._run([json.dumps({"./output.json": "{"}), recovered])
-        self.assertEqual(self.calls, ["plan_arbitrate", "plan_arbitrate_reask"])
-        self.assertEqual(plan["title"], "重问后")
-        self.assertEqual(plan_score(decision), 7.5)
-        self.assertNotIn("arbitration_failed", decision)
-
-    def test_a_failed_reask_is_recorded_not_retried_further(self):
-        # The recovery is bounded: one re-ask, then the plan proceeds UNARBITRATED
-        # and says so. Re-rolling candidates cannot fix a parse failure.
-        debris = json.dumps({"./output.json": "{"})
-        plan, decision = self._run([debris, debris])
-        self.assertEqual(self.calls, ["plan_arbitrate", "plan_arbitrate_reask"])
-        self.assertTrue(decision["arbitration_failed"])
-        self.assertEqual(plan, CANDIDATE, "must fall back to a real candidate plan")
-
-    def test_reask_can_be_disabled_and_then_costs_nothing(self):
-        debris = json.dumps({"./output.json": "{"})
-        _, decision = self._run([debris], {"arbiter_reask_enabled": False})
-        self.assertEqual(self.calls, ["plan_arbitrate"])
-        self.assertTrue(decision["arbitration_failed"])
-
-    def test_a_reask_exception_never_wedges_planning(self):
-        def boom(client, paths, config, system, user, **kw):
-            self.calls.append(kw.get("tag", "?"))
-            if kw.get("tag") == "plan_arbitrate_reask":
-                raise RuntimeError("gateway 500")
-            return json.dumps({"./output.json": "{"})
-
-        cfg = {"novel": {"telemetry_enabled": False,
-                         "used_element_ledger_enabled": False}, "api": {}}
-        with mock.patch.object(planning, "call_llm", side_effect=boom), \
-             mock.patch.object(planning, "load_json_with_repair",
-                               side_effect=lambda c, p, cf, raw, fallback=None:
-                                   json.loads(raw) if raw.strip() else (fallback or {})):
-            plan, decision = planning.arbitrate_plan(None, mock.MagicMock(), None,
-                                                     cfg, 7, [CANDIDATE], [[]])
-        self.assertTrue(decision["arbitration_failed"])
-        self.assertEqual(plan, CANDIDATE)
 
 
 class CoerceIndexStillHoldsTests(unittest.TestCase):

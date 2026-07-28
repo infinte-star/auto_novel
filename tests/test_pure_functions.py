@@ -25,7 +25,6 @@ from quality import opening_hook_gate, length_band_check, flat_chapter_streak  #
 from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from memory import _recency_aware_state  # noqa: E402
 from memory import _contract_to_markdown  # noqa: E402
-from pipeline import _apply_force_accept_patches  # noqa: E402
 from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
 from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 from writing import _chapter_write_max_tokens  # noqa: E402
@@ -487,59 +486,6 @@ class BeatCoverageTests(unittest.TestCase):
         self.assertFalse(report["enabled"])
         self.assertTrue(report["passed"])
 
-class QualityDebtPatchTests(unittest.TestCase):
-    def test_force_accept_patches_land_without_llm(self):
-        import shutil
-        from pathlib import Path
-        from config import Paths
-
-        root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "manual_tmp_test" / "quality_debt_patch"
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-        root.mkdir(parents=True, exist_ok=True)
-        try:
-            ckpt = root / "logs" / "checkpoints"
-            paths = Paths(
-                book=root / "book.md",
-                state=root / "state.md",
-                title=root / "title.txt",
-                bible=root / "memory" / "bible.md",
-                characters=root / "memory" / "characters.md",
-                timeline=root / "memory" / "timeline.md",
-                threads=root / "memory" / "threads.md",
-                volume_plan=root / "memory" / "volume_plan.md",
-                compass=root / "memory" / "compass.md",
-                voices=root / "memory" / "voices.md",
-                voice=root / "memory" / "voice.md",
-                contract=root / "memory" / "contract.md",
-                glossary=root / "memory" / "glossary.md",
-                chapters_dir=root / "chapters",
-                logs_dir=root / "logs",
-                database=root / "story_state.db",
-            )
-            ckpt.mkdir(parents=True, exist_ok=True)
-            chapter = "第一章 断绝\n\n周窈看清了。\n"
-            review = {
-                "score": 7.8,
-                "patches": [{
-                    "op": "replace",
-                    "locator": "周窈看清了",
-                    "before": "周窈看清了",
-                    "after": "周窈知道那条手腕上应该有什么",
-                }],
-            }
-            patched, new_review = _apply_force_accept_patches(
-                paths,
-                {"novel": {"quality_debt_apply_patches": True}},
-                1,
-                chapter,
-                review,
-            )
-            self.assertIn("周窈知道那条手腕上应该有什么", patched)
-            self.assertEqual(new_review["quality_debt_patches_applied"], 1)
-            self.assertTrue((root / "logs" / "checkpoints" / "ch0001" / "quality_debt_patched.md").exists())
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
 
 
 class JsonSalvageTests(unittest.TestCase):
@@ -1905,42 +1851,6 @@ class RecentDimensionScoreTests(unittest.TestCase):
         self.assertGreaterEqual(sum(vals) / len(vals), 9.3)  # saturated window
 
 
-class ReplanRoiTests(unittest.TestCase):
-    """Tests for pipeline._recent_replan_ineffective ROI breaker."""
-
-    def setUp(self):
-        import tempfile
-        self.tmpdir = __import__("pathlib").Path(tempfile.mkdtemp())
-        self.paths = _make_paths(self.tmpdir)
-        (self.tmpdir / "logs").mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-    def _write_replan(self, ch, before, after):
-        from checkpoint import save_checkpoint
-        save_checkpoint(self.paths, ch, "quality_replan_done.json",
-                        {"score_before": before, "score_after": after})
-
-    def test_ineffective_when_recent_gains_small(self):
-        from pipeline import _recent_replan_ineffective
-        self._write_replan(8, 7.0, 7.1)
-        self._write_replan(9, 7.2, 7.0)
-        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
-        self.assertTrue(_recent_replan_ineffective(self.paths, 10, cfg))
-
-    def test_effective_when_a_recent_replan_worked(self):
-        from pipeline import _recent_replan_ineffective
-        self._write_replan(8, 7.0, 7.1)
-        self._write_replan(9, 6.5, 8.0)  # big gain
-        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
-        self.assertFalse(_recent_replan_ineffective(self.paths, 10, cfg))
-
-    def test_no_history_not_ineffective(self):
-        from pipeline import _recent_replan_ineffective
-        cfg = {"novel": {"replan_max_attempts": 2, "replan_min_gain": 0.3}}
-        self.assertFalse(_recent_replan_ineffective(self.paths, 10, cfg))
 
 
 class OpeningHookGateTests(unittest.TestCase):
@@ -2530,72 +2440,6 @@ class GateRegistryTests(unittest.TestCase):
         self.assertIsNone(REGISTRY.get("nonexistent_gate"))
 
 
-class RevisionTrackerTests(unittest.TestCase):
-    """Tests for RevisionTracker (Phase 5: revision plateau detection)."""
-
-    def _make(self, threshold=8.0, max_no_improvement=1, plateau_window=3, plateau_band=0.3):
-        from pipeline import RevisionTracker
-        return RevisionTracker(threshold, max_no_improvement, plateau_window, plateau_band)
-
-    def test_converged_immediately(self):
-        t = self._make(threshold=7.0)
-        self.assertEqual(t.record(8.0, True), "converged")
-
-    def test_converged_requires_accepted(self):
-        t = self._make(threshold=7.0)
-        self.assertEqual(t.record(8.0, False), "continue")
-
-    def test_stalled_after_no_improvement(self):
-        t = self._make(threshold=8.0, max_no_improvement=2)
-        self.assertEqual(t.record(6.0, False), "continue")  # round 0, best=6
-        self.assertEqual(t.record(5.5, False), "continue")   # no improve 1
-        self.assertEqual(t.record(5.0, False), "stalled")    # no improve 2
-
-    def test_improvement_resets_stall_counter(self):
-        t = self._make(threshold=8.0, max_no_improvement=2)
-        t.record(6.0, False)
-        t.record(5.5, False)  # no improve 1
-        t.record(6.5, False)  # improve — resets
-        t.record(6.0, False)  # no improve 1 again
-        self.assertEqual(t.record(5.5, False), "stalled")  # no improve 2
-
-    def test_plateau_detected(self):
-        t = self._make(threshold=8.0, max_no_improvement=5, plateau_window=3, plateau_band=0.3)
-        t.record(7.0, False)
-        t.record(7.2, False)
-        self.assertEqual(t.record(7.1, False), "plateau")
-
-    def test_no_plateau_when_spread_wide(self):
-        t = self._make(threshold=8.0, max_no_improvement=5, plateau_window=3, plateau_band=0.3)
-        t.record(7.0, False)
-        t.record(7.5, False)
-        self.assertEqual(t.record(7.0, False), "continue")
-
-    def test_plateau_window_respected(self):
-        t = self._make(threshold=9.0, max_no_improvement=5, plateau_window=4, plateau_band=0.3)
-        t.record(7.0, False)
-        t.record(7.1, False)
-        t.record(7.2, False)
-        self.assertEqual(t.record(7.0, False), "plateau")  # window=4 filled
-
-    def test_converged_takes_priority_over_plateau(self):
-        t = self._make(threshold=7.0, plateau_window=3, plateau_band=0.5)
-        t.record(6.8, True)
-        t.record(7.0, True)
-        self.assertEqual(t.record(7.1, True), "converged")
-
-    def test_summary(self):
-        t = self._make()
-        t.record(6.0, False)
-        t.record(7.0, False)
-        s = t.summary()
-        self.assertEqual(s["scores"], [6.0, 7.0])
-        self.assertEqual(s["best_score"], 7.0)
-        self.assertEqual(s["rounds"], 2)
-
-    def test_stall_not_triggered_on_round_zero(self):
-        t = self._make(threshold=8.0, max_no_improvement=1)
-        self.assertEqual(t.record(5.0, False), "continue")
 
 
 class ReasoningMaxTokensTests(unittest.TestCase):
@@ -2870,64 +2714,6 @@ class ChapterModeMonotonyTests(unittest.TestCase):
         self.assertEqual(_classify_chapter_mode(pl, "action", 3), "action")
 
 
-class VolumeTransitionTests(unittest.TestCase):
-    """Layer 二 治本: deterministic volume/arc boundary transition steer.
-
-    Guards against arc overstay (yeban_guize ground the 城中村 arc to Ch28 because
-    nothing enforced the planned Ch21 → 卷二 transition).
-    """
-
-    VP = (
-        "## 第1卷：第八条（第1-20章）\n### 卷目标(O)\n林越活过三处讳地。\n\n"
-        "## 第2卷：守夜人（第21-47章）\n### 卷目标(O)\n林越进入守夜人协会换取7号讳地准入。\n"
-    )
-
-    def _vt(self, ch, **cfg):
-        from planning import volume_transition_directive
-        return volume_transition_directive(ch, self.VP, {"novel": cfg})
-
-    def test_parse_ranges(self):
-        from planning import parse_volume_ranges
-        r = parse_volume_ranges(self.VP)
-        self.assertEqual([(x["start"], x["end"]) for x in r], [(1, 20), (21, 47)])
-        self.assertEqual(r[1]["name"], "守夜人")
-
-    def test_transition_fires_at_volume_boundary(self):
-        # Ch21/22 = 卷二开篇 grace window => hard transition (the missed pivot).
-        for ch in (21, 22):
-            v = self._vt(ch)
-            self.assertEqual(v["level"], "transition")
-            self.assertTrue(v["is_transition"])
-            self.assertIn("卷务转场", v["block"])
-
-    def test_no_transition_first_volume(self):
-        # Ch1 is the first volume's opening — no previous volume to close.
-        v = self._vt(1)
-        self.assertFalse(v["is_transition"])
-
-    def test_mid_volume_is_context_not_transition(self):
-        v = self._vt(25)  # 25-21=4 >= grace(2)
-        self.assertEqual(v["level"], "context")
-        self.assertFalse(v["is_transition"])
-
-    def test_goal_extracted_into_block(self):
-        v = self._vt(21)
-        self.assertIn("守夜人协会", v["block"])
-
-    def test_grace_configurable(self):
-        # grace=1 => only Ch21 transitions, Ch22 is context.
-        self.assertTrue(self._vt(21, volume_transition_grace=1)["is_transition"])
-        self.assertFalse(self._vt(22, volume_transition_grace=1)["is_transition"])
-
-    def test_disabled_returns_ok(self):
-        v = self._vt(21, volume_transition_enabled=False)
-        self.assertEqual(v["level"], "ok")
-        self.assertEqual(v["block"], "")
-
-    def test_no_ranges_degrades_gracefully(self):
-        from planning import volume_transition_directive
-        v = volume_transition_directive(21, "no volume headers here", {"novel": {}})
-        self.assertEqual(v["level"], "ok")
 
 
 class VolumePlanWindowTests(unittest.TestCase):

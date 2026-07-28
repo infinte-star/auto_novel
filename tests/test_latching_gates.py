@@ -120,12 +120,15 @@ class BookFossilFirstDraftCorpusTest(unittest.TestCase):
 
     Not a restatement of `in_current`: the fix above makes a hard reject require the
     chapter under review to CONTAIN the phrase, and this pins the consequence of the
-    corpus the callers actually build. `review.py` iterates `range(1, chapter_num + 1)`
-    but guards each entry with `p.exists()`, and on a first draft the chapter has not
-    been saved yet (`save_chapter` runs after the review), so the corpus is Ch1..n-1
-    and `in_current` is False for every candidate. The hard reject therefore cannot
-    fire on a first draft in EITHER engine — it needs a resume, where the file is
-    already on disk.
+    corpus the caller actually builds. `v2/run.py:load_corpus` asks for Ch1..n, but
+    on a first draft the chapter has not been saved yet (`save_chapter` runs after
+    acceptance), so the corpus is Ch1..n-1 and `in_current` is False for every
+    candidate. The hard reject therefore cannot fire on a first draft at all — it
+    needs a resume, where the file is already on disk.
+
+    This held identically in v1 (`review.py` iterated `range(1, chapter_num + 1)`
+    guarded by `p.exists()`), which is what made the matched-position A/B one
+    ruler; that half of the assertion went with v1's deletion.
 
     This is why `tools/replay_gates.py` recomputes the gate instead of asking whether
     the phrase appears in the chapter text: measured on tangshuting Ch171-200, the
@@ -151,22 +154,23 @@ class BookFossilFirstDraftCorpusTest(unittest.TestCase):
         self.assertIn(FOSSIL, res["phrases"])
         self.assertTrue(res["directives"])
 
-    def test_both_engines_build_the_same_first_draft_corpus(self):
-        # A source assertion, because the equality is what makes the v1/v2 A/B one
-        # ruler. If either side starts feeding the draft in, its arm gets a strictly
-        # stricter gate than the other and the comparison silently tilts.
+    def test_the_engine_asks_for_the_inclusive_slice_and_gets_the_exclusive_one(self):
+        # A source assertion, because every FPY' number ever published for this gate
+        # depends on it. If the caller starts feeding the draft text in (rather than
+        # reading it off disk after save), the gate becomes strictly stricter than
+        # the one those numbers were measured under, with no test failing.
         import re
         from pathlib import Path
-        root = Path(__file__).resolve().parent.parent
-        v1 = (root / "review.py").read_text(encoding="utf-8")
-        self.assertRegex(
-            v1, r"for num in range\(1, chapter_num \+ 1\):\s*\n\s*p = chapter_path",
-            "review.py's fossil corpus loop changed shape")
-        self.assertIn("if p.exists():", v1)
-        v2 = (root / "v2" / "run.py").read_text(encoding="utf-8")
+        v2 = (Path(__file__).resolve().parent.parent / "v2" / "run.py").read_text(
+            encoding="utf-8")
         self.assertTrue(
             re.search(r"_chapter_texts\(paths, 1, chapter_num\)", v2),
-            "v2/run.py:load_corpus no longer passes the Ch1..n slice review.py does")
+            "v2/run.py:load_corpus no longer passes the Ch1..n slice")
+        self.assertNotIn(
+            "book_texts[chapter_num] = ", v2,
+            "load_corpus started splicing the unsaved draft into the corpus — that "
+            "makes a first-draft hard fossil reject possible and invalidates every "
+            "archived FPY' reading of this gate")
 
 
 REASONING = "推理"      # baseline form for suspense / rule-horror

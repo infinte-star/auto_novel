@@ -50,7 +50,7 @@ from config import Paths, log, read_text
 from llm import call_llm, json_prompt, load_json_with_repair, safe_json_loads
 # Pure function; `memory.py` is otherwise unused by v2 and this import is the one
 # thing Phase D has to relocate (see the module docstring).
-from memory import volume_plan_window
+from memory import volume_plan_window, volume_transition_directive
 from store import db_event, validate_plan_continuity
 from v2 import canon
 
@@ -205,13 +205,46 @@ def _volume_plan(paths: Paths, config: dict[str, Any], start: int, span: int) ->
         return ""
 
 
+def _volume_transition(paths: Paths, config: dict[str, Any], chapters: list[int]) -> str:
+    """The volume-boundary steer for any chapter in this arc, or "".
+
+    Ported from v1's plan call (`planning.generate_candidate_plans`) rather than
+    dropped with it: a volume boundary is a deterministic fact in `volume_plan.md`,
+    and the yeban_guize 城中村 overstay-to-Ch28 is what happens when nothing
+    enforces the planned Ch21 transition. The arc call is the right consumer
+    because an `arc_span` of 10 does NOT align with volume ranges — a boundary
+    usually lands mid-arc, and the one call planning across it is this one.
+
+    Only the HARD `transition` level is injected. v1 also emitted a mid-volume
+    「本卷定位」 context note; the arc prompt already carries the volume-plan window
+    verbatim, so here that note would only restate it.
+    """
+    try:
+        text = read_text(paths.volume_plan)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    blocks = []
+    for ch in chapters:
+        try:
+            vt = volume_transition_directive(ch, text, config)
+        except Exception:
+            continue
+        if vt.get("is_transition") and vt.get("block"):
+            blocks.append(vt["block"])
+    return "\n".join(blocks)
+
+
 def arc_user_prompt(state: canon.StoryState, chapters: list[int], *,
                     volume_plan: str = "", prev_skeleton: str = "",
-                    finale_note: str = "") -> str:
+                    finale_note: str = "", volume_transition: str = "") -> str:
     """The volatile half of the arc prompt. Pure, so its shape is testable."""
     parts = [state.volatile_block()]
     if volume_plan:
         parts.append("## 卷纲（本弧窗口）\n" + volume_plan)
+    if volume_transition:
+        parts.append(volume_transition)
     if prev_skeleton:
         parts.append("## 上一弧留下的骨架（默认延续，偏离必须在 arc_intent 里说明）\n"
                      + prev_skeleton)
@@ -267,6 +300,7 @@ def generate_arc(
         volume_plan=_volume_plan(paths, config, start_ch, span),
         prev_skeleton=skeleton_block(prev_skeleton, chapters),
         finale_note=finale_note,
+        volume_transition=_volume_transition(paths, config, chapters),
     )
 
     raw = call(

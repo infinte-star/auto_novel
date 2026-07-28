@@ -948,6 +948,7 @@ def main() -> None:
     # in a row is a failure mode more tokens will not fix.
     breaker_n = int(config["novel"].get("quality_breaker_consecutive", 2))
     blocked_streak = 0
+    halted_by_breaker = False
 
     while True:
         if book_reached_target(paths.book, target):
@@ -974,7 +975,38 @@ def main() -> None:
                        f"committed with unresolved blocks (last: "
                        f"{', '.join(run.blocks)}). Halting so a human decides; "
                        f"re-running resumes cleanly.")
+            halted_by_breaker = True
             break
+
+    if halted_by_breaker:
+        log(paths, f"v2 halted by quality breaker at total_chars={count_chars(paths.book)}; "
+                   f"post-completion passes skipped.")
+        return
+
+    log(paths, f"v2 done total_chars={count_chars(paths.book)}")
+
+    # Two config keys `pipeline.main` owned. They are ported verbatim rather than
+    # dropped with v1: both default false, but `package_after_complete: true` in an
+    # existing config would otherwise stop working with no error — a silent feature
+    # loss is worse than the 14 lines. Package runs first so it describes the
+    # canonical chapters/book.md; both are best-effort and never touch prose.
+    if bool(config["novel"].get("package_after_complete", False)):
+        try:
+            from package import build_package
+            log(paths, "v2 generating book package (titles/intros/synopsis)")
+            build_package(client, paths, config)
+        except Exception as exc:
+            log(paths, f"Package generation failed (non-fatal): {exc}")
+
+    if bool(config["novel"].get("refine_after_complete", False)):
+        try:
+            from refine import refine_book
+            log(paths, "v2 starting post-completion refine pass")
+            refine_book(client, paths, conn, config)
+        except Exception as exc:
+            log(paths, f"Refine pass failed (non-fatal): {exc}")
+
+    log(paths, "v2 book complete")
 
 
 __all__ = [

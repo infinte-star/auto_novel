@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 import store
 from checkpoint import load_checkpoint
 from config import Paths
+from memory import volume_transition_directive
 from v2 import beat, canon
 
 
@@ -367,6 +368,122 @@ class EnsureCardTest(unittest.TestCase):
         second = FakeCall(arc_plan={"cards": [_card(c) for c in range(11, 21)]})
         self._ensure(11, second)
         self.assertIn("开庭", second.calls[0]["user"])
+
+
+class ArcVolumeTransitionWiringTests(unittest.TestCase):
+    """`beat._volume_transition`: which boundaries reach the arc prompt.
+
+    v1 asked this per chapter, at plan time. v2 asks it once per arc, which means
+    the arc call must be handed EVERY boundary inside its span — an `arc_span` of
+    10 does not align with volume ranges, so the usual case is a boundary landing
+    mid-arc. A per-arc caller that only looked at `start_ch` would silently stop
+    steering exactly the transitions v1 caught.
+    """
+
+    VP = (
+        "## 第1卷：第八条（第1-20章）\n### 卷目标(O)\n林越活过三处讳地。\n\n"
+        "## 第2卷：守夜人（第21-47章）\n### 卷目标(O)\n林越进入守夜人协会换取7号讳地准入。\n"
+    )
+
+    def _vt(self, chapters, vp=None, **cfg):
+        with TemporaryDirectory() as td:
+            paths = _paths(Path(td))
+            if vp is not None:
+                paths.volume_plan.write_text(vp, encoding="utf-8")
+            return beat._volume_transition(paths, _config(**cfg), chapters)
+
+    def test_a_boundary_inside_the_span_is_injected(self):
+        # Ch21 is the 卷二 opening; an arc of 16..25 straddles it.
+        out = self._vt(list(range(16, 26)), self.VP)
+        self.assertIn("卷务转场", out)
+        self.assertIn("守夜人协会", out)
+
+    def test_an_arc_with_no_boundary_injects_nothing(self):
+        self.assertEqual(self._vt(list(range(30, 40)), self.VP), "")
+
+    def test_only_the_hard_level_is_injected_not_the_context_note(self):
+        # Ch25 is mid-volume: `volume_transition_directive` still returns a
+        # `context` block, and the arc prompt must NOT carry it (the volume-plan
+        # window is already in the prompt verbatim).
+        self.assertEqual(
+            volume_transition_directive(25, self.VP, _config())["level"], "context")
+        self.assertEqual(self._vt([25], self.VP), "")
+
+    def test_a_missing_volume_plan_is_not_an_error(self):
+        self.assertEqual(self._vt([21], None), "")
+        self.assertEqual(self._vt([21], ""), "")
+
+    def test_the_block_reaches_the_prompt(self):
+        state = canon.build(21, brief="纲要", bible="世界", voice="声音")
+        user = beat.arc_user_prompt(state, [21], volume_transition="## ⚠ 卷务转场\n收束上一卷")
+        self.assertIn("卷务转场", user)
+
+
+class VolumeTransitionTests(unittest.TestCase):
+    """Layer 二 治本: deterministic volume/arc boundary transition steer.
+
+    Guards against arc overstay (yeban_guize ground the 城中村 arc to Ch28 because
+    nothing enforced the planned Ch21 → 卷二 transition).
+
+    Moved to `memory.py` when v1 was deleted — it parses `volume_plan.md`, which is
+    that module's file. Its consumer moved from v1's per-chapter plan call to
+    `v2/beat._volume_transition`, which injects only the HARD `transition` level
+    into the arc call; the mid-volume `context` level is still produced and still
+    tested here, because the level boundary is what `volume_transition_grace`
+    means and a caller that wanted the note back must find it working.
+    """
+
+    VP = (
+        "## 第1卷：第八条（第1-20章）\n### 卷目标(O)\n林越活过三处讳地。\n\n"
+        "## 第2卷：守夜人（第21-47章）\n### 卷目标(O)\n林越进入守夜人协会换取7号讳地准入。\n"
+    )
+
+    def _vt(self, ch, **cfg):
+        from memory import volume_transition_directive
+        return volume_transition_directive(ch, self.VP, {"novel": cfg})
+
+    def test_parse_ranges(self):
+        from memory import parse_volume_ranges
+        r = parse_volume_ranges(self.VP)
+        self.assertEqual([(x["start"], x["end"]) for x in r], [(1, 20), (21, 47)])
+        self.assertEqual(r[1]["name"], "守夜人")
+
+    def test_transition_fires_at_volume_boundary(self):
+        # Ch21/22 = 卷二开篇 grace window => hard transition (the missed pivot).
+        for ch in (21, 22):
+            v = self._vt(ch)
+            self.assertEqual(v["level"], "transition")
+            self.assertTrue(v["is_transition"])
+            self.assertIn("卷务转场", v["block"])
+
+    def test_no_transition_first_volume(self):
+        # Ch1 is the first volume's opening — no previous volume to close.
+        v = self._vt(1)
+        self.assertFalse(v["is_transition"])
+
+    def test_mid_volume_is_context_not_transition(self):
+        v = self._vt(25)  # 25-21=4 >= grace(2)
+        self.assertEqual(v["level"], "context")
+        self.assertFalse(v["is_transition"])
+
+    def test_goal_extracted_into_block(self):
+        v = self._vt(21)
+        self.assertIn("守夜人协会", v["block"])
+
+    def test_grace_configurable(self):
+        # grace=1 => only Ch21 transitions, Ch22 is context.
+        self.assertTrue(self._vt(21, volume_transition_grace=1)["is_transition"])
+        self.assertFalse(self._vt(22, volume_transition_grace=1)["is_transition"])
+
+    def test_disabled_returns_ok(self):
+        v = self._vt(21, volume_transition_enabled=False)
+        self.assertEqual(v["level"], "ok")
+        self.assertEqual(v["block"], "")
+
+    def test_no_ranges_degrades_gracefully(self):
+        from memory import volume_transition_directive
+        v = volume_transition_directive(21, "no volume headers here", {"novel": {}})
+        self.assertEqual(v["level"], "ok")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,16 @@
-"""Unit tests for the P4 rework trigger and the L0 repair ladder (REDESIGN L5/L6).
+"""Unit tests for the L0 repair ladder (REDESIGN L5/L6).
 
-Two contracts are load-bearing here:
+The load-bearing contract: every L0 fixer must be safe to run unconditionally —
+no dialogue damage, no canon corruption (fossil rotation is bank-only), and no
+change at all when nothing fired.
 
-1. `pipeline._rework_needed` in ``rework_trigger: score`` mode must be
-   point-for-point identical to the expression it replaced
-   (``score < quality_threshold or not accepted``) across a
-   (score × accepted × gate_rejects) grid. The default config must not change
-   engine behaviour at all — otherwise the eventual A/B has two variables.
-2. Every L0 fixer must be safe to run unconditionally: no dialogue damage, no
-   canon corruption (fossil rotation is bank-only), and no change at all when
-   nothing fired.
+The rework-trigger tests that used to open this file went with v1: `rework_trigger`
+was a rule keyed on the self-score, and v2 has no score in any gate — release is
+`quality.hard_block_reasons` alone (`v2/accept.py`). What replaced the
+`_repair_fossil_rejects` escape hatch is ordering, not a hatch: v2 repairs before
+the accept decision reads the report, so there is nothing to undo (`v2/repair.py`
+docstring). Those behaviours are covered by `tests/test_v2_accept.py` and
+`tests/test_v2_run.py`.
 
 Zero LLM calls: only pure functions are exercised. `apply_l1` needs a client and
 is covered by the offline replay + the live A/B instead.
@@ -18,8 +19,6 @@ import unittest
 
 import fix
 import fossil_fix
-import pipeline
-import planning
 from quality import REGISTRY
 
 
@@ -29,106 +28,8 @@ def _config(**novel) -> dict:
     return {"novel": cfg}
 
 
-class RewordTriggerScoreModeTest(unittest.TestCase):
-    """Score mode must reproduce the historical predicate exactly."""
-
-    def test_equivalent_to_legacy_expression_on_full_grid(self):
-        threshold = 8.0
-        config = _config()
-        for score in (0.0, 4.6, 6.4, 6.5, 7.6, 7.99, 8.0, 8.5, 10.0):
-            for accepted in (True, False):
-                for rejects in ([], [{"gate": "cross_chapter_repetition"}]):
-                    review = {"score": score, "accepted": accepted, "gate_rejects": rejects}
-                    legacy = score < threshold or not accepted
-                    got, reason = pipeline._rework_needed(review, config, 1)
-                    self.assertEqual(
-                        got, legacy,
-                        f"score={score} accepted={accepted} rejects={bool(rejects)}",
-                    )
-                    self.assertEqual(bool(reason), got)
-
-    def test_unknown_trigger_value_falls_back_to_score_mode(self):
-        review = {"score": 7.6, "accepted": False}
-        for value in ("", "SCORE", "nonsense", None):
-            got, _ = pipeline._rework_needed(review, _config(rework_trigger=value), 1)
-            self.assertTrue(got)
-
-    def test_missing_score_key_is_treated_as_below_threshold(self):
-        got, _ = pipeline._rework_needed({"accepted": True}, _config(), 1)
-        self.assertTrue(got)
 
 
-class RewordTriggerDeterministicModeTest(unittest.TestCase):
-    def setUp(self):
-        self.config = _config(rework_trigger="deterministic", rework_score_floor=6.5)
-
-    def _needed(self, **review):
-        review.setdefault("score", 7.6)
-        review.setdefault("accepted", False)
-        return pipeline._rework_needed(review, self.config, 1)
-
-    def test_noise_band_chapter_is_accepted(self):
-        """The whole point: 7.6 with accepted=False from the threshold alone."""
-        needed, reason = self._needed()
-        self.assertFalse(needed)
-        self.assertEqual(reason, "")
-
-    def test_score_under_floor_reworks(self):
-        needed, reason = self._needed(score=6.4)
-        self.assertTrue(needed)
-        self.assertIn("floor", reason)
-
-    def test_floor_is_inclusive(self):
-        self.assertFalse(self._needed(score=6.5)[0])
-
-    def test_gate_reject_reworks(self):
-        needed, reason = self._needed(gate_rejects=[{"gate": "cross_chapter_repetition"}])
-        self.assertTrue(needed)
-        self.assertIn("cross_chapter_repetition", reason)
-
-    def test_style_collapse_reworks(self):
-        needed, reason = self._needed(style_health={"penalty": 2.5})
-        self.assertTrue(needed)
-        self.assertIn("style_collapse", reason)
-
-    def test_style_penalty_below_block_does_not_rework(self):
-        self.assertFalse(self._needed(style_health={"penalty": 1.0})[0])
-
-    def test_hard_contradiction_reworks(self):
-        needed, reason = self._needed(contradictions=[{"severity": "hard", "issue": "x"}])
-        self.assertTrue(needed)
-        self.assertIn("hard_contradictions", reason)
-
-    def test_soft_contradiction_does_not_rework(self):
-        self.assertFalse(self._needed(contradictions=[{"severity": "soft"}])[0])
-
-    def test_hard_contract_violation_reworks(self):
-        self.assertTrue(self._needed(contract_violations=[{"severity": "hard"}])[0])
-
-    def test_length_band_block_reworks(self):
-        needed, reason = self._needed(length_band={"block": True})
-        self.assertTrue(needed)
-        self.assertIn("length_band", reason)
-
-    def test_adjacent_repetition_block_reworks(self):
-        self.assertTrue(self._needed(adjacent_repetition={"level": "block"})[0])
-
-    def test_constraint_pileup_reworks(self):
-        needed, reason = self._needed(constraint_violations_structured=[1, 2, 3])
-        self.assertTrue(needed)
-        self.assertIn("constraints_unmet", reason)
-
-    def test_two_unmet_constraints_do_not_rework(self):
-        self.assertFalse(self._needed(constraint_violations_structured=[1, 2])[0])
-
-    def test_unexplained_not_accepted_reworks(self):
-        """accepted=False above threshold means an unenumerated block fired."""
-        needed, reason = self._needed(score=8.5, accepted=False)
-        self.assertTrue(needed)
-        self.assertIn("accepted=False", reason)
-
-    def test_clean_high_score_does_not_rework(self):
-        self.assertFalse(self._needed(score=8.5, accepted=True)[0])
 
 
 class PlanRepairsTest(unittest.TestCase):
@@ -361,176 +262,8 @@ class ReduceEmDashIfNeededTest(unittest.TestCase):
         self.assertEqual(fix.reduce_em_dash_if_needed(text, _config(em_dash_reduce_enabled=False)), text)
 
 
-class RiskUpshiftFloorTest(unittest.TestCase):
-    """The rework trigger and the risk upshift must not fight over the same score.
-
-    Measured in the P4 A/B: the deterministic arm released Ch47-49 at 6.9/6.9/6.8,
-    which the 7.0 risk floor read as collapse, so it bought 3 candidate drafts on
-    3 of 4 chapters and ended up MORE expensive than the arm that reworked
-    (16.25 vs 14.75 calls/chapter). See `planning._risk_score_floor`.
-    """
-
-    def test_score_mode_uses_the_plain_floor(self):
-        self.assertEqual(planning._risk_score_floor(_config()), 7.0)
-        self.assertEqual(
-            planning._risk_score_floor(_config(risk_upshift_score_floor=7.5)), 7.5)
-
-    def test_deterministic_mode_drops_to_the_rework_floor(self):
-        cfg = _config(rework_trigger="deterministic")
-        self.assertEqual(planning._risk_score_floor(cfg), 6.5)
-        # A released 6.8 is normal in this mode, so it must not read as distress.
-        self.assertLess(6.8, planning._risk_score_floor(_config()))
-        self.assertGreater(6.8, planning._risk_score_floor(cfg))
-
-    def test_deterministic_mode_never_raises_the_floor(self):
-        """min(), not assignment: a config that already set a low floor keeps it."""
-        cfg = _config(rework_trigger="deterministic",
-                      risk_upshift_score_floor=6.0, rework_score_floor=6.5)
-        self.assertEqual(planning._risk_score_floor(cfg), 6.0)
-
-    def test_unknown_trigger_value_is_treated_as_score_mode(self):
-        self.assertEqual(
-            planning._risk_score_floor(_config(rework_trigger="  DETERMINISTIC ")), 6.5)
-        self.assertEqual(planning._risk_score_floor(_config(rework_trigger="typo")), 7.0)
 
 
-class RepairFossilRejectsTest(unittest.TestCase):
-    """`pipeline._repair_fossil_rejects` clears a fossil reject only after the
-    phrase is provably gone. It changes the text, never the ruler.
-
-    Why it lives in the review loop rather than in `_stage_fix`: a fossil
-    gate_reject routes `_classify_replan_failure` straight to a STRUCTURAL replan,
-    and `_stage_fix` runs after that decision — the free repair could never
-    prevent the expensive re-roll it exists to replace.
-    """
-
-    def _state(self, root, text, review):
-        from config import Paths
-
-        paths = Paths(
-            book=root / "book.md", state=root / "state.md", title=root / "title.txt",
-            bible=root / "b.md", characters=root / "c.md", timeline=root / "t.md",
-            threads=root / "th.md", volume_plan=root / "vp.md", compass=root / "cp.md",
-            voices=root / "vs.md", voice=root / "v.md", contract=root / "ct.md",
-            glossary=root / "g.md", chapters_dir=root / "chapters",
-            logs_dir=root / "logs", database=root / "story_state.db",
-        )
-        paths.logs_dir.mkdir(parents=True, exist_ok=True)
-        st = pipeline.ChapterState(
-            client=None, paths=paths, conn=None, config=_config(),
-            chapter_num=7, background=None, resume=False,
-        )
-        st.chapter = text
-        st.review = review
-        return st
-
-    def _run(self, text, review):
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as td:
-            st = self._state(Path(td), text, review)
-            return st, pipeline._repair_fossil_rejects(st, 0)
-
-    def _reject_review(self, **extra):
-        review = {
-            "score": 6.0, "accepted": True,
-            "gate_rejects": [{"gate": "book_wide_fossils_ratio",
-                              "phrases": ["声音压得很低"], "fracs": [0.31]}],
-            "book_fossils": {"hard_fossils": [{"phrase": "声音压得很低", "frac": 0.31}]},
-            "failure_codes": ["fossil_repetition"],
-        }
-        review.update(extra)
-        return review
-
-    def test_repaired_reject_is_cleared_and_the_phrase_is_gone(self):
-        st, did = self._run("他声音压得很低，只说了一句。", self._reject_review())
-        self.assertTrue(did)
-        self.assertEqual(st.review["gate_rejects"], [])
-        self.assertNotIn("声音压得很低", st.chapter)
-        self.assertEqual(st.review["fossil_rotate"]["replaced"], ["声音压得很低"])
-        self.assertEqual(st.review["fossil_rotate"]["stale_gates"], [])
-
-    def test_failure_codes_are_rederived_not_left_stale(self):
-        """`_classify_replan_failure` reads `failure_codes` BEFORE gate_rejects, so
-        a stale `fossil_repetition` code would keep forcing the structural replan."""
-        import taxonomy
-
-        review = self._reject_review()
-        self.assertEqual(taxonomy.replan_kind(review["failure_codes"]), "structural")
-        st, _ = self._run("他声音压得很低。", review)
-        self.assertNotIn("failure_codes", st.review)
-        self.assertIsNone(taxonomy.replan_kind(st.review.get("failure_codes") or []))
-
-    def test_an_unrelated_code_source_is_preserved(self):
-        """Re-derivation must not amount to wiping the field: a code that comes from
-        `problems` rather than from the repaired gate has to survive."""
-        review = self._reject_review(problems=["REPEAT: 大段复述上一章"])
-        review["failure_codes"] = ["adjacent_repeat", "fossil_repetition"]
-        st, _ = self._run("他声音压得很低。", review)
-        self.assertEqual(st.review["failure_codes"], ["adjacent_repeat"])
-
-    def test_unrelated_rejects_survive(self):
-        review = self._reject_review()
-        review["gate_rejects"].append({"gate": "contract_hard", "count": 2})
-        st, did = self._run("他声音压得很低。", review)
-        self.assertTrue(did)
-        self.assertEqual([g["gate"] for g in st.review["gate_rejects"]], ["contract_hard"])
-
-    def test_unrotatable_phrase_keeps_the_reject(self):
-        """Bank-only rotation: a book-specific proper noun must stay, and so must
-        the reject that named it."""
-        review = self._reject_review()
-        review["gate_rejects"][0]["phrases"] = ["老市场街七号"]
-        review["book_fossils"] = {"hard_fossils": [{"phrase": "老市场街七号"}]}
-        st, did = self._run("老市场街七号的门开了。", review)
-        self.assertFalse(did)
-        self.assertEqual(len(st.review["gate_rejects"]), 1)
-        self.assertIn("老市场街七号", st.chapter)
-
-    def test_stale_reject_on_an_absent_phrase_is_cleared_and_labelled(self):
-        """A reject for a phrase this chapter does not contain is the latching-gate
-        failure mode — a forced replan with nothing here to act on. It clears, but
-        as `stale`, so a gate bug never hides inside a repair."""
-        st, did = self._run("门开了，谁也没说话。", self._reject_review())
-        self.assertTrue(did)
-        self.assertEqual(st.review["gate_rejects"], [])
-        self.assertEqual(st.review["fossil_rotate"]["stale_gates"],
-                         ["book_wide_fossils_ratio"])
-        self.assertEqual(st.review["fossil_rotate"]["resolved_gates"], [])
-
-    def test_idempotent_on_resume(self):
-        """Resume replays the cached review against an already-rotated chapter;
-        the reject must still clear even though nothing is left to replace."""
-        st, _ = self._run("他声音压得很低。", self._reject_review())
-        st2, did = self._run(st.chapter, self._reject_review())
-        self.assertTrue(did)
-        self.assertEqual(st2.review["gate_rejects"], [])
-
-    def test_no_fossil_reject_is_a_no_op(self):
-        review = {"score": 6.0, "gate_rejects": [{"gate": "contract_hard"}]}
-        st, did = self._run("他声音压得很低。", review)
-        self.assertFalse(did)
-        self.assertIn("声音压得很低", st.chapter)
-        self.assertNotIn("fossil_rotate", st.review)
-
-    def test_disabled_with_l0(self):
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as td:
-            st = self._state(Path(td), "他声音压得很低。", self._reject_review())
-            st.config = _config(fix_l0_enabled=False)
-            self.assertFalse(pipeline._repair_fossil_rejects(st, 0))
-            self.assertEqual(len(st.review["gate_rejects"]), 1)
-
-    def test_score_and_penalty_are_never_touched(self):
-        """The score was computed from the pre-rotation text. Crediting the fossil
-        penalty back would leave score and measurement describing different texts —
-        the same trap `_stage_fix` avoids with `style_health_after_fix`."""
-        st, _ = self._run("他声音压得很低。", self._reject_review())
-        self.assertEqual(st.review["score"], 6.0)
-        self.assertEqual(st.review["book_fossils"]["hard_fossils"][0]["frac"], 0.31)
 
 
 if __name__ == "__main__":

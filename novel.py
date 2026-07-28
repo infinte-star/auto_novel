@@ -160,17 +160,27 @@ def _run_inprocess(name: str) -> int:
         # byte-identical arms instead of two hand-built runs.
         from config import load_config  # noqa: E402  (after env vars, same as below)
 
-        engine = str(load_config()["novel"].get("engine", "v1")).strip().lower()
-        if engine in ("", "v1"):
-            from pipeline import main  # noqa: E402  (must import after env vars are set)
-        elif engine == "v2":
-            from v2.run import main  # noqa: E402
+        engine = str(load_config()["novel"].get("engine", "v2")).strip().lower()
+        if engine in ("", "v2"):
+            from v2.run import main  # noqa: E402  (must import after env vars are set)
+        elif engine == "v1":
+            # v1 (pipeline/planning/review/taxonomy) was DELETED after the
+            # matched-position A/B settled it (docs/REDESIGN_V2.md §9.7). An
+            # existing config still saying `engine: v1` must be told, not quietly
+            # run on v2 — the two engines write different checkpoint labels and
+            # review payload keys, so a silent switch mid-book is a measurement
+            # forgery as much as a behaviour change.
+            print(f"[novel] ERROR: novel.engine: v1 in {config_path}, but the v1 "
+                  f"engine was removed. Set `engine: v2` (or delete the key — v2 "
+                  f"is the default). v1 is recoverable from git history if you "
+                  f"need it: see docs/REDESIGN_V2.md §9.7 for what settled it.")
+            return 2
         else:
             print(f"[novel] ERROR: unknown novel.engine {engine!r} in {config_path} "
-                  f"(expected v1 or v2). Refusing to guess — picking the wrong "
-                  f"engine would silently write the chapter with the other one.")
+                  f"(expected v2). Refusing to guess — picking the wrong engine "
+                  f"would silently write the chapter with the other one.")
             return 2
-        print(f"[novel] engine={engine or 'v1'}")
+        print(f"[novel] engine={engine or 'v2'}")
         main()
         return 0
     finally:

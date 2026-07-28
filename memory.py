@@ -1749,3 +1749,88 @@ def glossary_block(paths: Paths, config: dict[str, Any]) -> str:
         "不得擅自改名、改设定或赋予白名单外的能力；如需引入全新名词，确保与下列不冲突。\n"
         f"{snippet}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Volume/arc boundary steer (moved here from planning.py with v1's deletion).
+# Lives beside `volume_plan_window` because it parses the same file: this is the
+# one memory file that grows linearly with the book, and these are its two
+# deterministic readers. The consumer is now `v2/beat.py`'s arc call — the
+# analogue of planning.py's plan call, i.e. the one that decides what the next
+# chapters do.
+# ---------------------------------------------------------------------------
+
+def parse_volume_ranges(volume_plan_text: str) -> list[dict[str, Any]]:
+    """Parse '## 第N卷：<name>（第A-B章）' headers from a volume_plan. Deterministic.
+
+    Returns [{label, name, start, end, pos}] in document order. Tolerant of
+    full/half-width colons and parens.
+    """
+    ranges: list[dict[str, Any]] = []
+    if not volume_plan_text:
+        return ranges
+    pat = re.compile(
+        r"##\s*第\s*([0-9一二三四五六七八九十]+)\s*卷\s*[：:]\s*(.*?)\s*[（(]\s*第\s*(\d+)\s*[-–—~]\s*(\d+)\s*章"
+    )
+    for m in pat.finditer(volume_plan_text):
+        ranges.append({
+            "label": m.group(1), "name": m.group(2).strip(),
+            "start": int(m.group(3)), "end": int(m.group(4)), "pos": m.start(),
+        })
+    return ranges
+
+
+def _volume_goal_head(volume_plan_text: str, vol: dict[str, Any], ranges: list[dict[str, Any]], limit: int = 220) -> str:
+    """Extract a volume section's '### 卷目标(O)' text (up to the next volume)."""
+    start = int(vol.get("pos", 0))
+    later = [r["pos"] for r in ranges if r["pos"] > start]
+    section = volume_plan_text[start:(min(later) if later else len(volume_plan_text))]
+    m = re.search(r"###\s*卷目标\(?O?\)?\s*\n+(.+?)(?:\n#|\Z)", section, re.S)
+    return " ".join(m.group(1).split())[:limit] if m else ""
+
+
+def volume_transition_directive(chapter_num: int, volume_plan_text: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic volume/arc boundary steer (治本 for arc overstay).
+
+    Parses the volume_plan's 第N卷（第A-B章）ranges. When chapter_num sits in the
+    opening `volume_transition_grace` window of a volume (other than the first),
+    emits a HARD transition block telling the planner to close the previous
+    volume and switch scene/form to this volume's goal — automating the manual
+    pivot yeban_guize needed (it overstayed the 城中村 arc to Ch28 because nothing
+    enforced the planned Ch21 → 卷二 transition). Mid-volume, emits a light
+    context note so the planner stays volume-aware and rotates form. Pure
+    parse+inject, no LLM; degrades to an empty block on any failure.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    res: dict[str, Any] = {"level": "ok", "block": "", "volume": None, "is_transition": False}
+    if not bool(cfg.get("volume_transition_enabled", True)):
+        return res
+    ranges = parse_volume_ranges(volume_plan_text)
+    if not ranges:
+        return res
+    cur = next((r for r in ranges if r["start"] <= chapter_num <= r["end"]), None)
+    if cur is None:
+        cur = max(ranges, key=lambda r: r["end"])  # past all ranges → last (finale) volume
+    res["volume"] = f"第{cur['label']}卷 {cur['name']}".strip()
+    goal = _volume_goal_head(volume_plan_text, cur, ranges)
+    grace = max(int(cfg.get("volume_transition_grace", 2)), 1)
+    is_first = cur["start"] <= min(r["start"] for r in ranges)
+    in_open_window = 0 <= (chapter_num - cur["start"]) < grace
+    if in_open_window and not is_first:
+        res["level"] = "transition"
+        res["is_transition"] = True
+        res["block"] = (
+            f"## ⚠ 卷务转场（最高优先级）\n"
+            f"本章（第{chapter_num}章）进入【{res['volume']}】开篇转场区。务必：\n"
+            f"1. 收束上一卷的场景与悬念——不要延续上一卷的地点/机制/套路继续磨；\n"
+            f"2. 把场景与章型切换到本卷设定，推进本卷主线。\n"
+            + (f"本卷目标：{goal}\n" if goal else "")
+        )
+    else:
+        res["level"] = "context"
+        res["block"] = (
+            f"## 本卷定位\n本章属【{res['volume']}】。"
+            + (f"本卷目标：{goal}" if goal else "")
+            + "\n推进本卷主线，并与近几章的章型/形态错开，避免同型连发。\n"
+        )
+    return res

@@ -125,15 +125,16 @@ api:
 
 novel:
   # ── 引擎选择（REDESIGN v2）──────────────────────────────────────────────────
-  # v1（默认）：pipeline.py 的五阶段委员会 —— plan→write→review→revise→extract。
-  # v2：v2/run.py 的确定性决策表 —— 每章 2 次模型调用（write 一次出正文+ChapterDelta，
-  #     canon 一次举证式核对），每 10 章一次 arc 规划，修复只走 L0/L1。
-  #     验收全部走 quality.hard_block_reasons，与 v1 同一把尺；自评分不参与任何门。
-  # 这是 A/B 的实验变量本身：`novel.py fork <书> --as <臂> --flip engine --set v2`
-  # 就是单变量、HEAD 分叉、两臂字节相同的对照。**不设为 required**：磁盘上已有的
-  # 每本书的 config.yaml 都没有这个键，把它设成必填会让所有存量书立刻加载失败，
-  # 而 v1 是一个完全正确的默认值。
-  engine: v1
+  # v2（默认，唯一）：v2/run.py 的确定性决策表 —— 每章 2 次模型调用（write 一次出
+  #     正文+ChapterDelta，canon 一次举证式核对），每 10 章一次 arc 规划，修复只走
+  #     L0/L1。验收全部走 quality.hard_block_reasons，自评分不参与任何门。
+  # v1（pipeline.py 五阶段委员会）已在等位置 A/B 结算后删除：FPY′ 96.7% vs 86.7%、
+  #     2.50 vs 25.77 调用/章、盲判未测出 v2 更差（docs/REDESIGN_V2.md §9.7）。
+  #     写 `engine: v1` 会得到一条明确报错而不是静默跑 v2——两个引擎的 checkpoint
+  #     标签与 review payload 键不同，静默切换等于伪造测量。
+  # **不设为 required**：磁盘上已有的每本书的 config.yaml 都没有这个键，把它设成
+  # 必填会让所有存量书立刻加载失败，而 v2 是一个完全正确的默认值。
+  engine: v2
   # ── 题材检测 profile（config.py:genre_detection_profile）───────────────────
   # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
   # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
