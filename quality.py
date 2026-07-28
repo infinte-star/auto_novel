@@ -20,6 +20,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
+from config import safe_score
+
 
 # ---------------------------------------------------------------------------
 # Gate Registry: centralized metadata for deterministic quality gates.
@@ -4095,3 +4097,132 @@ def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[s
         reasons.append(f"constraints_unmet={len(failed)}")
 
     return reasons
+
+
+# ---------------------------------------------------------------------------
+# Plan-arbitration decision readers (pure; moved here from planning.py)
+# ---------------------------------------------------------------------------
+# The arbitration dict is UNTRUSTED input, keys included: it is LLM-produced and
+# `llm.load_json_with_repair` accepts any repair that merely *parses*, so a
+# salvage fragment can be laundered into a decision. These readers are the guard,
+# and they live in `quality.py` because they are exactly the same kind of thing as
+# `hard_block_reasons` — zero-LLM pure functions over an untrusted payload — and
+# because both engines need them without either owning the other's planner.
+ARBITER_KEYS = ("selected_index", "scores", "merged_plan", "required_constraints")
+
+
+def _coerce_index(val: Any, default: int = 0) -> int:
+    """Robustly parse an arbiter-supplied index that may be malformed.
+    Arbitration JSON is LLM-produced and untrusted: selected_index / scores[].index
+    have shown up as '^1', ' 1 ', 1.0, None. A bad value must never crash planning
+    (that wedges the whole run). Extract the first signed integer run, else default."""
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        m = re.search(r"-?\d+", str(val or ""))
+        return int(m.group()) if m else default
+
+
+def _normalize_decision(decision: Any) -> dict[str, Any]:
+    """Repair the arbitration dict's SHAPE before anything reads it.
+
+    Same untrusted-input doctrine as `_coerce_index`, one level up: the *keys* are
+    LLM-produced too, and `llm.load_json_with_repair`'s repair call makes it worse
+    rather than better -- a repair whose output merely PARSES is accepted, so a
+    salvaged fragment like `{"./output.json": "{"}` is laundered into a decision.
+
+    Measured over all 934 archived arbitrations: 16 are unusable, 14 of them in
+    guize_guaitan alone (34 arbitrations) and every other book <=1. Observed key
+    forms: `.selected_index`, `''`, `./output.json`, `./merged_plan.json`,
+    `./response.json`, `./scores`, `/assistant`.
+
+    **Key repair recovers 0 of those 16 on its own** — the `.selected_index` cases
+    ship `scores: []`, `merged_plan: {}`, `required_constraints: []` beside the bad
+    key, so the content was lost, not just the label. It is kept anyway because it
+    is free and because `_decision_usable` must judge content, not spelling; the
+    call-site re-ask is what actually recovers these.
+
+    The one shape here that DOES recover is a single score row promoted to the top
+    level (tangshuting Ch175: `{index, score, pros, cons}`) — that is the
+    measurement itself, merely unwrapped.
+
+    Three repairs, all conservative: unwrap a single-key wrapper, rebuild the
+    envelope around a bare score row, and strip leading path/quote junk off a key
+    when the result is an expected key that is not already present. Never invents a
+    key, never overwrites a well-spelled one.
+    """
+    if not isinstance(decision, dict):
+        return {}
+    if len(decision) == 1:
+        inner = next(iter(decision.values()))
+        if isinstance(inner, dict) and any(k in inner for k in ARBITER_KEYS):
+            decision = inner
+    if (isinstance(decision.get("score"), (int, float))
+            and not isinstance(decision.get("score"), bool)
+            and not any(k in decision for k in ARBITER_KEYS)):
+        decision = {"selected_index": _coerce_index(decision.get("index", 0)),
+                    "scores": [decision]}
+    out: dict[str, Any] = {}
+    for key, val in decision.items():
+        fixed = str(key).strip().strip("./\"' \t")
+        out[fixed if (fixed != key and fixed in ARBITER_KEYS
+                      and fixed not in decision) else key] = val
+    return out
+
+
+def _decision_usable(decision: Any) -> bool:
+    """True when the arbiter said something a downstream reader can act on.
+
+    `ARBITER_SYSTEM` demands both `scores` and `merged_plan`; either one alone is
+    still usable (the plan, or the measurement). Neither means the call produced
+    nothing but salvage debris, and the engine's only recovery today is a whole
+    extra plan round -- ~4 calls to replace 1.
+    """
+    if not isinstance(decision, dict):
+        return False
+    mp = decision.get("merged_plan")
+    return bool(decision.get("scores")) or bool(isinstance(mp, dict) and mp)
+
+
+def decision_has_score(decision: Any) -> bool:
+    """True when the arbiter actually MEASURED the plan (non-empty `scores`).
+
+    `plan_score` must keep returning 0.0 for an empty list -- `chapter_metrics`
+    persists that column and readers expect a float -- so "was it measured at all"
+    needs its own predicate. A missing measurement is NOT a low one: 0.0 sits below
+    every threshold, so `create_plan` used to buy a full extra plan round on it.
+    `arc.py` leaves `scores` deliberately empty for the same reason (a fabricated
+    score would poison `chapter_metrics.plan_score`), which is a second reason no
+    reader may read 0.0 as a verdict.
+    """
+    if not isinstance(decision, dict):
+        return False
+    return any(isinstance(s, dict) and s.get("score") is not None
+               for s in (decision.get("scores") or []))
+
+
+def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> float:
+    """The selected plan's arbiter score, or 0.0 when nothing was measured.
+
+    The float contract is load-bearing (`chapter_metrics.plan_score`), so 0.0 is
+    the "no measurement" sentinel — use `decision_has_score` to tell that apart
+    from a genuinely terrible plan before gating on it.
+    """
+    scores = decision.get("scores") or []
+    if not scores:
+        return 0.0
+    if selected_index is None:
+        selected_index = _coerce_index(decision.get("selected_index", 0))
+    for score in scores:
+        if not isinstance(score, dict):
+            continue
+        if _coerce_index(score.get("index", -1), -1) == selected_index:
+            return safe_score(score.get("score", 0))
+    first = scores[0] if isinstance(scores[0], dict) else {}
+    return safe_score(first.get("score", 0))

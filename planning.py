@@ -12,7 +12,12 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import Paths, log, safe_score, cost_savings_disabled
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import beat_directive, chapter_schedule_directive, cacheable_prefix, lite_memory_context, memory_context, rhythm_diagnostics, structural_repetition_analysis
-from store import db_event, db_lock, get_active_constraints, get_overdue_reader_promises, get_reader_promises, get_silent_threads, recent_events, recent_metrics, recent_quality_feedback
+from quality import (ARBITER_KEYS, _coerce_index, _decision_usable, _normalize_decision,
+                     decision_has_score, plan_score)
+from store import (_recent_selected_plans, db_event, db_lock, get_active_constraints,
+                   get_overdue_reader_promises, get_reader_promises, get_silent_threads,
+                   recent_events, recent_metrics, recent_quality_feedback,
+                   used_element_ledger)
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -347,66 +352,6 @@ def _select_strategies_bandit(
     return picked
 
 
-def _recent_selected_plans(
-    conn: Any, lookback: int = 8, exclude_chapter: int | None = None
-) -> list[dict[str, Any]]:
-    """Return the most recent arbiter-selected (merged) plans, newest first.
-
-    Used for scene-skeleton dedupe: the candidate generator is told to avoid
-    re-running the same conflict/payoff/beats that recent chapters already used,
-    which is the engine's main defense against "infinitely slicing one scene".
-
-    ``exclude_chapter`` MUST be passed with the chapter currently being planned.
-    Otherwise this returns the chapter's OWN just-written ``plan_arbitration``
-    event (arbitrate_plan persists it before the dedupe check reads it back),
-    so scene_similarity compares the plan against itself and ``max_sim`` is
-    pinned at 1.0 on every chapter — silently turning the dedupe BLOCK into a
-    guaranteed false positive that wastes a full extra plan-generation round.
-    """
-    # Over-fetch so that excluding the current chapter's own (possibly multiple)
-    # arbitration rows still leaves up to ``lookback`` genuine prior chapters.
-    fetch = lookback + 6
-    try:
-        with db_lock():
-            if exclude_chapter is not None:
-                rows = conn.execute(
-                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
-                    "AND chapter != ? ORDER BY id DESC LIMIT ?",
-                    (int(exclude_chapter), fetch),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
-                    "ORDER BY id DESC LIMIT ?",
-                    (fetch,),
-                ).fetchall()
-        events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
-    except Exception:
-        return []
-    plans: list[dict[str, Any]] = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if exclude_chapter is not None and ev.get("chapter") == int(exclude_chapter):
-            continue
-        payload = ev.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        decision = payload.get("decision") or {}
-        merged = decision.get("merged_plan")
-        cand = payload.get("plans") or []
-        if isinstance(merged, dict) and merged:
-            plans.append(merged)
-        elif cand:
-            try:
-                sel = int(decision.get("selected_index", 0))
-            except (ValueError, TypeError):
-                sel = 0
-            if 0 <= sel < len(cand) and isinstance(cand[sel], dict):
-                plans.append(cand[sel])
-        if len(plans) >= lookback:
-            break
-    return plans
 
 
 # ---------------------------------------------------------------------------
@@ -428,72 +373,9 @@ def _recent_selected_plans(
 # NO cacheable_prefix impact (it lands in the variable user-message segment).
 # ---------------------------------------------------------------------------
 
-# Golden-finger / ability verbs. Kept generic so it works cross-genre (触痕/辨隙/
-# 临终视像/声纹...). The neighbouring concrete object is captured to form
-# "深读门把手"-style usage signatures the writer/planner must vary.
-_DEVICE_VERBS = (
-    "深读", "凝神", "残力", "残影", "触痕", "按指腹", "指腹", "摸", "触",
-    "辨隙", "深听", "聆听", "听出", "回放", "视像", "读取", "读出", "读到",
-)
-
-# High-signal evidence nouns recur as fossils ("门把手"/"硬币"/"提手"...). Generic
-# household/crime物件 so the same regex serves any closed-room mystery without a
-# per-novel list. Falls back gracefully when nothing matches.
-_EVIDENCE_NOUNS = (
-    "门把手", "把手", "栏杆", "提手", "硬币", "箱扣", "钥匙环", "钥匙", "铝牌",
-    "淤伤", "凹痕", "金属粉末", "粉末", "磁带", "录音机", "纽扣", "袖口",
-    "鞋印", "压痕", "伤口", "表带", "链节", "镜子", "倒影", "照片", "锁",
-    "绳", "血迹", "指甲", "螺丝", "扳手", "刀", "玻璃", "窗", "门",
-)
 
 
-def used_element_ledger(
-    conn: Any, config: dict[str, Any], chapter_num: int, lookback: int = 6
-) -> dict[str, list[str]]:
-    """Mine recently-used concrete devices / evidence / payoff_types so the
-    planner, arbiter and writer can be forced to vary them this chapter.
 
-    Returns {"device_usage": [...], "evidence": [...], "payoff_types": [...]}.
-    Each list is the top-N most-frequently-reused items across the last
-    ``lookback`` selected plans (newest first). No LLM call; safe to disable by
-    ignoring the result. Never raises — returns empty lists on any failure.
-    """
-    try:
-        recent = _recent_selected_plans(conn, lookback=lookback, exclude_chapter=chapter_num)
-    except Exception:
-        return {"device_usage": [], "evidence": [], "payoff_types": []}
-    device: list[str] = []
-    evidence: list[str] = []
-    ptypes: list[str] = []
-    verb_alt = "|".join(re.escape(v) for v in _DEVICE_VERBS)
-    noun_alt = "|".join(re.escape(n) for n in _EVIDENCE_NOUNS)
-    # device usage = ability verb followed (within ~6 chars) by a concrete object
-    usage_re = re.compile(rf"(?:{verb_alt})[^，。；、\s]{{0,6}}?({noun_alt})")
-    noun_re = re.compile(noun_alt)
-    for rp in recent:
-        if not isinstance(rp, dict):
-            continue
-        pt = rp.get("payoff_type")
-        if pt:
-            ptypes.append(str(pt)[:30])
-        blob_parts = [str(rp.get(k, "")) for k in ("payoff", "conflict", "info_source", "goal", "pressure")]
-        beats = rp.get("beats")
-        if isinstance(beats, list):
-            blob_parts.extend(str(b) for b in beats[:8])
-        blob = " ".join(blob_parts)
-        for m in usage_re.finditer(blob):
-            device.append(m.group(0)[:20])
-        for m in noun_re.finditer(blob):
-            evidence.append(m.group(0))
-
-    def _topn(xs: list[str], n: int = 8) -> list[str]:
-        return [w for w, _ in Counter(x for x in xs if x).most_common(n)]
-
-    return {
-        "device_usage": _topn(device),
-        "evidence": _topn(evidence),
-        "payoff_types": _topn(ptypes),
-    }
 
 
 def _serial_milestone_block(config: dict[str, Any], chapter_num: int) -> str:
@@ -1564,119 +1446,16 @@ def arbitrate_plan(
             pass
     return plan, decision
 
-ARBITER_KEYS = ("selected_index", "scores", "merged_plan", "required_constraints")
 
 
-def _normalize_decision(decision: Any) -> dict[str, Any]:
-    """Repair the arbitration dict's SHAPE before anything reads it.
-
-    Same untrusted-input doctrine as `_coerce_index`, one level up: the *keys* are
-    LLM-produced too, and `llm.load_json_with_repair`'s repair call makes it worse
-    rather than better -- a repair whose output merely PARSES is accepted, so a
-    salvaged fragment like `{"./output.json": "{"}` is laundered into a decision.
-
-    Measured over all 934 archived arbitrations: 16 are unusable, 14 of them in
-    guize_guaitan alone (34 arbitrations) and every other book ≤1. Observed key
-    forms: `.selected_index`, `''`, `./output.json`, `./merged_plan.json`,
-    `./response.json`, `./scores`, `/assistant`.
-
-    **Key repair recovers 0 of those 16 on its own** — the `.selected_index` cases
-    ship `scores: []`, `merged_plan: {}`, `required_constraints: []` beside the bad
-    key, so the content was lost, not just the label. It is kept anyway because it
-    is free and because `_decision_usable` must judge content, not spelling; the
-    call-site re-ask is what actually recovers these.
-
-    The one shape here that DOES recover is a single score row promoted to the top
-    level (tangshuting Ch175: `{index, score, pros, cons}`) — that is the
-    measurement itself, merely unwrapped.
-
-    Three repairs, all conservative: unwrap a single-key wrapper, rebuild the
-    envelope around a bare score row, and strip leading path/quote junk off a key
-    when the result is an expected key that is not already present. Never invents a
-    key, never overwrites a well-spelled one.
-    """
-    if not isinstance(decision, dict):
-        return {}
-    if len(decision) == 1:
-        inner = next(iter(decision.values()))
-        if isinstance(inner, dict) and any(k in inner for k in ARBITER_KEYS):
-            decision = inner
-    if (isinstance(decision.get("score"), (int, float))
-            and not isinstance(decision.get("score"), bool)
-            and not any(k in decision for k in ARBITER_KEYS)):
-        decision = {"selected_index": _coerce_index(decision.get("index", 0)),
-                    "scores": [decision]}
-    out: dict[str, Any] = {}
-    for key, val in decision.items():
-        fixed = str(key).strip().strip("./\"' \t")
-        out[fixed if (fixed != key and fixed in ARBITER_KEYS
-                      and fixed not in decision) else key] = val
-    return out
 
 
-def _decision_usable(decision: Any) -> bool:
-    """True when the arbiter said something a downstream reader can act on.
-
-    `ARBITER_SYSTEM` demands both `scores` and `merged_plan`; either one alone is
-    still usable (the plan, or the measurement). Neither means the call produced
-    nothing but salvage debris, and the engine's only recovery today is a whole
-    extra plan round -- ~4 calls to replace 1.
-    """
-    if not isinstance(decision, dict):
-        return False
-    mp = decision.get("merged_plan")
-    return bool(decision.get("scores")) or bool(isinstance(mp, dict) and mp)
 
 
-def decision_has_score(decision: Any) -> bool:
-    """True when the arbiter actually MEASURED the plan (non-empty `scores`).
-
-    `plan_score` must keep returning 0.0 for an empty list -- `chapter_metrics`
-    persists that column and readers expect a float -- so "was it measured at all"
-    needs its own predicate. A missing measurement is NOT a low one: 0.0 sits below
-    every threshold, so `create_plan` used to buy a full extra plan round on it.
-    `arc.py` leaves `scores` deliberately empty for the same reason (a fabricated
-    score would poison `chapter_metrics.plan_score`), which is a second reason no
-    reader may read 0.0 as a verdict.
-    """
-    if not isinstance(decision, dict):
-        return False
-    return any(isinstance(s, dict) and s.get("score") is not None
-               for s in (decision.get("scores") or []))
 
 
-def _coerce_index(val: Any, default: int = 0) -> int:
-    """Robustly parse an arbiter-supplied index that may be malformed.
-    Arbitration JSON is LLM-produced and untrusted: selected_index / scores[].index
-    have shown up as '^1', ' 1 ', 1.0, None. A bad value must never crash planning
-    (that wedges the whole run). Extract the first signed integer run, else default."""
-    if isinstance(val, bool):
-        return default
-    if isinstance(val, int):
-        return val
-    if isinstance(val, float):
-        return int(val)
-    try:
-        return int(str(val).strip())
-    except (ValueError, TypeError):
-        import re as _re
-        m = _re.search(r"-?\d+", str(val or ""))
-        return int(m.group()) if m else default
 
 
-def plan_score(decision: dict[str, Any], selected_index: int | None = None) -> float:
-    scores = decision.get("scores") or []
-    if not scores:
-        return 0.0
-    if selected_index is None:
-        selected_index = _coerce_index(decision.get("selected_index", 0))
-    for score in scores:
-        if not isinstance(score, dict):
-            continue
-        if _coerce_index(score.get("index", -1), -1) == selected_index:
-            return safe_score(score.get("score", 0))
-    first = scores[0] if isinstance(scores[0], dict) else {}
-    return safe_score(first.get("score", 0))
 
 def _recovery_active(paths: Paths, chapter_num: int) -> bool:
     """True when a mid-book degradation recovery directive (written by

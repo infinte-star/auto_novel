@@ -641,7 +641,7 @@ def plan_from_arc(
         sim = None
         if bool(config["novel"].get("scene_dedupe_enabled", True)):
             try:
-                from planning import _recent_selected_plans
+                from store import _recent_selected_plans
                 from quality import scene_similarity
 
                 # `_recent_selected_plans` reads `plan_arbitration` events, which

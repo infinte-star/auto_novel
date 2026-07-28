@@ -1796,31 +1796,6 @@ GLOSSARY_SYSTEM = """你是本书的设定词条/名词表维护编辑。
 - 名词总数控制在合理范围(优先保留主角/高频/易混名词)，不要堆砌一次性龙套。"""
 
 
-def glossary_block(paths: Paths, config: dict[str, Any]) -> str:
-    """Render memory/glossary.md as a compact writer-prompt injection block.
-
-    Read-only and best-effort: returns "" when the glossary is missing/empty or
-    the feature is disabled. Rides in the writer's variable carryover section —
-    it is NOT part of cacheable_prefix, so updating it never invalidates the
-    prompt cache for prior chapters.
-    """
-    if not bool(config["novel"].get("glossary_enabled", True)):
-        return ""
-    try:
-        text = read_text(paths.glossary).strip()
-    except Exception:
-        return ""
-    # Skip when empty or only a scaffold heading with no real entries.
-    if len(text) < 40:
-        return ""
-    budget = int(config["novel"].get("glossary_inject_chars", 1800) or 1800)
-    snippet = text[:budget]
-    return (
-        "## 名词表 / 设定一致性(写作时严格遵守，勿改写专有名词)\n"
-        "以下是本书已确立的专有名词与硬设定。本章涉及这些名词时，必须使用其 canonical 写法，"
-        "不得擅自改名、改设定或赋予白名单外的能力；如需引入全新名词，确保与下列不冲突。\n"
-        f"{snippet}"
-    )
 
 
 def refresh_glossary(

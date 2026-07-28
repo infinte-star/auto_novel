@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import threading
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1038,3 +1040,141 @@ def get_overdue_revelations(conn: Any, chapter_num: int, grace: int = 5, limit: 
         ]
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Recently-used plan elements (pure reads over the `plan_arbitration` event log;
+# moved here from planning.py so the writer can consult them without importing a
+# planner). Both engines read them; only v1 writes `plan_arbitration` events, so
+# under v2 these return empty and every consumer degrades to "no avoid-list".
+# ---------------------------------------------------------------------------
+
+
+def _recent_selected_plans(
+    conn: Any, lookback: int = 8, exclude_chapter: int | None = None
+) -> list[dict[str, Any]]:
+    """Return the most recent arbiter-selected (merged) plans, newest first.
+
+    Used for scene-skeleton dedupe: the candidate generator is told to avoid
+    re-running the same conflict/payoff/beats that recent chapters already used,
+    which is the engine's main defense against "infinitely slicing one scene".
+
+    ``exclude_chapter`` MUST be passed with the chapter currently being planned.
+    Otherwise this returns the chapter's OWN just-written ``plan_arbitration``
+    event (arbitrate_plan persists it before the dedupe check reads it back),
+    so scene_similarity compares the plan against itself and ``max_sim`` is
+    pinned at 1.0 on every chapter — silently turning the dedupe BLOCK into a
+    guaranteed false positive that wastes a full extra plan-generation round.
+    """
+    # Over-fetch so that excluding the current chapter's own (possibly multiple)
+    # arbitration rows still leaves up to ``lookback`` genuine prior chapters.
+    fetch = lookback + 6
+    try:
+        with db_lock():
+            if exclude_chapter is not None:
+                rows = conn.execute(
+                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                    "AND chapter != ? ORDER BY id DESC LIMIT ?",
+                    (int(exclude_chapter), fetch),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chapter, payload FROM events WHERE event_type='plan_arbitration' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (fetch,),
+                ).fetchall()
+        events = [{"chapter": r["chapter"], "payload": json.loads(r["payload"])} for r in rows]
+    except Exception:
+        return []
+    plans: list[dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if exclude_chapter is not None and ev.get("chapter") == int(exclude_chapter):
+            continue
+        payload = ev.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        decision = payload.get("decision") or {}
+        merged = decision.get("merged_plan")
+        cand = payload.get("plans") or []
+        if isinstance(merged, dict) and merged:
+            plans.append(merged)
+        elif cand:
+            try:
+                sel = int(decision.get("selected_index", 0))
+            except (ValueError, TypeError):
+                sel = 0
+            if 0 <= sel < len(cand) and isinstance(cand[sel], dict):
+                plans.append(cand[sel])
+        if len(plans) >= lookback:
+            break
+    return plans
+
+
+# Golden-finger / ability verbs. Kept generic so it works cross-genre (触痕/辨隙/
+# 临终视像/声纹...). The neighbouring concrete object is captured to form
+# "深读门把手"-style usage signatures the writer/planner must vary.
+_DEVICE_VERBS = (
+    "深读", "凝神", "残力", "残影", "触痕", "按指腹", "指腹", "摸", "触",
+    "辨隙", "深听", "聆听", "听出", "回放", "视像", "读取", "读出", "读到",
+)
+
+# High-signal evidence nouns recur as fossils ("门把手"/"硬币"/"提手"...). Generic
+# household/crime物件 so the same regex serves any closed-room mystery without a
+# per-novel list. Falls back gracefully when nothing matches.
+_EVIDENCE_NOUNS = (
+    "门把手", "把手", "栏杆", "提手", "硬币", "箱扣", "钥匙环", "钥匙", "铝牌",
+    "淤伤", "凹痕", "金属粉末", "粉末", "磁带", "录音机", "纽扣", "袖口",
+    "鞋印", "压痕", "伤口", "表带", "链节", "镜子", "倒影", "照片", "锁",
+    "绳", "血迹", "指甲", "螺丝", "扳手", "刀", "玻璃", "窗", "门",
+)
+
+
+def used_element_ledger(
+    conn: Any, config: dict[str, Any], chapter_num: int, lookback: int = 6
+) -> dict[str, list[str]]:
+    """Mine recently-used concrete devices / evidence / payoff_types so the
+    planner, arbiter and writer can be forced to vary them this chapter.
+
+    Returns {"device_usage": [...], "evidence": [...], "payoff_types": [...]}.
+    Each list is the top-N most-frequently-reused items across the last
+    ``lookback`` selected plans (newest first). No LLM call; safe to disable by
+    ignoring the result. Never raises — returns empty lists on any failure.
+    """
+    try:
+        recent = _recent_selected_plans(conn, lookback=lookback, exclude_chapter=chapter_num)
+    except Exception:
+        return {"device_usage": [], "evidence": [], "payoff_types": []}
+    device: list[str] = []
+    evidence: list[str] = []
+    ptypes: list[str] = []
+    verb_alt = "|".join(re.escape(v) for v in _DEVICE_VERBS)
+    noun_alt = "|".join(re.escape(n) for n in _EVIDENCE_NOUNS)
+    # device usage = ability verb followed (within ~6 chars) by a concrete object
+    usage_re = re.compile(rf"(?:{verb_alt})[^，。；、\s]{{0,6}}?({noun_alt})")
+    noun_re = re.compile(noun_alt)
+    for rp in recent:
+        if not isinstance(rp, dict):
+            continue
+        pt = rp.get("payoff_type")
+        if pt:
+            ptypes.append(str(pt)[:30])
+        blob_parts = [str(rp.get(k, "")) for k in ("payoff", "conflict", "info_source", "goal", "pressure")]
+        beats = rp.get("beats")
+        if isinstance(beats, list):
+            blob_parts.extend(str(b) for b in beats[:8])
+        blob = " ".join(blob_parts)
+        for m in usage_re.finditer(blob):
+            device.append(m.group(0)[:20])
+        for m in noun_re.finditer(blob):
+            evidence.append(m.group(0))
+
+    def _topn(xs: list[str], n: int = 8) -> list[str]:
+        return [w for w, _ in Counter(x for x in xs if x).most_common(n)]
+
+    return {
+        "device_usage": _topn(device),
+        "evidence": _topn(evidence),
+        "payoff_types": _topn(ptypes),
+    }

@@ -21,7 +21,7 @@ from config import (
 )
 from llm import call_llm, json_prompt, load_json_with_repair
 from memory import cacheable_prefix, contract_capsule, memory_context, writing_memory_context
-from planning import plan_score
+from quality import plan_score
 from store import db_event, db_lock, recent_quality_feedback, store_causal_links, upsert_reader_promise
 
 if TYPE_CHECKING:
@@ -1823,7 +1823,7 @@ def write_chapter(
     # than producing a near-verbatim repeat that only cross_repeat catches later.
     if bool(config["novel"].get("used_element_ledger_enabled", True)):
         try:
-            from planning import used_element_ledger
+            from store import used_element_ledger
 
             led = used_element_ledger(
                 conn, config, chapter_num,
@@ -1845,7 +1845,7 @@ def write_chapter(
     # section only — never folded into cacheable_prefix sources.
     if bool(config["novel"].get("glossary_enabled", True)):
         try:
-            from review import glossary_block as _glossary_block
+            from memory import glossary_block as _glossary_block
             gb = _glossary_block(paths, config)
             if gb:
                 carryover_block += "\n" + gb + "\n"
@@ -2025,7 +2025,7 @@ def write_chapter(
         try:
             from config import log
             from quality import location_transition
-            from planning import _recent_selected_plans
+            from store import _recent_selected_plans
             _recent = _recent_selected_plans(
                 conn,
                 lookback=int(config["novel"].get("scene_entry_lookback", 3)),

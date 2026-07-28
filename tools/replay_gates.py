@@ -207,7 +207,7 @@ def _plan_score(novel: Path, ch: int, fix_unmeasured: bool = False) -> float | N
     pay = _payload(novel / "logs" / "checkpoints" / f"ch{ch:04d}"
                    / "plan_initial_attempt0_arbitration.json") or {}
     try:
-        from planning import _normalize_decision, decision_has_score, plan_score
+        from quality import _normalize_decision, decision_has_score, plan_score
         dec = pay.get("decision") or {}
         if fix_unmeasured:
             dec = _normalize_decision(dec)
