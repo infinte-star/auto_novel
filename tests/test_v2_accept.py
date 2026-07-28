@@ -473,5 +473,139 @@ class AdvisoryWiringTest(unittest.TestCase):
                                   f"{name} declares {layer} with no fixer")
 
 
+class EmDashTrendWiringTest(unittest.TestCase):
+    """`style_health`'s em-dash TREND term, wired into v2 2026-07-28.
+
+    **Every case here goes through the real seam** — real `chapter_metrics` rows
+    in a real SQLite file, read back by `accept._em_history` inside
+    `acceptance_report`. A test that handed `em_history=` to `quality.style_health`
+    directly would pass just as happily on the engine as it stood yesterday, which
+    never opened the table at all. That is the same self-deception the
+    fingerprint-library and opening-route wirings each had to be re-tested for.
+
+    The term is silent without a baseline, so for two months v2 ran a strictly
+    smaller gate than `quality.py` documents and nothing said so: an absent
+    history reads exactly like a healthy trend.
+    """
+
+    # A rise off a low mean: mean(1.0,1.2,1.1) = 1.1, so a draft at ~4/k is a
+    # >2x rise while still well under `style_em_dash_per_kchar_warn` (6.0). That
+    # gap is the entire case the static tier cannot see.
+    PRIOR = [(7, 1.0), (8, 1.2), (9, 1.1)]
+
+    def setUp(self):
+        import store
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from config import Paths
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        p = Paths(
+            book=root / "book.md", state=root / "state.md", title=root / "t.txt",
+            bible=root / "b.md", characters=root / "c.md", timeline=root / "tl.md",
+            threads=root / "th.md", volume_plan=root / "vp.md",
+            compass=root / "cp.md", voices=root / "vs.md", voice=root / "v.md",
+            contract=root / "ct.md", glossary=root / "g.md",
+            chapters_dir=root / "chapters", logs_dir=root / "logs",
+            database=root / "story_state.db",
+        )
+        p.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.conn = store.init_db(p)
+        self.addCleanup(self.conn.close_current)
+
+    def _seed(self, rows=None):
+        """Put real rows in the real table.
+
+        Raw SQL rather than `writing.update_structured_state`: the seam under test
+        is `chapter_metrics` -> `store.recent_metrics` -> `accept._em_history`, and
+        the writer needs a plan/extraction/review triple that has nothing to do
+        with it. The two columns touched here are the two that side reads.
+        """
+        for ch, em in (rows if rows is not None else self.PRIOR):
+            self.conn.execute(
+                "INSERT INTO chapter_metrics (chapter, em_dash_per_kchar, "
+                "created_at) VALUES (?, ?, datetime('now'))", (ch, em))
+        self.conn.commit()
+
+    def _text(self, em_per_kchar):
+        """A ~2000-char clean chapter carrying a chosen em-dash density."""
+        base = "汤舒婷推开顾家老宅后厨的门，她在灶台夹层里摸到一枚刻字的铜钥匙。" * 60
+        n = round(em_per_kchar * len(base) / 1000.0)
+        return "第10章 铜钥匙\n\n" + base + "——" * n
+
+    def _report(self, text, conn=None):
+        return accept.acceptance_report(10, text, None, _cfg(), conn=conn)
+
+    def test_the_trend_fires_on_a_rise_the_static_tier_cannot_see(self):
+        self._seed()
+        r = self._report(self._text(4.0), conn=self.conn)
+        flags = r["style_health"]["flags"]
+        self.assertTrue(any(f.startswith("em_dash_trend_rise") for f in flags), flags)
+        # Proof it is the TREND and not the static tier: 4.0/k is under warn 6.0.
+        self.assertFalse(any(f.startswith(("em_dash_high", "em_dash_overload"))
+                             for f in flags), flags)
+        self.assertEqual(r["style_health"]["metrics"]["em_dash_recent_mean"], 1.1)
+
+    def test_the_directive_reaches_the_next_chapters_writer(self):
+        # The whole payoff. `v2/run.py` injects
+        # `writer_directives_for_next_chapter`; a flag nobody is told about buys
+        # nothing.
+        self._seed()
+        r = self._report(self._text(4.0), conn=self.conn)
+        self.assertTrue(any("破折号" in d
+                            for d in r["writer_directives_for_next_chapter"]))
+
+    def test_without_a_conn_the_term_stays_silent(self):
+        # Offline callers (tools, tests) pass no conn. Silence is the honest
+        # answer there -- an unmeasured trend must not be reported as a rising one.
+        r = self._report(self._text(4.0))
+        self.assertFalse(any(f.startswith("em_dash_trend")
+                             for f in r["style_health"]["flags"]))
+        self.assertNotIn("em_dash_recent_mean", r["style_health"]["metrics"])
+
+    def test_an_unreadable_conn_degrades_to_silence_rather_than_aborting(self):
+        # The term is advisory and has never blocked, so a metrics read that
+        # fails must not take the chapter down with it. Asserting the report is
+        # still produced, not merely that no exception escaped.
+        class _Broken:
+            def execute(self, *a, **k):
+                raise RuntimeError("no such table")
+
+        r = self._report(self._text(4.0), conn=_Broken())
+        self.assertTrue(r["accepted"])
+        self.assertFalse(any(f.startswith("em_dash_trend")
+                             for f in r["style_health"]["flags"]))
+
+    def test_a_single_prior_chapter_is_not_a_baseline(self):
+        # `em_dash_penalty` needs >=2 points; one chapter's density is noise, and
+        # treating it as a mean would fire the trend on chapter 2 of every book.
+        self._seed([(9, 1.0)])
+        r = self._report(self._text(4.0), conn=self.conn)
+        self.assertFalse(any(f.startswith("em_dash_trend")
+                             for f in r["style_health"]["flags"]))
+
+    def test_this_chapters_own_row_is_never_its_own_baseline(self):
+        # A rescued or resumed chapter already has a `chapter_metrics` row from
+        # the previous attempt. Left in, the chapter is compared against itself,
+        # the ratio collapses to ~1.0, and the term goes quiet exactly when the
+        # engine is retrying a chapter it already found suspect.
+        self._seed(self.PRIOR + [(10, 4.0), (11, 4.0)])
+        r = self._report(self._text(4.0), conn=self.conn)
+        self.assertEqual(r["style_health"]["metrics"]["em_dash_recent_mean"], 1.1)
+        self.assertTrue(any(f.startswith("em_dash_trend_rise")
+                            for f in r["style_health"]["flags"]))
+
+    def test_wiring_it_does_not_move_the_ruler_on_the_measured_corpus(self):
+        # Measured on all 63 archived v2 round-0 drafts: the term fires 4 times
+        # and crosses `style_penalty_block` zero times. This pins the arithmetic
+        # that makes that true -- the trend charge for a <2.5x rise is 0.5, which
+        # cannot reach the 2.0 block line on its own.
+        self._seed()
+        r = self._report(self._text(4.0), conn=self.conn)
+        self.assertLess(r["style_health"]["penalty"], 2.0)
+        self.assertEqual(quality.hard_block_reasons(r, _cfg()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

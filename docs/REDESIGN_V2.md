@@ -878,7 +878,7 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 
 | 键 | 为什么它是缺陷报告 |
 | --- | --- |
-| `style_em_dash_trend_window` | 没有任何调用点给 `style_health` 传 `em_history`（`v2/accept.py:608` 只传 text+config），于是 `recent_mean` 恒为 `None`，**破折号趋势项在 v2 里从不发火**。那正是抓到 gudai50_v2 Ch20-24 从 6.6 爬到 8.8、而静态档在 +1.0 上躺平的那一项；也正是 `fpy_prime._normalize` 重盖的那一项——**尺子现在建模了一个引擎已经不执行的门**。`tech_history` 同理。 |
+| `style_em_dash_trend_window` | 没有任何调用点给 `style_health` 传 `em_history`（`v2/accept.py:608` 只传 text+config），于是 `recent_mean` 恒为 `None`，**破折号趋势项在 v2 里从不发火**。那正是抓到 gudai50_v2 Ch20-24 从 6.6 爬到 8.8、而静态档在 +1.0 上躺平的那一项。**已于 2026-07-28 接上，结算见 §9.11.2**——其中「尺子建模了一个引擎不执行的门」这句原判是错的，`_restamp_style_penalty` 的 `if not old_em` 让它碰不到 v2 载荷。 |
 | `scene_dedupe_sim_warn`、`scene_dedupe_candidate_block` | v1 的三级升级（WARN 追加 `required_constraints` / BLOCK 重试 / 0.97 绝对天花板）只剩 BLOCK 一级：`arc.validate_card` 只收一个 `scene_sim_block`。另两级住在被删的 `review.py`/`planning.py` 里。 |
 | `telemetry_enabled` | `telemetry.py` 根本不读它，遥测关不掉。无害（严格观察者），但配置文件许下了一个它不兑现的承诺。 |
 
@@ -933,3 +933,52 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 
 零指标变更（两条线都在弧规划/离线判官上，不动验收）：`fpy_prime` 仍是 **365/438 = 83%**，
 测试 769 → 778 全绿，`tools/orphan_defs.py --constants` 现在报 **0 孤儿、0 TESTS-ONLY**。
+
+### 9.11.2 破折号趋势项：接上一个「引擎跑的门比文档小」的缺陷（2026-07-28）
+
+§9.11 留下的三条待决接线里，这是坐在 FPY′ 通路上的那一条。
+`quality.style_health` 的签名是 `(text, config, em_history=None, tech_history=None)`，
+趋势项**没有基线就静默**；`v2/accept.py:608` 只传 text+config，于是从 v2 上线起
+`recent_mean` 恒为 `None`，**引擎跑的是一个比 `quality.py` 文档里那个更小的门**——
+而这种缩小是不出声的：缺席的历史读起来和「趋势健康」一模一样。
+
+**结论先行：接上，但它的价值不是拦稿，是提前一章的写手指令。**
+`v2/accept.py:_em_history` 从 `chapter_metrics` 读回，走 `store.recent_metrics`，
+丢掉章号 ≥ 当前章的行。
+
+三个测量决定了这个形状，其中两个先给出过错答案：
+
+**① 语料选错，答案就反过来。** 同一段回放跑在 `chapters/*.md`（修复后正文）上：
+438 章里 18 次触发、**全是噪声**。原因是 L0 的破折号削减已经把成品拉到 ~3.0/千字的天花板，
+剩下的序列在 0.0↔2.8 之间振荡，而无破折号的章把均值拽向零，于是任何一个正常的 2.8/千字
+都读成「2 倍上升」。跑在**归档首稿**（`review_round0.json` 的 metrics）上才是引擎看见的东西：
+63 章 v2 首稿里触发 **4 次**，em 分别是 3.3 / 4.67 / 5.32 / 5.85，基线均值 1.5–3.1，
+每一次都是朝着 6.0 静态档真实爬升的一章——**静态档要到下一章才会开口**。
+一条通用纪律：**任何拿成品正文回答「首稿有多糟」的测量都被修复层污染了**，
+这与 §9.4 的 replay_ccc 自伤是同一个病。
+
+**② 跨过阻塞线 0 次**，所以接上不可能损 FPY′：<2.5 倍的上升记 0.5，单靠它到不了 2.0。
+这也是为什么它可以直接接、不需要 A/B——**代价为零的一侧是可以证明的**。
+
+**③ 「尺子建模了一个引擎不执行的门」这个原判是错的**，必须更正。
+`fpy_prime._restamp_style_penalty` 在 `if not old_em: return None` 处退出：
+归档 flag 里必须**已经**带着破折号扣分，才会被重算。全部 708 份归档首稿实测——
+645 份 v1 里 626 份带 `em_dash_recent_mean`，63 份 v2 里**一份都没有**，
+实际被重盖的恰好 90 份且全是 v1。所以尺子从不在没收过这笔费的那条臂上凭空加费。
+真正成立的说法窄得多、但读 §9.7 的结算时仍需知道：v1 首稿能把趋势扣分累加到 2.0 阻塞线上，
+接线前的 v2 首稿结构上不能，**`style_health.penalty` 在两臂间不是同一个量**。
+这个不对称从此往后被这次接线关掉，但它已经烙在归档里。
+
+`tech_history` 判为**不接**：数据是有的（`chapter_metrics.tech_per_kchar` 每行都有值，
+早前记的「没有这一列」是错的），但 `quality.py:643` 是 `_ = tech_history`——
+静态合取已在校准回放里抓住塌缩段，趋势逻辑缓做。传进去会**看起来像一个能力**而不改变任何判决。
+
+测试走真实 DB 缝（真 SQLite + 真 `chapter_metrics` 行 + `acceptance_report` 内部读回）。
+把 `em_history=` 直接喂给 `quality.style_health` 的测试，在昨天那个从不打开这张表的引擎上
+也会通过——和 §9.10 / §9.11.1 同一种自欺，第三次了。
+反证过：拆掉接线 3 挂，拆掉「排除本章自己那行」1 挂，让读失败抛出去 1 挂。
+其中「排除本章自己那行」不是洁癖：**重救（rescue）中的章在这张表里已经有自己的上一次尝试**，
+留着它就是拿本章和本章比，比值塌到 ~1.0，趋势项恰好在引擎正在重试一个它已经觉得可疑的章时闭嘴。
+
+`fpy_prime` 仍是 **365/438 = 83%**（它回放归档载荷，看不见只向前生效的引擎改动），
+测试 778 → 785 全绿。

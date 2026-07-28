@@ -44,6 +44,7 @@ from typing import Any, Iterable, Sequence
 
 import arc
 import quality
+import store
 from quality import REGISTRY, hard_block_reasons
 
 # ---------------------------------------------------------------------------
@@ -543,6 +544,69 @@ def canon_check(
 # The report
 # ---------------------------------------------------------------------------
 
+def _em_history(
+    conn: Any,
+    chapter_num: int,
+    config: dict[str, Any],
+) -> list[float] | None:
+    """The prior chapters' em-dash density, oldest-first, or None.
+
+    `style_health`'s TREND term is a function of (this chapter's density, the
+    recent mean) and is SILENT without a baseline. v2 called `style_health` with
+    no history, so the term never fired here — the engine ran a strictly smaller
+    gate than the one `quality.py` documents, and the difference is the case the
+    static tier cannot see: a climb that is still below `style_em_dash_per_kchar_warn`.
+
+    Measured on the 63 archived v2 round-0 drafts (2026-07-28): the term fires 4
+    times, at em 3.3 / 4.67 / 5.32 / 5.85 rising off means of 1.5–3.1, and
+    **crosses `style_penalty_block` zero times**. So wiring it cannot cost FPY′ —
+    what it buys is 4 early-warning directives into the next chapter's writer
+    prompt, one chapter before the static tier at 6.0 would have spoken.
+
+    Two traps, both of which produced a wrong number first:
+    * **The measurement must run on round-0 drafts, not on `chapters/*.md`.** On
+      repaired final prose the same replay fires 18 times and every one is noise —
+      L0 em-dash reduction has already pulled the drafts down to a ~3.0/k ceiling,
+      so the surviving series oscillates 0.0↔2.8 and any normal chapter reads as a
+      "2x rise" over a mean that em-free chapters dragged toward zero.
+    * **Rows at or after `chapter_num` must be dropped.** On a resumed or rescued
+      chapter this table already holds THIS chapter's own row from the previous
+      attempt, and leaving it in compares the chapter against itself. That is why
+      the query asks for one more row than the window.
+
+    `tech_history` is deliberately NOT supplied even though the data is there
+    (`chapter_metrics.tech_per_kchar`, populated on every row): `quality.py:643`
+    is `_ = tech_history` under a note that the trend logic is deferred because
+    the static conjunction already caught the collapse stretches in calibration
+    replay. Passing it would read as a wired capability while changing no verdict.
+    v1 passed it and got the same nothing.
+    """
+    # The no-conn case is checked explicitly rather than left to the `except`
+    # below, which it would also reach: offline callers (tools, tests) passing no
+    # conn are the NORMAL path, and routing them through an error handler makes
+    # that handler look load-bearing for something it is not.
+    if conn is None:
+        return None
+    window = max(int(config.get("novel", {}).get(
+        "style_em_dash_trend_window", 5)), 1)
+    try:
+        rows = store.recent_metrics(conn, window + 1)
+    except Exception:
+        # A read failure degrades to "no baseline" rather than aborting the
+        # chapter — this term is advisory and has never blocked (see above). The
+        # column is guaranteed present by `store.init_db`'s migration, so the
+        # realistic trigger is a conn that is not one.
+        return None
+    seq = sorted(
+        (int(r["chapter"]), float(r["em_dash_per_kchar"]))
+        for r in rows
+        if r.get("chapter") is not None
+        and isinstance(r.get("em_dash_per_kchar"), (int, float))
+        and int(r["chapter"]) < chapter_num
+    )
+    return [v for _, v in seq[-window:]] or None
+
+
 def acceptance_report(
     chapter_num: int,
     text: str,
@@ -571,11 +635,14 @@ def acceptance_report(
     *canon_claims* are the cite-or-drop candidates from the canon check (the one
     low-reasoning LLM call). Uncited ones never reach the payload.
 
-    *recent_payoff_types* and *conn* feed the two advisory gates that read the
-    book's recent history rather than this chapter's text. Both are optional and
-    both default to skipping their gate: an advisory that cannot be computed must
-    stay ABSENT from the payload, not appear as a clean result. `payoff_beat_density`
-    with no history would report a payoff drought of zero and read as healthy.
+    *recent_payoff_types* and *conn* feed the gates that read the book's recent
+    history rather than this chapter's text. Both are optional and both default to
+    skipping their gate: an advisory that cannot be computed must stay ABSENT from
+    the payload, not appear as a clean result. `payoff_beat_density` with no
+    history would report a payoff drought of zero and read as healthy. *conn* also
+    supplies `style_health`'s em-dash trend baseline (`_em_history`) — without it
+    that gate runs with its trend term permanently silent, which is a smaller gate
+    than the one `quality.py` documents rather than a passing one.
 
     *book_scans* names which book-level gates may run this chapter; `None` runs
     every one whose config switch is on. It exists because `review.py` runs the
@@ -605,7 +672,8 @@ def acceptance_report(
 
     # --- style_health -> style_collapse -----------------------------------
     if enabled("style_health"):
-        report["style_health"] = quality.style_health(body, config)
+        report["style_health"] = quality.style_health(
+            body, config, em_history=_em_history(conn, chapter_num, config))
 
     # --- length / opening: the ruler reads `.block` -----------------------
     # `length_band_check` stores under a key that is NOT the gate name, and its

@@ -263,7 +263,7 @@ decorators.
 
 | gate / layer | config | behaviour |
 | --- | --- | --- |
-| `quality.style_health(text, config)` | `style_health_enabled`, `style_em_dash_per_kchar_warn`/`_bad`, `style_min_avg_sentence_chars`, `style_fragment_line_ratio_max`, `style_penalty_cap`, `style_penalty_block` | deterministic prose metrics (em-dash density, avg sentence length, fragment-line ratio, dialogue presence) → `penalty`, `flags`, writer `directives`. Blocks at `style_penalty_block` |
+| `quality.style_health(text, config, em_history=…)` | `style_health_enabled`, `style_em_dash_per_kchar_warn`/`_bad`, `style_em_dash_trend_window`, `style_min_avg_sentence_chars`, `style_fragment_line_ratio_max`, `style_penalty_cap`, `style_penalty_block` | deterministic prose metrics (em-dash density, avg sentence length, fragment-line ratio, dialogue presence) → `penalty`, `flags`, writer `directives`. Blocks at `style_penalty_block`. **`em_history` is not optional in practice** — without it the em-dash TREND term is silent and the gate is strictly smaller than this row describes; `v2/accept.py:_em_history` supplies it from `chapter_metrics` |
 | `quality.scene_similarity(plan, recent_plans)` | `scene_dedupe_enabled`, `scene_dedupe_sim_warn`/`_block`/`_identical`, `scene_dedupe_short_novel_block`, `scene_dedupe_candidate_block` | Jaccard similarity of a plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent cards projected through `card_to_plan` |
 | `quality.cross_chapter_repetition` | `style_cross_repeat_reject_count` (8) | signature clauses reused verbatim across chapters → a `level` of `advise` or `reject` |
 | `quality.dialogue_health` | `dialogue_health_enabled`, `dialogue_char_ratio_min` (0.10), `dialogue_char_ratio_target` (0.20) | dialogue-ratio gate over text inside `"…"`; reached via `fix.py`'s L1 dialogue injection |
@@ -341,13 +341,23 @@ all 29 role-routing keys look dead and are not.
 
 Four dead keys were **held back on purpose**, because they are dead from a wiring
 break rather than from replacement, and deleting the knob would bury the bug
-report:
-- `style_em_dash_trend_window` — nothing supplies `style_health`'s `em_history`
-  (`v2/accept.py:608` passes text and config only), so `recent_mean is None` on
-  every call and **the em-dash TREND term never fires in v2**. That is the check
-  that caught gudai50_v2 Ch20-24 climbing 6.6→8.8 while the static tier flat-lined
-  at +1.0 — and it is the same term `fpy_prime._normalize` re-stamps, so the ruler
-  currently models a gate the engine no longer runs. Same for `tech_history`.
+report. One is now settled:
+- `style_em_dash_trend_window` — **wired 2026-07-28** (`v2/accept.py:_em_history`).
+  Nothing had supplied `style_health`'s `em_history`, so `recent_mean` was `None`
+  on every v2 call and the em-dash TREND term — the check that caught gudai50_v2
+  Ch20-24 climbing 6.6→8.8 while the static tier flat-lined at +1.0 — never fired.
+  It now reads `chapter_metrics` back through `store.recent_metrics`, dropping rows
+  at or after the current chapter so a rescued chapter is never its own baseline.
+  Measured on the 63 archived v2 round-0 drafts before wiring: **fires 4 times,
+  crosses `style_penalty_block` zero times**, so it cannot cost FPY′ — what it buys
+  is 4 early-warning writer directives at em 3.3–5.85, one chapter before the
+  static tier at 6.0 speaks. **The corpus choice is the whole measurement**: replay
+  the same term over `chapters/*.md` and it fires 18 times, all noise, because L0
+  em-dash reduction has already pulled the shipped prose to a ~3.0/k ceiling and
+  the surviving series oscillates 0.0↔2.8 around a mean that em-free chapters drag
+  toward zero. `tech_history` is deliberately still unsupplied: the data exists
+  (`chapter_metrics.tech_per_kchar`, populated) but `quality.py:643` is `_ =
+  tech_history`, so passing it would look like a capability and change no verdict.
 - `scene_dedupe_sim_warn`, `scene_dedupe_candidate_block` — see the escalation note
   above: v2 kept only the BLOCK step.
 - `telemetry_enabled` — `telemetry.py` reads it nowhere, so telemetry cannot be
@@ -467,7 +477,7 @@ reports fixed bugs as live problems. `fpy_prime._normalize` re-stamps two by
 default (`--raw` replays payloads verbatim), and each changes which bucket looks
 like the top killer:
 - v1's contract backstop stamped keyword-matched `problems` text as a HARD violation until `b54bfd0` downgraded it to SOFT. 22 archived chapters fail their first draft on that alone — the whole difference between "`hard_contract` is the #1 killer at 54" (wrong) and "32, second to gate_rejects" (right), and between tunshi_xitong at 85% and its true 98%.
-- `style_health`'s em-dash TREND term charged a flat +1.0, which stacked onto the static tier's +1.0 to hit `style_penalty_block` (2.0) *exactly*; it is now graduated by ratio. 31 archived chapters were scored under the flat rule and 5 block on it alone. Two execution rules: only the em-dash terms are recomputed (every other component's input is the chapter text, which round0 no longer describes after revision), and a penalty already at `style_penalty_cap` is skipped because it is no longer a sum of its terms. `_restamp_style_penalty` calls `quality.em_dash_penalty` — the arithmetic was extracted into that pure function precisely so the tool cannot drift from the engine. LESSONS §13. **Caveat as of 2026-07-28:** the trend term does not run in v2 at all (nothing supplies `em_history`), so this normalization currently models a gate the live engine has stopped enforcing — see the held-back keys under the wiring gap.
+- `style_health`'s em-dash TREND term charged a flat +1.0, which stacked onto the static tier's +1.0 to hit `style_penalty_block` (2.0) *exactly*; it is now graduated by ratio. 31 archived chapters were scored under the flat rule and 5 block on it alone. Two execution rules: only the em-dash terms are recomputed (every other component's input is the chapter text, which round0 no longer describes after revision), and a penalty already at `style_penalty_cap` is skipped because it is no longer a sum of its terms. `_restamp_style_penalty` calls `quality.em_dash_penalty` — the arithmetic was extracted into that pure function precisely so the tool cannot drift from the engine. LESSONS §13. **The re-stamp cannot reach a v2 payload, and that is by construction, not luck:** it bails on `if not old_em` — an archived flag must already carry an em-dash charge before the term is recomputed. Measured over all 708 archived round-0 payloads: 626 of 645 v1 payloads carry `em_dash_recent_mean`, none of the 63 v2 ones do, and exactly 90 (all v1) are re-stamped. So the ruler never invents a trend penalty on the arm that never charged one. What IS true is narrower and still worth knowing when reading the settled A/B: v1 drafts could accrue trend penalty toward the 2.0 block line and pre-wiring v2 drafts structurally could not, so `style_health.penalty` was not the same quantity across the arms. That asymmetry is closed going forward by the `_em_history` wiring above; it remains baked into the archive.
 
 Two failure buckets that survive both normalizations are **not** defects to fix:
 `hard_contradictions` (5 misses, one per book, each a concrete canon breach the
