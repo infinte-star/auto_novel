@@ -31,6 +31,17 @@ fix that actually buys +6.0pt.
      replan because chapter_mode went quiet, without giving those gates their
      first chance to speak, would fabricate a gain.
 
+  C  a MISSING plan measurement no longer reads as a score of 0.0. `plan_score`
+     returns 0.0 for an empty `scores` list, so a vacuous / salvaged arbitration
+     used to sit below every threshold and force a full plan round. Replayed by
+     re-normalizing the archived decision (`planning._normalize_decision`) and
+     passing `None` instead of 0.0 when it still carries no measurement.
+
+     **C implies B**: both are settled by re-running the plan-gate chain, and the
+     chain reads today's `quality.py`, so B's fix cannot be un-applied by this
+     tool. `--fix C` therefore adds B and says so, rather than quietly reporting
+     B+C under C's name.
+
 Read before trusting any "which gate caused this retry" claim: `scene_dedupe_retry`
 is NOT the scene-dedupe gate's event. It is the GENERIC `duplicate_blocked` retry
 marker shared by scene_similarity + narrative_pattern + chapter_mode, and it is
@@ -62,13 +73,22 @@ from tools.fpy_prime import (COUNTED_REPLANS, PINNED, _normalize,  # noqa: E402
 FIX_ALIASES: dict[str, str] = {
     "A": "book_wide_fossils",
     "B": "chapter_mode_monotony",
+    "C": "unmeasured_plan_score",
 }
 FIX_IDS = set(FIX_ALIASES)
 _BY_NAME = {v.upper(): k for k, v in FIX_ALIASES.items()}
+# Fixes that can only be replayed together (see the C entry in the module docstring).
+IMPLIES: dict[str, set[str]] = {"C": {"B"}}
+# The subset settled by re-running the pre-write plan-gate chain.
+CHAIN_FIXES = {"B", "C"}
 
 
-def parse_fixes(spec: str) -> set[str]:
-    """Parse a `--fix` spec into fix ids. Raises ValueError on an unknown token."""
+def parse_fixes(spec: str) -> tuple[set[str], set[str]]:
+    """Parse a `--fix` spec. Returns (fixes, implied). ValueError on unknown token.
+
+    `implied` is reported by the caller so a fix that cannot be isolated never gets
+    measured under a name that overstates it.
+    """
     out: set[str] = set()
     for tok in (t.strip().upper() for t in str(spec).split(",")):
         if not tok:
@@ -81,7 +101,8 @@ def parse_fixes(spec: str) -> set[str]:
             raise ValueError(
                 f"unknown --fix token {tok!r}; known: "
                 + ", ".join(f"{k}/{v}" for k, v in sorted(FIX_ALIASES.items())))
-    return out
+    implied = {d for f in out for d in IMPLIES.get(f, ())} - out
+    return out | implied, implied
 
 
 # `plan_initial` is the only replan label produced by the pre-write gate chain;
@@ -133,12 +154,24 @@ def _plans(novel: Path) -> dict[int, dict]:
     return out
 
 
-def _plan_score(novel: Path, ch: int) -> float | None:
+def _plan_score(novel: Path, ch: int, fix_unmeasured: bool = False) -> float | None:
+    """The arbiter's self-score for attempt0, or None when it never measured one.
+
+    `fix_unmeasured` replays fix C: normalize the decision's shape first (which
+    recovers a bare score row), then return None -- not 0.0 -- when the arbiter
+    still produced no `scores`. 0.0 is below every threshold, so reading a missing
+    measurement as one fabricated a `low_plan_score` block on 12 archived rounds.
+    """
     pay = _payload(novel / "logs" / "checkpoints" / f"ch{ch:04d}"
                    / "plan_initial_attempt0_arbitration.json") or {}
     try:
-        from planning import plan_score
-        return float(plan_score(pay.get("decision") or {}))
+        from planning import _normalize_decision, decision_has_score, plan_score
+        dec = pay.get("decision") or {}
+        if fix_unmeasured:
+            dec = _normalize_decision(dec)
+            if not decision_has_score(dec):
+                return None
+        return float(plan_score(dec))
     except Exception:
         return None
 
@@ -224,7 +257,7 @@ def replay_novel(name: str, lo: int, hi: int, fixes: set[str], detail: bool):
     except Exception as exc:
         print(f"  ! {name}: config unreadable ({exc}); skipped")
         return 0, 0, 0, [], {}, {}
-    plans = _plans(novel) if "B" in fixes else {}
+    plans = _plans(novel) if fixes & CHAIN_FIXES else {}
     window = max(int(cfg["novel"].get("scene_dedupe_window", 8)),
                  int(cfg["novel"].get("chapter_mode_window", 6)))
 
@@ -271,15 +304,16 @@ def replay_novel(name: str, lo: int, hi: int, fixes: set[str], detail: bool):
                 keep.append(g)
             patched["gate_rejects"] = keep
 
-        if "B" in fixes and GATED_REPLAN in replans:
+        if fixes & CHAIN_FIXES and GATED_REPLAN in replans:
             plan = plans.get(ch)
             if plan:
                 recent = [plans[c] for c in
                           sorted((c for c in plans if c < ch), reverse=True)[:window]]
-                blocker = plan_chain_block(plan, recent, _plan_score(novel, ch), cfg, ch)
+                score = _plan_score(novel, ch, fix_unmeasured="C" in fixes)
+                blocker = plan_chain_block(plan, recent, score, cfg, ch)
                 if blocker is None:
                     new_replans.discard(GATED_REPLAN)
-                    why.append("B:plan_chain_clear")
+                    why.append("+".join(sorted(fixes & CHAIN_FIXES)) + ":plan_chain_clear")
                 else:
                     still[blocker] = still.get(blocker, 0) + 1
 
@@ -309,7 +343,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        fixes = parse_fixes(args.fix)
+        fixes, implied = parse_fixes(args.fix)
     except ValueError as exc:
         print(f"error: {exc}")
         return 2
@@ -320,7 +354,11 @@ def main() -> int:
 
     w = max(len(x) for x in names)
     print("fixes active: " + (", ".join(f"{f}/{FIX_ALIASES[f]}" for f in sorted(fixes))
-                              or "none") + "\n")
+                              or "none"))
+    if implied:
+        print("  (" + ", ".join(sorted(implied)) + " added: not separable from the "
+              "requested fix -- see the module docstring)")
+    print()
     print_exclusions(dropped)
     print(f"{'novel':<{w}}  {'FPY before':>13}  {'FPY after':>13}   delta")
     t_old = t_new = t_n = 0

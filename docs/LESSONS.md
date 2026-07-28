@@ -592,8 +592,8 @@ Two traps it exists to avoid, both of which produced a wrong answer first:
   blocking, `visual_payoff` / `executability` / plan-score downstream of it never
   ran. Dropping a replan because one gate went quiet, without giving the rest
   their first chance to speak, fabricates a gain — so the replay re-runs the
-  *whole* chain in engine order and reports a survivor histogram (8 survived:
-  5 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
+  *whole* chain in engine order and reports a survivor histogram (7 survived:
+  4 `low_plan_score`, 2 `chapter_mode`, 1 `visual_payoff`).
 
 Measured, `--fix` isolating each arm over the 435 archived chapters of the six
 non-derivative books (see "第三次测量污染" below — the first run of this table said
@@ -602,13 +602,18 @@ non-derivative books (see "第三次测量污染" below — the first run of thi
 | arm | library FPY′ | notes |
 | --- | --- | --- |
 | baseline | 359/435 = **82.5%** | 4 books < 80% |
-| fossil `in_current` only | 372/435 = 85.5% (+3.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
-| chapter_mode frac only | 370/435 = 85.1% (+2.5) | tangshuting_e2e 62.2→86.7 |
-| **both** | 386/435 = **88.7%** (+6.2) | e2e →93.3 (+31.1, super-additive) |
+| A fossil `in_current` only | 372/435 = 85.5% (+3.0) | tangshuting 76.4→81.9, yeban 76.9→84.6 |
+| B chapter_mode frac only | 371/435 = 85.3% (+2.8) | tangshuting_e2e 62.2→88.9 |
+| A+B | 386/435 = 88.7% (+6.2) | e2e →93.3 (+31.1, super-additive) |
+| C unmeasured plan score | 372/435 = 85.5% (+3.0) | **= B + 1 chapter**; C cannot be replayed without B |
+| **A+B+C** | 387/435 = **89.0%** (+6.4) | guize_guaitan 69.2→76.9 is C's whole FPY′ effect |
 
-Super-additive because both gates were blocking the *same* chapters: fixing one
-leaves the chapter failing on the other, so neither arm alone can show the full
-gain. **Isolate arms to attribute, but decide on the combined number.**
+A+B is super-additive because both gates were blocking the *same* chapters: fixing
+one leaves the chapter failing on the other, so neither arm alone can show the full
+gain. **Isolate arms to attribute, but decide on the combined number.** C is the
+opposite shape — worth 1 chapter on this metric and 37 LLM calls off it (see
+「没测出来」被当成「测出来很差」 below); FPY′ counts only `plan_initial`, and 8 of
+the 12 rounds C removes are `quality_replan`.
 
 ### 第三次测量污染：派生书目稀释了每一个「全库」数字
 
@@ -706,6 +711,63 @@ token 都没匹配上，工具照样打了一份表头回显着这两个名字�
 测是 **+6.2pt**（82.5% → 88.7%）。一个测量工具的默认行为绝不能是「静默降级成 no-op 再输出
 一个看起来权威的数字」：现在描述性门名是合法别名，未知 token 直接 `return 2`。同类前三例
 见本节与 §5（`pairwise_ab` 给被测臂记账、`compare` 的循环判据、`fpy_prime` 未归一化旧语义）。
+
+### 「没测出来」被当成「测出来很差」：一份 JSON 残骸买走整轮规划（2026-07-28）
+
+同一个缺陷类的第四例，但方向反过来：**不是门闸死，而是缺失的测量被读成了最低分。**
+
+`planning.plan_score` 对空 `scores` 返回 `0.0`——这个契约本身是对的（`chapter_metrics.plan_score`
+要的是 float，`arc.py` 也故意留空 `scores` 以免伪造分数污染指标）。问题是 `create_plan`
+的重试闸把这个 0.0 当判决读：0.0 低于任何门槛，于是**一份解析失败的仲裁 JSON 会强制引擎多跑
+一整轮规划**，而重掷候选根本治不了「仲裁没解析出来」。
+
+根因在 `llm.load_json_with_repair`：修复调用的产物只要**能解析**就被接受，于是
+`{"./output.json": "{"}` 这样的残骸被洗成了一份合法 decision。全库 934 次归档仲裁的实测：
+
+| 形态 | 次数 |
+| --- | --- |
+| 不可用仲裁（`scores` 与 `merged_plan` 皆空/缺） | **16 / 934** |
+| ——其中 guize_guaitan（共 34 次仲裁） | **14** |
+| ——其他每本 ≤1（huangliang 1、tangshuting 1，其余 0） | 2 |
+| 被键名/形态修复救回（离线，0 调用） | 1 |
+| 需要重问仲裁 | 15 |
+
+被弄坏的键名形态：`.selected_index`、`''`、`./output.json`、`./merged_plan.json`、
+`./response.json`、`./scores`、`/assistant`。
+
+两点必须写下来，因为它们各自纠正了我先前的一个错判：
+
+- **键名修复单独救不回任何一例。** 14 份 `.selected_index` payload 旁边的
+  `scores: []`、`merged_plan: {}`、`required_constraints: []` 全是空的——丢的是内容不是标签。
+  键名修复照样保留（免费，且 `_decision_usable` 必须判内容而不是判拼写），但**真正的恢复手段是
+  在仲裁处重问一次**。我一开始按「`merged_plan` 完好」写进了 docstring，是读数据才发现写错的。
+- **唯一真能离线救回的形态是一行 `scores` 被提到了顶层**（tangshuting Ch175：
+  `{index, score, pros, cons}`）——那就是测量本身，只是少了信封。补上信封后它的分是 5.5，
+  低于 `plan_retry_score`，于是那一轮重规划变成**合法**的了：治本之后该书那一章不是缺陷而是差计划。
+
+成本（按归档 checkpoint 里 attempt1 的调用产物逐个数，不是估的）：
+
+```
+12 轮被强制的额外规划   48 次调用  ->  11 次重问 + 1 次离线形态修复  =  11 次   省 37
+其中 3 轮的 attempt1 本身也是残骸（guize 的评审端点问题），重问同样可能失败 ->
+  标 decision["arbitration_failed"]，不再拿整轮规划当恢复手段
+```
+
+FPY′ 侧只 **+0.2pt（386→387）**，因为 FPY′ 按设计只计 `plan_initial`，而 12 轮里 8 轮是
+`quality_replan`（在发布规则下游，被排除）。真正的收益是调用成本，加上一件账目问题：这 16 次里
+仲裁的 `merged_plan` 与 `required_constraints` 是**静默丢失**的——章节按未仲裁的候选写出来、
+没有任何硬约束，而日志里什么都没说。修法：`_normalize_decision` / `_decision_usable` /
+`decision_has_score` 三个纯函数 + `arbitrate_plan` 里一次有界重问
+（`arbiter_reask_enabled`）+ `create_plan` 在「压根没测量」时跳过按分重试并记
+`plan_score_unavailable`。测量工具侧是 `tools/replay_gates.py --fix C`。
+
+**`load_json_with_repair` 的普遍问题没有一并修**：它对所有调用点都是「能解析即接受」，
+`screen_candidates` / `review_candidate_plans` 走的是同一条路。但除 guize_guaitan 外全库干净
+（≤1 例/本），按「先测量再推广」的规矩，加一个通用 `expect_keys` 契约要等有第二本书出问题再说。
+
+**`--fix C` 不能单独回放。** C 与 B 都靠重跑 plan-gate 链来结算，而链读的是**今天的**
+`quality.py`，所以 B 的修复无法被工具关掉。`parse_fixes` 因此在请求 C 时显式补上 B **并打印
+出来**——否则就是第四例测量污染（静默 no-op）的反向版本：把 B+C 的收益记在 C 名下。
 
 ### Two fixes measured and rejected before writing code
 

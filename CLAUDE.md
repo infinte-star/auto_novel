@@ -171,6 +171,26 @@ threads and memory.
 3. `review_candidate_plans` — fused 6-axis review (world/character/rhythm/payoff/foreshadowing/reader) per candidate, ONE LLM call expanded into 6 legacy reports via `_explode_fused_axes` (the only review path)
 4. `arbitrate_plan` — picks `selected_index`, emits `merged_plan` + `required_constraints`. Still runs with a single candidate: it merges rhythm diagnostics / recent quality feedback / used-element ledger into the plan
 
+**The arbitration dict is untrusted input, keys included.** `llm.load_json_with_repair`
+accepts any repair that merely *parses*, so a salvage fragment
+(`{"./output.json": "{"}`, `.selected_index` beside empty values) is laundered into a
+decision — 16 of 934 archived arbitrations, 14 of them in one book. Three pure
+functions guard the readers: `_normalize_decision` (unwrap a single-key wrapper,
+rebuild the envelope around a bare score row, repair `.`/quote/path-prefixed key
+spellings — never invents a key, never overwrites a well-spelled one),
+`_decision_usable` (has `scores` **or** a non-empty `merged_plan`), and
+`decision_has_score`. When unusable, `arbitrate_plan` re-asks the ARBITER once
+(`arbiter_reask_enabled`) and marks `decision["arbitration_failed"]` if that fails
+too — recovery costs 1 call instead of the ~4 a whole plan round was paying.
+
+**A missing measurement is not a low one.** `plan_score` returns 0.0 for an empty
+`scores` list (its float contract is load-bearing for `chapter_metrics.plan_score`,
+and `arc.py` leaves `scores` empty on purpose), but 0.0 is below every threshold, so
+`create_plan`'s score gate read a parse failure as a terrible plan and bought a full
+extra plan round — 12 library-wide, 48 archived calls where 11 would do. The gate now
+consults `decision_has_score` and logs `plan_score_unavailable` instead. Re-rolling
+candidates cannot fix an arbitration parse failure. LESSONS §13.
+
 ### Arc planner (`arc.py`, `arc_planning_enabled`, default **false**)
 Alternative to the five-stage committee (REDESIGN L2): ONE high-reasoning call
 every `arc_span` (10) chapters emits a **ChapterCard** per chapter, so 错峰兑现 /
@@ -340,9 +360,10 @@ retries (`plan_initial_attempt[1-9]`, `plan_critical`,
 `plan_fossil_catastrophe`) — `plan_quality_replan`/`plan_hard_floor` are excluded
 because they are downstream of the release rule. Thresholds are pinned at engine
 defaults in `fpy_prime.PINNED` so two arms with divergent configs are still judged
-by one ruler. Library-wide it reads **82.5% → 88.7%** after the latching-gate fixes
-(vs 12%–63% for "self-score ≥ 8.0"), and it names the failing gate for every miss;
-the leading remaining killers are `gate_rejects` (20) and `hard_contract` (13).
+by one ruler. Library-wide it reads **82.5% → 89.0%** after the latching-gate fixes
+plus the unmeasured-plan-score fix (vs 12%–63% for "self-score ≥ 8.0"), and it names
+the failing gate for every miss; the leading remaining killers are `gate_rejects`
+(20) and `hard_contract` (13).
 
 **The aggregate excludes derivative novel dirs, and that changes answers.**
 `fpy_prime.discover_novels` (shared with `replay_gates`) drops provable
@@ -359,15 +380,18 @@ is proof of a copy, not a heuristic. LESSONS §13.
 
 **`fpy_prime` cannot settle a change to a gate's LOGIC** — it replays archived
 payloads, so a verdict already baked into them is frozen and the tool reports the
-old answer forever. Use **`python tools/replay_gates.py [novel…] [--fix A,B]
+old answer forever. Use **`python tools/replay_gates.py [novel…] [--fix A,B,C]
 [--detail]`** for that: it recomputes the changed gates from the primary data they
 read (chapter texts, archived `plan_initial_attempt0_arbitration.json`, each
 novel's own config) and re-runs `_hard_block_reasons` on the corrected payload.
-Two traps it encodes, each of which gave a wrong answer first: `scene_dedupe_retry`
+Three traps it encodes, each of which gave a wrong answer first: `scene_dedupe_retry`
 is the **generic** `duplicate_blocked` marker shared by three gates, not the
-scene-dedupe gate's own event; and the plan-gate chain is sequential with
+scene-dedupe gate's own event; the plan-gate chain is sequential with
 `continue`, so a replan may only be dropped after the gates downstream of the
-removed blocker get their first chance to speak. LESSONS §13.
+removed blocker get their first chance to speak; and **a fix that cannot be
+isolated must say so** — `--fix C` adds B (both are settled by re-running the chain,
+and the chain reads today's `quality.py`) and prints the implication, instead of
+reporting B+C under C's name. LESSONS §13.
 
 **Before adding any blocking gate, answer: what can THIS chapter do to turn it
 green?** If nothing, the gate latches and every forced retry it buys is a
@@ -375,7 +399,10 @@ guaranteed first-pass failure. Three measured instances (fossil hard-rejects on 
 frozen book-cumulative ratio, `chapter_mode_monotony` counting a genre label,
 `CONTRACT_SYSTEM` fabricating an `ability_whitelist` for an ability-free brief) cost
 4.0pt of library FPY′ between them — same defect class as the deleted
-`fingerprint_warn_threshold`. LESSONS §13.
+`fingerprint_warn_threshold`. The inverse question is just as load-bearing: **can the
+signal your gate reads distinguish "bad" from "not measured"?** A sentinel that
+doubles as a verdict (`plan_score`'s 0.0 for an empty `scores` list) makes every
+parse failure look like the worst possible input. LESSONS §13.
 
 **A retro-replay must normalize engine semantics that have since changed**, or it
 reports fixed bugs as live problems. `review.py`'s contract backstop stamped

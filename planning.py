@@ -1508,7 +1508,42 @@ def arbitrate_plan(
         max_tokens=12000, temperature=0.25, cacheable_prefix=cacheable_prefix(paths, config),
         tag="plan_arbitrate",
     )
-    decision = load_json_with_repair(client, paths, config, raw)
+    decision = _normalize_decision(load_json_with_repair(client, paths, config, raw))
+    if not _decision_usable(decision):
+        # Recover HERE, with one targeted call, instead of letting a whole plan round
+        # be the recovery mechanism. Measured: 16 of 934 archived arbitrations land
+        # here, and key repair alone salvages the CONTENT of none of them (the
+        # mangled-key payloads carry `merged_plan: {}`), so re-asking is the only
+        # recovery -- it was just being paid for at ~4 calls instead of 1, with the
+        # arbiter's `merged_plan` + `required_constraints` silently lost meanwhile.
+        keys = sorted(str(k) for k in decision)[:6]
+        log(paths, f"Ch{chapter_num} arbitration unusable (keys={keys}); "
+                   f"{'re-asking the arbiter once' if bool(config['novel'].get('arbiter_reask_enabled', True)) else 're-ask disabled'}")
+        db_event(conn, chapter_num, "arbitration_unusable",
+                 {"keys": keys, "raw_head": str(raw)[:400]})
+        if bool(config["novel"].get("arbiter_reask_enabled", True)):
+            try:
+                raw2 = call_llm(
+                    client, paths, config, ARBITER_SYSTEM,
+                    json_prompt(user + "\n\n注意：上一次输出不是合法的仲裁 JSON（键名被破坏或内容为空）。"
+                                       "请严格按系统提示的键名与层级重新输出恰好一个完整 JSON 对象，"
+                                       "必须包含 selected_index、scores、merged_plan、required_constraints，"
+                                       "键名不得带路径前缀、引号或点号。"),
+                    max_tokens=12000, temperature=0.25,
+                    cacheable_prefix=cacheable_prefix(paths, config),
+                    tag="plan_arbitrate_reask",
+                )
+                retry = _normalize_decision(
+                    load_json_with_repair(client, paths, config, raw2, fallback={}))
+                if _decision_usable(retry):
+                    decision = retry
+                    log(paths, f"Ch{chapter_num} arbitration recovered by re-ask")
+            except Exception as exc:
+                log(paths, f"Arbiter re-ask failed (non-fatal) Ch{chapter_num}: {exc}")
+        if not _decision_usable(decision):
+            # Downstream must know the plan is UNARBITRATED (no merged_plan, no
+            # required_constraints) rather than merely low-scoring.
+            decision["arbitration_failed"] = True
     _sel = _coerce_index(decision.get("selected_index", 0))
     if not (0 <= _sel < len(plans)):
         _sel = 0
@@ -1528,6 +1563,87 @@ def arbitrate_plan(
         except Exception:
             pass
     return plan, decision
+
+ARBITER_KEYS = ("selected_index", "scores", "merged_plan", "required_constraints")
+
+
+def _normalize_decision(decision: Any) -> dict[str, Any]:
+    """Repair the arbitration dict's SHAPE before anything reads it.
+
+    Same untrusted-input doctrine as `_coerce_index`, one level up: the *keys* are
+    LLM-produced too, and `llm.load_json_with_repair`'s repair call makes it worse
+    rather than better -- a repair whose output merely PARSES is accepted, so a
+    salvaged fragment like `{"./output.json": "{"}` is laundered into a decision.
+
+    Measured over all 934 archived arbitrations: 16 are unusable, 14 of them in
+    guize_guaitan alone (34 arbitrations) and every other book ≤1. Observed key
+    forms: `.selected_index`, `''`, `./output.json`, `./merged_plan.json`,
+    `./response.json`, `./scores`, `/assistant`.
+
+    **Key repair recovers 0 of those 16 on its own** — the `.selected_index` cases
+    ship `scores: []`, `merged_plan: {}`, `required_constraints: []` beside the bad
+    key, so the content was lost, not just the label. It is kept anyway because it
+    is free and because `_decision_usable` must judge content, not spelling; the
+    call-site re-ask is what actually recovers these.
+
+    The one shape here that DOES recover is a single score row promoted to the top
+    level (tangshuting Ch175: `{index, score, pros, cons}`) — that is the
+    measurement itself, merely unwrapped.
+
+    Three repairs, all conservative: unwrap a single-key wrapper, rebuild the
+    envelope around a bare score row, and strip leading path/quote junk off a key
+    when the result is an expected key that is not already present. Never invents a
+    key, never overwrites a well-spelled one.
+    """
+    if not isinstance(decision, dict):
+        return {}
+    if len(decision) == 1:
+        inner = next(iter(decision.values()))
+        if isinstance(inner, dict) and any(k in inner for k in ARBITER_KEYS):
+            decision = inner
+    if (isinstance(decision.get("score"), (int, float))
+            and not isinstance(decision.get("score"), bool)
+            and not any(k in decision for k in ARBITER_KEYS)):
+        decision = {"selected_index": _coerce_index(decision.get("index", 0)),
+                    "scores": [decision]}
+    out: dict[str, Any] = {}
+    for key, val in decision.items():
+        fixed = str(key).strip().strip("./\"' \t")
+        out[fixed if (fixed != key and fixed in ARBITER_KEYS
+                      and fixed not in decision) else key] = val
+    return out
+
+
+def _decision_usable(decision: Any) -> bool:
+    """True when the arbiter said something a downstream reader can act on.
+
+    `ARBITER_SYSTEM` demands both `scores` and `merged_plan`; either one alone is
+    still usable (the plan, or the measurement). Neither means the call produced
+    nothing but salvage debris, and the engine's only recovery today is a whole
+    extra plan round -- ~4 calls to replace 1.
+    """
+    if not isinstance(decision, dict):
+        return False
+    mp = decision.get("merged_plan")
+    return bool(decision.get("scores")) or bool(isinstance(mp, dict) and mp)
+
+
+def decision_has_score(decision: Any) -> bool:
+    """True when the arbiter actually MEASURED the plan (non-empty `scores`).
+
+    `plan_score` must keep returning 0.0 for an empty list -- `chapter_metrics`
+    persists that column and readers expect a float -- so "was it measured at all"
+    needs its own predicate. A missing measurement is NOT a low one: 0.0 sits below
+    every threshold, so `create_plan` used to buy a full extra plan round on it.
+    `arc.py` leaves `scores` deliberately empty for the same reason (a fabricated
+    score would poison `chapter_metrics.plan_score`), which is a second reason no
+    reader may read 0.0 as a verdict.
+    """
+    if not isinstance(decision, dict):
+        return False
+    return any(isinstance(s, dict) and s.get("score") is not None
+               for s in (decision.get("scores") or []))
+
 
 def _coerce_index(val: Any, default: int = 0) -> int:
     """Robustly parse an arbiter-supplied index that may be malformed.
@@ -2151,6 +2267,22 @@ def create_plan(
         if score > best_score:
             best_plan, best_decision, best_score = plan, decision, score
         if score >= min_score:
+            break
+        if not decision_has_score(decision):
+            # No measurement != a bad plan. `plan_score` returns 0.0 for an empty
+            # `scores` list and 0.0 is below every threshold, so a vacuous / salvaged
+            # arbitration used to force a full extra plan round. Measured library-wide:
+            # 11 such retries, and 7 of them had no gate that would have blocked
+            # anyway -- the retry was caused purely by the fabricated 0.0.
+            log(paths, f"Ch{chapter_num} arbitration produced no scores"
+                       f"{' (UNARBITRATED: re-ask also failed)' if decision.get('arbitration_failed') else ''}"
+                       f"; accepting the plan without a score-driven retry "
+                       f"(missing measurement is not a low score). Re-rolling candidates "
+                       f"cannot fix an arbitration parse failure.")
+            db_event(conn, chapter_num, "plan_score_unavailable",
+                     {"attempt": attempt,
+                      "arbitration_failed": bool(decision.get("arbitration_failed")),
+                      "keys": sorted(str(k) for k in decision)[:8]})
             break
         if score >= retry_score and not cost_savings_disabled(config, chapter_num):
             log(

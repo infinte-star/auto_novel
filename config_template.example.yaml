@@ -173,6 +173,13 @@ novel:
   min_plan_score: 8.0
   plan_retry_score: 6.5
   plan_max_attempts: 2
+  # 仲裁 JSON 解析失败时，只重问仲裁一次，而不是让整轮规划当恢复手段。
+  # 实测（全库 934 次归档仲裁）：16 次不可用，其中 14 次在 guize_guaitan 一本（共 34 次），
+  # 键名被 JSON 修复调用弄坏（`.selected_index`、空串、`./output.json`…）且值全空。
+  # 这类残骸让 plan_score 读出 0.0，被重试闸当成「最差计划」，全库因此多跑 12 轮规划、
+  # 48 次调用；改成「重问一次」后同样 12 轮只要 11 次调用，且仲裁的 merged_plan /
+  # required_constraints 不再静默丢失。见 docs/LESSONS.md §13。
+  arbiter_reask_enabled: true
   plan_skip_screen: true
   # 弧级规划（REDESIGN.md L2）：每 arc_span 章跑「一次」高推理调用产出 arc_span 张
   # ChapterCard，替代逐章的「策略老虎机 → N 候选 → 预筛 → 6 轴融合评审 → 仲裁」五段委员会。
