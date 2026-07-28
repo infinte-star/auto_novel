@@ -104,8 +104,9 @@ class ContractFulfilmentTest(unittest.TestCase):
 
     def test_hook_must_land_in_the_tail_not_just_somewhere(self):
         # The hook is staged in paragraph one and then abandoned -- the exact
-        # failure `revise_hook_only` exists for. Body-anywhere matching would
-        # call this a pass.
+        # failure v1 spent a `revise_hook_only` call on, and which v2 has no
+        # repair for at all, so this check is the last line. Body-anywhere
+        # matching would call it a pass.
         text = ("第10章\n\n铜钥匙插进阁楼那把锁，锁芯只转了半圈就卡死。\n\n"
                 + "汤舒婷推开顾家老宅后厨的门。" * 20
                 + "她在灶台夹层里摸到一枚刻字的铜钥匙。" * 20

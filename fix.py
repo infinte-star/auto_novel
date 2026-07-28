@@ -39,9 +39,13 @@ from quality import REGISTRY, reduce_em_dash_density, style_health
 # 642 measured reviews); `plan_repairs` simply skips those, so declaring a layer
 # is never the same thing as promising a fixer.
 #
-# `hook_revise` deliberately has NO entry: the chapter ending / hook repair is
-# already wired as its own pipeline stage (`revise_hook_only`), and running it
-# from here too would double the call.
+# `hook_revise` has NO entry, and the reason changed under it. It used to be
+# "already wired as its own pipeline stage (`revise_hook_only`), so an entry here
+# would double the call" — but `revise_hook_only` died with v1, so today the
+# absence is a capability gap, not a de-duplication. v2 answers a weak exit hook
+# at write time (the card's `exit_hook` is a scored CCC field) and nowhere else.
+# Same class as the unwired gates in CLAUDE.md's wiring-gap table: measure before
+# adding a fixer, do not assume the old comment's reason still holds.
 # ---------------------------------------------------------------------------
 
 ACTION_BY_GATE: dict[str, str] = {
@@ -79,6 +83,29 @@ _QUOTES = "“”「」『』\"'"
 def gate_result(review: dict[str, Any], gate: str) -> Any:
     """Read a gate's result out of a review report, honouring `REPORT_KEY`."""
     return (review or {}).get(REPORT_KEY.get(gate, gate))
+
+
+def _length_band_needs_expand(review: dict[str, Any]) -> bool:
+    """False only when `length_band_check` fired on the side expand cannot fix.
+
+    The gate flags BOTH sides of the band and `gate_fired` cannot tell them
+    apart, so every over-length chapter used to be planned an expand — the one
+    fixer whose own docstring says it handles the short side only. Measured over
+    the archive's `review_round0.json` payloads: of 195 chapters that planned
+    `expand_to_band`, **109 (56%) were over-length**, i.e. a guaranteed no-op
+    holding one of the two `fix_max_l1_calls` slots. Twice it pushed a real
+    fixer out of the plan — `tangshuting_e2e` Ch46 and `yeban_guize` Ch8 both
+    lost `em_dash_targeted` to the cap. The long side needs nothing here: the
+    gate emits its own next-chapter directive, and a gross overshoot blocks.
+
+    Stated as "not the long side" rather than "is the short side" so the failure
+    is the safe one. If the gate's flag vocabulary ever drifts, this keeps
+    planning the expand (whose own floor check then declines it, out loud)
+    instead of silently dropping the short side's only fixer.
+    """
+    result = gate_result(review, "length_band_check")
+    flags = (result.get("flags") or []) if isinstance(result, dict) else []
+    return not any(str(f).startswith("chapter_too_long") for f in flags)
 
 
 def gate_fired(result: Any) -> bool:
@@ -125,6 +152,8 @@ def plan_repairs(review: dict[str, Any], config: dict[str, Any]) -> list[dict[st
             if REGISTRY.repair(gate) != layer:
                 continue
             if not gate_fired(gate_result(review, gate)):
+                continue
+            if action == "expand_to_band" and not _length_band_needs_expand(review):
                 continue
             if action in seen_actions:
                 continue
@@ -555,17 +584,30 @@ def expand_to_band(
     Only handles the SHORT side of `length_band_check`: over-length is left to
     the next-chapter directive, because deterministically choosing what to cut
     from a finished chapter is not a repair, it is an edit with plot risk.
+    `plan_repairs` enforces that side (`_length_band_needs_expand`); the floor
+    check below is the second half of the same guard, for a text that grew after
+    the report that planned this step.
+
+    Every exit says why. This is the only repair layer that spends money, and an
+    exit that returns the text in silence is indistinguishable from a step that
+    was never planned — which is how 56% of this fixer's planned invocations
+    turned out to be over-length chapters nobody could see it declining.
     """
     from config import log
 
     cfg = config["novel"]
     cmin = int(cfg.get("chapter_min_chars", 2500))
     clen = len((text or "").strip())
-    if clen == 0 or clen >= cmin:
+    if clen == 0:
+        log(paths, f"L1 expand skipped Ch{chapter_num}: empty text")
+        return text
+    if clen >= cmin:
+        log(paths, f"L1 expand skipped Ch{chapter_num}: {clen} chars, already at the {cmin} floor")
         return text
     paras = _paragraphs(text)
     body = [p for p in paras if len(p.strip()) >= 30 and not p.strip().startswith("第")]
     if not body:
+        log(paths, f"L1 expand skipped Ch{chapter_num}: no paragraph long enough to expand")
         return text
     # Thinnest paragraphs first — those are where the chapter skipped process.
     picks = sorted(body, key=lambda p: len(p))[: int(cfg.get("fix_expand_max_paragraphs", 4))]
@@ -574,16 +616,25 @@ def expand_to_band(
         rewrites = _numbered_rewrite(
             client, paths, config, _EXPAND_SYSTEM,
             f"本章共 {clen} 字，偏短，需要补足约 {need} 字。扩写以下 {len(picks)} 个段落：",
+            # min_ratio 1.0 admits a same-length "expansion", which is churn with
+            # no metric gain — but raising the floor can only DROP items from the
+            # window, which can only shrink the splice and turn a partial gain
+            # into the no-growth discard below. The measured problem is calls
+            # that return nothing usable, and a higher floor moves toward it.
             picks, tag="fix_expand", min_ratio=1.0, max_ratio=3.0,
         )
     except Exception as exc:
         log(paths, f"L1 expand call failed Ch{chapter_num} (non-fatal): {exc}")
         return text
     if not rewrites:
+        log(paths, f"L1 expand discarded Ch{chapter_num}: the call returned no usable "
+                   f"paragraph ({len(picks)} sent, needed +{need} chars)")
         return text
     candidate = _splice(text, picks, rewrites)
     new_len = len(candidate.strip())
     if new_len <= clen:
+        log(paths, f"L1 expand discarded Ch{chapter_num}: spliced {len(rewrites)} "
+                   f"paragraph(s) but the chapter did not grow ({clen} -> {new_len})")
         return text
     if new_len > int(cfg.get("chapter_max_chars", 7000)):
         log(paths, f"L1 expand rejected Ch{chapter_num}: {clen} -> {new_len} overshoots the band")
@@ -619,12 +670,16 @@ def inject_dialogue(
     before_ratio = float(before.get("metrics", {}).get("dialogue_char_ratio", 0.0) or 0.0)
     target = float(cfg.get("dialogue_char_ratio_target", 0.20))
     if before_ratio >= target:
+        log(paths, f"L1 dialogue skipped Ch{chapter_num}: ratio {before_ratio:.2f} "
+                   f"already at the {target:.2f} target")
         return text
     picks = [
         p for p in _paragraphs(text)
         if len(p.strip()) >= 60 and not any(q in p for q in "“”")
     ]
     if not picks:
+        log(paths, f"L1 dialogue skipped Ch{chapter_num}: no quote-free paragraph "
+                   f"long enough to turn into dialogue")
         return text
     picks = sorted(picks, key=lambda p: -len(p))[: int(cfg.get("fix_dialogue_max_paragraphs", 4))]
     try:
@@ -638,6 +693,8 @@ def inject_dialogue(
         log(paths, f"L1 dialogue call failed Ch{chapter_num} (non-fatal): {exc}")
         return text
     if not rewrites:
+        log(paths, f"L1 dialogue discarded Ch{chapter_num}: the call returned no usable "
+                   f"paragraph ({len(picks)} sent)")
         return text
     candidate = _splice(text, picks, rewrites)
     after_ratio = float(
@@ -661,13 +718,24 @@ def em_dash_targeted(
     text: str,
     review: dict[str, Any],
 ) -> str:
-    """Escalate a still-too-dense em-dash chapter to the targeted rewrite call."""
+    """Escalate a still-too-dense em-dash chapter to the targeted rewrite call.
+
+    The only unlogged exit here is `candidate == text`, and it needs no line of
+    its own: `reduce_em_dashes_targeted` already names every one of its own
+    outcomes (nothing parsed / size-rejected / applied N), so the reason is on
+    the previous log line rather than missing.
+    """
     from config import log
     from writing import reduce_em_dashes_targeted
 
     cfg = config["novel"]
+    target = float(cfg.get("em_dash_reduce_target_per_kchar", 3.0))
     density = float(style_health(text, config).get("metrics", {}).get("em_dash_per_kchar", 0) or 0)
-    if density <= float(cfg.get("em_dash_reduce_target_per_kchar", 3.0)):
+    if density <= target:
+        # The normal path: L0's punctuation pass already got there, and this
+        # planned step is a free no-op. Silence made that look like L1 idling.
+        log(paths, f"L1 em-dash skipped Ch{chapter_num}: density {density:.1f}/kchar "
+                   f"already under the {target:.1f} target")
         return text
     candidate = reduce_em_dashes_targeted(client, paths, config, text)
     if candidate == text:

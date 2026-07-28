@@ -214,6 +214,16 @@ def run_layer(
         return idle
 
     if not applied or not new_text or new_text == text:
+        # A layer that RAN and kept nothing is a different event from a layer
+        # with nothing to run, and for L1 the difference is a paid call. Both
+        # printed `blocks N->N` and nothing else, which is how this stayed
+        # invisible: across the settlement A/B's two v2 arms, 13 `fix_expand`
+        # calls produced 7 `v2_repair_l1` events, and the missing 6 left no
+        # record of what they bought. The COUNT is recoverable (the calls are in
+        # `llm_calls.jsonl`, the keeps in the event log); the reason only ever
+        # existed here, and each fixer now names it on the line above.
+        _log(paths, f"v2.repair Ch{chapter_num} {layer} kept nothing from "
+                    f"[{','.join(actions)}]")
         return idle
 
     try:

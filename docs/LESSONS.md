@@ -205,6 +205,32 @@ subset (`声音压得很低`, 49 firings); the rest are book-specific proper nou
 (`老市场街七号`, 42) that must never be rotated — swapping those is canon
 corruption, not repair.
 
+**The mirror of a silent gate: a gate that fires loudly into a fixer that cannot
+help it** (measured 2026-07-28). `fix.gate_fired` asks only "are there flags", so
+it cannot read a *side*: `length_band_check` flags both `chapter_too_short(N)` and
+`chapter_too_long(N)`, and both were routed to `expand_to_band`. Replayed over the
+archive, **109 of 195 planned expands (56%) were over-length chapters** — a fixer
+that can only ever return the text unchanged. The cost is not the wasted call
+(the fixer's own floor check declines it before spending anything); it is the
+**slot**: `fix_max_l1_calls` is enforced in `plan_repairs`, so a no-op planned
+first evicts a real fixer, twice in the archive (`tangshuting_e2e` Ch46,
+`yeban_guize` Ch8, both losing `em_dash_targeted`).
+
+Two generalizable rules came out of it:
+- **State a side predicate as the negative of the side you cannot fix**, not as
+  the positive of the one you can. `not chapter_too_long` keeps planning the
+  expand when the gate's vocabulary drifts, and the fixer declines out loud;
+  `is chapter_too_short` would silently delete the short side's only repair.
+- **In a paid path, a silent early return is indistinguishable from never having
+  been planned** — which is exactly what hid the above through a whole A/B, since
+  `v2/repair.py` printed `blocks N->N` for both. Before adding a new event type
+  for it, check whether the *count* is already derivable from two independent
+  append-only ledgers (here: 13 `fix_expand` rows in `llm_calls.jsonl` vs 7
+  `v2_repair_l1` events ⇒ 6 discards). It was; only the *reason* was missing, and
+  a reason belongs in a log line, not in a second writer.
+
+REDESIGN_V2 §9.11.5.
+
 ---
 
 ## 5. A/B methodology — short opening runs fabricate positive results

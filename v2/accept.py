@@ -314,7 +314,9 @@ def contract_fulfilment(
             add("who", name, got, [name], [name] if got else [])
 
     # exit_hook -- must land in the TAIL. A hook mentioned in paragraph two and
-    # then dropped is exactly the failure `revise_hook_only` exists for.
+    # then dropped is exactly the failure v1 spent a `revise_hook_only` call on.
+    # That call went with v1 and has no v2 successor, so this tail check is now
+    # the only thing standing between a dropped hook and a shipped chapter.
     hook = str(card.get("exit_hook") or "").strip()
     if hook:
         add("exit_hook", hook, *_hit(hook, tail, tail_grams))

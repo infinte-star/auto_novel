@@ -12,10 +12,16 @@ the accept decision reads the report, so there is nothing to undo (`v2/repair.py
 docstring). Those behaviours are covered by `tests/test_v2_accept.py` and
 `tests/test_v2_run.py`.
 
-Zero LLM calls: only pure functions are exercised. `apply_l1` needs a client and
-is covered by the offline replay + the live A/B instead.
+Zero LLM calls. The L1 fixers appear here anyway: their pre-call exits need no
+client at all, and the post-call ones are reached with `_numbered_rewrite`
+stubbed. What is asserted about them is not prose quality but whether a spent
+call leaves a record — see `L1ExitsAreAudibleTest`.
 """
+import tempfile
+import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import fix
 import fossil_fix
@@ -90,10 +96,154 @@ class PlanRepairsTest(unittest.TestCase):
         self.assertEqual(fix.plan_repairs({"length_band_check": {"flags": ["short"]}}, _config()), [])
         self.assertTrue(fix.plan_repairs({"length_band": {"flags": ["short"]}}, _config()))
 
+    # --- the band has two sides and only one of them has a fixer here ---
+
+    def test_the_long_side_plans_no_expand(self):
+        """`expand_to_band` cannot fix an over-length chapter, so planning it
+        burns one of two L1 slots on a guaranteed no-op. 109 of the archive's
+        195 planned expands were this case."""
+        review = {"length_band": {"flags": ["chapter_too_long(6336)"], "penalty": 1.17}}
+        self.assertEqual(fix.plan_repairs(review, _config()), [])
+
+    def test_the_short_side_still_plans_one(self):
+        review = {"length_band": {"flags": ["chapter_too_short(2416)"]}}
+        self.assertEqual(
+            [s["action"] for s in fix.plan_repairs(review, _config())], ["expand_to_band"])
+
+    def test_the_long_side_no_longer_displaces_a_real_fixer(self):
+        """`tangshuting_e2e` Ch46 / `yeban_guize` Ch8 both lost `em_dash_targeted`
+        to the cap because an over-length chapter held a slot ahead of it."""
+        review = {
+            "length_band": {"flags": ["chapter_too_long(4021)"], "penalty": 0.01},
+            "dialogue_health": {"penalty": 0.4},
+            "style_health": {"penalty": 0.5, "flags": ["em_dash_high"]},
+        }
+        steps = fix.plan_repairs(review, _config(fix_max_l1_calls=2))
+        actions = [s["action"] for s in steps if s["layer"] == "L1"]
+        self.assertEqual(actions, ["inject_dialogue", fix._EM_DASH_L1_ACTION])
+
+    def test_an_unrecognized_length_flag_still_plans_the_expand(self):
+        """Fail-safe direction: the rule is "not the long side", not "is the
+        short side", so a drift in the gate's vocabulary cannot silently drop
+        the short side's only fixer. The fixer's own floor check declines it,
+        out loud."""
+        review = {"length_band": {"flags": ["some_future_flag"]}}
+        self.assertEqual(
+            [s["action"] for s in fix.plan_repairs(review, _config())], ["expand_to_band"])
+
     def test_every_action_gate_declares_a_matching_layer(self):
         for gate, action in fix.ACTION_BY_GATE.items():
             layer = REGISTRY.repair(gate)
             self.assertIn(layer, ("L0", "L1"), f"{gate} declares {layer} but has action {action}")
+
+
+class L1ExitsAreAudibleTest(unittest.TestCase):
+    """L1 is the only repair layer that spends money; a silent exit hides that.
+
+    `v2/repair.py` prints `blocks N->N` whether the layer ran or not, so a fixer
+    that returned the text unchanged left no record of having been called at all.
+    Across the settlement A/B's two v2 arms, 13 `fix_expand` calls produced 7
+    `v2_repair_l1` events; the other 6 are invisible in the logs, and one of them
+    (`ts_v2arm` Ch225, 13:45:02) prints the exact same line as a chapter whose L1
+    row never fired. These tests pin the reason to the log.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = types.SimpleNamespace(logs_dir=Path(self._tmp.name))
+
+    def _log_text(self) -> str:
+        p = self.paths.logs_dir / "run.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    # --- exits that spend nothing, but still answer for a planned step ---
+
+    def test_expand_says_so_when_the_chapter_is_already_at_the_floor(self):
+        text = "第1章 门\n\n" + "他推开门，铁锈味涌了出来。" * 40
+        out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=100),
+                                 7, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("L1 expand skipped Ch7", self._log_text())
+        self.assertIn("already at the 100 floor", self._log_text())
+
+    def test_expand_says_so_when_no_paragraph_can_be_expanded(self):
+        text = "第1章 门\n\n他推开门。\n灯灭了。"
+        out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=3000),
+                                 8, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("no paragraph long enough", self._log_text())
+
+    # --- exits that spend a call and throw the result away ---
+
+    def test_expand_says_so_when_the_call_returns_nothing_usable(self):
+        text = "第1章 门\n\n" + "他推开门，铁锈味涌了出来，灯在头顶晃。" * 3
+        with mock.patch.object(fix, "_numbered_rewrite", return_value={}):
+            out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=3000),
+                                     9, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("L1 expand discarded Ch9", self._log_text())
+        self.assertIn("no usable paragraph", self._log_text())
+
+    def test_expand_says_so_when_the_splice_did_not_grow_the_chapter(self):
+        para = "他推开门，铁锈味涌了出来，灯在头顶晃。" * 3
+        text = f"第1章 门\n\n{para}"
+        with mock.patch.object(fix, "_numbered_rewrite", return_value={0: "他推开门。"}):
+            out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=3000),
+                                     10, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("did not grow", self._log_text())
+
+    def test_dialogue_says_so_when_the_call_returns_nothing_usable(self):
+        text = "第1章 门\n\n" + "他推开门，铁锈味涌了出来，灯在头顶晃了一下。" * 4
+        with mock.patch.object(fix, "_numbered_rewrite", return_value={}):
+            out = fix.inject_dialogue(None, self.paths, _config(), 11, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("L1 dialogue discarded Ch11", self._log_text())
+
+    def test_dialogue_says_so_when_the_ratio_is_already_at_target(self):
+        # `dialogue_health` reports 0.0 below 200 chars, so the sample has to
+        # clear that floor for the ratio branch to be the one under test.
+        text = "第1章 门\n\n" + "“别过来。”他往后退了一步。" * 30
+        out = fix.inject_dialogue(None, self.paths, _config(), 12, text, {})
+        self.assertEqual(out, text)
+        self.assertIn("already at the", self._log_text())
+
+    # --- and the rule itself, so a new exit cannot be added silently ---
+
+    def test_no_exit_from_a_paid_fixer_is_silent(self):
+        """Structural: every `return text` in the two fixers that own their call
+        must be answered for inside its OWN branch.
+
+        The window is the enclosing suite, not the N preceding lines: a fixed
+        lookback lets a newly-silenced exit hide behind the log line of the
+        branch above it. That false negative was real — deleting
+        `expand_to_band`'s "no usable paragraph" line left this test green
+        because the `except` clause four lines up still logged.
+
+        `em_dash_targeted` is deliberately out of scope: its call lives in
+        `writing.reduce_em_dashes_targeted`, which logs each of its own outcomes,
+        so its one bare exit is explained by the line above it rather than by a
+        duplicate.
+        """
+        import inspect
+
+        for fixer in (fix.expand_to_band, fix.inject_dialogue):
+            lines = inspect.getsource(fixer).splitlines()
+            for i, line in enumerate(lines):
+                if line.strip() != "return text":
+                    continue
+                indent = len(line) - len(line.lstrip())
+                branch = []
+                for prev in reversed(lines[:i]):
+                    if not prev.strip():
+                        continue
+                    if len(prev) - len(prev.lstrip()) < indent:
+                        break  # the `if`/`except` that opened this suite
+                    branch.append(prev)
+                self.assertIn(
+                    "log(paths", "\n".join(branch),
+                    f"{fixer.__name__} line {i + 1} returns the text without saying why")
 
 
 class MergeFragmentLinesTest(unittest.TestCase):

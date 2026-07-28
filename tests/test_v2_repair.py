@@ -205,6 +205,27 @@ class RunLayerTest(unittest.TestCase):
         self.assertEqual(out.skipped, ("expand_to_band",))
         self.assertEqual(out.applied, ())
 
+    def test_a_layer_that_ran_and_kept_nothing_says_so(self):
+        """A layer that RAN and kept nothing is a different event from a layer
+        with nothing to run — and for L1 the difference is a paid call.
+
+        Both used to print `blocks N->N` and nothing else, which is how the waste
+        stayed invisible: across the settlement A/B's two v2 arms, 13 `fix_expand`
+        calls produced only 7 `v2_repair_l1` events, so 6 paid calls left no
+        record of what they bought.
+        """
+        lines: list[str] = []
+        with mock.patch.object(repair, "_log", lambda p, m: lines.append(m)):
+            with mock.patch.object(fix, "apply_l1", return_value=("原文", [])):
+                ran = self._run("L1", report=_l1_report(), client=object())
+            idle = self._run("L1", report=_clean(), client=object())
+
+        self.assertFalse(ran.changed)
+        self.assertIn("L1 kept nothing from [expand_to_band]", "\n".join(lines))
+        # The line is only worth having if the OTHER case stays quiet.
+        self.assertFalse(idle.changed)
+        self.assertEqual(len([l for l in lines if "kept nothing" in l]), 1)
+
     def test_l1_runs_with_a_client_and_is_judged_the_same_way(self):
         with mock.patch.object(fix, "apply_l1", return_value=("扩写后的文", ["expand_to_band"])) as f:
             out = self._run("L1", report=_l1_report(), client=object())
