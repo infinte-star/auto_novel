@@ -213,55 +213,5 @@ class RunLayerTest(unittest.TestCase):
         self.assertEqual(f.call_count, 1)
 
 
-class RepairDraftTest(unittest.TestCase):
-
-    def test_l0_clearing_the_blocks_means_l1_is_never_bought(self):
-        with mock.patch.object(fix, "apply_l0", return_value=("干净的文", ["em_dash_reduce"])), \
-                mock.patch.object(fix, "apply_l1") as l1:
-            out = repair.repair_draft(
-                text="原文", report=_l0_report(), config=_config(), chapter_num=7,
-                recheck=lambda t: _clean(), client=object())
-        l1.assert_not_called()
-        self.assertTrue(out.cleared)
-        self.assertEqual(out.layers, ("L0",))
-
-    def test_l1_runs_when_l0_leaves_something_blocking(self):
-        after_l0 = _l1_report()
-        with mock.patch.object(fix, "apply_l0", return_value=("半修的文", ["fossil_rotate(1)"])), \
-                mock.patch.object(fix, "apply_l1", return_value=("扩写的文", ["expand_to_band"])):
-            out = repair.repair_draft(
-                text="原文", report=_l0_report(), config=_config(), chapter_num=7,
-                recheck=lambda t: after_l0 if t == "半修的文" else _clean(),
-                client=object())
-        self.assertEqual(out.text, "扩写的文")
-        self.assertEqual(out.layers, ("L0", "L1"))
-        self.assertEqual(out.applied, ("fossil_rotate(1)", "expand_to_band"))
-        self.assertTrue(out.cleared)
-
-    def test_the_starting_blocks_are_the_ladders_not_the_last_layers(self):
-        # `improved` has to mean "better than the draft we were handed", or a
-        # second layer that changed nothing would report the ladder as a no-op.
-        after_l0 = _l1_report()
-        with mock.patch.object(fix, "apply_l0", return_value=("半修的文", ["fossil_rotate(1)"])), \
-                mock.patch.object(fix, "apply_l1", return_value=("扩写的文", ["expand_to_band"])):
-            out = repair.repair_draft(
-                text="原文", report=_l0_report(), config=_config(), chapter_num=7,
-                recheck=lambda t: after_l0 if t == "半修的文" else _clean(),
-                client=object())
-        self.assertEqual(len(out.blocks_before), 2)  # gate_rejects + style_collapse
-        self.assertEqual(out.blocks_after, ())
-        self.assertTrue(out.improved)
-
-    def test_an_already_clean_draft_touches_no_fixer(self):
-        with mock.patch.object(fix, "apply_l0") as l0, mock.patch.object(fix, "apply_l1") as l1:
-            out = repair.repair_draft(
-                text="原文", report=_clean(), config=_config(), chapter_num=7,
-                recheck=lambda t: _clean())
-        l0.assert_not_called()
-        l1.assert_not_called()
-        self.assertTrue(out.cleared)
-        self.assertEqual(out.summary(), "blocks 0->0")
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -97,30 +97,6 @@ def platform_opening(config: dict[str, Any]) -> str:
     return PLATFORM_OPENING.get(preset, PLATFORM_OPENING["general"])
 
 
-# Golden-finger (金手指) design hints, injected into the PLANNER. 免费流读者偏好
-# 简单直给、即时反馈的金手指；复杂绕口的设定劝退。付费/起点男频容忍复杂体系，
-# 故仅对免费流预设输出该约束（其余返回 ""，不污染长线体系文）。
-PLATFORM_GOLDEN_FINGER = {
-    "fanqie_free": (
-        "## 金手指设计约束（番茄免费流·本章大纲须遵守）\n"
-        "- 简单直给：金手指/能力的运作要一句话能懂、即时反馈，禁止绕口的多层设定与一次性大段规则倾倒。\n"
-        "- 有代价/稀缺：能力须有清晰代价、冷却或资源稀缺，不能无限白给——否则爽感快速通胀、读者麻木。\n"
-        "- 兑现具体：本章用到金手指时要落到一次具体、可见的爽点场面，而非抽象描述其强大。"
-    ),
-    "qimao_free": (
-        "## 金手指设计约束（七猫免费流·本章大纲须遵守）\n"
-        "- 低门槛可懂：能力运作直给、少用复杂专名；每次使用都要有可感的情绪收益。\n"
-        "- 有代价/稀缺：金手指须有代价或限制，避免无限白给导致爽感贬值。"
-    ),
-}
-
-
-def platform_golden_finger(config: dict[str, Any]) -> str:
-    """Return planner-side golden-finger constraints for free-flow presets; "" otherwise."""
-    preset = str(config.get("novel", {}).get("platform_preset", "general")).strip() or "general"
-    return PLATFORM_GOLDEN_FINGER.get(preset, "")
-
-
 def _tokenize(text: str) -> set[str]:
     cleaned = re.sub(r"[^一-鿿A-Za-z0-9]", "", text)
     if len(cleaned) < 2:

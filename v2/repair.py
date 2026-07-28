@@ -237,48 +237,6 @@ def run_layer(
                          blocks_before=before, blocks_after=after)
 
 
-def repair_draft(
-    *,
-    text: str,
-    report: dict[str, Any],
-    config: dict[str, Any],
-    chapter_num: int,
-    recheck: Recheck,
-    client: Any = None,
-    paths: Any = None,
-    layers: Sequence[str] = LAYERS,
-) -> RepairOutcome:
-    """L0 then L1, each re-scored, stopping as soon as nothing blocks.
-
-    The early exit is the cost control: L1 spends bounded LLM calls, and a draft
-    L0 already made acceptable has no business buying them. `run.py` can also
-    drive the layers one at a time (that is what the decision table does, so
-    each layer gets its own checkpoint); this is the whole-ladder convenience
-    the smoke path and the tests use.
-    """
-    start = tuple(block_reasons(report, config))
-    cur = RepairOutcome(text=text, report=report,
-                        blocks_before=start, blocks_after=start)
-    applied: list[str] = []
-    ran: list[str] = []
-    reverted: list[str] = []
-    skipped: list[str] = []
-    for layer in layers:
-        if cur.cleared:
-            break
-        out = run_layer(layer, text=cur.text, report=cur.report, config=config,
-                        chapter_num=chapter_num, recheck=recheck,
-                        client=client, paths=paths)
-        applied.extend(out.applied)
-        ran.extend(out.layers)
-        reverted.extend(out.reverted)
-        skipped.extend(out.skipped)
-        cur = dataclasses.replace(out, blocks_before=cur.blocks_before)
-    return dataclasses.replace(
-        cur, applied=tuple(applied), layers=tuple(ran),
-        reverted=tuple(reverted), skipped=tuple(skipped))
-
-
 __all__ = [
     "LAYERS", "RepairOutcome", "pending", "run_layer", "repair_draft",
     "reason_kind", "reason_kinds",

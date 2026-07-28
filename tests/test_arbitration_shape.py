@@ -27,8 +27,8 @@ Zero LLM calls: every function under test is pure.
 """
 import unittest
 
-from quality import (_coerce_index, _decision_usable, _normalize_decision,
-                     decision_has_score, plan_score)
+from quality import (_coerce_index, _normalize_decision, decision_has_score,
+                     plan_score)
 
 GOOD = {
     "selected_index": 1,
@@ -56,7 +56,11 @@ class NormalizeDecisionTests(unittest.TestCase):
                     "required_constraints": [], "reader_expectation_delta": ""}
         fixed = _normalize_decision(archived)
         self.assertEqual(fixed.get("selected_index"), 0)
-        self.assertFalse(_decision_usable(fixed))
+        # Asserted through `decision_has_score` since `_decision_usable` was
+        # deleted with v1's plan committee: the property is that repair recovers
+        # the KEY and invents no CONTENT, and the live predicate still shows it.
+        self.assertFalse(decision_has_score(fixed))
+        self.assertFalse(fixed.get("merged_plan"))
 
     def test_bare_score_row_is_rebuilt_into_an_envelope(self):
         # tangshuting Ch175 verbatim shape: the arbiter emitted ONE element of
@@ -64,7 +68,6 @@ class NormalizeDecisionTests(unittest.TestCase):
         # envelope saves a plan round instead of a re-ask.
         d = _normalize_decision({"index": 0, "score": 5.5,
                                  "pros": ["紧张的枪口对峙场景"], "cons": ["与设定矛盾"]})
-        self.assertTrue(_decision_usable(d))
         self.assertTrue(decision_has_score(d))
         self.assertEqual(plan_score(d), 5.5)
         self.assertEqual(d["selected_index"], 0)
@@ -102,37 +105,14 @@ class NormalizeDecisionTests(unittest.TestCase):
         self.assertEqual(_normalize_decision(payload), payload)
 
     def test_unrecognisable_keys_survive_verbatim(self):
-        # Nothing is invented and nothing is dropped: the caller's `_decision_usable`
-        # check is what decides, and the db_event logs the real key names.
+        # Nothing is invented and nothing is dropped: the caller decides whether
+        # what survived is usable, and the db_event logs the real key names.
         d = _normalize_decision({"./output.json": "{", "/assistant": ""})
         self.assertEqual(sorted(d), ["./output.json", "/assistant"])
 
     def test_non_dict_input_degrades_to_empty(self):
         for junk in (None, "", [], "text", 3):
             self.assertEqual(_normalize_decision(junk), {})
-
-
-class DecisionUsableTests(unittest.TestCase):
-
-    def test_scores_alone_is_usable(self):
-        self.assertTrue(_decision_usable({"scores": [{"index": 0, "score": 8.0}]}))
-
-    def test_merged_plan_alone_is_usable(self):
-        self.assertTrue(_decision_usable({"merged_plan": {"title": "x"}}))
-
-    def test_salvage_debris_is_not_usable(self):
-        self.assertFalse(_decision_usable({"./output.json": "{"}))
-        self.assertFalse(_decision_usable({}))
-        self.assertFalse(_decision_usable(None))
-
-    def test_empty_containers_are_not_usable(self):
-        # The exact archived shape: keys present, both values vacuous.
-        self.assertFalse(_decision_usable({"scores": [], "merged_plan": {}}))
-
-    def test_selected_index_alone_is_not_usable(self):
-        # It carries neither the measurement nor the merge, so it cannot stand in
-        # for an arbitration — but it must not crash the predicate either.
-        self.assertFalse(_decision_usable({"selected_index": 0}))
 
 
 class DecisionHasScoreTests(unittest.TestCase):
@@ -164,11 +144,6 @@ class DecisionHasScoreTests(unittest.TestCase):
 
     def test_zero_is_a_measurement_when_the_arbiter_really_said_zero(self):
         self.assertTrue(decision_has_score({"scores": [{"index": 0, "score": 0}]}))
-
-
-CANDIDATE = {"title": "候选0", "goal": "g", "beats": ["a"]}
-
-
 
 
 class CoerceIndexStillHoldsTests(unittest.TestCase):

@@ -44,13 +44,6 @@ SYNOPSIS_SYSTEM = """你是网文平台的内容运营，负责为已完结作�
 - 不要营销空话，紧扣这本书实际写出来的内容。"""
 
 
-CHAPTER_TITLE_SYSTEM = """你是中文网文的章节起名编辑。
-给你一章的剧情要点，请起一个【钩子化、不剧透】的短章节标题。
-只返回恰好一个合法 JSON 对象，不要输出其它内容：
-{"title": "<不带'第N章'前缀的纯标题，6-16字，制造悬念或情绪张力，不得剧透本章结局或关键反转>"}
-要求：标题要勾人想点开，但不能把本章的核心反转/结局写进标题；不要书名号、不要标点堆砌。"""
-
-
 HOOK_PACKAGE_SYSTEM = """你是免费阅读平台（番茄为主）的爆款选品/运营，负责在作品【开写之前】先定下"吸量包"。
 吸量是流量漏斗第一层：书名/简介决定点击率，烂书名能直接干掉九成机会。请据下方设定产出可 A/B 的吸量素材。
 只返回恰好一个合法 JSON 对象，不要输出其它内容：
@@ -387,72 +380,3 @@ def _render_package_md(package: dict[str, Any]) -> str:
     out.append(_section("包装建议", package.get("package_notes")))
     return "".join(p for p in out if p)
 
-
-# 第N章 title-line matcher: captures the "第N章" prefix and the trailing title.
-_TITLE_LINE_RE = re.compile(
-    r"^(\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章)(.*)$"
-)
-
-
-def refine_chapter_title(
-    client: Any,
-    paths: Paths,
-    config: dict[str, Any],
-    chapter_num: int,
-    plan: dict[str, Any],
-    chapter_text: str,
-) -> str:
-    """Return a hook-y, non-spoilery short chapter title (no 第N章 prefix).
-
-    Falls back to the plan's title on any failure, so the caller can use the
-    result unconditionally. Pure LLM helper; does not touch files.
-    """
-    fallback = str(plan.get("title") or "").strip()
-    if not bool(config["novel"].get("chapter_title_refine_enabled", False)):
-        return fallback
-    try:
-        beats = [str(b).strip() for b in (plan.get("beats") or []) if str(b).strip()][:6]
-        user = f"""## 本章剧情要点
-- 工作标题：{fallback or "(无)"}
-- 冲突：{plan.get("conflict_type", "")}
-- 兑现：{plan.get("payoff_type", "")}
-- beats：{json.dumps(beats, ensure_ascii=False)}
-
-为第 {chapter_num} 章起一个钩子化、不剧透的短标题。"""
-        raw = call_llm(
-            client, paths, config, CHAPTER_TITLE_SYSTEM, json_prompt(user),
-            max_tokens=400, temperature=0.7, tag="chapter_title",
-        )
-        data = load_json_with_repair(client, paths, config, raw, fallback={})
-        title = str((data or {}).get("title", "")).strip() if isinstance(data, dict) else ""
-        # Strip any accidental 第N章 prefix / book brackets the model added.
-        title = re.sub(r"^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章\s*", "", title)
-        title = title.strip(" 　《》「」“”\"'：:—-")
-        if title and len(title) <= 30:
-            log(paths, f"Refined chapter title Ch{chapter_num}: {fallback!r} -> {title!r}")
-            return title
-        return fallback
-    except Exception as exc:
-        log(paths, f"Chapter title refine failed (non-fatal) Ch{chapter_num}: {exc}")
-        return fallback
-
-
-def apply_chapter_title(chapter_text: str, chapter_num: int, new_title: str) -> str:
-    """Replace ONLY the title portion of the chapter's first 第N章 line.
-
-    Keeps the "第N章" prefix and all body prose verbatim; swaps the trailing
-    title text for `new_title`. If the first line has no 第N章 marker, or
-    new_title is empty, the text is returned unchanged.
-    """
-    if not new_title or not new_title.strip():
-        return chapter_text
-    new_title = new_title.strip()
-    lines = chapter_text.split("\n", 1)
-    first = lines[0]
-    rest = lines[1] if len(lines) > 1 else ""
-    m = _TITLE_LINE_RE.match(first)
-    if not m:
-        return chapter_text
-    prefix = m.group(1).rstrip()
-    new_first = f"{prefix} {new_title}"
-    return new_first + ("\n" + rest if rest or len(lines) > 1 else "")

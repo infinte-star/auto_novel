@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import normalize_chapter  # noqa: E402
-from quality import beat_coverage, plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
+from quality import plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
 from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
 from quality import store_chapter_fingerprint  # noqa: E402
 from quality import prose_texture  # noqa: E402
@@ -208,68 +208,6 @@ class AiFlavorPivotTests(unittest.TestCase):
         self.assertFalse(_NEGATIVE_PAIR.search(pivot))
 
 
-class ScheduleRowExtractionTests(unittest.TestCase):
-    """_extract_schedule_rows: 从卷纲逐章表读第 N 章排期行（自动扩写触发判定的底座）。"""
-
-    VP = "\n".join([
-        "## 第二卷（第25-48章）",
-        "- **角色高光轮值表**：",
-        "| 章号 | 核心成员高光 | 钩子成员 |",
-        "|------|-------------|---------|",
-        "| Ch12 | 陆时砚、谢观澜 | 顾峥 |",
-        "| Ch120 | 不该被Ch12匹配到 | x |",
-        "| 第13章 | 白景昀认亲 | 江野 |",
-        "| Ch12-14 | 卷区间行，不该被单章匹配 | y |",
-        "- **爽点兑现节拍表**：",
-        "| 章号 | 主爽点类型 | 兑现 |",
-        "| Ch12 | 打脸反杀 | 实锤僵尸粉 |",
-    ])
-
-    def test_extracts_exact_chapter_rows(self):
-        from memory import _extract_schedule_rows
-        out = _extract_schedule_rows(self.VP, 12)
-        self.assertIn("陆时砚、谢观澜", out)      # 角色高光表 Ch12 行
-        self.assertIn("打脸反杀", out)           # 爽点节拍表 Ch12 行
-        self.assertNotIn("不该被Ch12匹配", out)  # Ch120 排除
-        self.assertNotIn("卷区间行", out)         # Ch12-14 排除
-        self.assertNotIn("白景昀", out)          # 第13章 不混入
-
-    def test_other_chapter(self):
-        from memory import _extract_schedule_rows
-        out = _extract_schedule_rows(self.VP, 13)
-        self.assertIn("白景昀认亲", out)
-        self.assertNotIn("陆时砚", out)
-
-    def test_missing_chapter_returns_empty(self):
-        from memory import _extract_schedule_rows
-        self.assertEqual(_extract_schedule_rows(self.VP, 99), "")
-        self.assertEqual(_extract_schedule_rows("", 12), "")
-
-
-class ScheduleAutoExtendTests(unittest.TestCase):
-    """_schedule_needs_extend: 自动扩写卷纲的触发判定（临近详细排期末尾→需扩）。"""
-
-    VP = "\n".join([
-        "| 章号 | 高光 |", "| Ch23 | a |", "| Ch24 | b |",   # 卷一详到 Ch24
-        "| Ch31 | c |", "| Ch47 | d |", "| Ch48 | e |",       # 补写详到 Ch31-48
-    ])
-
-    def test_needs_extend_near_end_of_detail(self):
-        from memory import _schedule_needs_extend
-        # 写到 Ch46，lookahead=3 → 看 Ch49，无排期 → 需扩
-        self.assertTrue(_schedule_needs_extend(self.VP, 46, 3))
-
-    def test_no_extend_when_covered(self):
-        from memory import _schedule_needs_extend
-        # 写到 Ch33，lookahead=3 → 看 Ch36... Ch36 无行? 用 Ch44→Ch47(有) 应不扩
-        self.assertFalse(_schedule_needs_extend(self.VP, 44, 3))   # Ch47 有排期
-        self.assertFalse(_schedule_needs_extend(self.VP, 45, 3))   # Ch48 有排期
-
-    def test_extend_past_last_detailed(self):
-        from memory import _schedule_needs_extend
-        self.assertTrue(_schedule_needs_extend(self.VP, 50, 3))    # Ch53 早已无排期
-
-
 class SceneDraftSplitTests(unittest.TestCase):
     """_split_beats_into_scenes: ①(b) 密集章分段助手（保序、≤max_segments、~2 beat/段）。"""
 
@@ -446,48 +384,6 @@ class FirstDraftExecutionLedgerTests(unittest.TestCase):
         self.assertTrue(_beat_needs_concretization("她意识到证词存在矛盾。"))
 
 
-class BeatCoverageTests(unittest.TestCase):
-    """Deterministic beat-coverage gate (quality.beat_coverage)."""
-
-    @staticmethod
-    def _body(extra: str = "") -> str:
-        # >500 chars of filler so the short-text auto-pass doesn't trigger.
-        return "第10章 残响\n\n" + ("林夕沿着走廊往前走，灯光在地面投下长长的影子。" * 20) + extra
-
-    def test_realized_beat_passes_exact(self):
-        plan = {"beats": [
-            "林夕发现安瓿碎裂方向与针孔方向矛盾。",
-        ]}
-        body = self._body("她蹲下身，注意到安瓿碎裂方向朝外，而针孔方向却指向床头——两者矛盾。")
-        report = beat_coverage(body, plan, {"novel": {}})
-        self.assertTrue(report["passed"])
-        self.assertEqual(report["missing_beats"], [])
-
-    def test_reworded_beat_passes_via_bigram_fallback(self):
-        plan = {"beats": ["她检查药箱搭扣上的指纹划痕。"]}
-        # "药箱的搭扣" rewords "药箱搭扣"; bigram coverage should still hit.
-        body = self._body("她俯身检查药箱的搭扣，指纹划痕在灯下清晰可见。")
-        report = beat_coverage(body, plan, {"novel": {}})
-        self.assertTrue(report["passed"])
-
-    def test_abstract_beat_auto_passes(self):
-        plan = {"beats": ["她意识到自己可能错了。"]}
-        report = beat_coverage(self._body(), plan, {"novel": {}})
-        self.assertTrue(report["passed"])
-
-    def test_short_text_auto_passes(self):
-        plan = {"beats": ["林夕发现安瓿碎裂方向矛盾。"]}
-        report = beat_coverage("太短", plan, {"novel": {}})
-        self.assertTrue(report["passed"])
-
-    def test_disabled_via_config(self):
-        plan = {"beats": ["林夕发现安瓿碎裂方向矛盾。"]}
-        report = beat_coverage(self._body(), plan, {"novel": {"beat_coverage_enabled": False}})
-        self.assertFalse(report["enabled"])
-        self.assertTrue(report["passed"])
-
-
-
 class JsonSalvageTests(unittest.TestCase):
     def test_clean_json(self):
         self.assertEqual(safe_json_loads('{"a": 1}'), {"a": 1})
@@ -545,68 +441,6 @@ class PromptEnhancementTests(unittest.TestCase):
         system = _enhance_system_prompt("base system", {"api": {}, "novel": {}}, tag="", wants_json=wants_json)
         self.assertTrue(wants_json)
         self.assertIn("JSON 任务额外纪律", system)
-
-
-class BookConsistencyTests(unittest.TestCase):
-    """config.book_is_consistent decides whether the resume path can skip the
-    O(n) rebuild_book. It must be conservative: consistent only when book.md
-    demonstrably contains the latest chapter."""
-
-    def _setup(self):
-        import shutil
-        import tempfile
-        from pathlib import Path
-        from config import write_text
-
-        root = Path(tempfile.mkdtemp(prefix="book_consist_"))
-        paths = _make_paths(root)
-        paths.chapters_dir.mkdir(parents=True, exist_ok=True)
-        return root, paths, write_text, shutil
-
-    def test_consistent_book_skips_rebuild(self):
-        from config import book_is_consistent
-        root, paths, write_text, shutil = self._setup()
-        try:
-            ch1 = "第一章\n\n内容甲。\n"
-            ch2 = "第二章\n\n内容乙，结尾在这里。\n"
-            write_text(paths.chapters_dir / "0001.md", ch1)
-            write_text(paths.chapters_dir / "0002.md", ch2)
-            write_text(paths.book, ch1.strip() + "\n\n" + ch2.strip() + "\n")
-            self.assertTrue(book_is_consistent(paths))
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
-
-    def test_missing_latest_chapter_triggers_rebuild(self):
-        from config import book_is_consistent
-        root, paths, write_text, shutil = self._setup()
-        try:
-            ch1 = "第一章\n\n内容甲。\n"
-            ch2 = "第二章\n\n内容乙，结尾在这里。\n"
-            write_text(paths.chapters_dir / "0001.md", ch1)
-            write_text(paths.chapters_dir / "0002.md", ch2)
-            # book.md is stale: it only has chapter 1 (the latest append was lost).
-            write_text(paths.book, ch1.strip() + "\n")
-            self.assertFalse(book_is_consistent(paths))
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
-
-    def test_missing_book_file_triggers_rebuild(self):
-        from config import book_is_consistent
-        root, paths, write_text, shutil = self._setup()
-        try:
-            write_text(paths.chapters_dir / "0001.md", "第一章\n\n内容。\n")
-            self.assertFalse(book_is_consistent(paths))
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
-
-    def test_no_chapters_is_consistent(self):
-        from config import book_is_consistent
-        root, paths, write_text, shutil = self._setup()
-        try:
-            write_text(paths.book, "something\n")
-            self.assertTrue(book_is_consistent(paths))
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
 
 
 class RetrievalShardTests(unittest.TestCase):
@@ -758,35 +592,6 @@ class ThreadLocalConnTests(unittest.TestCase):
             self.assertEqual(len(events), 30)
         finally:
             shutil.rmtree(root, ignore_errors=True)
-
-
-class ChapterTitleTests(unittest.TestCase):
-    def test_apply_replaces_only_title_keeps_body(self):
-        from package import apply_chapter_title
-        text = "第12章 旧标题\n\n正文第一行。\n正文第二行。\n"
-        out = apply_chapter_title(text, 12, "新钩子标题")
-        self.assertTrue(out.startswith("第12章 新钩子标题"))
-        self.assertIn("正文第一行。", out)
-        self.assertIn("正文第二行。", out)
-        self.assertNotIn("旧标题", out)
-
-    def test_apply_chinese_numeral_prefix(self):
-        from package import apply_chapter_title
-        text = "第三章 起\n\n内容。"
-        out = apply_chapter_title(text, 3, "暗涌")
-        self.assertTrue(out.startswith("第三章 暗涌"))
-        self.assertIn("内容。", out)
-
-    def test_apply_noop_when_no_title_line(self):
-        from package import apply_chapter_title
-        text = "没有章节标记的正文。\n第二行。"
-        self.assertEqual(apply_chapter_title(text, 1, "X"), text)
-
-    def test_apply_noop_when_empty_title(self):
-        from package import apply_chapter_title
-        text = "第1章 标题\n\n正文。"
-        self.assertEqual(apply_chapter_title(text, 1, ""), text)
-        self.assertEqual(apply_chapter_title(text, 1, "   "), text)
 
 
 class PackageRenderTests(unittest.TestCase):
@@ -1463,14 +1268,6 @@ class RelationshipStoreTests(unittest.TestCase):
         self.assertEqual(len(rels), 1)
         self.assertEqual(rels[0]["stage"], "tension")
 
-    def test_stale_relationships(self):
-        from store import upsert_relationship, get_stale_relationships
-        upsert_relationship(self.conn, 1, "A", "B", stage="contact", intensity=0.5)
-        upsert_relationship(self.conn, 10, "C", "D", stage="trust", intensity=0.8)
-        stale = get_stale_relationships(self.conn, chapter_num=12, stale_threshold=8)
-        self.assertEqual(len(stale), 1)
-        self.assertIn("A", stale[0]["char_a"] + stale[0]["char_b"])
-
     def test_invalid_stage_falls_back(self):
         from store import upsert_relationship, get_relationships
         upsert_relationship(self.conn, 1, "A", "B", stage="invalid_stage")
@@ -1726,49 +1523,6 @@ class RefinedTextAcceptableTests(unittest.TestCase):
         self.assertIn("grew beyond", reason)
 
 
-class CharacterAppearanceRateTests(unittest.TestCase):
-    """Tests for quality.character_appearance_rate + character_names_from_md."""
-
-    def test_names_from_md(self):
-        from quality import character_names_from_md
-        md = (
-            "# 人物状态机档案\n"
-            "## 主角：汤舒婷\n### 状态\n文本\n"
-            "## 核心配角①：陆时砚（唯一官配）\n文本\n"
-            "## 核心反派①：高子昂（前男友）\n文本\n"
-            "## Consolidated\n压缩内容\n"
-        )
-        names = character_names_from_md(md)
-        self.assertEqual(names, ["汤舒婷", "陆时砚", "高子昂"])
-
-    def test_appearance_rate_and_under_served(self):
-        from quality import character_appearance_rate
-        texts = {
-            1: "汤舒婷和陆时砚在店里", 2: "汤舒婷一个人",
-            3: "汤舒婷想起高子昂", 4: "汤舒婷继续", 5: "汤舒婷收尾陆时砚也在",
-        }
-        res = character_appearance_rate(["汤舒婷", "陆时砚", "高子昂"], texts, window=5, floor=0.15)
-        self.assertEqual(res["rates"]["汤舒婷"], 1.0)
-        self.assertEqual(res["rates"]["陆时砚"], 0.4)
-        self.assertEqual(res["rates"]["高子昂"], 0.2)
-        # nobody under 0.15 here
-        self.assertFalse(res["under_served"])
-
-    def test_under_served_flagged(self):
-        from quality import character_appearance_rate
-        texts = {i: "汤舒婷独角戏" for i in range(1, 21)}
-        texts[20] = "汤舒婷独角戏还是没有别人"  # 陆时砚 never appears
-        res = character_appearance_rate(["汤舒婷", "陆时砚"], texts, window=15, floor=0.15)
-        under = {u["name"] for u in res["under_served"]}
-        self.assertIn("陆时砚", under)
-        self.assertNotIn("汤舒婷", under)
-
-    def test_empty_inputs(self):
-        from quality import character_appearance_rate
-        self.assertEqual(character_appearance_rate([], {1: "x"})["rates"], {})
-        self.assertEqual(character_appearance_rate(["甲"], {})["rates"], {})
-
-
 class PayoffDensityTests(unittest.TestCase):
     """Tests for payoff_beat_density: 爽点 cadence."""
 
@@ -1850,49 +1604,6 @@ class InformationDensityTests(unittest.TestCase):
         self.assertEqual(information_density(rich, plan, None, {"novel": {}}),
                          information_density(rich, plan, {"beats_audit": []},
                                              {"novel": {}}))
-
-
-class RecentDimensionScoreTests(unittest.TestCase):
-    """Tests for store.recent_dimension_scores (dimension de-inflation input)."""
-
-    def setUp(self):
-        import sqlite3, tempfile
-        self.tmpdir = tempfile.mkdtemp()
-        self.conn = sqlite3.connect(os.path.join(self.tmpdir, "t.db"))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript("""
-            CREATE TABLE chapter_metrics (
-                chapter INTEGER PRIMARY KEY, hook_score REAL, readthrough_score REAL
-            );
-        """)
-        for ch, hk in enumerate([9.5, 10.0, 10.0, 9.8, 10.0, 7.0], start=1):
-            self.conn.execute(
-                "INSERT INTO chapter_metrics(chapter, hook_score, readthrough_score) VALUES (?,?,?)",
-                (ch, hk, hk))
-        self.conn.commit()
-
-    def tearDown(self):
-        self.conn.close()
-        import shutil
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-    def test_returns_newest_first(self):
-        from store import recent_dimension_scores
-        vals = recent_dimension_scores(self.conn, "hook_score", 3)
-        self.assertEqual(vals[0], 7.0)  # chapter 6, newest
-
-    def test_before_chapter_excludes(self):
-        from store import recent_dimension_scores
-        vals = recent_dimension_scores(self.conn, "hook_score", 10, before_chapter=6)
-        self.assertNotIn(7.0, vals)
-        self.assertEqual(len(vals), 5)
-
-    def test_saturation_average(self):
-        from store import recent_dimension_scores
-        vals = recent_dimension_scores(self.conn, "hook_score", 5, before_chapter=6)
-        self.assertGreaterEqual(sum(vals) / len(vals), 9.3)  # saturated window
-
-
 
 
 class OpeningHookGateTests(unittest.TestCase):
@@ -2388,7 +2099,7 @@ class GateRegistryTests(unittest.TestCase):
         gates = REGISTRY.list_gates()
         self.assertGreaterEqual(len(gates), 20)
         for name in ("style_health", "ai_flavor_health", "cross_chapter_repetition",
-                      "dialogue_health", "beat_coverage", "scene_similarity"):
+                      "dialogue_health", "opening_hook_gate", "scene_similarity"):
             self.assertIn(name, gates)
 
     def test_function_identity_preserved(self):
@@ -2830,42 +2541,6 @@ class VolumePlanWindowTests(unittest.TestCase):
     def test_lookahead_is_configurable(self):
         self.assertNotIn("| Ch43 |", self._win(41, lookahead=0))
         self.assertIn("| Ch43 |", self._win(41, lookahead=2))
-
-
-class ChapterScheduleDirectiveTests(unittest.TestCase):
-    """可见 != 遵守：卷纲窗口修好后 Ch43 仍把 ⭐ 给了排期标注「无镜头」的角色，
-    所以本章排期行要抬成硬指令。"""
-
-    PLAN = VolumePlanWindowTests.PLAN
-
-    def _d(self, ch, **novel):
-        from memory import chapter_schedule_directive
-        return chapter_schedule_directive(self.PLAN, ch, {"novel": novel})
-
-    def test_quotes_this_chapters_row_with_caption(self):
-        d = self._d(41)
-        self.assertIn("第 41 章", d)
-        self.assertIn("角色高光轮值表", d)
-        self.assertIn("展台炸场", d)
-        self.assertIn("无镜头", d)      # 标记含义须解释，否则模型无从遵守
-        self.assertIn("risk", d)        # 允许有理由的偏离
-
-    def test_other_chapters_rows_are_not_quoted(self):
-        d = self._d(41)
-        self.assertNotIn("切换通道", d)   # Ch31
-        self.assertNotIn("二期售罄", d)   # Ch48
-
-    def test_no_row_for_this_chapter_is_silent(self):
-        self.assertEqual(self._d(99), "")
-        self.assertEqual(self._d(0), "")
-
-    def test_gate_can_be_disabled(self):
-        self.assertEqual(self._d(41, chapter_schedule_directive_enabled=False), "")
-
-    def test_malformed_plan_degrades_to_empty(self):
-        from memory import chapter_schedule_directive
-        self.assertEqual(chapter_schedule_directive("", 41, {"novel": {}}), "")
-        self.assertEqual(chapter_schedule_directive("no tables here", 41, {"novel": {}}), "")
 
 
 class HardFossilTailAnchorTests(unittest.TestCase):

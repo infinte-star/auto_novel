@@ -840,3 +840,53 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 走 `canon.load`，即 `adopt-trial` 真正依赖的那条路（`conn=None` 可行，`load` 把每个 store 调用都包在 `_safe` 里）。
 
 零 LLM 变更，`tools/fpy_prime.py` 接线前后同为 **365/438 = 83%**；测试 804 → 815 全绿。
+
+### 9.11 扫掉 v1 删除留下的孤儿：49 个定义 / 133 个配置键（2026-07-28）
+
+`95361b9` 删掉 v1 的七个模块，但**被它们调用的东西留在原地**。`GateRegistry` 从不派发、
+`quality.py` 的门只在有人按名字调用时才运行——同一条性质让「没有调用点」在任何测试里都不可见：
+孤儿定义全都语法正确、全都 import 成功、全都不影响 769 个测试。
+
+**先造工具，不靠 grep。** v2 的 docstring 成打地引用 v1 的函数名，而 docstring 里的散文
+在 token grep 里算引用——**恰好把这次删除造成的孤儿藏住了**。所以
+`tools/orphan_defs.py` 从 AST 收引用，docstring 永不贡献。五条判据，每条都先给了一个错答案：
+
+1. **模块内引用必须算。** 第一次跑报 490 个定义 / 15k 行，因为它把定义所在文件排除了，
+   于是每个只被自己模块调用的私有助手（`_shard_dir`，5 次自引）都成了孤儿。
+2. **`ast.Store` 不能算。** 常量自己的 `X = ...` 目标就是一个 `ast.Name`，
+   算上它以后每个未使用的常量都像在自引，`--constants` 第一次跑报了个干净的零。
+3. **`unittest` 按名字发现 `TestCase` 子类**，没有任何东西引用它们。
+4. **「只被自己的测试引用」是带不在场证明的死代码**——测试让它永远绿，而没有任何东西发布它。
+   整个章节标题特性（refine + apply + 配置键）就是这样躲过两轮审计的。
+5. **f-string 读出来的配置键没有字面量可 grep。** `config.py:512` 读
+   `api.get(f"{role}_base_url")`，于是 29 个角色路由键全都看起来是死的，而它们全是活的。
+   这一条最危险：把 `writing_api_key` 删掉，报错要等到下一次真实运行。
+
+**删除会级联。** 首轮切 35 个定义之后，重扫又出 14 个——只有被删掉的那些命名过它们
+（`writing.EXTRACT_SYSTEM` 48 行的提示词、`memory.MEMORY_COMPRESS_SYSTEM`、
+`store._DB_LOCK`——v2 没有后台线程池，那把锁从来没人取过）。共三轮才收敛到 0。
+所以规则是：**每次删完重跑一次 census，直到它报零**。
+
+配置键 133 个，不是先前记下的 ~14——那个数字是在 v1 删除完成前数的。
+`config.py:load_config` 的 `required` 字典里有 4 个在删除清单上
+（`max_revision_rounds`/`candidate_plans`/`stage_review_every`/`repeat_window`），
+**顺序在这里是承载性的**：只从模板删而留在 `required` 里，`novel.py create` 出来的每一本新书
+都会在 `load_config` 直接抛错。两处必须同一次提交改完，
+且 `config_template.yaml`（gitignore 但必须存在）和 `config_template.example.yaml`（tracked）都要改。
+
+**四个键故意留下**，因为它们死于接线断裂而非死于被替代——删掉旋钮就把缺陷报告一起埋了：
+
+| 键 | 为什么它是缺陷报告 |
+| --- | --- |
+| `style_em_dash_trend_window` | 没有任何调用点给 `style_health` 传 `em_history`（`v2/accept.py:608` 只传 text+config），于是 `recent_mean` 恒为 `None`，**破折号趋势项在 v2 里从不发火**。那正是抓到 gudai50_v2 Ch20-24 从 6.6 爬到 8.8、而静态档在 +1.0 上躺平的那一项；也正是 `fpy_prime._normalize` 重盖的那一项——**尺子现在建模了一个引擎已经不执行的门**。`tech_history` 同理。 |
+| `scene_dedupe_sim_warn`、`scene_dedupe_candidate_block` | v1 的三级升级（WARN 追加 `required_constraints` / BLOCK 重试 / 0.97 绝对天花板）只剩 BLOCK 一级：`arc.validate_card` 只收一个 `scene_sim_block`。另两级住在被删的 `review.py`/`planning.py` 里。 |
+| `telemetry_enabled` | `telemetry.py` 根本不读它，遥测关不掉。无害（严格观察者），但配置文件许下了一个它不兑现的承诺。 |
+
+`compare.py` 的 `RELEASE_RULE_KEYS` 仍然点名若干已删的键，这是**故意的**：
+它是一张*警戒*名单而不是读者。已经写出来的每一本 `novels/*/config.yaml` 都还带着那些键，
+所以在老书上 `--flip rework_trigger` 依然做得到，也依然必须被标成循环。
+
+零行为变更：`tools/fpy_prime.py` 前后同为 **365/438 = 83%**，测试 815 → 769 全绿
+（少的 46 个是随被测函数一起删的用例，其中 7 个类是 v1 计划委员会/记忆压缩/自动扩写卷纲的测试）。
+两个 TESTS-ONLY 孤儿**不删**，它们是下一次提交要接的线：
+`quality.fingerprint_avoidance_context`（14 本书上都有实质输出）与 `v2.anchor.wr_against_anchor`。

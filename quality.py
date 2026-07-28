@@ -2173,75 +2173,6 @@ def dialogue_health(
 # chapters while the creative contract's "非官配需完整成长线" rule has no metric.
 # ---------------------------------------------------------------------------
 
-def character_names_from_md(md: str) -> list[str]:
-    """Extract principal-cast names from a `characters.md` state-machine file.
-
-    Parses `## …：名字（备注）` section headers: takes the text after the last
-    fullwidth/half-width colon and strips any trailing （…）/(…) parenthetical.
-    Headers without a colon (e.g. `## Consolidated`, `## Ch5`) are skipped, so
-    only real character sections are returned. Order-preserving, de-duplicated.
-    """
-    names: list[str] = []
-    seen: set[str] = set()
-    for line in (md or "").splitlines():
-        s = line.strip()
-        if not s.startswith("## "):
-            continue
-        header = s[3:].strip()
-        # Only headers of the form "role：name" name a character.
-        idx = max(header.rfind("："), header.rfind(":"))
-        if idx < 0:
-            continue
-        name = header[idx + 1:].strip()
-        # Drop a trailing parenthetical annotation.
-        for lp, rp in (("（", "）"), ("(", ")")):
-            p = name.find(lp)
-            if p >= 0:
-                name = name[:p].strip()
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
-    return names
-
-
-def character_appearance_rate(
-    names: list[str],
-    texts_by_chapter: dict[int, str],
-    window: int = 15,
-    floor: float = 0.15,
-) -> dict[str, Any]:
-    """Fraction of the recent `window` chapters in which each name appears.
-
-    Returns {"rates": {name: frac}, "under_served": [{"name","rate"}], "window"}.
-    The first name (protagonist) is measured but never reported as under-served —
-    only secondary leads starving out is the failure mode this guards. Safe no-op
-    on empty inputs.
-    """
-    result: dict[str, Any] = {"rates": {}, "under_served": [], "window": 0}
-    if not names or not texts_by_chapter:
-        return result
-
-    ordered = sorted(texts_by_chapter.keys())
-    windowed = ordered[-window:] if window > 0 else ordered
-    denom = len(windowed)
-    result["window"] = denom
-    if denom <= 0:
-        return result
-
-    rates: dict[str, float] = {}
-    for name in names:
-        hits = sum(1 for ch in windowed if name and name in (texts_by_chapter.get(ch) or ""))
-        rates[name] = round(hits / denom, 2)
-    result["rates"] = rates
-
-    under: list[dict[str, Any]] = []
-    for name in names[1:]:  # skip protagonist
-        if rates.get(name, 0.0) < floor:
-            under.append({"name": name, "rate": rates.get(name, 0.0)})
-    result["under_served"] = under
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Descriptor-frequency gate: catch short (3-6 char) phrases that evade both
 # the clause min_len (7) and the ngram window (6).
@@ -2644,81 +2575,6 @@ def _fragment_hit(fragment: str, chapter_text: str, chapter_bigrams: set[str], m
     if not grams:
         return False
     return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= min_bigram_cov
-
-
-@REGISTRY.register(
-    "beat_coverage", config_key="beat_coverage_enabled", tag_prefix="beat",
-    phase="pipeline", repair="L1", scope="chapter",
-    proof="642-review census does not reach it: the census samples review "
-          "payloads and this is a pipeline-phase gate. It is the direct ancestor "
-          "of v2's CCC (does the prose fulfil what the plan promised), so its "
-          "calibration is settled by CCR in tools/ccr_baseline.py, not by "
-          "gate_census.")
-def beat_coverage(
-    chapter_text: str,
-    plan: dict[str, Any],
-    config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Deterministic check that each plan beat's concrete anchors appear in prose.
-
-    Returns:
-      {
-        "enabled": bool,
-        "passed": bool,          # every anchored beat hit >=1 anchor AND
-                                 # overall anchor hit-rate >= beat_coverage_min
-        "coverage": float,       # matched anchors / total anchors (1.0 if none)
-        "beats": [{"beat","anchors","missing","hit"}],
-        "missing_beats": [...],  # beats with ZERO anchor hits (the repair list)
-        "missing_anchors": [...] # flat list of all unmatched anchors
-      }
-
-    Conservative: beats with no extractable anchors auto-pass; matching accepts
-    bigram-level rewording. A "pass" here is necessary, not sufficient — the
-    LLM beats_audit still judges whether a mentioned beat was truly DRAMATIZED.
-    """
-    cfg = (config or {}).get("novel", {}) if config else {}
-    enabled = bool(cfg.get("beat_coverage_enabled", True))
-    result: dict[str, Any] = {
-        "enabled": enabled, "passed": True, "coverage": 1.0,
-        "beats": [], "missing_beats": [], "missing_anchors": [],
-    }
-    beats = plan.get("beats") if isinstance(plan, dict) else None
-    if not enabled or not isinstance(beats, list) or not beats:
-        return result
-    body = _strip_title_line(str(chapter_text or ""))
-    if len(body) < 500:
-        # Too short to judge (provider refusal guard elsewhere refuses <500 anyway).
-        return result
-
-    min_cov = float(cfg.get("beat_coverage_min", 0.6))
-    frag_bigram_cov = float(cfg.get("beat_coverage_fragment_bigram", 0.7))
-    chapter_bigrams = _text_bigrams(body)
-
-    total_anchors = 0
-    total_hits = 0
-    all_anchored_beats_hit = True
-    for raw_beat in beats[:12]:
-        beat = str(raw_beat or "").strip()
-        if not beat:
-            continue
-        anchors = _beat_anchor_fragments(beat)
-        hits = [a for a in anchors if _fragment_hit(a, body, chapter_bigrams, frag_bigram_cov)]
-        missing = [a for a in anchors if a not in hits]
-        beat_hit = (not anchors) or bool(hits)
-        result["beats"].append({
-            "beat": beat[:160], "anchors": anchors, "missing": missing, "hit": beat_hit,
-        })
-        total_anchors += len(anchors)
-        total_hits += len(hits)
-        result["missing_anchors"].extend(missing)
-        if not beat_hit:
-            all_anchored_beats_hit = False
-            result["missing_beats"].append(beat[:200])
-
-    coverage = (total_hits / total_anchors) if total_anchors else 1.0
-    result["coverage"] = round(coverage, 3)
-    result["passed"] = all_anchored_beats_hit and coverage >= min_cov
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -4148,20 +4004,6 @@ def _normalize_decision(decision: Any) -> dict[str, Any]:
         out[fixed if (fixed != key and fixed in ARBITER_KEYS
                       and fixed not in decision) else key] = val
     return out
-
-
-def _decision_usable(decision: Any) -> bool:
-    """True when the arbiter said something a downstream reader can act on.
-
-    `ARBITER_SYSTEM` demands both `scores` and `merged_plan`; either one alone is
-    still usable (the plan, or the measurement). Neither means the call produced
-    nothing but salvage debris, and the engine's only recovery today is a whole
-    extra plan round -- ~4 calls to replace 1.
-    """
-    if not isinstance(decision, dict):
-        return False
-    mp = decision.get("merged_plan")
-    return bool(decision.get("scores")) or bool(isinstance(mp, dict) and mp)
 
 
 def decision_has_score(decision: Any) -> bool:

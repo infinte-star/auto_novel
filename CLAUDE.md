@@ -150,7 +150,7 @@ and why `api.stream: true` is mandatory for one of them: LESSONS §1. Check
 | `refine.py`, `fossil_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
 | `compare.py` | `compare` / `ablate` / `fork` experiment harness |
 | `trial.py`, `benchmark.py` | opening trials, local sample library |
-| `tools/*.py` | zero/low-LLM analysis: `fpy_prime` (acceptance metric), `replay_gates` (settles gate-logic changes), `ccr_baseline`, `gate_census`, `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory`, `truncate_arm` |
+| `tools/*.py` | zero/low-LLM analysis: `fpy_prime` (acceptance metric), `replay_gates` (settles gate-logic changes), `ccr_baseline`, `gate_census`, `orphan_gates` (does a gate still fire), `orphan_defs` (does anything still name it — defs / constants / config keys), `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory`, `truncate_arm` |
 
 ## Architecture
 
@@ -279,7 +279,7 @@ decorators.
 | `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form was 19.6% of the largest prompt and grew linearly while carrying no signal (194 distinct flows in 200 chapters). `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. LESSONS §8 |
 
 Two routing rules inside that table are load-bearing:
-- **Scene dedupe escalates in three steps.** WARN appends `required_constraints`; BLOCK forces a card retry (relaxed to `scene_dedupe_short_novel_block` in chapter-capped mode, but **not** disabled there); `scene_dedupe_sim_identical` (0.97) is an absolute ceiling that forces retry in EVERY mode.
+- **Scene dedupe escalated in three steps under v1; v2 kept only one.** `arc.validate_card` takes a single `scene_sim_block` (`v2/beat.py:429`, default 0.85) and files a CRITICAL above it. The WARN tier that appended `required_constraints`, the chapter-capped relaxation, and the `scene_dedupe_sim_identical` (0.97) absolute ceiling all lived in the deleted `review.py`/`planning.py` — their config keys (`scene_dedupe_sim_warn`, `scene_dedupe_candidate_block`) now have no reader. Found by `tools/orphan_defs.py --config`; it is a wiring gap to settle per tier, not a redesign that dropped them deliberately.
 - **A `cross_chapter_repetition` reject is structural, not cosmetic** — it lands in `gate_rejects`, and the repair rows answer it before `rescue` can buy a rewrite.
 
 #### Wiring gap left by the v1 deletion — settled per gate, by measurement
@@ -328,19 +328,36 @@ own blind spot: `_fired` recognized no key named `repeat`, which made
 `hook_tail_repetition`'s only verdict invisible and nearly argued a live gate out
 of the tree.
 
-Roughly 2.2k lines of other orphans came with the same deletion (`memory.py`'s
-`beat_directive`/`rhythm_diagnostics`/`structural_repetition_analysis`/
-`lite_memory_context`/`chapter_schedule_directive`, `writing.py`'s
-`revise_chapter`/`revise_hook_only`/`repair_missing_beats`/`extract_events`,
-`arc.plan_from_arc`, `store.hook_health_check`, plus ~14 config keys with no
-reader outside `config.py`'s `required` dict and `compare.py`'s diff display:
-`rework_trigger`, `rework_score_floor`, `candidate_plans`, `candidate_chapters`,
-`max_revision_rounds`, `risk_upshift_*`, `cold_reader_enabled`,
-`macro_progress_enabled`, `failure_taxonomy_enabled`, `arbiter_reask_enabled`,
-`plan_skip_screen`, `adaptive_downshift_enabled`, `voice_refresh_skip_penalty`,
-`replan_on_low_quality`, `pack_review_*`, `consecutive_force_accept_limit`).
-Same rule applies: some are dead weight and some are capabilities v2 has not
-replaced.
+The rest of that deletion's debris is swept (2026-07-28): **49 module-level defs
+and constants / ~2.4k lines, plus 133 config keys** whose only consumer was v1
+machinery v2 replaced. `python tools/orphan_defs.py [--constants|--config]` is the
+census — the companion to `orphan_gates.py`, and the tool to re-run after any
+deletion, because a cut cascades (the first sweep exposed 14 more defs that only
+the deleted ones had named, and two rounds after that before it converged). Its
+docstring carries five predicates that each gave a wrong answer first; the one
+worth knowing without reading it is that **a config key read through an f-string
+has no literal to grep** — `config.py:512` reads `api.get(f"{role}_base_url")`, so
+all 29 role-routing keys look dead and are not.
+
+Four dead keys were **held back on purpose**, because they are dead from a wiring
+break rather than from replacement, and deleting the knob would bury the bug
+report:
+- `style_em_dash_trend_window` — nothing supplies `style_health`'s `em_history`
+  (`v2/accept.py:608` passes text and config only), so `recent_mean is None` on
+  every call and **the em-dash TREND term never fires in v2**. That is the check
+  that caught gudai50_v2 Ch20-24 climbing 6.6→8.8 while the static tier flat-lined
+  at +1.0 — and it is the same term `fpy_prime._normalize` re-stamps, so the ruler
+  currently models a gate the engine no longer runs. Same for `tech_history`.
+- `scene_dedupe_sim_warn`, `scene_dedupe_candidate_block` — see the escalation note
+  above: v2 kept only the BLOCK step.
+- `telemetry_enabled` — `telemetry.py` reads it nowhere, so telemetry cannot be
+  turned off. Harmless (strict observer) but the config file makes a promise it
+  does not keep.
+
+`compare.py`'s `RELEASE_RULE_KEYS` still names several deleted keys, and that is
+deliberate: it is a *guard* list, not a reader. Every already-written
+`novels/*/config.yaml` still carries those keys, so `--flip rework_trigger` on an
+old book remains possible and must still be flagged as circular.
 
 **`quality_threshold` is a special case worth knowing about.** It is no longer a
 release rule anywhere — but `writing._prewrite_quality_contract` still reads it
@@ -450,7 +467,7 @@ reports fixed bugs as live problems. `fpy_prime._normalize` re-stamps two by
 default (`--raw` replays payloads verbatim), and each changes which bucket looks
 like the top killer:
 - v1's contract backstop stamped keyword-matched `problems` text as a HARD violation until `b54bfd0` downgraded it to SOFT. 22 archived chapters fail their first draft on that alone — the whole difference between "`hard_contract` is the #1 killer at 54" (wrong) and "32, second to gate_rejects" (right), and between tunshi_xitong at 85% and its true 98%.
-- `style_health`'s em-dash TREND term charged a flat +1.0, which stacked onto the static tier's +1.0 to hit `style_penalty_block` (2.0) *exactly*; it is now graduated by ratio. 31 archived chapters were scored under the flat rule and 5 block on it alone. Two execution rules: only the em-dash terms are recomputed (every other component's input is the chapter text, which round0 no longer describes after revision), and a penalty already at `style_penalty_cap` is skipped because it is no longer a sum of its terms. `_restamp_style_penalty` calls `quality.em_dash_penalty` — the arithmetic was extracted into that pure function precisely so the tool cannot drift from the engine. LESSONS §13.
+- `style_health`'s em-dash TREND term charged a flat +1.0, which stacked onto the static tier's +1.0 to hit `style_penalty_block` (2.0) *exactly*; it is now graduated by ratio. 31 archived chapters were scored under the flat rule and 5 block on it alone. Two execution rules: only the em-dash terms are recomputed (every other component's input is the chapter text, which round0 no longer describes after revision), and a penalty already at `style_penalty_cap` is skipped because it is no longer a sum of its terms. `_restamp_style_penalty` calls `quality.em_dash_penalty` — the arithmetic was extracted into that pure function precisely so the tool cannot drift from the engine. LESSONS §13. **Caveat as of 2026-07-28:** the trend term does not run in v2 at all (nothing supplies `em_history`), so this normalization currently models a gate the live engine has stopped enforcing — see the held-back keys under the wiring gap.
 
 Two failure buckets that survive both normalizations are **not** defects to fix:
 `hard_contradictions` (5 misses, one per book, each a concrete canon breach the

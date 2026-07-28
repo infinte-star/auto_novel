@@ -13,22 +13,6 @@ from config import Paths, read_text, write_text
 
 import sqlite3
 
-# Historically a single sqlite3 connection was shared across the main thread and
-# the BackgroundTasks daemon threads, guarded by one process-wide RLock that
-# serialized EVERY DB op (sqlite3 connections/cursors are not thread-safe). That
-# made WAL's reader/writer concurrency useless: finalize writes and planning
-# reads could never overlap.
-#
-# We now give each thread its OWN connection via `ThreadLocalConn` (below). WAL
-# already allows concurrent readers plus a single writer across connections, and
-# busy_timeout makes a contending writer wait instead of erroring. So the global
-# lock is no longer needed: `db_lock()` is kept as a NO-OP context manager purely
-# so the ~20 internal `with db_lock():` sites and the external callers
-# (writing.update_structured_state, planning.review_*, review.py) keep working
-# unchanged.
-_DB_LOCK = threading.RLock()  # retained for back-compat; no longer the serialization point
-
-
 def db_lock() -> Any:
     """Return a NO-OP context manager.
 
@@ -299,36 +283,6 @@ def recent_metrics(conn: Any, limit: int) -> list[dict[str, Any]]:
         ).fetchall()
     return [dict(row) for row in rows]
 
-def recent_dimension_scores(
-    conn: Any, dim: str, limit: int, before_chapter: int | None = None
-) -> list[float]:
-    """Return up to `limit` recent values of ONE chapter_metrics dimension
-    (e.g. 'hook_score'), newest-first, optionally excluding chapters >=
-    before_chapter. Built on recent_metrics so it inherits JsonStoryStore
-    compatibility and locking. Used by review.py's dimension de-inflation to
-    detect a reviewer dimension that has saturated (lost discrimination)."""
-    try:
-        rows = recent_metrics(conn, int(limit) + 5)
-    except Exception:
-        return []
-    out: list[float] = []
-    for r in rows:  # newest-first
-        try:
-            ch = int(r.get("chapter", 0))
-        except Exception:
-            ch = 0
-        if before_chapter is not None and ch >= int(before_chapter):
-            continue
-        v = r.get(dim)
-        if v is not None:
-            try:
-                out.append(float(v))
-            except Exception:
-                pass
-        if len(out) >= int(limit):
-            break
-    return out
-
 def recent_events(conn: Any, limit: int = 80, event_types: Any = None) -> list[dict[str, Any]]:
     """Return the most recent events, newest first.
 
@@ -379,28 +333,6 @@ def get_active_constraints(conn: Any, chapter_num: int) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
     except Exception:
         return []
-
-def store_stage_constraints(conn: Any, chapter_num: int, constraints: list[dict[str, Any]]) -> None:
-    if not constraints:
-        return
-    with db_lock():
-        for c in constraints:
-            expires = None
-            if c.get("expires_in_chapters"):
-                expires = chapter_num + int(c["expires_in_chapters"])
-            conn.execute(
-                """INSERT INTO stage_constraints(source_chapter, constraint_type, description, priority, expires_chapter, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    chapter_num,
-                    str(c.get("type", "require")),
-                    str(c.get("description", "")),
-                    int(c.get("priority", 5)),
-                    expires,
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
-        conn.commit()
 
 def store_causal_links(conn: Any, chapter_num: int, links: list[dict[str, Any]]) -> None:
     if not links:
@@ -563,47 +495,6 @@ def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
     except Exception:
         return []
 
-def hook_health_check(conn: Any, chapter_num: int, config: dict[str, Any]) -> dict[str, Any]:
-    orphan_threshold = int(config["novel"].get("hook_orphan_threshold", 30))
-    result: dict[str, Any] = {"orphaned": [], "blocked": [], "expired": [], "directives": []}
-    try:
-        with db_lock():
-            rows = conn.execute(
-                """SELECT id, description, status, introduced_chapter, due_chapter,
-                          updated_chapter, depends_on, priority, half_life
-                   FROM open_threads
-                   WHERE status IN ('open', 'building', 'advanced')""",
-            ).fetchall()
-    except Exception:
-        return result
-    open_ids = {r["id"] for r in rows}
-    for r in rows:
-        tid = r["id"]
-        desc = r["description"] or ""
-        intro = r["introduced_chapter"] or chapter_num
-        age = chapter_num - int(intro)
-        half_life = int(r["half_life"] or 0)
-        depends_on = str(r["depends_on"] or "").strip()
-        priority = int(r["priority"] or 5)
-        if depends_on and depends_on in open_ids:
-            result["blocked"].append({"id": tid, "description": desc, "blocked_by": depends_on})
-        if half_life > 0 and age > half_life * 1.5:
-            result["expired"].append({"id": tid, "description": desc, "age": age, "half_life": half_life, "priority": priority})
-        if age >= orphan_threshold and r["status"] == "open":
-            result["orphaned"].append({"id": tid, "description": desc, "age": age, "priority": priority})
-    if result["orphaned"]:
-        top = sorted(result["orphaned"], key=lambda x: -x["priority"])[:3]
-        result["directives"].append(
-            "【孤立钩子警告】以下伏笔已开放超过{}章未推进，请本章兑现或明确推进：{}".format(
-                orphan_threshold, "；".join(f'{h["description"][:60]}(已{h["age"]}章)' for h in top)))
-    if result["expired"]:
-        top = sorted(result["expired"], key=lambda x: -x["priority"])[:3]
-        result["directives"].append(
-            "【过期钩子】以下伏笔已超过最佳兑现窗口，优先收束：{}".format(
-                "；".join(f'{h["description"][:60]}(窗口{h["half_life"]}章,已{h["age"]}章)' for h in top)))
-    return result
-
-
 def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | None = None) -> dict[str, Any]:
     """Return an entity's stored state. The entities table only keeps the latest
     state (no temporal history yet), so `chapter` is accepted for API forward-
@@ -619,34 +510,6 @@ def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | No
     except Exception:
         pass
     return {}
-
-def get_character_voice_notes(conn: Any, focus_names: list[str], limit: int = 6) -> list[dict[str, Any]]:
-    """Lightweight character-consistency baseline: for each focus character, return
-    a snapshot of their last-known stance/voice from the entities table's state
-    dict. Reuses the existing 'character' entity state (no new table). Used by the
-    reviewer to flag cross-chapter voice/stance drift. Returns at most `limit`
-    entries, preferring names in `focus_names` order."""
-    if not focus_names:
-        return []
-    # Keys in the free-form state dict that signal stance/voice/disposition.
-    stance_keys = ("立场", "态度", "心态", "性格", "声音", "语气", "策略", "目标", "处境", "voice", "stance", "disposition", "goal", "status")
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for name in focus_names:
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        state = entity_state_as_of(conn, "character", name)
-        if not isinstance(state, dict) or not state:
-            continue
-        snapshot = {k: v for k, v in state.items() if any(s in str(k) for s in stance_keys)}
-        if not snapshot:
-            # Fall back to the whole (small) state when no stance key matched.
-            snapshot = dict(list(state.items())[:4])
-        out.append({"name": name, "baseline": snapshot})
-        if len(out) >= limit:
-            break
-    return out
 
 def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, limit: int = 8) -> list[dict[str, Any]]:
     """Open threads explicitly typed as reader promises whose due_chapter has
@@ -936,23 +799,6 @@ def get_relationships(conn: Any, limit: int = 15) -> list[dict[str, Any]]:
                 item["history"] = []
             out.append(item)
         return out
-    except Exception:
-        return []
-
-
-def get_stale_relationships(conn: Any, chapter_num: int, stale_threshold: int = 8, limit: int = 6) -> list[dict[str, Any]]:
-    """Relationships not updated in `stale_threshold` chapters — need advancement."""
-    try:
-        with db_lock():
-            rows = conn.execute(
-                """SELECT pair_key, char_a, char_b, stage, intensity, last_event, updated_chapter
-                   FROM character_relationships
-                   WHERE stage NOT IN ('broken', 'resolution')
-                   AND (? - updated_chapter) >= ?
-                   ORDER BY intensity DESC LIMIT ?""",
-                (chapter_num, stale_threshold, limit),
-            ).fetchall()
-        return [dict(row) for row in rows]
     except Exception:
         return []
 

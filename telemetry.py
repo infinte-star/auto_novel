@@ -204,43 +204,6 @@ def record_event(novel: str, genre: str, chapter: int, kind: str, payload: dict[
         return False
 
 
-def record_arbitration(novel: str, genre: str, chapter: int, decision: dict[str, Any], plans: list[Any]) -> bool:
-    """Store the raw arbitration event AND flatten it into strategy_outcomes.
-
-    strategy_outcomes is what the cross-book bandit prior reads; keeping it
-    flat (one row per candidate strategy) makes the prior a single indexed
-    GROUP BY instead of a JSON-parsing scan over events.
-    """
-    ok = record_event(novel, genre, chapter, "plan_arbitration", {"decision": decision, "plans": plans})
-    try:
-        decision = decision or {}
-        plans = plans or []
-        sel_idx = int(decision.get("selected_index", 0) or 0)
-        score_map: dict[int, float] = {}
-        for s in decision.get("scores") or []:
-            if isinstance(s, dict):
-                try:
-                    score_map[int(s.get("index", -1))] = safe_score(s.get("score", 0))
-                except (TypeError, ValueError):
-                    continue
-        for i, plan in enumerate(plans):
-            if not isinstance(plan, dict):
-                continue
-            strat = str(plan.get("strategy") or "").strip()
-            if not strat:
-                continue
-            _execute_with_retry(
-                "INSERT OR REPLACE INTO strategy_outcomes"
-                "(novel_name, genre, chapter, strategy, score, selected, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (novel, genre or "_default", int(chapter), strat,
-                 float(score_map.get(i, 5.0)), 1 if i == sel_idx else 0, _now()),
-            )
-    except Exception:
-        pass
-    return ok
-
-
 def record_revise_pair(
     novel: str,
     genre: str,

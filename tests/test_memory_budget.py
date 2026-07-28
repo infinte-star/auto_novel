@@ -1,18 +1,19 @@
 """Unit tests for the P2/P3 pure functions.
 
-- memory._compressible_sections (compress-ratchet fix)
 - memory._pack_sections (the one section-packer behind all four context builders)
 - novel._parse_price_table (model-aware cost reporting)
 - writing._hook_directives_block (吸量包 opening injection)
 
-memory.memory_context/lite_memory_context need Paths+conn so their max_chars
-behavior is exercised indirectly via the budget helpers here plus the live
-replay/ablation harnesses.
+`memory.memory_context` needs Paths+conn, so its max_chars behavior is exercised
+indirectly via the budget helper here plus the live replay/ablation harnesses.
+The compress-ratchet tests went with `_compressible_sections`: v2 has no memory
+compression path at all (its context is `v2/canon.py`'s projection), so the whole
+chain was orphaned by v1's deletion.
 """
 import random
 import unittest
 
-from memory import _compressible_sections, _pack_sections
+from memory import _pack_sections
 from novel import _parse_price_table
 from writing import _hook_directives_block
 
@@ -80,31 +81,6 @@ class TestPackSections(unittest.TestCase):
         head = "# H"
         self.assertEqual(_pack_sections([], 10, head), head)
         self.assertEqual(_pack_sections([("甲", "x", 10)], 10, head), head)
-
-
-def _mem_file(n_sections: int) -> str:
-    parts = ["# bible header\n"]
-    for i in range(1, n_sections + 1):
-        parts.append(f"## Ch{i}\n- 事件 {i}\n")
-    return "".join(parts)
-
-
-class TestCompressibleSections(unittest.TestCase):
-    def test_below_keep_recent_is_zero(self):
-        self.assertEqual(_compressible_sections(_mem_file(10), 30), 0)
-
-    def test_exactly_keep_recent_is_zero(self):
-        self.assertEqual(_compressible_sections(_mem_file(30), 30), 0)
-
-    def test_excess_counted(self):
-        self.assertEqual(_compressible_sections(_mem_file(37), 30), 7)
-
-    def test_header_only_is_zero(self):
-        self.assertEqual(_compressible_sections("# just a header\nsome text\n", 30), 0)
-
-    def test_single_section_is_zero(self):
-        # compress_memory_file early-returns at <=2 split parts; trigger must agree.
-        self.assertEqual(_compressible_sections(_mem_file(1), 0), 0)
 
 
 class TestPriceTable(unittest.TestCase):

@@ -280,13 +280,12 @@ def load_config() -> dict[str, Any]:
         "novel": [
             "chapter_words",
             "target_words",
+            # Kept although no release rule reads it any more: it is still the
+            # number `writing._prewrite_quality_contract` tells the writer to aim
+            # for, so a config without it silently drops a line from the prompt.
             "quality_threshold",
-            "max_revision_rounds",
-            "candidate_plans",
             "min_plan_score",
             "recent_tail_chars",
-            "stage_review_every",
-            "repeat_window",
             "fatigue_window",
         ],
         "paths": [
@@ -530,10 +529,6 @@ def configured_role_endpoints(config: dict[str, Any], role: str) -> list[tuple[s
     return endpoints
 
 
-def configured_review_endpoints(config: dict[str, Any]) -> list[tuple[str, str]]:
-    """Backward-compatible wrapper: endpoints for the reviewer model."""
-    return configured_role_endpoints(config, "review")
-
 def get_paths(config: dict[str, Any]) -> Paths:
     raw = config["paths"]
     return Paths(
@@ -705,10 +700,6 @@ def narrative_mode(config: dict[str, Any]) -> str:
     return raw if raw in NARRATIVE_MODES else "balanced"
 
 
-def tail_text(path: Path, n_chars: int) -> str:
-    text = read_text(path)
-    return text[-n_chars:] if len(text) > n_chars else text
-
 def chapter_path(paths: Paths, chapter_num: int) -> Path:
     return paths.chapters_dir / f"{chapter_num:04d}.md"
 
@@ -751,46 +742,3 @@ def rebuild_book(paths: Paths) -> None:
     if chunks:
         write_text(paths.book, "\n\n".join(chunks) + "\n")
 
-
-def book_is_consistent(paths: Paths) -> bool:
-    """Cheap check that book.md already reflects every saved chapter file.
-
-    `save_chapter` builds book.md incrementally by appending each chapter, so in
-    the normal (non-corrupt) case book.md is already complete and the O(n)
-    `rebuild_book` (glob + read + sort + rewrite of the whole multi-MB file) is
-    pure waste on the resume path. This guard lets the caller skip rebuild when
-    book.md is demonstrably consistent with chapters/.
-
-    Conservative by design: ANY doubt (missing book.md, can't read a chapter,
-    last chapter's body not found in book.md) returns False so the caller falls
-    back to a full rebuild. It never reports a stale/short book as consistent.
-
-    Verification is intentionally lightweight (no full O(n) concat compare):
-      1. book.md exists and is non-empty.
-      2. The highest-numbered chapter file's stripped body is a substring of
-         book.md — i.e. the most recent append landed. A truncated/older book.md
-         (the only state rebuild actually needs to fix on resume) fails here.
-    """
-    if not paths.book.exists():
-        return False
-    if not paths.chapters_dir.exists():
-        # No chapters at all -> nothing to rebuild from; treat as consistent.
-        return True
-    chapter_files = [p for p in paths.chapters_dir.glob("*.md") if p.stem.isdigit()]
-    if not chapter_files:
-        return True
-    try:
-        book_text = read_text(paths.book)
-    except OSError:
-        return False
-    if not book_text.strip():
-        return False
-    last_file = max(chapter_files, key=lambda p: int(p.stem))
-    try:
-        last_body = read_text(last_file).strip()
-    except OSError:
-        return False
-    if not last_body:
-        # An empty last chapter file is odd; rebuild to be safe.
-        return False
-    return last_body in book_text
