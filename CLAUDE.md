@@ -146,7 +146,7 @@ and why `api.stream: true` is mandatory for one of them: LESSONS §1. Check
 | `checkpoint.py` | per-stage checkpoints + resume detection |
 | `llm.py` | streaming, timeouts, salvage, JSON repair, refusal retry |
 | `config.py` | YAML-subset config, paths, endpoints, `is_final_chapter` |
-| `telemetry.py` | cross-book sink `telemetry/global.db` (write-only observer) |
+| `telemetry.py` | cross-book sink `telemetry/global.db` (write-only observer; populated by `telemetry backfill` only, never by a run) |
 | `refine.py`, `fossil_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
 | `compare.py` | `compare` / `ablate` / `fork` experiment harness |
 | `trial.py`, `benchmark.py` | opening trials, local sample library |
@@ -367,9 +367,12 @@ report. One is now settled:
   so a repair that ignored a continuity CRITICAL or the scene similarity came back
   with an empty `still` and was filed as fixed — the same omitted-argument shape as
   `style_health`'s missing `em_history`, one row above.
-- `telemetry_enabled` — `telemetry.py` reads it nowhere, so telemetry cannot be
-  turned off. Harmless (strict observer) but the config file makes a promise it
-  does not keep.
+- ~~`telemetry_enabled`~~ — **settled 2026-07-28 and deleted from both templates.**
+  It described v1's per-chapter dual-write, which no longer happens at all; the only
+  populator is the user-typed `telemetry backfill`, and a config key vetoing that
+  would be wrong rather than missing. The census's real find here was next door: the
+  backfill's event filter was v1-only, so a v2 book imported zero events. Both are in
+  the telemetry section above.
 
 `compare.py`'s `RELEASE_RULE_KEYS` still names several deleted keys, and that is
 deliberate: it is a *guard* list, not a reader. Every already-written
@@ -552,8 +555,20 @@ ablation/fork report instead of a hand-compared full rerun.
 Each novel has its own `story_state.db`; `telemetry.py` is the ONE shared sink
 (`telemetry/global.db`, WAL, one fresh connection per write so N processes write
 concurrently). Strict observer / safe no-op: any failure returns an empty value and
-never stalls a chapter. Currently **write-only** (logging + `telemetry stats`) —
-the consumption layers were deleted; see LESSONS §9.
+never stalls a chapter. Currently **write-only** — the consumption layers were
+deleted; see LESSONS §9.
+
+**Nothing writes it during a run.** The per-chapter dual-writers were v1's, so the
+only populator today is the user-typed `novel.py telemetry backfill`, which
+reconstructs from each book's own `story_state.db` + checkpoints. Two consequences:
+there is deliberately **no `telemetry_enabled` knob** (a config key cannot
+sensibly veto a command the user just typed), and **which events reach the sink is
+`telemetry.IMPORTED_EVENT_TYPES`, not "all of them"**. That tuple was v1-only until
+2026-07-28, so a v2-written book imported ZERO events and reported success
+(`v2smoke`: 0 of 19). `strategy_outcomes` and `revise_pairs` are still empty on a
+v2 book and correctly so — the first flattens a plan committee v2 does not have,
+the second reads `chapter_revised_round*.md` files v2 never writes because L0/L1
+splice in place. REDESIGN_V2 §9.11.4.
 
 ### Memory (`memory.py`)
 v2 gets its per-chapter context from `v2/canon.py`, so `memory.py` survives for

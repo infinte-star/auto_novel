@@ -880,7 +880,7 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 | --- | --- |
 | `style_em_dash_trend_window` | 没有任何调用点给 `style_health` 传 `em_history`（`v2/accept.py:608` 只传 text+config），于是 `recent_mean` 恒为 `None`，**破折号趋势项在 v2 里从不发火**。那正是抓到 gudai50_v2 Ch20-24 从 6.6 爬到 8.8、而静态档在 +1.0 上躺平的那一项。**已于 2026-07-28 接上，结算见 §9.11.2**——其中「尺子建模了一个引擎不执行的门」这句原判是错的，`_restamp_style_penalty` 的 `if not old_em` 让它碰不到 v2 载荷。 |
 | `scene_dedupe_sim_warn`、`scene_dedupe_candidate_block` | v1 的三级升级（WARN 追加 `required_constraints` / BLOCK 重试 / 0.97 绝对天花板）只剩 BLOCK 一级：`arc.validate_card` 只收一个 `scene_sim_block`。另两级住在被删的 `review.py`/`planning.py` 里。**已于 2026-07-28 结算：判为死键并删除，结算见 §9.11.3**——它们不是断掉的接线，是高于实测区间的阈值。 |
-| `telemetry_enabled` | `telemetry.py` 根本不读它，遥测关不掉。无害（严格观察者），但配置文件许下了一个它不兑现的承诺。 |
+| `telemetry_enabled` | `telemetry.py` 根本不读它，遥测关不掉。无害（严格观察者），但配置文件许下了一个它不兑现的承诺。**已于 2026-07-28 结算：删键，而真缺陷是 backfill 的事件过滤器只认 v1 事件类型，见 §9.11.4。** |
 
 `compare.py` 的 `RELEASE_RULE_KEYS` 仍然点名若干已删的键，这是**故意的**：
 它是一张*警戒*名单而不是读者。已经写出来的每一本 `novels/*/config.yaml` 都还带着那些键，
@@ -1051,3 +1051,52 @@ WARN 行删掉，BLOCK 行改成同时认中文消息。
 首过判决里该出现的相似度问题消失、写手拿到的是修复前那张卡的 advisories。
 第四个用例（改了场地的修复被接受，且只花一次修复调用）在两种写法下都过，
 它守的是「这个修正不会把每次修复的成本翻倍」。测试 785 → 789 全绿。
+
+### 9.11.4 `telemetry_enabled`：旋钮删掉，而全局库其实看不见 v2（2026-07-28）
+
+§9.11 的第三条、也是最后一条待决接线。原判是「`telemetry.py` 不读它，遥测关不掉」。
+查完调用图，这句话的前提就不成立：**运行期根本没有任何东西写遥测**。
+`record_chapter_metrics` / `record_event` / `record_revise_pair` 的调用点只有同模块的
+`backfill_novel`，而 `backfill` 只由手敲的 `novel.py telemetry backfill` 触发——
+每章双写是 v1 的行为，随 v1 一起删掉了。所以那个键描述的不是一条断线，
+**是一件已经不存在的事**；而用一个配置键去否决用户刚敲下的命令没有道理。
+判定：**删键**（两份模板同改，`config.py` 的 `required` 里本来就没有它）。
+
+**真缺陷在隔壁一行。** `_iter_source_rows` 的事件过滤器写死了四个类型
+（`plan_arbitration` / `cold_reader` / `quality_debt` / `panel_report`），
+**四个全是 v1 的**。于是一本 v2 写的书 backfill 完事件数为 **0**，而命令报告成功。
+`v2smoke`（唯一没有 v1 历史的书）实测 **19 个事件里 0 个可见**——
+又是这一轮反复出现的那个形状：**一个 0 同时意味着「没测」和「这本书没什么可报的」**。
+两个 v2 臂看着有 394 / 317 个可见事件，那些全是 fork 继承来的 v1 行。
+
+拓宽后（`IMPORTED_EVENT_TYPES` 常量，SQL 从它生成，避免两处漂移）：
+
+| 书 | 之前 | 之后 |
+| --- | --- | --- |
+| `v2smoke`（纯 v2） | 0 | 7 |
+| `ts_v2arm` | 394 | 469 |
+| `ts_v2match` | 317 | 381 |
+| 全库 | 2,462 | **2,674** |
+
+进来的是每一条返工/降级信号：`v2_rescue` / `v2_repair_l0` / `v2_repair_l1` /
+`card_repair` / `card_unresolved` / `card_degraded` / `card_single_replan` /
+`arc_generated` / `v2_chapter_trace` / `delta_missing`，外加两个引擎都发的
+`gate_reject`（它也一直不在名单里）。**故意不进**的是 `story_event`
+（每本 ~1.2k 行，那是正典而不是遥测，抄进来就等于给每本书的状态开第二个写者）
+与纯记账的 `chapter_completed` / `chapter_extraction` / `bootstrap`。
+
+**另外两张表在 v2 上是空的，而这是对的，不是坏的。** `strategy_outcomes` 摊平的是
+一个 v2 没有的计划委员会；`revise_pairs` 读 `chapter_revised_round*.md`，
+v2 从不写这种文件——L0/L1 是就地缝补而不是整章重roll，所以没有 before/after 对，
+而它记的分正是发布规则拒绝使用的自评分。两者都写进模块 docstring，
+免得下一个人把「空」当成缺陷来修。
+
+**这次修正今天买不到任何可测收益，必须说清楚。** 全局库没有消费层（LESSONS §9），
+而 backfill 从各书自己的 `story_state.db` 重建、可以随时重跑，所以数据一天也没丢。
+值得现在改的理由只有一条：第一个消费者读到的会是「v2 的书没有返工事件」，
+那是假的。一行 SQL 换一个假零，划算。
+
+测试是新增的 `tests/test_telemetry_backfill.py`，走真 SQLite + 真 `store.db_event` 的缝
+（直接断言 `IMPORTED_EVENT_TYPES` 的测试在 SQL 与常量漂移之后还会通过），
+并且**只读**——`_iter_source_rows` 不碰全局库，测试不会污染 `telemetry/global.db`。
+反证：把常量改回四个 v1 类型，2 挂。测试 789 → 793 全绿。

@@ -343,10 +343,12 @@ novel:
   # 防止 premise 枯竭/上下文污染时全速烧 token（v11 曾连烧 5 章 21 次 replan）。设 0 关闭。
   quality_breaker_consecutive: 2
   # 跨书学习层（全局 telemetry 仓库 telemetry/global.db）
-  # genre：题材标签，全局库按 genre 分桶
+  # genre：题材标签，全局库按 genre 分桶。**唯一还被 telemetry 读的键**。
   genre: _default
-  # telemetry_enabled：每章把 metrics/仲裁/修订对/冷读结果异步双写进全局库（失败静默，不影响生成）
-  telemetry_enabled: true
+  # telemetry_enabled 已删除（2026-07-28）：它描述的「每章异步双写全局库」是 v1 的行为，
+  # 随 v1 一起没了；今天全局库只由手敲的 `novel.py telemetry backfill` 从各书自己的
+  # story_state.db 重建。一个配置键否决用户刚敲下的命令是没有道理的，所以这个旋钮
+  # 不是缺了接线，而是没有可关的东西。详见 REDESIGN_V2 §9.11.4。
   # 章节级语义去重（阻止无限切片同一场景）。**单级**：卡片骨架与近 window 章的
   # Jaccard 相似度 >= scene_dedupe_sim_block 时，写作前退回重修一次卡片
   # （v2/beat.py:_scene_sim，一次便宜调用，不是废稿）。

@@ -6,13 +6,28 @@ aggregated so the engine can learn ACROSS books instead of restarting from
 zero on every new novel:
 
   - chapter_metrics   per-chapter review scores (copied from each book's db)
-  - events            raw cross-book events (plan_arbitration / cold_reader /
-                      panel_report / quality_debt ...)
+  - events            raw cross-book events, filtered by `IMPORTED_EVENT_TYPES`
   - strategy_outcomes plan_arbitration flattened to one row per candidate
                       strategy, so the planning bandit can read a cross-book
                       prior with a single indexed query (no JSON parsing)
   - revise_pairs      before/after revision text + review verdicts — natural
                       preference pairs for future fine-tuning
+
+Two of those four tables are v1-shaped and stay empty on a v2 book, for opposite
+reasons. `strategy_outcomes` flattens a plan committee v2 does not have. And
+`revise_pairs` reads `chapter_revised_round*.md`, which v2 never writes: its L0/L1
+fixers splice passages in place instead of re-rolling a chapter, so there is no
+before/after pair to record and its scores would be the self-score the release
+rule already refuses to use. Both are correctly empty, not broken — unlike the
+`events` filter, which was silently v1-only until 2026-07-28 (see
+`IMPORTED_EVENT_TYPES`).
+
+**Nothing writes here during a run.** The live writers were v1's; today the sink
+is populated only by the explicitly-typed `novel.py telemetry backfill`, which
+reconstructs everything from each book's own `story_state.db` and checkpoints. So
+`record_*` being reachable is a capability, not a running cost — and there is
+deliberately no `telemetry_enabled` knob, because a config key cannot sensibly
+veto a command the user just typed.
 
 Design constraints (load-bearing):
   * NEVER block or break the generation pipeline. Every public writer returns
@@ -258,6 +273,32 @@ def _unwrap_checkpoint(path: Path) -> Any:
     return data
 
 
+#: Event types worth importing into the cross-book sink. Everything else in a
+#: book's `events` table is canon bulk (`story_event`, ~1.2k rows/book),
+#: bookkeeping (`chapter_completed`, `chapter_extraction`, `bootstrap`), or
+#: already carried by `chapter_metrics`.
+#:
+#: The four v1 names came first, and after v1's deletion they were ALL of it —
+#: so a v2-written book imported ZERO events while reporting success. Measured
+#: on `v2smoke`, the only book with no v1 history: 0 of its 19 events were
+#: visible here. That zero reads exactly like "this book had nothing to report".
+#: The v2 rows are the ones a future consumer would actually want — every one of
+#: them is a rework or a degradation, which is what the sink exists to compare
+#: across books. `gate_reject` is emitted by both engines and was missing too.
+IMPORTED_EVENT_TYPES = (
+    # v1 (still most of the archive)
+    "plan_arbitration", "cold_reader", "quality_debt", "panel_report",
+    # both engines
+    "gate_reject",
+    # v2: card trouble before a word is written
+    "arc_generated", "card_repair", "card_single_replan", "card_unresolved",
+    "card_degraded",
+    # v2: rework and per-chapter trace
+    "v2_repair_l0", "v2_repair_l1", "v2_rescue", "v2_chapter_trace",
+    "delta_missing",
+)
+
+
 def _iter_source_rows(novel_dir: Path, cfg: dict[str, dict[str, Any]]):
     """Yield ("metrics"|"event", row_dict) from the book's own SQLite store."""
     db_rel = str((cfg.get("paths") or {}).get("database") or "")
@@ -269,9 +310,11 @@ def _iter_source_rows(novel_dir: Path, cfg: dict[str, dict[str, Any]]):
             try:
                 for r in src.execute("SELECT * FROM chapter_metrics"):
                     yield "metrics", dict(r)
+                placeholders = ",".join("?" * len(IMPORTED_EVENT_TYPES))
                 for r in src.execute(
                     "SELECT id, chapter, event_type, payload, created_at FROM events"
-                    " WHERE event_type IN ('plan_arbitration','cold_reader','quality_debt','panel_report')"
+                    f" WHERE event_type IN ({placeholders})",
+                    IMPORTED_EVENT_TYPES,
                 ):
                     yield "event", dict(r)
             finally:

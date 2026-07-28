@@ -399,8 +399,23 @@ them.
 
 Recovery point: git commit `9dd1ec0` and earlier. Bring them back when the
 library reaches the scale where they beat noise (**≥5 finished books**), not
-before. Telemetry itself stays: it is write-only today (logging +
+before. Telemetry itself stays: it is write-only today (`telemetry backfill` +
 `telemetry stats`), which is cheap and keeps the sample accumulating.
+
+**"Keeps the sample accumulating" was half true, and the false half is the
+lesson** (measured 2026-07-28). Nothing writes telemetry during a run any more —
+the per-chapter dual-writers were v1's — so the sink is populated only by the
+user-typed `novel.py telemetry backfill`, which reconstructs from each book's own
+`story_state.db`. That part is fine: the primary data persists, so the sample is
+not lost. What was actually broken is that backfill's event filter named four
+**v1-only** event types, so a v2-written book imported **zero** events and
+reported success (`v2smoke`, the only book with no v1 history: 0 of 19 events
+visible). A dormant sink is cheap; a dormant sink that will hand its first
+consumer "v2 books have no rework events" is not. Widening the filter moved the
+library from 2,462 to 2,674 imported events, +75 on the biggest v2 arm.
+`telemetry_enabled` was deleted in the same pass — it described the dead
+per-chapter path, and a config key vetoing a command the user just typed makes no
+sense. REDESIGN_V2 §9.11.4.
 
 The 3 BeatCoverage test failures observed during that refactor are historical
 leftovers, not regressions from it.
