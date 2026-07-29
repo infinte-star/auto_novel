@@ -56,8 +56,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-import config as config_mod  # noqa: E402
-import quality  # noqa: E402
+import engine.config as config_mod  # noqa: E402
+import engine.quality as quality  # noqa: E402
 from gate_census import _advised, _fired  # noqa: E402
 from fpy_prime import discover_novels, print_exclusions  # noqa: E402
 
@@ -275,7 +275,7 @@ def archived_plan(novel: Path, chapter: int) -> dict[str, Any] | None:
     card = _checkpoint_payload(d / "chapter_card.json")
     if isinstance(card, dict) and card.get("payoff_type") is not None:
         try:
-            import arc
+            import engine.plan as arc
 
             plan, _ = arc.card_to_plan(card)
             return plan

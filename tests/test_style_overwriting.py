@@ -6,7 +6,7 @@ floor, and the tech-jargon × dialogue-starvation conjunction.
 """
 import unittest
 
-from quality import style_health
+from engine.quality import style_health
 
 
 def _cfg(**novel_keys):
@@ -147,7 +147,7 @@ class TestEmDashPenaltyIsTheSameArithmetic(unittest.TestCase):
         return "第7章 标题\n\n" + body + "——" * dashes
 
     def test_graduated_ladder_by_ratio(self):
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
         # Below the static warn line, so only the trend term speaks. The ladder is
         # what stopped a 1.9× rise from stacking to the 2.0 block line.
         for base, em, want in ((2.0, 3.8, 0.3),    # 1.90x
@@ -163,13 +163,13 @@ class TestEmDashPenaltyIsTheSameArithmetic(unittest.TestCase):
         # tangshuting Ch6 verbatim: 6.36/k against a 3.37/k mean. Under the old flat
         # charge this was 1.0 + 1.0 = 2.0 = `style_penalty_block` exactly, i.e. a
         # "collapse". Today it is 1.3 and the chapter is merely warned.
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
         pen, _, _ = em_dash_penalty(6.36, 3.37, _cfg())
         self.assertAlmostEqual(pen, 1.3)
         self.assertLess(pen, 2.0)
 
     def test_a_real_collapse_still_reaches_the_block_line(self):
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
         # yeban_guize Ch9: 7.18/k vs 2.20/k = 3.3x -> 1.0 static + 1.0 trend.
         self.assertAlmostEqual(em_dash_penalty(7.18, 2.20, _cfg())[0], 2.0)
         # Overload alone blocks with no baseline at all.
@@ -180,13 +180,13 @@ class TestEmDashPenaltyIsTheSameArithmetic(unittest.TestCase):
         self.assertTrue(any(f.startswith("em_dash_sustained") for f in flags))
 
     def test_no_baseline_suppresses_trend_and_sustained(self):
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
         pen, flags, _ = em_dash_penalty(5.0, None, _cfg())
         self.assertEqual(pen, 0.0)
         self.assertEqual(flags, [])
 
     def test_noise_floor_and_absolute_delta_still_guard_the_trend(self):
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
         # A 3x rise below the 1.5/k floor is noise, not drift.
         self.assertEqual(em_dash_penalty(1.2, 0.4, _cfg())[0], 0.0)
         # A big multiplicative rise with a sub-1.0/k absolute delta is too.
@@ -194,7 +194,7 @@ class TestEmDashPenaltyIsTheSameArithmetic(unittest.TestCase):
 
     def test_style_health_charges_exactly_what_the_helper_says(self):
         """The extraction must be behaviour-preserving, measured on real text."""
-        from quality import em_dash_penalty, style_health
+        from engine.quality import em_dash_penalty, style_health
         cfg = _cfg()
         for dashes, hist in ((0, None), (8, None), (8, [1.0, 1.2]),
                              (20, [1.0, 1.2]), (20, [7.0, 8.0])):

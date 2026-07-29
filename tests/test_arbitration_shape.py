@@ -27,7 +27,7 @@ Zero LLM calls: every function under test is pure.
 """
 import unittest
 
-from quality import (_coerce_index, _normalize_decision, decision_has_score,
+from engine.quality import (_coerce_index, _normalize_decision, decision_has_score,
                      plan_score)
 
 GOOD = {

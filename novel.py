@@ -158,29 +158,23 @@ def _run_inprocess(name: str) -> int:
         # `compare.cmd_fork --flip` can only flip config keys — which is what
         # makes the v1/v2 A/B a single-variable HEAD fork with two
         # byte-identical arms instead of two hand-built runs.
-        from config import load_config  # noqa: E402  (after env vars, same as below)
+        from engine.config import load_config  # noqa: E402  (after env vars, same as below)
 
-        engine = str(load_config()["novel"].get("engine", "v2")).strip().lower()
-        if engine in ("", "v2"):
-            from v2.run import main  # noqa: E402  (must import after env vars are set)
+        engine = str(load_config()["novel"].get("engine", "v3")).strip().lower()
+        if engine in ("", "v3", "v2"):
+            from engine.loop import main  # noqa: E402
         elif engine == "v1":
-            # v1 (pipeline/planning/review/taxonomy) was DELETED after the
-            # matched-position A/B settled it (docs/REDESIGN_V2.md §9.7). An
-            # existing config still saying `engine: v1` must be told, not quietly
-            # run on v2 — the two engines write different checkpoint labels and
-            # review payload keys, so a silent switch mid-book is a measurement
-            # forgery as much as a behaviour change.
             print(f"[novel] ERROR: novel.engine: v1 in {config_path}, but the v1 "
-                  f"engine was removed. Set `engine: v2` (or delete the key — v2 "
+                  f"engine was removed. Set `engine: v3` (or delete the key — v3 "
                   f"is the default). v1 is recoverable from git history if you "
                   f"need it: see docs/REDESIGN_V2.md §9.7 for what settled it.")
             return 2
         else:
             print(f"[novel] ERROR: unknown novel.engine {engine!r} in {config_path} "
-                  f"(expected v2). Refusing to guess — picking the wrong engine "
+                  f"(expected v3). Refusing to guess — picking the wrong engine "
                   f"would silently write the chapter with the other one.")
             return 2
-        print(f"[novel] engine={engine or 'v2'}")
+        print(f"[novel] engine={engine or 'v3'}")
         main()
         return 0
     finally:
@@ -202,7 +196,7 @@ def _set_novel_env(name: str) -> tuple[Path, Path]:
 def cmd_trial(name: str, variants: int | None, chapters: int | None) -> int:
     _validate_name(name)
     _set_novel_env(name)
-    from trial import run_opening_trial  # noqa: E402
+    from commands.trial import run_opening_trial  # noqa: E402
 
     out = run_opening_trial(variants=variants, chapters=chapters)
     print(f"[novel] opening trial complete: {out}")
@@ -262,7 +256,7 @@ def cmd_script(
       * <name> --chapters A-B                convert chapters A..B of novels/<name>/
       * <name>                               convert the whole novels/<name>/book.md
     """
-    from screenplay import convert_file, convert_text
+    from commands.screenplay import convert_file, convert_text
 
     # Standalone file mode (no novel name needed).
     if input_path:
@@ -306,7 +300,7 @@ def cmd_script(
         return 2
 
     out_path = Path(out).resolve() if out else default_out
-    import config as _config
+    import engine.config as _config
 
     # _set_novel_env set NOVEL_CONFIG, but config.py captured CONFIG_FILE at import;
     # refresh it so load_config()/get_paths() read this novel's config.
@@ -1427,9 +1421,9 @@ def cmd_package(name: str) -> int:
     """
     _validate_name(name)
     _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
-    from config import get_paths, load_config, read_text  # noqa: E402
-    from llm import build_client  # noqa: E402
-    from package import build_package  # noqa: E402
+    from engine.config import get_paths, load_config, read_text  # noqa: E402
+    from engine.llm import build_client  # noqa: E402
+    from commands.package import build_package  # noqa: E402
 
     config = load_config()
     paths = get_paths(config)
@@ -1453,10 +1447,10 @@ def cmd_refine(name: str) -> int:
     logs/refine/ checkpoints."""
     _validate_name(name)
     _set_novel_env(name)  # sets NOVEL_CONFIG/NOVEL_PROMPT before importing config-bound code
-    from config import get_paths, load_config, read_text  # noqa: E402
-    from llm import build_client  # noqa: E402
-    from store import init_db  # noqa: E402
-    from refine import refine_book  # noqa: E402
+    from engine.config import get_paths, load_config, read_text  # noqa: E402
+    from engine.llm import build_client  # noqa: E402
+    from engine.store import init_db  # noqa: E402
+    from commands.refine import refine_book  # noqa: E402
 
     config = load_config()
     paths = get_paths(config)
@@ -1492,7 +1486,7 @@ def cmd_telemetry_backfill() -> int:
     telemetry/global.db. Idempotent: INSERT OR REPLACE on composite keys, so
     re-running never duplicates rows."""
     try:
-        import telemetry
+        import commands.telemetry as telemetry
     except Exception as exc:
         print(f"[novel] telemetry module unavailable: {exc}")
         return 1
@@ -1525,7 +1519,7 @@ def cmd_telemetry_backfill() -> int:
 
 def cmd_telemetry_stats(genre: str | None) -> int:
     try:
-        import telemetry
+        import commands.telemetry as telemetry
     except Exception as exc:
         print(f"[novel] telemetry module unavailable: {exc}")
         return 1
@@ -1673,14 +1667,14 @@ def main() -> int:
     if args.command == "refine":
         return cmd_refine(args.name)
     if args.command == "compare":
-        from compare import cmd_compare
+        from commands.compare import cmd_compare
         return cmd_compare(args.name_a, args.name_b, ch_from=args.ch_from, ch_to=args.ch_to)
     if args.command == "ablate":
-        from compare import cmd_ablate
+        from commands.compare import cmd_ablate
         return cmd_ablate(args.name, flip_key=args.flip, set_value=args.set_value, chapters=args.chapters)
 
     if args.command == "fork":
-        from compare import cmd_fork
+        from commands.compare import cmd_fork
         return cmd_fork(args.name, as_name=args.as_name, flip_key=args.flip,
                         set_value=args.set_value, chapters=args.chapters)
     if args.command == "telemetry":
@@ -1689,7 +1683,7 @@ def main() -> int:
         if args.telemetry_command == "stats":
             return cmd_telemetry_stats(genre=args.genre)
     if args.command == "fix-fossils":
-        from fossil_fix import cmd_fix_fossils
+        from commands.fossil_fix import cmd_fix_fossils
         return cmd_fix_fossils(
             args.name, dry_run=args.dry_run,
             max_keep=args.max_keep,

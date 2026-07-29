@@ -13,7 +13,7 @@ import json
 import sqlite3
 import unittest
 
-import quality
+import engine.quality as quality
 
 
 def _db(flows: list[list[str]], payoff: str = "reveal", conflict: str = "personnel"):

@@ -209,7 +209,7 @@ class ContractIntegrityTest(unittest.TestCase):
                          {"turn", "forbid"})
 
     def test_the_proxy_loses_a_hard_field_and_the_tool_knows_which(self):
-        from v2.accept import HARD_FIELDS
+        from engine.loop import HARD_FIELDS
         lost = set(HARD_FIELDS) - set(ccr.PROXY_FIELDS)
         self.assertEqual(lost, {"turn"},
                          "if the hard set changes, the header text that names the "

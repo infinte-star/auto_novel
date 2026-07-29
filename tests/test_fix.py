@@ -23,9 +23,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import fix
-import fossil_fix
-from quality import REGISTRY
+import engine.quality as fix
+import commands.fossil_fix as fossil_fix
+import engine.quality as _engine_quality
+from engine.quality import REGISTRY
 
 
 def _config(**novel) -> dict:
@@ -178,7 +179,7 @@ class L1ExitsAreAudibleTest(unittest.TestCase):
 
     def test_expand_says_so_when_the_call_returns_nothing_usable(self):
         text = "第1章 门\n\n" + "他推开门，铁锈味涌了出来，灯在头顶晃。" * 3
-        with mock.patch.object(fix, "_numbered_rewrite", return_value={}):
+        with mock.patch.object(_engine_quality, "_numbered_rewrite", return_value={}):
             out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=3000),
                                      9, text, {})
         self.assertEqual(out, text)
@@ -188,7 +189,7 @@ class L1ExitsAreAudibleTest(unittest.TestCase):
     def test_expand_says_so_when_the_splice_did_not_grow_the_chapter(self):
         para = "他推开门，铁锈味涌了出来，灯在头顶晃。" * 3
         text = f"第1章 门\n\n{para}"
-        with mock.patch.object(fix, "_numbered_rewrite", return_value={0: "他推开门。"}):
+        with mock.patch.object(_engine_quality, "_numbered_rewrite", return_value={0: "他推开门。"}):
             out = fix.expand_to_band(None, self.paths, _config(chapter_min_chars=3000),
                                      10, text, {})
         self.assertEqual(out, text)
@@ -196,7 +197,7 @@ class L1ExitsAreAudibleTest(unittest.TestCase):
 
     def test_dialogue_says_so_when_the_call_returns_nothing_usable(self):
         text = "第1章 门\n\n" + "他推开门，铁锈味涌了出来，灯在头顶晃了一下。" * 4
-        with mock.patch.object(fix, "_numbered_rewrite", return_value={}):
+        with mock.patch.object(_engine_quality, "_numbered_rewrite", return_value={}):
             out = fix.inject_dialogue(None, self.paths, _config(), 11, text, {})
         self.assertEqual(out, text)
         self.assertIn("L1 dialogue discarded Ch11", self._log_text())

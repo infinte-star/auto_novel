@@ -10,7 +10,6 @@ api:
   base_url: "https://api.example.com/v1"
   api_key: "sk-YOUR-API-KEY-HERE"
   api_keys: ""
-  user_agent: "claude-cli/2.1.177 (external, cli)"
   # 注意：多篇小说并行运行时共享同一批 API key 的 RPM/TPM 配额，
   # 如需隔离请给不同小说分配不同的 api_key / api_key_groups。
   # 端点优先级：api_key_groups 里的端点全部是 primary（轮询顺序即列出顺序），
@@ -95,19 +94,21 @@ api:
   planning_model:
   planning_thinking_mode: auto
   planning_thinking_budget_tokens: 0
-  # 写作（write/revise/beat_repair/refine_rewrite）→ gemini-2.5-pro（文学质感/长上下文）
-  # 注1：该端点非流式必 nginx 504，必须保持 api.stream: true（引擎默认流式）。
-  # 注2：gemini 默认思考链跑满 ~70s 才吐第一个字，超过网关 504 阈值。实测
-  #      thinking_mode=auto（不发参数）与 thinking:{type:disabled} 都 504，
-  #      只有 OpenAI 式 reasoning_effort: none 能压住（首字 ~29s / 3.1k 字约 170s）。
-  #      writing_reasoning_effort 由 llm.py 注入 extra_body 顶层；留空即不发该参数。
+  # 写作（write/revise/beat_repair/refine_rewrite）→ **留空，继承主力模型**。
+  # 曾默认 gemini-2.5-pro @ littlesheep，已撤下：已结算的 v2 臂（ts_v2match）四对角色键
+  # 全空、全书单端点单模型跑完 200 章，那才是被验证过的配置；一本新书默认就带上第二个
+  # 网关，等于把一个未受控变量装进出厂配置。
+  # gemini 那两条实测结论留档（换回去时会再撞上，别重新发现一遍）：该端点非流式必
+  # nginx 504（api.stream 必须 true）；gemini 思考链跑满 ~70s 才吐首字，也会 504，
+  # thinking_mode=auto 与 thinking:{type:disabled} 都压不住，只有 OpenAI 式
+  # reasoning_effort: none 能压住（首字 ~29s）。
   writing_base_url: ""
   writing_api_key: ""
   writing_keys:
-  writing_model: gemini-2.5-pro
+  writing_model:
   writing_thinking_mode: auto
   writing_thinking_budget_tokens: 0
-  writing_reasoning_effort: none
+  writing_reasoning_effort:
   # 提取（extract/state_update/memory_compress）→ deepseek-v4-flash @ littlesheep（便宜结构化）
   extraction_base_url: ""
   extraction_api_key: ""
@@ -125,16 +126,11 @@ api:
 
 novel:
   # ── 引擎选择（REDESIGN v2）──────────────────────────────────────────────────
-  # v2（默认，唯一）：v2/run.py 的确定性决策表 —— 每章 2 次模型调用（write 一次出
-  #     正文+ChapterDelta，canon 一次举证式核对），每 10 章一次 arc 规划，修复只走
-  #     L0/L1。验收全部走 quality.hard_block_reasons，自评分不参与任何门。
-  # v1（pipeline.py 五阶段委员会）已在等位置 A/B 结算后删除：FPY′ 96.7% vs 86.7%、
-  #     2.50 vs 25.77 调用/章、盲判未测出 v2 更差（docs/REDESIGN_V2.md §9.7）。
-  #     写 `engine: v1` 会得到一条明确报错而不是静默跑 v2——两个引擎的 checkpoint
-  #     标签与 review payload 键不同，静默切换等于伪造测量。
-  # **不设为 required**：磁盘上已有的每本书的 config.yaml 都没有这个键，把它设成
-  # 必填会让所有存量书立刻加载失败，而 v2 是一个完全正确的默认值。
-  engine: v2
+  # v3（默认）：engine/loop.py —— v2 的确定性决策表合并为 6 模块，删除零值路径
+  #     （LLM canon check、9 advisory gates），每章 ~1.5 次模型调用。
+  # v2：v2/run.py 兼容别名，通过 backward compat stub 走同一套代码。
+  # v1（已删除）：写 `engine: v1` 会得到明确报错。
+  engine: v3
   # ── 题材检测 profile（config.py:genre_detection_profile）───────────────────
   # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
   # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
@@ -181,12 +177,6 @@ novel:
   arc_span: 10                   # 每次弧规划覆盖的章数（3-20，越大越省但越远的卡片越可能失准）
   arc_max_tokens: 32000          # 一次要出 arc_span 张卡片，输出预算必须够
   arc_temperature: 0.75
-  # ①(b) 密集章分场景顺序出稿（正交开关，默认 false=opt-in，不影响现有书）：beat 数≥min 时把该章
-  # 拆成 ≤max_segments 段、逐段只写少量 beat 并承接上段结尾，最后拼接。降低单次多目标挤压，让密集
-  # 章写透而非清单化。任一段失败自动回退单次出稿。群像/多线密集书建议开启。
-  scene_drafting_enabled: false
-  scene_draft_min_beats: 5
-  scene_draft_max_segments: 3
   # Temperature spread for parallel candidate-plan generation. Candidate i uses
   # temp_base + i*temp_step (clamped to 1.1). A wider spread is the cheapest
   # defense against the candidates converging into near-identical drafts: low-temp
@@ -194,7 +184,6 @@ novel:
   # 0.60 / 0.72 / 0.84 for 3 candidates.
   plan_candidate_temp_base: 0.6
   plan_candidate_temp_step: 0.12
-  recent_tail_chars: 5000
   fatigue_window: 12
   context_budget_reserve_chars: 40000
   # Bounds the ThreadPoolExecutor used for parallel candidate-plan generation,
@@ -210,11 +199,8 @@ novel:
   candidate_chapters: 1
   prewrite_quality_contract: true
   prewrite_dimension_floor: 7.7
-  # P2 降本：规划侧上下文预算。plan_memory_chars 封顶候选生成/场景分解用的 4-tier
-  # memory_context（v12 实测每次候选 prompt ~168K 字、占全书成本 49%；tier1/2 总能装下，
-  # tier3/4 截断）。plan_arbitrate_memory_chars 是仲裁改用 lite 上下文后的专用预算
-  # （仲裁只做"选择"，候选大纲+agent 报告已在 prompt 里）。设 0 恢复旧行为（不封顶）。
-  plan_memory_chars: 60000
+  # 上下文预算（v12 实测 memory_context 每次 prompt ~168K 字、占全书成本 49%；tier1/2
+  # 总能装下，tier3/4 截断）。设 0 恢复旧行为（不封顶）。
   writing_memory_chars: 50000
   cacheable_prefix_chars: 30000
   # refine 是显式的完本后手动步骤（python novel.py refine <name>），不再默认自动烧钱。
@@ -330,10 +316,6 @@ novel:
   intra_repeat_block: 0.45
   intra_repeat_warn_penalty: 0.8
   intra_repeat_block_penalty: 2.0
-  # 已用元素账本（P0 防后期重复坍缩）：扫最近 scene_dedupe_window 章已选大纲，抽出
-  # 已反复使用的金手指用法/物证/兑现类型，作为明文避免清单前置注入「候选生成 + 仲裁评分 +
-  # 写手」三处，把差异化从事后扣分前移到生成时预防。零额外 LLM 调用、不影响 cacheable_prefix。
-  used_element_ledger_enabled: true
   # O1: 章末钩子回收检测：本章结尾与近几章结尾的句子集合重合即判"回收旧钩子"，
   # 即使 hook_strength 打分很高也强制 hook-only 重写（治"章末钩子与上章完全相同"复发债）
   hook_repeat_tail_chars: 300
@@ -412,10 +394,6 @@ novel:
   chapter_mode_min_window: 4
   chapter_mode_warn_penalty: 0.5
   chapter_mode_block_penalty: 1.2
-  # 形态分类器基线偏置（治"纯关键词分类被偶发内容词带偏"）：在题材核心形态
-  # chapter_mode_baseline（悬疑/规则怪谈=reasoning智斗）上偏置——非基线形态只有当其
-  # 关键词命中超过基线 chapter_mode_baseline_margin 个才判为该形态，否则归基线。防止
-  # 满是"协会/牺牲"内容词的智斗章被误判成 advancement/emotional 而漏掉形态疲劳。
   # 形态分类器基线偏置（治"纯关键词分类被偶发内容词带偏"）：在题材核心形态
   # chapter_mode_baseline（悬疑/规则怪谈=reasoning智斗）上偏置——非基线形态只有当其
   # 关键词命中超过基线 chapter_mode_baseline_margin 个才判为该形态，否则归基线。防止
@@ -539,9 +517,6 @@ novel:
   # narrative_mode: serial               # 题材profile自动设定(爽文=serial,悬疑=reasoning,历史=balanced);取消注释可手动覆盖
   # 平台/读者预设：general / qidian_male / fanqie_free / jinjiang_female / qimao_free
   platform_preset: fanqie_free
-  # 人设记忆点：bootstrap 让每个主要人物带 1-3 个标志记忆点(口头禅/标志动作/外号/反差)，写作时提醒自然复现
-  # （仅对新 bootstrap 的书生效；老书不自动补）
-  signature_trait_surface: true
   # 爆款样本库：把 markdown/txt/json 放到 benchmarks/<platform>/<style>/ 下，生成时会召回结构参照
   benchmark_enabled: true
   benchmark_dir: "benchmarks"
@@ -574,9 +549,6 @@ novel:
   hook_directives_inject_enabled: true
   # 章节起名优化：用钩子化、不剧透的短标题替换正文首行标题(只动首行，正文不变)；默认关，便于消融
   chapter_title_refine_enabled: false
-  # 词条/名词表一致性层：阶段审校时刷新 memory/glossary.md，写作时作为变量段注入，评审复用 contradictions 核对
-  glossary_enabled: true
-  glossary_inject_chars: 1800
   # 文体纹理（量化密度 vs 诗意密度）变奏检测与指令注入
   prose_texture_enabled: true
   texture_num_high_per_kchar: 8.0
@@ -662,10 +634,6 @@ novel:
   shareable_line_enabled: true
   shareable_min_score: 2.0
   shareable_tail_chars: 500
-  # ── 结构化上下文回忆：从数据库追踪的实体/伏线/关系/悬念中提取与本章相关的状态快照注入写手 ──
-  structured_recall_enabled: true
-  structured_recall_max_chars: 3000
-  structured_recall_thread_horizon: 5
 
 paths:
   book: "novels/__NOVEL__/book.md"

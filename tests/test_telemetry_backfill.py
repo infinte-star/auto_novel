@@ -15,9 +15,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import store
-import telemetry
-from config import Paths
+import engine.store as store
+import commands.telemetry as telemetry
+from engine.config import Paths
 
 
 def _paths(root: Path) -> Paths:

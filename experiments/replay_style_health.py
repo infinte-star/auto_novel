@@ -46,8 +46,8 @@ def main() -> int:
     os.environ["NOVEL_CONFIG"] = str(cfg_path.relative_to(ROOT))
     os.environ.setdefault("NOVEL_PROMPT", str((ROOT / "novels" / name / "prompt.md").relative_to(ROOT)))
     sys.path.insert(0, str(ROOT))
-    import config as config_mod  # noqa: E402
-    from quality import style_health  # noqa: E402
+    import engine.config as config_mod  # noqa: E402
+    from engine.quality import style_health  # noqa: E402
 
     config = config_mod.load_config()
     ncfg = config.get("novel", {})

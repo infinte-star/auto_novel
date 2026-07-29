@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("NOVEL_CONFIG", "config.yaml")
 
-from arc import card_to_plan  # noqa: E402
-from quality import scene_similarity  # noqa: E402
+from engine.plan import card_to_plan  # noqa: E402
+from engine.quality import scene_similarity  # noqa: E402
 
 WINDOW = 8
 WARN, BLOCK, SHORT, IDENT = 0.6, 0.82, 0.92, 0.97

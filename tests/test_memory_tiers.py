@@ -17,8 +17,8 @@ import json
 import unittest
 from pathlib import Path
 
-import config as _config
-import memory
+import engine.config as _config
+import engine.bootstrap as memory
 
 
 class _FakeConn:

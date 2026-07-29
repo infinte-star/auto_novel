@@ -43,7 +43,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from compare import OFFLINE_TOOL_TAGS  # noqa: E402
+from commands.compare import OFFLINE_TOOL_TAGS  # noqa: E402
 
 # Tags that are post-completion tooling rather than chapter generation. The time
 # window already excludes them in practice; this is the belt to that braces, and

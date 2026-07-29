@@ -21,8 +21,8 @@ Zero LLM calls.
 """
 import unittest
 
-import quality
-from quality import GATE_SCOPES, REGISTRY, REPAIR_LAYERS, GateRegistry
+import engine.quality as quality
+from engine.quality import GATE_SCOPES, REGISTRY, REPAIR_LAYERS, GateRegistry
 
 
 class RegisterValidationTest(unittest.TestCase):

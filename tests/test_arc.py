@@ -10,7 +10,7 @@ wrong is a silent quality regression rather than a crash.
 """
 import unittest
 
-from arc import (
+from engine.plan import (
     OPENING_TYPES,
     arc_window,
     card_to_plan,
@@ -147,7 +147,7 @@ class TestCardToPlan(unittest.TestCase):
     def test_no_fake_arbiter_score(self):
         """plan_score() must read 0.0, not an invented number — it lands in
         chapter_metrics.plan_score and in the writer's quality contract."""
-        from quality import plan_score
+        from engine.quality import plan_score
         self.assertEqual(self.decision["scores"], [])
         self.assertEqual(plan_score(self.decision), 0.0)
 

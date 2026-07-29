@@ -13,9 +13,9 @@ chain was orphaned by v1's deletion.
 import random
 import unittest
 
-from memory import _pack_sections
+from engine.bootstrap import _pack_sections
 from novel import _parse_price_table
-from writing import _hook_directives_block
+from engine.write import _hook_directives_block
 
 
 def _pack_reference(sections, budget, header=None):

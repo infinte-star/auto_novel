@@ -40,7 +40,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 os.environ.setdefault("NOVEL_CONFIG", "config.yaml")
 
-import fix  # noqa: E402
+import engine.quality as fix  # noqa: E402
 from fpy_prime import _payload, discover_novels, print_exclusions  # noqa: E402
 
 # The engine defaults, pinned: two arms with divergent configs must be judged by

@@ -64,8 +64,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import config as config_mod  # noqa: E402
-from quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
+import engine.config as config_mod  # noqa: E402
+from engine.quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
 from tools.fpy_prime import (COUNTED_REPLANS, PINNED, _normalize,  # noqa: E402
                              _payload, discover_novels, print_exclusions)
 
@@ -162,7 +162,7 @@ def _live_hard_fossils(novel: Path, ch: int, cfg: dict) -> list[str] | None:
     which the caller must treat as "keep the archived reject" rather than as a pass.
     """
     try:
-        import quality
+        import engine.quality as quality
         texts: dict[int, str] = {}
         for n in range(1, ch):
             t = _chapter_text(novel, n)
@@ -207,7 +207,7 @@ def _plan_score(novel: Path, ch: int, fix_unmeasured: bool = False) -> float | N
     pay = _payload(novel / "logs" / "checkpoints" / f"ch{ch:04d}"
                    / "plan_initial_attempt0_arbitration.json") or {}
     try:
-        from quality import _normalize_decision, decision_has_score, plan_score
+        from engine.quality import _normalize_decision, decision_has_score, plan_score
         dec = pay.get("decision") or {}
         if fix_unmeasured:
             dec = _normalize_decision(dec)
@@ -229,7 +229,7 @@ def plan_chain_block(plan: dict, recent: list[dict], score: float | None,
     """
     nv = config["novel"]
     try:
-        from quality import (chapter_mode_monotony, narrative_pattern_repetition,
+        from engine.quality import (chapter_mode_monotony, narrative_pattern_repetition,
                              plan_executability_gate, plan_visual_payoff_check,
                              scene_similarity)
     except Exception:

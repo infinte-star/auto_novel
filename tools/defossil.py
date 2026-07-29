@@ -179,7 +179,7 @@ def apply_fixes(
 ) -> list[dict[str, Any]]:
     """Apply rewrites/deletes to chapter files. Returns the log of changes."""
     if not dry_run:
-        from llm import call_llm
+        from engine.llm import call_llm
     by_chapter: dict[int, list[dict[str, Any]]] = {}
     for occ in occurrences:
         if occ.get("decision") == "keep":
@@ -378,8 +378,8 @@ def main():
     print("\nLoading config and LLM client...")
     _setup_env(args.novel)
     sys.path.insert(0, str(ROOT))
-    from config import load_config, get_paths, configured_api_endpoints
-    from llm import LLMClientPool
+    from engine.config import load_config, get_paths, configured_api_endpoints
+    from engine.llm import LLMClientPool
     from openai import OpenAI
 
     config = load_config()

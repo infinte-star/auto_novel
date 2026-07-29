@@ -274,7 +274,7 @@ def main() -> int:
             p.unlink()
     os.environ["NOVEL_CONFIG"] = str((nd / "config.yaml").relative_to(ROOT))
     os.environ.setdefault("NOVEL_PROMPT", str((nd / "prompt.md").relative_to(ROOT)))
-    import config as _config
+    import engine.config as _config
     import retrieval
     cfg = _config.load_config()
     paths = _config.get_paths(cfg)
@@ -282,7 +282,7 @@ def main() -> int:
     print(f"[truncate] RAG index rebuilt from scratch: {n_idx} chapters")
 
     if args.max_chapters:
-        from compare import _get_config_key, _set_config_key
+        from commands.compare import _get_config_key, _set_config_key
         cfg_path = nd / "config.yaml"
         text = cfg_path.read_text(encoding="utf-8")
         old = _get_config_key(text, "max_chapters")
@@ -290,7 +290,7 @@ def main() -> int:
                             encoding="utf-8")
         print(f"[truncate] max_chapters: {old} -> {args.max_chapters}")
 
-    from config import find_last_chapter
+    from engine.config import find_last_chapter
     print(f"[truncate] find_last_chapter now reports Ch{find_last_chapter(paths)}")
     return 0
 

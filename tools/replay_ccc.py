@@ -102,9 +102,9 @@ def main() -> int:
     os.environ["NOVEL_CONFIG"] = str((nd / "config.yaml").relative_to(ROOT))
     os.environ.setdefault("NOVEL_PROMPT", str((nd / "prompt.md").relative_to(ROOT)))
 
-    import config as _config
-    import quality
-    from v2 import accept
+    import engine.config as _config
+    import engine.quality as quality
+    import engine.loop as accept
 
     cfg = _config.load_config()
 

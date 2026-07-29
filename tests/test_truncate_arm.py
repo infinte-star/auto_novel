@@ -197,7 +197,7 @@ class DatabaseRollbackTest(unittest.TestCase):
     def test_the_live_state_tables_are_the_ones_v2_actually_reads(self):
         # If this list drifts from what v2/canon.py consults, the rollback stops
         # being faithful for the arm it exists to prepare.
-        src = (ROOT / "v2" / "canon.py").read_text(encoding="utf-8")
+        src = (ROOT / "engine" / "loop.py").read_text(encoding="utf-8")
         for fn in ("recent_events", "get_open_threads", "recent_metrics",
                    "get_overdue_reader_promises", "get_active_constraints"):
             self.assertIn(fn, src)

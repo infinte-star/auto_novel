@@ -675,8 +675,16 @@ the 12 rounds C removes are `quality_replan`.
 ### 第三次测量污染：派生书目稀释了每一个「全库」数字
 
 CLAUDE.md already records two instances of a measurement charging the thing it
-measures (`pairwise_ab` billing an arm 10 calls for being judged; `compare.py`'s
-circular score lines). This is the third, and it was found by trying to act on a
+measures: `tools/pairwise_ab.py` borrowing an arm's config for its own API keys
+appended its judge calls to that arm's `llm_calls.jsonl` — the exact file
+`compare._llm_totals` reads for calls/chapter — charging it 10 calls for the cost
+of being measured and inflating its own P4 report from 14.25 to 14.75
+calls/chapter (fixed by redirecting the judge's logs via
+`dataclasses.replace(paths, logs_dir=…)` to `experiments/pairwise_logs/`, with
+`compare.OFFLINE_TOOL_TAGS` filtering such rows out of already-written logs and
+printing the excluded count); and `compare.py` flagging its own score lines as
+circular when the flipped key is in `RELEASE_RULE_KEYS`. This is the third, and
+it was found by trying to act on a
 library aggregate: every top remaining killer pointed at the same book family, so
 I claimed `tangshuting_v1_backup` was "a copy, counted twice". **It isn't a pure
 copy** — only 76 of its 200 chapters are byte-identical to `tangshuting`. Measuring

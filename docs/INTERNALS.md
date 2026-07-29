@@ -9,6 +9,140 @@ post-completion / standalone tools.
 
 ---
 
+## Module map
+
+| module | role |
+| --- | --- |
+| `v2/run.py` | the decision table + the chapter loop; the only orchestrator |
+| `v2/beat.py` | one arc call per `arc_span` chapters → a ChapterCard per chapter (two-layer rolling) |
+| `v2/write.py` | ONE call returns prose **and** the `ChapterDelta` (no separate extraction call) |
+| `v2/accept.py` | the decidable acceptance set, contract fulfilment (CCC), cite-or-drop |
+| `v2/repair.py` | runs `fix.py`'s L0/L1 ladder, then re-judges it by the acceptance ruler |
+| `v2/canon.py` | `StoryState` — the whole context projected once, ~15k chars, split stable/volatile |
+| `v2/anchor.py` | the external anchor: blinded, position-debiased pairwise prose judge |
+| `quality.py` | deterministic gate library (registry + metrics), zero LLM |
+| `fix.py` | repair ladder L0/L1 implementations — fix instead of re-roll |
+| `arc.py` | the ChapterCard *vocabulary* (`ARC_SYSTEM`, `normalize_card`, `validate_card`, `card_to_plan`) that `v2/beat.py` imports |
+| `writing.py` | writer prompt doctrine (`GENRE_PROFILES`, `_build_write_system`), `save_chapter`, `update_structured_state`, `update_state_file` |
+| `memory.py` | `bootstrap`, `cacheable_prefix`, `memory_context`, volume-plan windowing + transition steer |
+| `retrieval.py` | dependency-free TF-IDF RAG + exemplar blocks |
+| `store.py` | SQLite persistence (`story_state.db`), JSON fallback, event log readers |
+| `checkpoint.py` | per-stage checkpoints + resume detection |
+| `llm.py` | streaming, timeouts, salvage, JSON repair, refusal retry |
+| `config.py` | YAML-subset config, paths, endpoints, `is_final_chapter` |
+| `telemetry.py` | cross-book sink `telemetry/global.db` (write-only observer; populated by `telemetry backfill` only, never by a run) |
+| `refine.py`, `fossil_fix.py`, `screenplay.py`, `package.py` | post-completion / standalone tools |
+| `compare.py` | `compare` / `ablate` / `fork` experiment harness |
+| `trial.py`, `benchmark.py` | opening trials, local sample library |
+| `tools/*.py` | zero/low-LLM analysis: `fpy_prime` (acceptance metric), `replay_gates` (settles gate-logic changes), `ccr_baseline`, `gate_census`, `orphan_gates` (does a gate still fire), `orphan_defs` (does anything still name it — defs / constants / config keys), `replay_l0`, `prompt_census`, `pairwise_ab`, `probe_reasoning`, `defossil`, `rebuild_memory`, `truncate_arm` |
+
+---
+
+## Quality gates (`quality.py`)
+
+`GateRegistry` is a metadata registry, **not a dispatcher** — nothing calls
+`REGISTRY.get(name)(...)`. A gate runs only where some module calls it by name,
+which is why the table below is the ground truth and not the `@register`
+decorators.
+
+| gate / layer | config | behaviour |
+| --- | --- | --- |
+| `quality.style_health(text, config, em_history=…)` | `style_health_enabled`, `style_em_dash_per_kchar_warn`/`_bad`, `style_em_dash_trend_window`, `style_min_avg_sentence_chars`, `style_fragment_line_ratio_max`, `style_penalty_cap`, `style_penalty_block` | deterministic prose metrics (em-dash density, avg sentence length, fragment-line ratio, dialogue presence) → `penalty`, `flags`, writer `directives`. Blocks at `style_penalty_block`. **`em_history` is not optional in practice** — without it the em-dash TREND term is silent and the gate is strictly smaller than this row describes; `v2/accept.py:_em_history` supplies it from `chapter_metrics` |
+| `quality.scene_similarity(plan, recent_plans)` | `scene_dedupe_enabled`, `scene_dedupe_window` (8), `scene_dedupe_sim_block` (0.82) | Jaccard similarity of a plan's scene skeleton (conflict/payoff/pressure/goal/beats) vs recent cards projected through `card_to_plan`. **Blind to `where` and `turn`** — mutating either leaves the similarity at 1.000; those are `validate_card`'s neighbour rules. ONE tier, and the other four are deleted rather than dormant (see the escalation note below; REDESIGN_V2 §9.11.3) |
+| `quality.cross_chapter_repetition` | `style_cross_repeat_reject_count` (8) | signature clauses reused verbatim across chapters → a `level` of `advise` or `reject` |
+| `quality.dialogue_health` | `dialogue_health_enabled`, `dialogue_char_ratio_min` (0.10), `dialogue_char_ratio_target` (0.20) | dialogue-ratio gate over text inside `"…"`; reached via `fix.py`'s L1 dialogue injection |
+| `quality.book_wide_fossils` | `book_fossil_enabled`, `book_fossil_chapter_frac` (0.30), `book_fossil_min_chapters` (6), `book_fossil_hard_ratio`, `book_fossil_struct_count` | 6-char CJK n-grams recurring across a large fraction of the WHOLE book (what `cross_chapter_repetition`'s 6-chapter window structurally misses). **A hard fossil requires `current_chapter` and only indicts a chapter that actually contains the phrase** — the ratio is book-cumulative, so without that the gate latches on and rejects compliant chapters forever. `book_fossil_hard_ratio` is floored at the candidacy fraction (below it, every candidate is automatically hard). LESSONS §13 |
+| `quality.descriptor_frequency` | `descriptor_frequency_enabled` | over-used descriptors across the book → `gate_rejects`; answered by keep-1 rotation |
+| `quality.adjacent_repetition` | `adjacent_repeat_*` | this chapter vs the previous one → `adjacent_repeat_block` |
+| `quality.length_band_check` | `chapter_min_chars` (2800), `chapter_max_chars` | band check; the short side is answered by L1 expand-to-band, the long side blocks. **Its config key only controls its penalty (default false) — the gate always runs**, so `REGISTRY.is_enabled` is not a "did this gate run" test |
+| `quality.opening_hook_gate` | `opening_hook_gate_enabled` | first-line hook strength → block; L0 demotes a scenery opening |
+| `quality.genre_adherence` | `genre_drift_reject_enabled` | genre-signal drift vs recent chapters → `gate_rejects` |
+| `quality.plan_executability_gate`, `plan_visual_payoff_check`, `narrative_pattern_repetition` | card-scope | plan/card gates, fixable before a word is written. Currently reached only by `tools/replay_gates.py` — see CLAUDE.md's wiring-gap note |
+| `retrieval.py` RAG | `rag_enabled`, `rag_top_k`, `rag_exclude_recent` | dependency-free TF-IDF char-bigram index (no embeddings). `index_chapter` is called idempotently from `save_chapter` → `logs/retrieval_index.json`; `retrieval_block` builds the "## 相关历史原文（检索…）" section; `backfill_index` indexes a finished book |
+| `retrieval.exemplar_block` | `exemplar_rag_enabled` (false), `exemplar_rag_top_k` | quotes the book's own strongest chapters back as style anchors. **Rank-based, not an absolute score threshold**; picks one dialogue-dense + one action-dense exemplar (LESSONS §7) |
+| `quality.fingerprint_avoidance_context` | `fingerprint_enabled` | the 全书结构指纹 block, consumed by **`v2/beat.py:_fingerprints` — once per arc, not once per chapter**. **Emits an aggregate (recurring move bigrams/trigrams + payoff/conflict/move frequencies), never one line per chapter** — the per-chapter form grew linearly while carrying no signal; the aggregate amortizes to ~123 chars/chapter and does not grow with the book (LESSONS §8, REDESIGN_V2 §9.11.1). **It returns the literal string `"None"`, not `""`, when it has nothing to say** (a v1 template convention), which `_fingerprints` filters — a header promising overused patterns with the word "None" under it is worse than no header. `store_chapter_fingerprint` keeps writing `skeleton_tokens` even though nothing reads it: that column is what lets a future recalibration be replayed offline. |
+
+Two routing rules: **scene dedupe is ONE tier**, the missing WARN/short-novel/
+0.97-ceiling/`force_retry` tiers were deleted on measurement, not restored
+(REDESIGN_V2 §9.11.3); a **`cross_chapter_repetition` reject is structural**,
+not cosmetic — it lands in `gate_rejects` before `rescue` can buy a rewrite.
+
+`quality.py` registers 23 gates, of which the chapter loop reaches 19 (CLAUDE.md
+names the wiring-gap disposition of the other 12). Gate calibration is measured,
+not guessed: `python tools/gate_census.py` and `python tools/replay_l0.py`.
+
+---
+
+## StoryState (`v2/canon.py`)
+
+ONE projection, ~15k chars, split by mutability: `stable` (~5.6k, the
+prompt-cache prefix) vs `volatile` (~11.5k). Three rules the projections obey:
+1. **A clipped section says so, in the text.** `_clip` appends
+   `〔…截断 N 字〕`; `_clip_items` drops whole items from the END and says how
+   many. Silent head truncation is what starved the mid-book for 40 chapters
+   before anyone noticed (LESSONS §6).
+2. **Empty and clipped are different facts.** An empty section emits no
+   header — printing `## 伏线` with nothing under it lies whenever the truth
+   is "the budget ate them".
+3. **Persistence has one writer.** `apply_delta` delegates to
+   `writing.update_structured_state`; a second writer against the same schema
+   is a second ruler that drifts invisibly.
+
+---
+
+## Memory (`memory.py`)
+
+v2 gets its per-chapter context from `v2/canon.py`, so `memory.py` survives for
+four jobs:
+- **`bootstrap`** — one-time generation of `state.md` + `memory/*.md` from
+  `prompt.md`. `extract_contract` runs BEFORE `_bootstrap_chain` and its
+  markdown feeds the bible + characters calls (`contract_md=`).
+- **`cacheable_prefix` / `memory_context`** — still read by `arc.py`,
+  `trial.py`, `package.py`. Four tiers must not overlap (tier2/tier3 are
+  prefixes of tier4; tier4 emits only the older tail).
+- **`volume_plan_window(text, chapter_num, cap, lookahead)`** — keeps blocks
+  whose header covers `chapter_num`, reduces out-of-range volumes to a header
+  breadcrumb, and inside kept blocks keeps only `| ChN |` rows for
+  `[chapter_num-1, chapter_num+lookahead]`.
+- **`volume_transition_directive`** — restates a volume boundary inside the
+  arc span as a hard obligation in the arc prompt (HARD level only).
+
+Per-chapter state persistence costs zero extra LLM calls: the write call
+returns the `ChapterDelta`, and `canon.apply_delta` → pure DB writes +
+deterministic markdown render consume it.
+
+---
+
+## Cross-book telemetry (`telemetry.py`)
+
+Each novel has its own `story_state.db`; `telemetry.py` is the ONE shared sink
+(`telemetry/global.db`, WAL, one fresh connection per write so N processes
+write concurrently). Strict observer / safe no-op: any failure returns an
+empty value and never stalls a chapter. Currently write-only — the
+consumption layers were deleted (LESSONS §9).
+
+Nothing writes it during a run — the only populator is the user-typed
+`novel.py telemetry backfill`, reconstructing from each book's own
+`story_state.db` + checkpoints. Which events reach the sink is
+`telemetry.IMPORTED_EVENT_TYPES`, not "all of them".
+
+---
+
+## Experiment harness CLI (`compare.py`)
+
+- `compare <a> <b>` — deterministic zero-LLM report → `experiments/`.
+- `fork <name> --as <new>` — the A/B tool for anything mid-book. Branches at
+  HEAD (copies `memory/`, `chapters/`, `book.md`, `state.md`,
+  `story_state.db`, RAG index) so both arms start byte-identical.
+- `ablate <name> --flip <key>` — chapter-capped copy with ONE key flipped,
+  restarts at Ch1.
+- `tools/pairwise_ab.py` — CLI over `v2/anchor.py`. `--b-from` offsets pairing
+  for arms at different outline positions; `--probe N` calibrates position
+  bias; `--anchor` judges one arm against `benchmarks/anchor/` and rejects
+  `--b`/`--b-from`/`--probe`/`--all`.
+
+---
+
 ## Persistence (`store.py`)
 
 SQLite (`story_state.db`, WAL) is the primary store. Tables: `events`,

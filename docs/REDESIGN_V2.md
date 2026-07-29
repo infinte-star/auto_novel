@@ -841,7 +841,7 @@ Ch1 和 Ch4 的 `stable_prefix()` 必须逐字节相同，而 Ch1 和 Ch99 的 `
 
 零 LLM 变更，`tools/fpy_prime.py` 接线前后同为 **365/438 = 83%**；测试 804 → 815 全绿。
 
-### 9.11 扫掉 v1 删除留下的孤儿：49 个定义 / 133 个配置键（2026-07-28）
+### 9.11 扫掉 v1 删除留下的孤儿：49 个定义（约 2.4k 行）/ 133 个配置键（2026-07-28）
 
 `95361b9` 删掉 v1 的七个模块，但**被它们调用的东西留在原地**。`GateRegistry` 从不派发、
 `quality.py` 的门只在有人按名字调用时才运行——同一条性质让「没有调用点」在任何测试里都不可见：
@@ -1163,3 +1163,86 @@ v2 从不写这种文件——L0/L1 是就地缝补而不是整章重roll，所�
 于是删掉 `expand_to_band` 的「no usable paragraph」那行仍然全绿——
 上方 `except` 分支的日志顶了缺口。改成回看**所属的那一层缩进块**之后，
 9 次突变里该挂的 3 次都挂了。测试 793 → 805 全绿。
+
+### 9.12 CLAUDE.md 精简迁入的引擎设计要点（2026-07-29）
+
+CLAUDE.md 从 605 行压到约 10% 体量的一部分：以下细节此前只写在 CLAUDE.md 的
+Architecture 章节里，本节之外没有第二份记录，现按模块迁入本节，CLAUDE.md 侧
+只留一句话+指到这里的指针。
+
+**Top-level loop（`v2/run.py:main`）为什么没有后台线程池。** v1 起线程池是因为
+定稿（finalization）、阶段评审、记忆压缩、计划预取都在一个 ~23 次调用章节的
+关键路径之外；v2 一章只有 ~2.5 次调用，且状态写入就是写作调用本身响应的一部分，
+线程池买不到东西，却要花屏障去恢复它本该破坏的顺序不变量——所以直接不建。
+
+**One chapter（`v2/run.py:DECISIONS`）决策表的四条顺序不变量。** 行序：
+`need_card → card_invalid → need_draft → need_report → l0_pending → l1_pending
+→ canon_pending → next_card_patch → rescue → commit`，`run_chapter` 每执行一个
+动作后**从头**重新读表，让失效的上游行被重新回答而不是被跳过。
+1. `need_report` 存在，是因为 `repair.pending` 是一个作用在报告上的纯函数——
+   「L0 有没有活干」在报告生成之前是不可回答的，零 LLM。
+2. 修复行**不**以 `r.blocks` 为门槛：修复层回答的是「哪些门触发了」，
+   而大多数可修复的发现根本到不了硬阻断（`length_band_check` 的短侧从不进
+   `hard_block_reasons`）。每个修复器都是"改善了才留"，所以一个没被触发的层
+   不花任何代价。
+3. 修复层压在 `rescue` **之上**，让廉价的确定性修复总是先于任何"买一次重写"。
+   v1 要为一个门手动把 `_repair_fossil_rejects` 塞进评审循环才能做到这点；
+   这里是所有门的默认顺序。
+4. `review_round0.json` 是原始首稿，在第一份报告存在的那一刻写下，
+   **永不被修复稿或抢救稿覆盖**——这是 `tools/fpy_prime.py` 回放的那份文件。
+   唯一的例外是canon 复核（`_act_canon`）：它重新计算而不是覆盖，因为canon
+   检查在最后运行、判定的是即将发布的文本，其引用要对着原始首稿重新核对，
+   一条只在修复后文本里才成立的发现，会被丢弃而不是记在首稿头上。
+
+`RESCUE_ATTEMPTS` 之所以能设上限：acceptance 集合里每一项的 `scope` 都是
+`"chapter"`，没有一条会跨章闩锁，所以每个阻断原因都是**这一章**的文本能自己
+转绿的东西。抢救次数用完仍有阻断，就带着阻断原样提交，不会永远重试；
+`quality_breaker_consecutive`（默认 2）数的是"带阻断提交的章数连续多少"，
+这是不需要 score 就能读出的 v2 原生求救信号。
+
+`chapter_completed.json` 必须在提交动作里**同步**写入——推迟写会让恢复检查
+重新进入这一章并在每次迭代里重复提交（即 v1 的循环泄漏事故）。
+
+**Planning（`v2/beat.py:generate_arc`）"没有兜底委员会"是硬约束，不是省事。**
+v1 的 `arc.plan_from_arc` 出问题时返回 `None`，让五阶段规划器兜底；v2 没有这层
+地板，所以每条失败路径必须以一张真卡片或一次异常结束——**绝不能是一张编造出来
+的卡片**。没人规划过的卡片依然会打出一个 CCR 分数，而那个数字什么都没测量到。
+另外，`memory.volume_transition_directive` 的 HARD 级别会注入到 arc span 里的
+**每一章**，因为 `arc_span`（10）不和 `volume_plan.md` 的卷边界对齐——只检查
+`start_ch` 会漏掉卷边界落在跨度中间的情况。
+
+**Writing（`v2/write.py:write_chapter`）"先正文、后 JSON"与哨兵行。**
+一次调用先输出正文，再输出一行哨兵，再输出承载 `canon.ChapterDelta` 五个字段
+的裸 JSON。退场钩子是一章网文里最重要的一句话，必须是写下的最后一句正文，
+而不是被匆匆带过、赶去凑一个 JSON 对象；而一章 5000 字塞进 JSON 字符串本身
+就是一个 5000 字的转义问题——所以 JSON 必须在正文之后，解析失败只丢结构化
+delta，绝不丢正文。验收清单里写的是门实际会抓取的**字面片段**，由
+`quality._beat_anchor_fragments` 生成，`accept.contract_fulfilment` 用的是同一次
+调用——告诉写手"把转折写出来"、却按「钥匙」这个词是否出现来打分，问的不是
+同一个问题。
+
+**Repair ladder（`v2/repair.py`→`fix.py`）"整层撤销"与化石两趟目标。**
+每个修复器只保证自己那个指标不变差，但 `style_health` 不是 v2 发布用的那把尺子，
+`accept.block_reasons` 才是——一次躲开化石却撞上相邻重复的轮换，或是解决了长度
+下限却撞穿上限的扩写，能过每一层内部守卫，却唯独过不了这一层。所以每一层修复
+后都用发布规则本身的 `recheck` 重新打分，**一旦引入了之前没有的阻断原因就整层
+撤销**——一次坏的轮换会连带撤销两次好的破折号修复，这是真实成本，但
+`fix.apply_l0` 只返回一个字符串，按动作粒度撤销等于重新实现一遍梯子。
+密度类门（`cross_chapter_repetition`、`descriptor_frequency`）靠"留一处"轮换即可
+清零；但 `book_wide_fossils` 的硬阻断是全书累计比例，只有**这一章零次出现**才能
+真正清掉，所以 `fix.rotate_fossils` 用两趟、两个不同目标跑——旧版共用"留一处"
+目标时，12 个真实案例里有 10 个因为该短语在本章只出现一次而"轮换"了个寂寞。
+`writing.fossil_tail_anchor`（`fossil_tail_anchor_enabled`）在 prompt 尾部重申硬化石
+禁令，是这个弱指令跟随写手的第四道锚点（能力胶囊、恢复指令、场景入场显著性
+之后），只对硬化石生效，且有 `FOSSIL_TAIL_ANCHOR_MAX` 上限——尾部太长会稀释
+它利用的那个位置优势。
+
+**External anchor（`v2/anchor.py`）"盲评"与"不带 cacheable_prefix"是写死的不变量，
+不只是实践惯例。** 双方标为甲/乙，臂名、引擎版本、路径都不传给模型；模块本身
+**从不 import `memory`**，结构上就没有 `cacheable_prefix` 可加——判断"是不是被
+（可能已经漂移的）书内上下文浸泡过"的这把尺子，价值就在于它没被浸泡过。
+
+**Experiment harness："开局短跑会伪造正收益"完整协议见 LESSONS §5**（一个变量、
+从 HEAD fork、匹配推理覆盖率、故意不拷贝 `logs/`、用 `target_words` 而不是
+`max_chapters` 定预算，以及 Windows 下 launch/venv-stub 的坑）；每一次引擎改动
+都应该带一份 ablation/fork 报告，而不是手工对比一次完整重跑。

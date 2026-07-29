@@ -19,8 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import fix  # noqa: E402
-from quality import style_health  # noqa: E402
+import engine.quality as fix  # noqa: E402
+from engine.quality import style_health  # noqa: E402
 
 CONFIG = {"novel": {}}  # gate defaults only: the replay must not depend on a novel's tuning
 

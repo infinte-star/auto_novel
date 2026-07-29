@@ -187,7 +187,7 @@ def main() -> int:
 
     from openai import OpenAI  # noqa: PLC0415 — must import after NOVEL_CONFIG is set
 
-    import config as cfg_mod  # noqa: PLC0415
+    import engine.config as cfg_mod  # noqa: PLC0415
 
     config = cfg_mod.load_config()
     api = config["api"]

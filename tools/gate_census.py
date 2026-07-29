@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from quality import REGISTRY  # noqa: E402
+from engine.quality import REGISTRY  # noqa: E402
 
 # Gates whose report key in the review payload differs from the gate name.
 REPORT_KEY = {"book_wide_fossils": "book_fossils", "length_band_check": "length_band"}

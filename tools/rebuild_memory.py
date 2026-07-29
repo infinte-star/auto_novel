@@ -103,7 +103,7 @@ MEMORY_SPECS = {
 def rebuild_memory(
     novel_dir: Path, client, paths, config, dry_run: bool = True
 ):
-    from llm import call_llm
+    from engine.llm import call_llm
 
     chapters_dir = novel_dir / "chapters"
     memory_dir = novel_dir / "memory"
@@ -192,8 +192,8 @@ def main():
     if args.apply:
         _setup_env(args.novel)
         sys.path.insert(0, str(ROOT))
-        from config import load_config, get_paths, configured_api_endpoints
-        from llm import LLMClientPool
+        from engine.config import load_config, get_paths, configured_api_endpoints
+        from engine.llm import LLMClientPool
         from openai import OpenAI
 
         config = load_config()

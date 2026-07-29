@@ -52,7 +52,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from v2 import anchor  # noqa: E402
+from engine import anchor  # noqa: E402
 
 
 def _load_arm(name: str) -> Path:
@@ -219,9 +219,9 @@ def main(argv: list[str] | None = None) -> int:
     # to be set before `config` is imported (see CLAUDE.md).
     os.environ["NOVEL_CONFIG"] = str((nd_a / "config.yaml").relative_to(ROOT))
     os.environ.setdefault("NOVEL_PROMPT", str((nd_a / "prompt.md").relative_to(ROOT)))
-    import config as _config  # noqa: E402
-    from compare import _rework_signals  # noqa: E402
-    from llm import build_client  # noqa: E402
+    import engine.config as _config  # noqa: E402
+    from commands.compare import _rework_signals  # noqa: E402
+    from engine.llm import build_client  # noqa: E402
 
     cfg = _config.load_config()
     # The judge borrows arm A's config for its API keys, but it must NOT log into

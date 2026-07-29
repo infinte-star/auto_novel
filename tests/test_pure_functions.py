@@ -15,25 +15,25 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import normalize_chapter  # noqa: E402
-from quality import plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
-from quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
-from quality import store_chapter_fingerprint  # noqa: E402
-from quality import prose_texture  # noqa: E402
-from quality import location_transition  # noqa: E402
-from quality import opening_hook_gate, length_band_check  # noqa: E402
-from config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
-from memory import _recency_aware_state  # noqa: E402
-from memory import _contract_to_markdown  # noqa: E402
-from llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
-from writing import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
-from writing import _chapter_write_max_tokens  # noqa: E402
-from quality import cross_chapter_repetition, descriptor_frequency, genre_adherence  # noqa: E402
+from engine.config import normalize_chapter  # noqa: E402
+from engine.quality import plan_visual_payoff_check, reduce_em_dash_density, scene_similarity, style_health  # noqa: E402
+from engine.quality import _narrative_pattern_sequence, _sequence_similarity, narrative_pattern_repetition  # noqa: E402
+from engine.quality import store_chapter_fingerprint  # noqa: E402
+from engine.quality import prose_texture  # noqa: E402
+from engine.quality import location_transition  # noqa: E402
+from engine.quality import opening_hook_gate, length_band_check  # noqa: E402
+from engine.config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
+from engine.bootstrap import _recency_aware_state  # noqa: E402
+from engine.bootstrap import _contract_to_markdown  # noqa: E402
+from engine.llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
+from engine.write import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
+from engine.write import _chapter_write_max_tokens  # noqa: E402
+from engine.quality import cross_chapter_repetition, descriptor_frequency, genre_adherence  # noqa: E402
 
 
 def _make_paths(root):
     """Build a Paths rooted at a temp dir (mirrors QualityDebtPatchTests)."""
-    from config import Paths
+    from engine.config import Paths
 
     return Paths(
         book=root / "book.md",
@@ -173,7 +173,7 @@ class AiFlavorPivotTests(unittest.TestCase):
     cfg = {"novel": {"ai_flavor_enabled": True}}
 
     def test_affirmative_pivot_flagged(self):
-        from quality import ai_flavor_health
+        from engine.quality import ai_flavor_health
         text = (
             "她要的不是同情，而是尊重。与其说她在卖货，不如说她在证明自己。"
             "不仅仅是冻梨，更是这片土地的心意。"
@@ -184,14 +184,14 @@ class AiFlavorPivotTests(unittest.TestCase):
         self.assertTrue(res["directives"])
 
     def test_anaphora_tricolon_flagged(self):
-        from quality import ai_flavor_health
+        from engine.quality import ai_flavor_health
         text = ("她想起了父亲，想起了奶奶，想起了那口老铁锅，眼眶悄悄热了。") * 10
         res = ai_flavor_health(text, self.cfg)
         self.assertGreaterEqual(res["metrics"].get("anaphora_longest", 0), 3)
         self.assertTrue(any("anaphora" in f for f in res["flags"]))
 
     def test_clean_concrete_prose_not_flagged(self):
-        from quality import ai_flavor_health
+        from engine.quality import ai_flavor_health
         text = (
             "七个人排成一排在没膝的雪里铲路，奶奶搬把椅子坐屋檐下直播。"
             "陆时砚拎着铁锹，肩上落了层薄雪。她弯腰捡起断掉的粉笔，把箭头画完。"
@@ -202,39 +202,10 @@ class AiFlavorPivotTests(unittest.TestCase):
 
     def test_negation_pivot_not_double_counted_as_negative_pair(self):
         # "不是X，而是Y" is a pivot (this check), NOT the negative-pair "不是X，也不是Y".
-        from quality import _TEMPLATE_PIVOT, _NEGATIVE_PAIR
+        from engine.quality import _TEMPLATE_PIVOT, _NEGATIVE_PAIR
         pivot = "这不是运气，而是本事。"
         self.assertTrue(_TEMPLATE_PIVOT.search(pivot))
         self.assertFalse(_NEGATIVE_PAIR.search(pivot))
-
-
-class SceneDraftSplitTests(unittest.TestCase):
-    """_split_beats_into_scenes: ①(b) 密集章分段助手（保序、≤max_segments、~2 beat/段）。"""
-
-    def test_splits_into_at_most_max_segments(self):
-        from writing import _split_beats_into_scenes
-        beats = [f"b{i}" for i in range(8)]
-        groups = _split_beats_into_scenes(beats, 3)
-        self.assertLessEqual(len(groups), 3)
-        self.assertGreaterEqual(len(groups), 2)
-        # 保序 + 无丢失
-        self.assertEqual([b for g in groups for b in g], beats)
-
-    def test_five_beats_three_segments(self):
-        from writing import _split_beats_into_scenes
-        groups = _split_beats_into_scenes([f"b{i}" for i in range(5)], 3)
-        self.assertEqual(len(groups), 3)  # ceil(5/2)=3 段
-
-    def test_short_beatlist_not_segmented(self):
-        from writing import _split_beats_into_scenes
-        self.assertEqual(len(_split_beats_into_scenes(["only"], 3)), 1)
-        self.assertEqual(_split_beats_into_scenes([], 3), [])
-
-    def test_blank_beats_dropped(self):
-        from writing import _split_beats_into_scenes
-        groups = _split_beats_into_scenes(["a", "  ", "", "b", "c", "d"], 3)
-        flat = [b for g in groups for b in g]
-        self.assertEqual(flat, ["a", "b", "c", "d"])
 
 
 class SceneSimilarityTests(unittest.TestCase):
@@ -457,7 +428,7 @@ class RetrievalShardTests(unittest.TestCase):
         return root, paths, shutil
 
     def test_index_and_merge(self):
-        import retrieval
+        import engine.retrieval as retrieval
         root, paths, shutil = self._setup()
         try:
             retrieval._INDEX_CACHE.clear()
@@ -477,7 +448,7 @@ class RetrievalShardTests(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
     def test_index_idempotent(self):
-        import retrieval
+        import engine.retrieval as retrieval
         root, paths, shutil = self._setup()
         try:
             retrieval._INDEX_CACHE.clear()
@@ -492,7 +463,7 @@ class RetrievalShardTests(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
     def test_retrieve_returns_old_chapter(self):
-        import retrieval
+        import engine.retrieval as retrieval
         root, paths, shutil = self._setup()
         try:
             retrieval._INDEX_CACHE.clear()
@@ -506,7 +477,7 @@ class RetrievalShardTests(unittest.TestCase):
 
     def test_legacy_monolithic_fallback_and_migration(self):
         import json
-        import retrieval
+        import engine.retrieval as retrieval
         root, paths, shutil = self._setup()
         try:
             retrieval._INDEX_CACHE.clear()
@@ -539,7 +510,7 @@ class ThreadLocalConnTests(unittest.TestCase):
     is now a no-op context manager."""
 
     def test_db_lock_is_noop_contextmanager(self):
-        import store
+        import engine.store as store
         with store.db_lock():
             pass  # must enter/exit cleanly without serializing
 
@@ -547,7 +518,7 @@ class ThreadLocalConnTests(unittest.TestCase):
         import shutil
         import tempfile
         from pathlib import Path
-        import store
+        import engine.store as store
         if store.sqlite3 is None:
             self.skipTest("sqlite3 unavailable")
         root = Path(tempfile.mkdtemp(prefix="tlc_"))
@@ -564,7 +535,7 @@ class ThreadLocalConnTests(unittest.TestCase):
         import tempfile
         import threading
         from pathlib import Path
-        import store
+        import engine.store as store
         if store.sqlite3 is None:
             self.skipTest("sqlite3 unavailable")
         root = Path(tempfile.mkdtemp(prefix="tlc_cc_"))
@@ -596,7 +567,7 @@ class ThreadLocalConnTests(unittest.TestCase):
 
 class PackageRenderTests(unittest.TestCase):
     def test_render_package_md_sections(self):
-        from package import _render_package_md
+        from commands.package import _render_package_md
         pkg = {
             "one_line": "一句话卖点",
             "titles": ["书名一", "书名二"],
@@ -613,7 +584,7 @@ class PackageRenderTests(unittest.TestCase):
         self.assertIn("含剧透概要内容", md)
 
     def test_render_skips_absent_sections(self):
-        from package import _render_package_md
+        from commands.package import _render_package_md
         md = _render_package_md({"titles": ["仅书名"]})
         self.assertIn("仅书名", md)
         self.assertNotIn("无剧透简介", md)
@@ -847,7 +818,7 @@ class ChapterFingerprintTests(unittest.TestCase):
         write that silently stopped emitting it would be a real loss.
         """
         import json as _json
-        import store
+        import engine.store as store
         orig_lock = store.db_lock
         store.db_lock = self._mock_db_lock()
         try:
@@ -876,7 +847,7 @@ class ChapterFingerprintTests(unittest.TestCase):
 
     def test_store_is_idempotent_per_chapter(self):
         """INSERT OR REPLACE: re-running a chapter must not double its row."""
-        import store
+        import engine.store as store
         orig_lock = store.db_lock
         store.db_lock = self._mock_db_lock()
         try:
@@ -1096,7 +1067,7 @@ class LongSpanFatigueTests(unittest.TestCase):
     def _db_with_tensions(self, tensions, payoff="reveal"):
         import shutil, tempfile
         from pathlib import Path
-        import store
+        import engine.store as store
         if store.sqlite3 is None:
             self.skipTest("sqlite3 unavailable")
         root = Path(tempfile.mkdtemp(prefix="lsf_"))
@@ -1129,7 +1100,7 @@ class LongSpanFatigueTests(unittest.TestCase):
         # values in 565 archived rows), so a diversity count over it measured
         # nothing on v1 either. This pins that neither term can come back
         # silently: even the input that used to trip them produces no flag.
-        from quality import long_span_fatigue
+        from engine.quality import long_span_fatigue
         conn = self._db_with_tensions([8, 9, 9, 8, 9, 8])
         res = long_span_fatigue(conn, 7, {"novel": {}})
         self.assertFalse(any("tension" in f for f in res["flags"]), res["flags"])
@@ -1141,7 +1112,7 @@ class LongSpanFatigueTests(unittest.TestCase):
         # because that is the whole reason it was kept rather than deleted.
         import tempfile
         from pathlib import Path
-        import store
+        import engine.store as store
         if store.sqlite3 is None:
             self.skipTest("sqlite3 unavailable")
         root = Path(tempfile.mkdtemp(prefix="lsf_v2_"))
@@ -1154,7 +1125,7 @@ class LongSpanFatigueTests(unittest.TestCase):
                 conn.execute(
                     "INSERT INTO chapter_metrics(chapter, payoff_type, created_at) "
                     "VALUES (?, ?, ?)", (i, "reveal", "2026-01-01T00:00:00"))
-        from quality import long_span_fatigue
+        from engine.quality import long_span_fatigue
         res = long_span_fatigue(conn, 7, {"novel": {"payoff_type_monotony_max": 3}})
         self.assertTrue(any("payoff_type_monotony" in f for f in res["flags"]),
                         res["flags"])
@@ -1162,7 +1133,7 @@ class LongSpanFatigueTests(unittest.TestCase):
     def test_payoff_monotony_uses_payoff_type_monotony_max_fallback(self):
         # config sets only payoff_type_monotony_max (not chapter_type_monotony_max);
         # long_span_fatigue must honour it via the fallback.
-        from quality import long_span_fatigue
+        from engine.quality import long_span_fatigue
         conn = self._db_with_tensions([8, 9, 7, 8, 9, 7], payoff="reveal")
         res = long_span_fatigue(conn, 7, {"novel": {"payoff_type_monotony_max": 3}})
         self.assertTrue(any("payoff_type_monotony" in f for f in res["flags"]))
@@ -1237,7 +1208,7 @@ class RelationshipStoreTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_upsert_new_relationship(self):
-        from store import upsert_relationship, get_relationships
+        from engine.store import upsert_relationship, get_relationships
         upsert_relationship(self.conn, 1, "林夕", "周临舟",
                             stage="tension", intensity=0.6,
                             event_desc="林夕质问周临舟偷改记录")
@@ -1248,7 +1219,7 @@ class RelationshipStoreTests(unittest.TestCase):
         self.assertEqual(len(rels[0]["history"]), 1)
 
     def test_upsert_updates_existing(self):
-        from store import upsert_relationship, get_relationships
+        from engine.store import upsert_relationship, get_relationships
         upsert_relationship(self.conn, 1, "林夕", "周临舟",
                             stage="contact", intensity=0.3, event_desc="初次相遇")
         upsert_relationship(self.conn, 5, "林夕", "周临舟",
@@ -1259,7 +1230,7 @@ class RelationshipStoreTests(unittest.TestCase):
         self.assertEqual(len(rels[0]["history"]), 2)
 
     def test_pair_key_order_independent(self):
-        from store import upsert_relationship, get_relationships
+        from engine.store import upsert_relationship, get_relationships
         upsert_relationship(self.conn, 1, "周临舟", "林夕",
                             stage="contact", event_desc="A")
         upsert_relationship(self.conn, 2, "林夕", "周临舟",
@@ -1269,7 +1240,7 @@ class RelationshipStoreTests(unittest.TestCase):
         self.assertEqual(rels[0]["stage"], "tension")
 
     def test_invalid_stage_falls_back(self):
-        from store import upsert_relationship, get_relationships
+        from engine.store import upsert_relationship, get_relationships
         upsert_relationship(self.conn, 1, "A", "B", stage="invalid_stage")
         rels = get_relationships(self.conn)
         self.assertEqual(rels[0]["stage"], "contact")
@@ -1306,7 +1277,7 @@ class InfoRevelationStoreTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_upsert_new_revelation(self):
-        from store import upsert_info_revelation, get_pending_revelations
+        from engine.store import upsert_info_revelation, get_pending_revelations
         upsert_info_revelation(self.conn, 3, {
             "id": "secret-1",
             "description": "密室里的血迹指向第二嫌疑人",
@@ -1320,7 +1291,7 @@ class InfoRevelationStoreTests(unittest.TestCase):
         self.assertEqual(pending[0]["importance"], 8)
 
     def test_upsert_updates_status(self):
-        from store import upsert_info_revelation, get_pending_revelations
+        from engine.store import upsert_info_revelation, get_pending_revelations
         upsert_info_revelation(self.conn, 3, {
             "id": "secret-2", "description": "隐藏身份",
             "status": "planted", "importance": 7,
@@ -1333,7 +1304,7 @@ class InfoRevelationStoreTests(unittest.TestCase):
         self.assertEqual(pending[0]["status"], "hinted")
 
     def test_revealed_not_pending(self):
-        from store import upsert_info_revelation, get_pending_revelations
+        from engine.store import upsert_info_revelation, get_pending_revelations
         upsert_info_revelation(self.conn, 3, {
             "id": "secret-3", "description": "已揭秘",
             "status": "planted", "importance": 9,
@@ -1345,7 +1316,7 @@ class InfoRevelationStoreTests(unittest.TestCase):
         self.assertEqual(len(pending), 0)
 
     def test_overdue_revelations(self):
-        from store import upsert_info_revelation, get_overdue_revelations
+        from engine.store import upsert_info_revelation, get_overdue_revelations
         upsert_info_revelation(self.conn, 2, {
             "id": "overdue-1", "description": "过期线索",
             "status": "planted", "due_chapter": 5, "importance": 7,
@@ -1355,7 +1326,7 @@ class InfoRevelationStoreTests(unittest.TestCase):
         self.assertGreater(overdue[0]["overdue_by"], 0)
 
     def test_not_overdue_within_grace(self):
-        from store import upsert_info_revelation, get_overdue_revelations
+        from engine.store import upsert_info_revelation, get_overdue_revelations
         upsert_info_revelation(self.conn, 2, {
             "id": "recent-1", "description": "近期线索",
             "status": "planted", "due_chapter": 8, "importance": 5,
@@ -1390,7 +1361,7 @@ class BookWideFossilTests(unittest.TestCase):
         )
 
     def test_detects_book_wide_fossil(self):
-        from quality import book_wide_fossils
+        from engine.quality import book_wide_fossils
         # 6-char fossil present in 8 of 10 chapters → above frac 0.30 & min 6
         texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
         res = book_wide_fossils(texts, {"novel": {}})
@@ -1399,14 +1370,14 @@ class BookWideFossilTests(unittest.TestCase):
         self.assertTrue(res["directives"])
 
     def test_below_threshold_not_flagged(self):
-        from quality import book_wide_fossils
+        from engine.quality import book_wide_fossils
         # fossil only in 3 of 12 chapters → below both frac and min_chapters(6)
         texts = self._book("陆知白抬起左手", n_with=3, n_without=9)
         res = book_wide_fossils(texts, {"novel": {}})
         self.assertFalse(self._has_fossil(res["phrases"], "陆知白抬起左手"))
 
     def test_overlapping_windows_collapsed(self):
-        from quality import book_wide_fossils
+        from engine.quality import book_wide_fossils
         texts = self._book("陆知白抬起左手", n_with=9, n_without=1)
         res = book_wide_fossils(texts, {"novel": {}})
         # shifted 6-grams of the same stub must not all survive as separate fossils
@@ -1417,14 +1388,14 @@ class BookWideFossilTests(unittest.TestCase):
                 self.assertFalse(shared, f"overlapping fossils not collapsed: {pa} / {pb}")
 
     def test_empty_and_disabled(self):
-        from quality import book_wide_fossils
+        from engine.quality import book_wide_fossils
         self.assertEqual(book_wide_fossils({}, {"novel": {}})["fossils"], [])
         texts = self._book("陆知白抬起左手", n_with=8, n_without=2)
         off = book_wide_fossils(texts, {"novel": {"book_fossil_enabled": False}})
         self.assertEqual(off["fossils"], [])
 
     def test_hard_fossil_by_ratio(self):
-        from quality import book_wide_fossils
+        from engine.quality import book_wide_fossils
         # fossil in 8/10 chapters (Ch1-8) = 0.8 frac, above the candidacy floor.
         # `current_chapter` is now REQUIRED for a hard verdict: the hard list is a
         # blocking reject, and a chapter that contains none of the entrenched
@@ -1450,36 +1421,36 @@ class EndingZoneTests(unittest.TestCase):
         return {"novel": base}
 
     def test_inside_zone(self):
-        from config import ending_zone_distance
+        from engine.config import ending_zone_distance
         self.assertEqual(ending_zone_distance(self._cfg(), 47), 3)
         self.assertEqual(ending_zone_distance(self._cfg(), 46), 4)
 
     def test_final_chapter_returns_none(self):
-        from config import ending_zone_distance
+        from engine.config import ending_zone_distance
         self.assertIsNone(ending_zone_distance(self._cfg(), 50))  # finale owned by is_final_chapter
 
     def test_outside_zone(self):
-        from config import ending_zone_distance
+        from engine.config import ending_zone_distance
         self.assertIsNone(ending_zone_distance(self._cfg(), 45))  # remaining=5 == zone, not < zone
         self.assertIsNone(ending_zone_distance(self._cfg(), 30))
 
     def test_no_max_chapters(self):
-        from config import ending_zone_distance
+        from engine.config import ending_zone_distance
         self.assertIsNone(ending_zone_distance(self._cfg(max_chapters=0), 47))
 
     def test_ending_aware_off(self):
-        from config import ending_zone_distance
+        from engine.config import ending_zone_distance
         self.assertIsNone(ending_zone_distance(self._cfg(ending_aware=False), 47))
 
     def test_cost_savings_disabled_in_zone_and_finale(self):
-        from config import cost_savings_disabled
+        from engine.config import cost_savings_disabled
         self.assertTrue(cost_savings_disabled(self._cfg(), 50))   # finale
         self.assertTrue(cost_savings_disabled(self._cfg(), 47))   # inside zone
         self.assertFalse(cost_savings_disabled(self._cfg(), 30))  # outside zone
         self.assertFalse(cost_savings_disabled(self._cfg(), 45))  # remaining==zone, not < zone
 
     def test_cost_savings_disabled_gates(self):
-        from config import cost_savings_disabled
+        from engine.config import cost_savings_disabled
         # explicit opt-out
         self.assertFalse(
             cost_savings_disabled(self._cfg(ending_zone_disables_cost_savings=False), 50)
@@ -1497,7 +1468,7 @@ class RefinedTextAcceptableTests(unittest.TestCase):
         return {"novel": base}
 
     def test_rewrite_allows_more_growth_than_polish(self):
-        from refine import _refined_text_acceptable
+        from commands.refine import _refined_text_acceptable
         original = "字" * 1000
         refined = "字" * 2200  # 2.2x
         ok_polish, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="polish")
@@ -1506,7 +1477,7 @@ class RefinedTextAcceptableTests(unittest.TestCase):
         self.assertTrue(ok_rewrite, "rewrite ceiling (2.5x) must accept 2.2x growth")
 
     def test_restructure_tier(self):
-        from refine import _refined_text_acceptable
+        from commands.refine import _refined_text_acceptable
         original = "字" * 1000
         refined = "字" * 1900  # 1.9x -> under restructure 2.0x, over polish 1.5x
         ok_restr, _ = _refined_text_acceptable(original, refined, self._cfg(), intensity="restructure")
@@ -1515,7 +1486,7 @@ class RefinedTextAcceptableTests(unittest.TestCase):
         self.assertFalse(ok_polish)
 
     def test_rewrite_still_rejects_extreme_growth(self):
-        from refine import _refined_text_acceptable
+        from commands.refine import _refined_text_acceptable
         original = "字" * 1000
         refined = "字" * 3000  # 3.0x, above rewrite 2.5x
         ok, reason = _refined_text_acceptable(original, refined, self._cfg(), intensity="rewrite")
@@ -1527,13 +1498,13 @@ class PayoffDensityTests(unittest.TestCase):
     """Tests for payoff_beat_density: 爽点 cadence."""
 
     def test_payoff_markers_counted(self):
-        from quality import payoff_beat_density
+        from engine.quality import payoff_beat_density
         text = "他当众揭穿了对方的伪证，全场目瞪口呆，对手脸色骤变，败下阵来。" * 5
         res = payoff_beat_density(text, ["reveal"], {"novel": {}})
         self.assertGreater(res["metrics"]["payoff_markers"], 0)
 
     def test_drought_directive(self):
-        from quality import payoff_beat_density
+        from engine.quality import payoff_beat_density
         # recent payoff_types all setup → drought beyond max_gap (1/0.34≈3)
         flat = "他翻看着资料，慢慢整理着思路，又记下了几行笔记。" * 5
         res = payoff_beat_density(flat, ["setup", "setup", "emotional", "setup"], {"novel": {}})
@@ -1541,7 +1512,7 @@ class PayoffDensityTests(unittest.TestCase):
         self.assertIn("爽点", res["directives"][0])
 
     def test_recent_strong_payoff_no_drought(self):
-        from quality import payoff_beat_density
+        from engine.quality import payoff_beat_density
         flat = "他翻看着资料，慢慢整理着思路。" * 5
         res = payoff_beat_density(flat, ["reveal", "setup", "setup"], {"novel": {}})
         self.assertEqual(res["metrics"]["chapters_since_payoff"], 0)
@@ -1552,7 +1523,7 @@ class InformationDensityTests(unittest.TestCase):
     """Tests for information_density: pure-transition-chapter detection."""
 
     def test_transition_chapter_flagged(self):
-        from quality import information_density
+        from engine.quality import information_density
         text = "他在房间里来回踱步，回想着这些天发生的事，没有结论。" * 5
         plan = {"payoff_type": "setup", "info_reveals": []}
         review = {"beats_audit": [{"status": "absent"}, {"status": "absent"}]}
@@ -1561,7 +1532,7 @@ class InformationDensityTests(unittest.TestCase):
         self.assertTrue(res["directives"])
 
     def test_rich_chapter_not_flagged(self):
-        from quality import information_density
+        from engine.quality import information_density
         text = "他当众揭穿了伪证，真相大白。" * 5
         plan = {"payoff_type": "reveal", "info_reveals": ["secret-1"]}
         review = {"beats_audit": [{"status": "realized"}]}
@@ -1569,7 +1540,7 @@ class InformationDensityTests(unittest.TestCase):
         self.assertFalse(res["low_information"])
 
     def test_disabled(self):
-        from quality import information_density
+        from engine.quality import information_density
         res = information_density("x", {}, {}, {"novel": {"info_density_enabled": False}})
         self.assertFalse(res["low_information"])
 
@@ -1579,7 +1550,7 @@ class InformationDensityTests(unittest.TestCase):
         # documented "3 of 4" bar really "2 of 2". Pin the surviving pair by name:
         # a third signal reappearing silently would move the bar without moving the
         # threshold, which is how this gate came to read 0/638 while looking enabled.
-        from quality import information_density
+        from engine.quality import information_density
         flat = "他在房间里来回踱步，回想着这些天发生的事，没有结论。" * 5
         res = information_density(flat, {"payoff_type": "setup"}, None, {"novel": {}})
         self.assertEqual(sorted(res["signals"]),
@@ -1587,7 +1558,7 @@ class InformationDensityTests(unittest.TestCase):
         self.assertTrue(res["low_information"])
 
     def test_one_signal_is_not_enough(self):
-        from quality import information_density
+        from engine.quality import information_density
         # A setup chapter that nonetheless lands a payoff marker: one signal only.
         rich = "他当众揭穿了伪证，真相大白。" * 5
         res = information_density(rich, {"payoff_type": "setup"}, None, {"novel": {}})
@@ -1598,7 +1569,7 @@ class InformationDensityTests(unittest.TestCase):
         # v2 has no `review["beats_audit"]`. Passing None must not make the gate
         # stricter than passing a clean audit did -- absence read as assent is the
         # inverse of the sentinel-as-verdict defect.
-        from quality import information_density
+        from engine.quality import information_density
         rich = "他当众揭穿了伪证，真相大白。" * 5
         plan = {"payoff_type": "reveal"}
         self.assertEqual(information_density(rich, plan, None, {"novel": {}}),
@@ -2095,7 +2066,7 @@ class GateRegistryTests(unittest.TestCase):
     """Tests for the quality.GateRegistry infrastructure."""
 
     def test_all_gates_registered(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         gates = REGISTRY.list_gates()
         self.assertGreaterEqual(len(gates), 20)
         for name in ("style_health", "ai_flavor_health", "cross_chapter_repetition",
@@ -2103,28 +2074,28 @@ class GateRegistryTests(unittest.TestCase):
             self.assertIn(name, gates)
 
     def test_function_identity_preserved(self):
-        from quality import REGISTRY, style_health, ai_flavor_health
+        from engine.quality import REGISTRY, style_health, ai_flavor_health
         self.assertIs(REGISTRY.get("style_health"), style_health)
         self.assertIs(REGISTRY.get("ai_flavor_health"), ai_flavor_health)
 
     def test_is_enabled_default_true(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertTrue(REGISTRY.is_enabled("style_health", {"novel": {}}))
 
     def test_is_enabled_disabled(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertFalse(REGISTRY.is_enabled("style_health", {"novel": {"style_health_enabled": False}}))
 
     def test_is_enabled_none_config(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertTrue(REGISTRY.is_enabled("style_health", None))
 
     def test_is_enabled_unknown_gate(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertTrue(REGISTRY.is_enabled("nonexistent_gate", {"novel": {}}))
 
     def test_accumulate_penalty_and_flags(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         report: dict = {}
         result = {"penalty": 1.5, "flags": ["em_dash_high", "fragment"], "directives": ["reduce em-dashes"]}
         pen = REGISTRY.accumulate(report, result, "style_health", "style")
@@ -2135,7 +2106,7 @@ class GateRegistryTests(unittest.TestCase):
         self.assertIn("reduce em-dashes", report["writer_directives_for_next_chapter"])
 
     def test_accumulate_zero_penalty_no_flags(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         report: dict = {}
         result = {"penalty": 0.0, "flags": [], "directives": ["do something"]}
         pen = REGISTRY.accumulate(report, result, "test_gate", "test")
@@ -2144,20 +2115,20 @@ class GateRegistryTests(unittest.TestCase):
         self.assertIn("do something", report["writer_directives_for_next_chapter"])
 
     def test_accumulate_deduplicates_directives(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         report: dict = {"writer_directives_for_next_chapter": ["existing"]}
         result1 = {"penalty": 0.0, "flags": [], "directives": ["existing", "new"]}
         REGISTRY.accumulate(report, result1, "g1", "g")
         self.assertEqual(report["writer_directives_for_next_chapter"], ["existing", "new"])
 
     def test_tag_prefix(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertEqual(REGISTRY.tag_prefix("style_health"), "style")
         self.assertEqual(REGISTRY.tag_prefix("ai_flavor_health"), "ai_flavor")
         self.assertEqual(REGISTRY.tag_prefix("cross_chapter_repetition"), "repeat")
 
     def test_list_gates_phase_filter(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         review_gates = REGISTRY.list_gates(phase="review")
         planning_gates = REGISTRY.list_gates(phase="planning")
         self.assertIn("style_health", review_gates)
@@ -2166,7 +2137,7 @@ class GateRegistryTests(unittest.TestCase):
         self.assertNotIn("style_health", planning_gates)
 
     def test_get_unknown_returns_none(self):
-        from quality import REGISTRY
+        from engine.quality import REGISTRY
         self.assertIsNone(REGISTRY.get("nonexistent_gate"))
 
 
@@ -2183,7 +2154,7 @@ class ReasoningMaxTokensTests(unittest.TestCase):
         import types
         import tempfile
         from pathlib import Path
-        import llm
+        import engine.llm as llm
 
         received = []
 
@@ -2268,7 +2239,7 @@ class ReasoningEffortWiringTests(unittest.TestCase):
         import types
         import tempfile
         from pathlib import Path
-        import llm
+        import engine.llm as llm
 
         seen = {}
 
@@ -2330,11 +2301,11 @@ class ChapterModeMonotonyTests(unittest.TestCase):
     """
 
     def _cm(self, cur, recent, **cfg):
-        from quality import chapter_mode_monotony
+        from engine.quality import chapter_mode_monotony
         return chapter_mode_monotony(cur, recent, {"novel": cfg})
 
     def test_classify_modes(self):
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         self.assertEqual(_classify_chapter_mode({"goal": "通过线索推理识破规则解谜"}), "reasoning")
         self.assertEqual(_classify_chapter_mode({"goal": "追击逃亡", "beats": ["搏斗", "突围反击"]}), "action")
         self.assertEqual(_classify_chapter_mode({"goal": "妹妹牺牲告别", "payoff": "痛哭诀别"}), "emotional")
@@ -2345,7 +2316,7 @@ class ChapterModeMonotonyTests(unittest.TestCase):
         # Default baseline is now "auto" (no genre core form) → an empty plan has no
         # keyword evidence at all, so it falls back to the neutral "daily" label
         # rather than silently asserting the suspense core form.
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         self.assertEqual(_classify_chapter_mode({}), "daily")
         self.assertEqual(_classify_chapter_mode({"goal": ""}), "daily")
         # With an explicit genre baseline the old bias behaviour is unchanged.
@@ -2359,7 +2330,7 @@ class ChapterModeMonotonyTests(unittest.TestCase):
         whose SUBJECT matter is an investigation (线索/证据/真相) must not be forced
         into "reasoning" just because the config carried a suspense baseline.
         """
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         plan = {"goal": "查线索核对证据逼近真相", "payoff": "两人摊牌坦白，信任重建，她选择和解"}
         self.assertEqual(_classify_chapter_mode(plan, "reasoning", 3), "reasoning")
         self.assertEqual(_classify_chapter_mode(plan, "auto", 3), "relational")
@@ -2368,7 +2339,7 @@ class ChapterModeMonotonyTests(unittest.TestCase):
 
     def test_genre_profile_scopes_the_gate(self):
         """The gate is genre-scoped, not template-hardcoded (config.py profiles)."""
-        from config import genre_detection_profile
+        from engine.config import genre_detection_profile
         for preset in ("suspense", "rule_horror", "guize"):
             prof = genre_detection_profile(preset)
             self.assertTrue(prof["chapter_mode_enabled"], preset)
@@ -2425,20 +2396,20 @@ class ChapterModeMonotonyTests(unittest.TestCase):
     def test_baseline_bias_keeps_reasoning_when_other_within_margin(self):
         # reasoning present (推理/识破) + emotional content higher but within margin
         # => stays "reasoning" (the yeban misclassification the bias fixes).
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         pl = {"goal": "林越推理识破隐规则", "payoff": "妹妹牺牲告别痛哭诀别绝望"}
         self.assertEqual(_classify_chapter_mode(pl, "reasoning", 3), "reasoning")
 
     def test_baseline_bias_allows_clear_formbreak(self):
         # A chapter that CLEARLY departs (other mode exceeds baseline by > margin)
         # is allowed through as a genuine form-break.
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         pl = {"goal": "揭露幕后阵营组织布局阴谋势力格局", "payoff": "推理"}  # advancement>>reasoning
         self.assertEqual(_classify_chapter_mode(pl, "reasoning", 3), "advancement")
 
     def test_baseline_configurable_per_genre(self):
         # Non-suspense genres can set a different baseline form.
-        from quality import _classify_chapter_mode
+        from engine.quality import _classify_chapter_mode
         pl = {"goal": "追击战斗搏斗", "payoff": "推理识破"}  # action vs reasoning
         # baseline=action, margin high => stays action even with some reasoning
         self.assertEqual(_classify_chapter_mode(pl, "action", 3), "action")
@@ -2490,7 +2461,7 @@ class VolumePlanWindowTests(unittest.TestCase):
     ])
 
     def _win(self, ch, cap=16000, **kw):
-        from memory import volume_plan_window
+        from engine.plan import volume_plan_window
         return volume_plan_window(self.PLAN, ch, cap, **kw)
 
     def test_current_volume_schedule_reaches_the_writer(self):
@@ -2520,7 +2491,7 @@ class VolumePlanWindowTests(unittest.TestCase):
         self.assertNotIn("| Ch41 |", w)
 
     def test_window_fits_cap_and_beats_head_truncation(self):
-        from memory import volume_plan_window
+        from engine.plan import volume_plan_window
         # 真实文件里第一卷单卷就 18350 字 > 16000 窗口，所以头部截断永远到不了第二卷。
         bloated = self.PLAN.replace("- 卷目标：从废墟站稳。", "- 卷目标：" + "细节。" * 2000, 1)
         w = volume_plan_window(bloated, 41, 2000)
@@ -2562,7 +2533,7 @@ class HardFossilTailAnchorTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from writing import _preflight_negative_list
+        from engine.write import _preflight_negative_list
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self._cache(root, [
@@ -2582,14 +2553,14 @@ class HardFossilTailAnchorTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from writing import _preflight_negative_list
+        from engine.write import _preflight_negative_list
         with tempfile.TemporaryDirectory() as td:
             neg = _preflight_negative_list(
                 _make_paths(Path(td)), None, {"novel": {}}, 1)
         self.assertEqual(neg["hard_fossils"], [])
 
     def test_anchor_quotes_every_phrase_with_its_frequency(self):
-        from writing import fossil_tail_anchor
+        from engine.write import fossil_tail_anchor
         out = fossil_tail_anchor(
             {"hard_fossils": [("声音压得很低", 0.42)]}, {"novel": {}})
         self.assertIn("声音压得很低", out)
@@ -2597,7 +2568,7 @@ class HardFossilTailAnchorTests(unittest.TestCase):
         self.assertIn("一次都不许出现", out)
 
     def test_anchor_is_capped(self):
-        from writing import FOSSIL_TAIL_ANCHOR_MAX, fossil_tail_anchor
+        from engine.write import FOSSIL_TAIL_ANCHOR_MAX, fossil_tail_anchor
         hard = [(f"化石{i}", 0.9 - i * 0.01) for i in range(12)]
         out = fossil_tail_anchor({"hard_fossils": hard}, {"novel": {}})
         # A long tail dilutes the position the block exists to exploit.
@@ -2606,14 +2577,14 @@ class HardFossilTailAnchorTests(unittest.TestCase):
         self.assertNotIn(f"化石{FOSSIL_TAIL_ANCHOR_MAX}", out)
 
     def test_anchor_is_empty_without_hard_fossils(self):
-        from writing import fossil_tail_anchor
+        from engine.write import fossil_tail_anchor
         self.assertEqual(fossil_tail_anchor({}, {"novel": {}}), "")
         self.assertEqual(fossil_tail_anchor(None, {"novel": {}}), "")
         self.assertEqual(
             fossil_tail_anchor({"hard_fossils": []}, {"novel": {}}), "")
 
     def test_anchor_can_be_disabled(self):
-        from writing import fossil_tail_anchor
+        from engine.write import fossil_tail_anchor
         self.assertEqual(
             fossil_tail_anchor({"hard_fossils": [("声音压得很低", 0.42)]},
                                {"novel": {"fossil_tail_anchor_enabled": False}}),

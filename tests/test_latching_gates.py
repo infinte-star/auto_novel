@@ -25,7 +25,7 @@ Zero LLM calls. Measured library effect of the pair: FPY' 81.8% -> 85.8%
 """
 import unittest
 
-from quality import book_wide_fossils, chapter_mode_monotony
+from engine.quality import book_wide_fossils, chapter_mode_monotony
 
 
 def _cfg(**novel) -> dict:
@@ -161,11 +161,11 @@ class BookFossilFirstDraftCorpusTest(unittest.TestCase):
         # the one those numbers were measured under, with no test failing.
         import re
         from pathlib import Path
-        v2 = (Path(__file__).resolve().parent.parent / "v2" / "run.py").read_text(
+        v2 = (Path(__file__).resolve().parent.parent / "engine" / "loop.py").read_text(
             encoding="utf-8")
         self.assertTrue(
             re.search(r"_chapter_texts\(paths, 1, chapter_num\)", v2),
-            "v2/run.py:load_corpus no longer passes the Ch1..n slice")
+            "engine/loop.py:load_corpus no longer passes the Ch1..n slice")
         self.assertNotIn(
             "book_texts[chapter_num] = ", v2,
             "load_corpus started splicing the unsaved draft into the corpus — that "
@@ -273,7 +273,7 @@ class EmptyAbilityWhitelistTest(unittest.TestCase):
     """
 
     def test_empty_whitelist_omits_the_section(self):
-        from memory import _contract_to_markdown
+        from engine.bootstrap import _contract_to_markdown
         md = _contract_to_markdown({
             "protagonist": "汤舒婷",
             "iron_rules": ["每章必须有一次具体的味觉描写"],
@@ -285,7 +285,7 @@ class EmptyAbilityWhitelistTest(unittest.TestCase):
         self.assertIn("必须全程维持的硬设定", md)
 
     def test_populated_whitelist_still_renders(self):
-        from memory import _contract_to_markdown
+        from engine.bootstrap import _contract_to_markdown
         md = _contract_to_markdown({
             "ability_whitelist": [{"name": "味觉共情", "modality": "cognitive"}],
         })

@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from tools.fpy_prime import discover_novels, print_exclusions  # noqa: E402
-from v2.accept import HARD_FIELDS, contract_fulfilment  # noqa: E402
+from engine.loop import HARD_FIELDS, contract_fulfilment  # noqa: E402
 
 # merged_plan -> ChapterCard. Only the fields `contract_fulfilment` reads.
 #

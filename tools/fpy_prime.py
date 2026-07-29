@@ -53,7 +53,7 @@ sys.path.insert(0, str(ROOT))
 # The ruler itself, not a copy of it. It lives in `quality.py` rather than
 # `pipeline.py` so this zero-LLM tool does not have to import the engine to
 # borrow the engine's own definition of "this draft is a write-off".
-from quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
+from engine.quality import hard_block_reasons as _hard_block_reasons  # noqa: E402
 
 # `_hard_block_reasons` reads a handful of `config["novel"]` thresholds. Using each
 # novel's own config would make two arms incomparable the moment their configs
@@ -302,7 +302,7 @@ def _restamp_style_penalty(sh: dict) -> dict | None:
     if not old_em:
         return None
     try:
-        from quality import em_dash_penalty
+        from engine.quality import em_dash_penalty
     except Exception:
         return None
     base = metrics.get("em_dash_recent_mean")
