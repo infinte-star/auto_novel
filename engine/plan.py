@@ -875,7 +875,11 @@ def ensure_card(
     if problems:
         log(paths, f"beat: card Ch{chapter_num} failed pre-write validation: {problems}")
         db_event(conn, chapter_num, "card_repair", {"problems": problems, "source": source})
-        fixed = repair_card(client, paths, config, card, problems, chapter_num, call=call)
+        try:
+            fixed = repair_card(client, paths, config, card, problems, chapter_num, call=call)
+        except Exception as exc:
+            log(paths, f"beat: card repair call failed Ch{chapter_num} (non-fatal): {exc}")
+            fixed = None
         # Re-judged by the SAME ruler that rejected it. The three-argument
         # `validate_card` that used to sit here runs a strictly SMALLER check than
         # the one that fired: continuity CRITICALs and the scene-dedupe similarity

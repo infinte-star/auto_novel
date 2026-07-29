@@ -314,9 +314,12 @@ def length_block(config: dict[str, Any]) -> str:
     target = int(novel.get("chapter_words", 4000) or 4000)
     lo = int(novel.get("chapter_min_chars", 2500) or 2500)
     hi = int(novel.get("chapter_max_chars", 7000) or 7000)
-    return (f"## 本章字数区间（硬性约束）\n"
+    dlg_pct = int(float(novel.get("dialogue_char_ratio_target", 0.20)) * 100)
+    return (f"## 本章字数与对话区间（硬性约束）\n"
             f"正文目标约 {target} 字，必须落在 {lo}-{hi} 字之间。"
-            f"低于下限会被判过短、高于上限会被判超长，两种都要返工。"
+            f"低于下限会被判过短、高于上限会被判超长，两种都要返工。\n"
+            f"对话（引号内台词）占正文篇幅不低于 {dlg_pct}%——"
+            f"关键信息通过人物对白推进，不要通篇叙述。\n"
             f"（第二段的状态增量 JSON 不计入字数。）")
 
 
@@ -827,7 +830,8 @@ _OUTPUT_SECTION = """## 输出要求
 
 _SENSORY_DIALOGUE_DEFAULT = """## 感官与对话
 - 每个场景至少2种感官锚点；用具体细节代替抽象描述。
-- 对话占全章25-45%，反映人物身份与心理，关键对话含潜台词。"""
+- 对话占全章25-45%，反映人物身份与心理，关键对话含潜台词。
+- 破折号（——）每千字不超过4个；需要停顿时用逗号或句号，需要解释时用括号或另起短句。"""
 
 _TIME_MARKER_BAN_DEFAULT = """## 时间标记禁令
 - 严禁以时间副词切换场景；时间流逝靠情节动作体现，每章最多2个时间词且与具体行为绑定。"""

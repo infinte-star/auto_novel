@@ -74,7 +74,7 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "opening_gate_mode": "crisis",
         "payoff_density_min": 0.5,            # ≤2 章一个强爽点
         "chapter_words": 2800,
-        "chapter_min_chars": 2200,
+        "chapter_min_chars": 2500,
         "chapter_max_chars": 3600,
         "length_band_penalty_enabled": True,
         "style_low_barrier_register": True,
@@ -83,7 +83,7 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         # 阈值由离线回放校准（experiments/replay_style_health.py）：健康对话书
         # 跑 8-18% 对话占比；塌缩章 0.5-3% + 黑话 ≥12/k。
         "style_max_avg_sentence_chars": 38.0,
-        "style_dialogue_ratio_min": 0.05,
+        "style_dialogue_ratio_min": 0.08,
         "style_tech_jargon_per_kchar_warn": 8.0,
         "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
