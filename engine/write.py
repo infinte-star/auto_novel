@@ -831,7 +831,8 @@ _OUTPUT_SECTION = """## 输出要求
 _SENSORY_DIALOGUE_DEFAULT = """## 感官与对话
 - 每个场景至少2种感官锚点；用具体细节代替抽象描述。
 - 对话占全章25-45%，反映人物身份与心理，关键对话含潜台词。
-- 破折号（——）每千字不超过4个；需要停顿时用逗号或句号，需要解释时用括号或另起短句。"""
+- 破折号（——）每千字不超过4个；需要停顿时用逗号或句号，需要解释时用括号或另起短句。
+- 连续超过3个自然段的纯叙述/描写必须被一句对话打断——长段叙述在手机端是灰色文字墙，读者直接划走。"""
 
 _TIME_MARKER_BAN_DEFAULT = """## 时间标记禁令
 - 严禁以时间副词切换场景；时间流逝靠情节动作体现，每章最多2个时间词且与具体行为绑定。"""
@@ -1012,7 +1013,9 @@ GENRE_PROFILES: dict[str, dict[str, str]] = {
             '- 本章至少有一个明确爽点：打脸、扮猪吃虎后的反转、资源/实力碾压、身份揭示之一，落到具体动作与对手反应上。\n'
             '- 代入感优先：主角的优势（重生先知/异能/资源）要让读者有“我也想这样”的爽，但优势必须有边界与代价。\n'
             '- 打脸要有铺垫：先有轻视/压迫/挑衅，再有反击，对手要聪明、有反应，禁止降智捧哏式纸片人。\n'
-            '- 现代都市细节要真实（行业、阶层、人情世故），不出戏。'
+            '- 现代都市细节要真实（行业、阶层、人情世故），不出戏。\n'
+            '- 信息差变现：本章主角必须至少有一个"利用预知/异能信息做出常人无法做出的判断"的时刻，'
+            '且该判断带来可见的收益或避免可见的损失，并被至少一个在场角色目睹或感知到。'
         ),
         "structure_template": (
             '## 结构模板\n'
@@ -1020,15 +1023,29 @@ GENRE_PROFILES: dict[str, dict[str, str]] = {
             '- 场景一（1000-1500字）：压迫/被轻视场景，铺垫反击的合理性\n'
             '- 场景二（800-1200字）：主角施展优势的关键场景，埋下打脸引信\n'
             '- 场景三（600-1000字）：打脸/反转/碾压兑现，呈现对手反应与代价\n'
-            '- 结尾钩（200-400字）：制造下章悬念，不用总结式收尾'
+            '- 结尾钩（200-400字）：制造下章悬念，不用总结式收尾\n'
+            '- 结尾钩的三选一（必须用其中之一收束全章）：\n'
+            '  ①反转弹出：最后一句揭示一个颠覆读者预期的新信息（新身份/新威胁/新发现）\n'
+            '  ②危机迫近：最后一句让主角面临一个迫在眉睫的、下一章必须解决的具体威胁\n'
+            '  ③悬念提问：最后一句抛出一个读者无法自行回答的具体问题\n'
+            '  禁止以内心感悟、环境描写、情绪沉淀、或总结式评论收尾。最后一段必须短（≤100字），独立成段。'
         ),
-        "sensory_dialogue": "",
+        "sensory_dialogue": (
+            '## 感官与对话\n'
+            '- 每个场景至少2种感官锚点；用具体细节代替抽象描述。\n'
+            '- 对话占全章25-45%，反映人物身份与心理，关键对话含潜台词。\n'
+            '- 破折号（——）每千字不超过4个；需要停顿时用逗号或句号，需要解释时用括号或另起短句。\n'
+            '- 连续超过3个自然段的纯叙述/描写必须被一句对话打断。\n'
+            '- 内心独白每千字不超过200字——能力副作用（记忆丧失、感知异常）优先用外部行为暴露'
+            '（叫错名字、忘记约定、重复已做过的事），而非用内心复盘告诉读者"我忘了"。'
+        ),
         "time_marker_ban": "",
         "genre_bans": (
             '## 禁止模式\n'
             '- 禁止廉价顿悟、解释性叙述代替戏剧化呈现。\n'
             '- 禁止对手降智送人头；禁止无铺垫无代价的碾压。\n'
-            '- 禁止开场连续两段是环境描写。'
+            '- 禁止开场连续两段是环境描写。\n'
+            '- 章尾禁止："他望着窗外陷入沉思"式收尾；"一切才刚刚开始"式套话；最后两段都是叙述/描写无对话无动作。'
         ),
         "extras": "",
     },
@@ -1365,6 +1382,7 @@ def _preflight_negative_list(
     _ADVISORY_FLAG_KEYS = (
         "ai_flavor_health", "paragraph_shape_health",
         "intra_chapter_repetition", "prose_texture",
+        "chapter_ending_strength",
     )
     for ch in range(max(1, chapter_num - lookback), chapter_num):
         for key in ("final_review.json", "review_round0.json"):
@@ -1429,6 +1447,28 @@ def _preflight_negative_list(
         if w and w not in fossils:
             fossils.add(w)
             items.append(f"体裁疲劳词「{w}」——尽量避免或限制使用。")
+
+    # Chapter-length variance check: when recent chapters swing wildly (CV > 0.30),
+    # inject a style_warning so the writer gets a length-consistency nudge.
+    if chapter_num >= 6:
+        recent_lens: list[int] = []
+        for ch in range(max(1, chapter_num - 5), chapter_num):
+            cp = chapter_path(paths, ch)
+            try:
+                recent_lens.append(len(read_text(cp)))
+            except Exception:
+                pass
+        if len(recent_lens) >= 3:
+            mean_len = sum(recent_lens) / len(recent_lens)
+            if mean_len > 0:
+                std_len = (sum((x - mean_len) ** 2 for x in recent_lens) / len(recent_lens)) ** 0.5
+                cv = std_len / mean_len
+                if cv > 0.30:
+                    target = int(config["novel"].get("chapter_words", 4000) or 4000)
+                    style_warnings.append(
+                        f"最近几章长度波动过大（最短{min(recent_lens)}字/最长{max(recent_lens)}字，CV={cv:.2f}），"
+                        f"本章请控制在{max(target - 500, 1500)}-{target + 500}字之间。"
+                    )
 
     return {
         "items": items[:10],

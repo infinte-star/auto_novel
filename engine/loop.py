@@ -935,6 +935,9 @@ def acceptance_report(
     if enabled("information_density"):
         report["information_density"] = quality.information_density(
             body, card, None, config)
+    if enabled("chapter_ending_strength"):
+        report["chapter_ending_strength"] = quality.chapter_ending_strength(
+            body, config)
 
     # --- directives -------------------------------------------------------
     wd = report["writer_directives_for_next_chapter"]
@@ -945,7 +948,8 @@ def acceptance_report(
                 "ai_flavor_health", "paragraph_shape_health",
                 "hook_tail_repetition", "intra_chapter_repetition",
                 "prose_texture", "dialogue_health", "long_span_fatigue",
-                "payoff_beat_density", "shareable_line", "information_density"):
+                "payoff_beat_density", "shareable_line", "information_density",
+                "chapter_ending_strength"):
         for d in (report.get(key) or {}).get("directives", []):
             if d not in wd:
                 wd.append(d)

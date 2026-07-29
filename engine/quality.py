@@ -2992,6 +2992,7 @@ from engine.quality_advisory import (  # noqa: F401,E402
     _NEGATIVE_PAIR,
     _TEMPLATE_PIVOT,
     ai_flavor_health,
+    chapter_ending_strength,
     hook_tail_repetition,
     information_density,
     intra_chapter_repetition,

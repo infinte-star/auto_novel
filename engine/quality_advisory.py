@@ -1038,3 +1038,55 @@ def information_density(
         )
     return {"low_information": low_info, "signals": signals, "directives": directives}
 
+
+@REGISTRY.register(
+    "chapter_ending_strength", config_key="ending_strength_enabled",
+    tag_prefix="ending", repair="advisory", scope="chapter",
+    proof="UNVALIDATED — new gate, no historical data yet. Designed as pure "
+          "advisory (no penalty) to avoid the threshold-unreachability defect "
+          "that killed the old chapter_ending_quality gate. Heuristic checks "
+          "three positive signals in the chapter tail; fires when none are "
+          "present.")
+def chapter_ending_strength(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect a chapter ending that lacks hook strength.
+
+    Scans the final ~150 chars for three positive signals (any one suffices):
+      - dialogue quote (ending on a spoken line)
+      - question mark (posing a question to the reader)
+      - dash/ellipsis (suspense rhythm)
+    When none are found, emits an advisory directive for the next chapter.
+    No penalty — ending quality is too subjective for a numeric score.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "has_hook": True, "signals": [], "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("ending_strength_enabled", True)) or not text:
+        return result
+    body = _strip_title_line(text)
+    if len(body) < 300:
+        return result
+    tail_len = int(cfg.get("ending_strength_tail_chars", 150))
+    tail = body[-tail_len:]
+    signals: list[str] = []
+    if re.search(r'["“”「」]', tail):
+        signals.append("dialogue")
+    if '？' in tail or '?' in tail:
+        signals.append("question")
+    if '——' in tail or '……' in tail:
+        signals.append("suspense_punct")
+    result["signals"] = signals
+    if signals:
+        return result
+    result["has_hook"] = False
+    result["flags"].append("weak_chapter_ending")
+    result["directives"].append(
+        "上一章以纯叙述/描写收尾，缺少钩子。"
+        "本章结尾请用三选一：①对话中抛出新悬念；②用问句让读者想知道答案；"
+        "③用反转/危机的具体动作收束，最后一段独立成段、短而狠。"
+    )
+    return result
+
