@@ -84,14 +84,13 @@ def _l1_advisory() -> dict:
     """A REAL short-chapter gate result: fires, offers an L1 fixer, never blocks.
 
     Built by calling the gate rather than by hand, because the whole point of
-    this case is a payload shape I got wrong once: `length_band_check` has no
-    path to `block=True` on the short side (only a gross overshoot can block),
-    so a blocks-gated repair predicate leaves `expand_to_band` unreachable and
-    v2 mute on short chapters — the failure the live smoke run surfaced at 2240
-    chars. Fabricating the payload is what hid it the first time.
+    this case is a payload shape I got wrong once: `length_band_check` only
+    blocks on the short side below `short_block_ratio` (default 0.5×min),
+    so a MILDLY short chapter (above the ratio) still needs `expand_to_band`
+    via the repair ladder. Fabricating the payload is what hid it the first time.
     """
     import engine.quality as quality
-    result = quality.length_band_check("正" * 1200, _config())
+    result = quality.length_band_check("正" * 1300, _config())
     assert not result["block"] and result["flags"], result
     return {"length_band": result, "block_reasons": [], "accepted": True}
 

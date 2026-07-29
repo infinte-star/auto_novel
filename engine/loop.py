@@ -62,13 +62,28 @@ from engine.config import (
     rebuild_book,
     write_text,
 )
+from engine.config import text_bigrams
 from engine import quality
 from engine.quality import REGISTRY, hard_block_reasons
 from engine.plan import ensure_card, CARD_CHECKPOINT, card_to_plan
-# engine.write imported lazily inside _act_write / _act_rescue to avoid
-# circular import: engine.write top-level imports ChapterDelta from here.
 from engine.llm import LLMClientPool
 from engine.store import db_event, init_db
+from engine.types import (  # noqa: F401 — re-exported for backward compat
+    BUDGET,
+    CLIP_MARK,
+    DEFAULT_TAIL_CHARS,
+    DROP_MARK,
+    STABLE_HEADER,
+    STABLE_SECTIONS,
+    TITLES,
+    VOLATILE_HEADER,
+    VOLATILE_SECTIONS,
+    AcceptanceReport,
+    ChapterDelta,
+    GateResult,
+    Section,
+    StoryState,
+)
 
 # ---------------------------------------------------------------------------
 # Checkpoints. Three of these names are NOT v2's to choose: `review_round0.json`,
@@ -109,51 +124,10 @@ RESCUE_ATTEMPTS = 1
 # StoryState projection (inlined from v2/canon.py)
 # ===========================================================================
 
-# Per-section char caps.
-BUDGET: dict[str, int] = {
-    # stable
-    "brief": 1500,
-    "facts": 2000,
-    "voice": 1500,
-    "route": 600,
-    # volatile
-    "card": 3000,
-    "focus": 800,
-    "threads": 1000,
-    "recent": 1500,
-    "ledger": 1000,
-    "rag": 4000,
-    "opening": 500,
-}
-
-STABLE_SECTIONS: tuple[str, ...] = ("brief", "facts", "voice", "route")
-VOLATILE_SECTIONS: tuple[str, ...] = ("card", "focus", "threads", "recent",
-                                      "ledger", "rag", "opening")
-
-TITLES: dict[str, str] = {
-    "brief": "创作纲要",
-    "facts": "世界与人物事实",
-    "voice": "叙事声音",
-    "route": "作品定位（已采纳开篇路线）",
-    "card": "本章卡片",
-    "focus": "主角当前处境",
-    "threads": "未结伏线",
-    "recent": "最近发生",
-    "ledger": "已用元素账",
-    "rag": "相关历史原文",
-    "opening": "开篇执行指令",
-}
-
 ROUTE_KEEP_STABLE: tuple[str, ...] = ("核心卖点", "差异化", "读者承诺")
 ROUTE_KEEP_OPENING: tuple[str, ...] = ("正式连载前修改指令",)
 
 OPENING_ROUTE_SPAN = 3
-
-STABLE_HEADER = "# 稳定参照（可缓存）"
-VOLATILE_HEADER = "# 本章上下文"
-
-CLIP_MARK = "〔…截断 {n} 字〕"
-DROP_MARK = "〔…另有 {n} 条未列出〕"
 
 
 # ---------------------------------------------------------------------------
@@ -196,63 +170,7 @@ def _clip_items(items: Sequence[str], cap: int) -> str:
     return "\n".join(kept)
 
 
-# ---------------------------------------------------------------------------
-# Sections
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass(frozen=True)
-class Section:
-    key: str
-    body: str
-    stable: bool
-
-    @property
-    def title(self) -> str:
-        return TITLES.get(self.key, self.key)
-
-    def render(self) -> str:
-        return f"## {self.title}\n{self.body}" if self.body.strip() else ""
-
-
-@dataclasses.dataclass(frozen=True)
-class StoryState:
-    """The projected context for exactly one chapter."""
-
-    chapter: int
-    sections: tuple[Section, ...]
-    stable_key: str = ""
-
-    def _join(self, stable: bool, header: str) -> str:
-        parts = [s.render() for s in self.sections if s.stable is stable]
-        parts = [p for p in parts if p]
-        return (header + "\n\n" + "\n\n".join(parts)) if parts else ""
-
-    def stable_prefix(self) -> str:
-        """The bytes that must not move. Feed this as ``cacheable_prefix``."""
-        return self._join(True, STABLE_HEADER)
-
-    def volatile_block(self) -> str:
-        return self._join(False, VOLATILE_HEADER)
-
-    def render(self) -> str:
-        head, tail = self.stable_prefix(), self.volatile_block()
-        return "\n\n".join(p for p in (head, tail) if p)
-
-    def section(self, key: str) -> str:
-        for s in self.sections:
-            if s.key == key:
-                return s.body
-        return ""
-
-    def sizes(self) -> dict[str, int]:
-        out = {s.key: len(s.body) for s in self.sections if s.body}
-        out["_stable"] = len(self.stable_prefix())
-        out["_volatile"] = len(self.volatile_block())
-        out["_total"] = len(self.render())
-        return out
-
-    def digest(self) -> str:
-        return hashlib.sha1(self.render().encode("utf-8")).hexdigest()[:12]
+# Section and StoryState live in engine.types; re-exported above.
 
 
 # ---------------------------------------------------------------------------
@@ -580,50 +498,7 @@ def load_story_state(
 # ChapterDelta
 # ---------------------------------------------------------------------------
 
-@dataclasses.dataclass(frozen=True)
-class ChapterDelta:
-    """The state change a chapter produced, as the writer reported it."""
-
-    events: tuple[dict[str, Any], ...] = ()
-    entities: tuple[dict[str, Any], ...] = ()
-    threads: tuple[dict[str, Any], ...] = ()
-    protagonist_state: dict[str, Any] = dataclasses.field(default_factory=dict)
-    next_directions: tuple[str, ...] = ()
-
-    @classmethod
-    def from_payload(cls, payload: Any) -> "ChapterDelta":
-        """Build from the write call's JSON. Never raises; missing is empty."""
-        d = payload if isinstance(payload, dict) else {}
-
-        def _dicts(key: str) -> tuple[dict[str, Any], ...]:
-            v = d.get(key)
-            return tuple(x for x in v if isinstance(x, dict)) if isinstance(v, list) else ()
-
-        nd = d.get("next_12_directions") or d.get("next_directions") or []
-        return cls(
-            events=_dicts("events"),
-            entities=_dicts("entities"),
-            threads=_dicts("threads"),
-            protagonist_state=d.get("protagonist_state") if isinstance(
-                d.get("protagonist_state"), dict) else {},
-            next_directions=tuple(str(x).strip() for x in nd
-                                  if isinstance(nd, list) and str(x).strip()),
-        )
-
-    def as_extraction(self) -> dict[str, Any]:
-        """The v1 extraction dict, for the one persistence path."""
-        return {
-            "events": list(self.events),
-            "entities": list(self.entities),
-            "threads": list(self.threads),
-            "protagonist_state": dict(self.protagonist_state),
-            "next_12_directions": list(self.next_directions),
-        }
-
-    @property
-    def empty(self) -> bool:
-        return not (self.events or self.entities or self.threads
-                    or self.protagonist_state)
+# ChapterDelta lives in engine.types; re-exported above.
 
 
 def apply_delta(paths: Any, conn: Any, chapter: int, delta: ChapterDelta, *,
@@ -659,13 +534,13 @@ NOT_IN_ACCEPTANCE: dict[str, str] = {
         "(did the prose stage what was promised) against the whole card rather "
         "than the `beats` list alone. Running both would double-charge.",
     "dialogue_health":
-        "the ruler never reads it: its verdict is a penalty, and review.py "
-        "never turns it into a gate_reject. Stays an L1 repair trigger.",
+        "runs as advisory in acceptance_report (directives forwarded to next "
+        "chapter) but never blocks — penalty only, no path into "
+        "hard_block_reasons.",
     "intra_chapter_repetition":
-        "same -- penalty only, no path into hard_block_reasons. Advisory.",
+        "runs as advisory — penalty only, directives forwarded.",
     "hook_tail_repetition":
-        "penalty only, thresholds never validated against a live BLOCKING "
-        "distribution. Advisory.",
+        "runs as advisory — penalty only, directives forwarded.",
     "scene_similarity": "card-phase; see CARD_GATES.",
     "narrative_pattern_repetition": "card-phase; see CARD_GATES.",
     "plan_visual_payoff_check": "card-phase; see CARD_GATES.",
@@ -685,7 +560,6 @@ CARD_GATES: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 HARD_FIELDS: tuple[str, ...] = ("where", "turn", "exit_hook")
-DEFAULT_TAIL_CHARS = 400
 FORBID_MIN_ANCHOR = 4
 
 OBLIGATION_MARKERS: tuple[str, ...] = ("必须", "务必", "应当", "应该", "需要", "要求")
@@ -704,10 +578,6 @@ def _is_misfiled_requirement(entry: str) -> bool:
 
 def _body(text: str) -> str:
     return quality._strip_title_line(str(text or ""))
-
-
-def _bigrams(text: str) -> set[str]:
-    return {text[i:i + 2] for i in range(len(text) - 1)}
 
 
 def _anchors(target: str) -> list[str]:
@@ -762,9 +632,9 @@ def contract_fulfilment(
     body = _body(text)
     if len(body) < 500:
         return out
-    grams = _bigrams(body)
+    grams = text_bigrams(body, strip="none")
     tail = body[-int(cfg.get("ccc_tail_chars", DEFAULT_TAIL_CHARS)):]
-    tail_grams = _bigrams(tail)
+    tail_grams = text_bigrams(tail, strip="none")
     hard_fields = set(HARD_FIELDS)
 
     def add(field: str, target: str, hit: bool, anchors: list[str], matched: list[str]):
@@ -1040,12 +910,42 @@ def acceptance_report(
              f"（出自 {c['target'][:40]}…），已豁免")
             for c in ccc["forbid_conflicts"]]
 
+    # --- advisory gates (zero-LLM, directives only) ------------------------
+    if enabled("ai_flavor_health"):
+        report["ai_flavor_health"] = quality.ai_flavor_health(body, config)
+    if enabled("paragraph_shape_health"):
+        report["paragraph_shape_health"] = quality.paragraph_shape_health(body, config)
+    if prior_texts and enabled("hook_tail_repetition"):
+        report["hook_tail_repetition"] = quality.hook_tail_repetition(
+            body, prior_texts, config)
+    if enabled("intra_chapter_repetition"):
+        report["intra_chapter_repetition"] = quality.intra_chapter_repetition(body, config)
+    if enabled("prose_texture"):
+        report["prose_texture"] = quality.prose_texture(body, config)
+    if enabled("dialogue_health"):
+        report["dialogue_health"] = quality.dialogue_health(body, config)
+    if conn and enabled("long_span_fatigue"):
+        report["long_span_fatigue"] = quality.long_span_fatigue(
+            conn, chapter_num, config)
+    if enabled("payoff_beat_density"):
+        report["payoff_beat_density"] = quality.payoff_beat_density(
+            body, recent_payoff_types, config)
+    if enabled("shareable_line"):
+        report["shareable_line"] = quality.shareable_line(body, config)
+    if enabled("information_density"):
+        report["information_density"] = quality.information_density(
+            body, card, None, config)
+
     # --- directives -------------------------------------------------------
     wd = report["writer_directives_for_next_chapter"]
     for key in ("style_health", "length_band", "opening_hook_gate",
                 "adjacent_repetition", "cross_chapter_repetition",
                 "book_fossils", "descriptor_frequency", "genre_adherence",
-                "contract_fulfilment"):
+                "contract_fulfilment",
+                "ai_flavor_health", "paragraph_shape_health",
+                "hook_tail_repetition", "intra_chapter_repetition",
+                "prose_texture", "dialogue_health", "long_span_fatigue",
+                "payoff_beat_density", "shareable_line", "information_density"):
         for d in (report.get(key) or {}).get("directives", []):
             if d not in wd:
                 wd.append(d)

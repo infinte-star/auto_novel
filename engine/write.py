@@ -42,7 +42,7 @@ from engine.config import (
 from engine.llm import call_llm, load_json_with_repair, safe_json_loads
 from engine.quality import plan_score
 from engine.store import db_event, db_lock, store_causal_links, upsert_reader_promise
-from engine.loop import ChapterDelta, StoryState
+from engine.types import ChapterDelta, StoryState
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -198,7 +198,8 @@ def contract_checklist(card: dict[str, Any] | None,
     """
     if not isinstance(card, dict) or not card:
         return ""
-    from engine.loop import DEFAULT_TAIL_CHARS, _anchors as _accept_anchors
+    from engine.types import DEFAULT_TAIL_CHARS
+    from engine.quality import _beat_anchor_fragments
 
     cfg = (config or {}).get("novel", {}) if config else {}
     tail = int(cfg.get("ccc_tail_chars", DEFAULT_TAIL_CHARS) or
@@ -207,7 +208,7 @@ def contract_checklist(card: dict[str, Any] | None,
     lines: list[str] = []
 
     def anchored(field: str, target: str, note: str = "") -> None:
-        anchors = _accept_anchors(target)
+        anchors = _beat_anchor_fragments(target)
         quoted = "".join(f"「{a}」" for a in anchors[:4])
         hint = f"　验收会在正文里搜这些词：{quoted}" if quoted else \
             "　（这一条写得太抽象，验收无法判定——请自己把它落成具体的人/物/动作）"
@@ -311,7 +312,7 @@ def negative_block(preflight: dict[str, Any] | None) -> str:
 def length_block(config: dict[str, Any]) -> str:
     novel = config["novel"]
     target = int(novel.get("chapter_words", 4000) or 4000)
-    lo = int(novel.get("chapter_min_chars", 2800) or 2800)
+    lo = int(novel.get("chapter_min_chars", 2500) or 2500)
     hi = int(novel.get("chapter_max_chars", 7000) or 7000)
     return (f"## 本章字数区间（硬性约束）\n"
             f"正文目标约 {target} 字，必须落在 {lo}-{hi} 字之间。"
@@ -1352,6 +1353,30 @@ def _preflight_negative_list(
             if gate_rejects or flags:
                 break
 
+    # Advisory gate flags from prior reviews — concrete patterns (AI cliches,
+    # paragraph shape issues, texture problems) that the advisory gates detected.
+    # These are zero-LLM checks whose results were persisted in acceptance_report;
+    # reading them here gives the writer a 5-chapter lookback of specific avoidance
+    # targets beyond the two gate_rejects names above.
+    _ADVISORY_FLAG_KEYS = (
+        "ai_flavor_health", "paragraph_shape_health",
+        "intra_chapter_repetition", "prose_texture",
+    )
+    for ch in range(max(1, chapter_num - lookback), chapter_num):
+        for key in ("final_review.json", "review_round0.json"):
+            data = load_checkpoint(paths, ch, key)
+            if not isinstance(data, dict):
+                continue
+            for gate_key in _ADVISORY_FLAG_KEYS:
+                gate_data = data.get(gate_key)
+                if not isinstance(gate_data, dict):
+                    continue
+                for flag in (gate_data.get("flags") or [])[:3]:
+                    flag_text = str(flag).strip()
+                    if flag_text and flag_text not in style_warnings:
+                        style_warnings.append(flag_text)
+            break
+
     # Book-wide fossils: persistent avoid-list mined across the WHOLE book by
     # review.book_wide_fossils (cached every book_fossil_every chapters). Unlike
     # the lookback fossils above, these reflect chronic habit-stiffening over the
@@ -1470,7 +1495,7 @@ def _chapter_write_max_tokens(config: dict[str, Any]) -> int | None:
     if explicit > 0:
         return explicit
     try:
-        cmax = int(nv.get("chapter_max_chars", 3600))
+        cmax = int(nv.get("chapter_max_chars", 7000))
     except (TypeError, ValueError):
         cmax = 3600
     ratio = float(nv.get("write_token_char_ratio", 1.15))

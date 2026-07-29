@@ -18,17 +18,11 @@ from tempfile import TemporaryDirectory
 import engine.store as store
 import commands.telemetry as telemetry
 from engine.config import Paths
+from tests.conftest import make_paths
 
 
 def _paths(root: Path) -> Paths:
-    return Paths(
-        book=root / "book.md", state=root / "state.md", title=root / "title.txt",
-        bible=root / "b.md", characters=root / "c.md", timeline=root / "t.md",
-        threads=root / "th.md", volume_plan=root / "vp.md", compass=root / "cp.md",
-        voices=root / "vs.md", voice=root / "v.md", contract=root / "ct.md",
-        glossary=root / "g.md", chapters_dir=root / "chapters",
-        logs_dir=root / "logs", database=root / "story_state.db",
-    )
+    return make_paths(root)
 
 
 class ImportedEventsTest(unittest.TestCase):

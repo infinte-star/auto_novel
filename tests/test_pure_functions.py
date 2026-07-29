@@ -1487,11 +1487,52 @@ class RefinedTextAcceptableTests(unittest.TestCase):
 
     def test_rewrite_still_rejects_extreme_growth(self):
         from commands.refine import _refined_text_acceptable
-        original = "字" * 1000
-        refined = "字" * 3000  # 3.0x, above rewrite 2.5x
+        original = "字" * 3000
+        refined = "字" * 9000  # 3.0x, above rewrite 2.5x
         ok, reason = _refined_text_acceptable(original, refined, self._cfg(), intensity="rewrite")
         self.assertFalse(ok)
         self.assertIn("grew beyond", reason)
+
+    def test_adaptive_cap_for_truncated_original(self):
+        from commands.refine import _refined_text_acceptable
+        original = "字" * 800
+        refined = "字" * 3500
+        cfg = self._cfg(**{"chapter_min_chars": "2800"})
+        ok, _ = _refined_text_acceptable(original, refined, cfg, intensity="rewrite")
+        self.assertTrue(ok, "truncated original below chapter_min must allow growth to reach chapter_min")
+
+    def test_adaptive_cap_not_applied_to_normal_chapter(self):
+        from commands.refine import _refined_text_acceptable
+        original = "字" * 3000
+        refined = "字" * 8000
+        cfg = self._cfg(**{"chapter_min_chars": "2800"})
+        ok, _ = _refined_text_acceptable(original, refined, cfg, intensity="rewrite")
+        self.assertFalse(ok, "normal-length original must still use standard grow cap")
+
+
+class LengthBandShortBlockTests(unittest.TestCase):
+    """Tests for length_band_check short-side blocking."""
+
+    def test_severely_short_chapter_blocks(self):
+        from engine.quality import length_band_check
+        text = "字" * 800
+        cfg = {"novel": {"chapter_min_chars": "2800"}}
+        result = length_band_check(text, cfg)
+        self.assertTrue(result["block"], "chapter at 29% of min must block")
+
+    def test_mildly_short_chapter_does_not_block(self):
+        from engine.quality import length_band_check
+        text = "字" * 2000
+        cfg = {"novel": {"chapter_min_chars": "2800"}}
+        result = length_band_check(text, cfg)
+        self.assertFalse(result["block"], "chapter at 71% of min must not block")
+
+    def test_custom_short_block_ratio(self):
+        from engine.quality import length_band_check
+        text = "字" * 1800
+        cfg = {"novel": {"chapter_min_chars": "2800", "length_band_short_block_ratio": "0.7"}}
+        result = length_band_check(text, cfg)
+        self.assertTrue(result["block"], "1800/2800=0.64 < 0.7 must block")
 
 
 class PayoffDensityTests(unittest.TestCase):
@@ -2589,6 +2630,57 @@ class HardFossilTailAnchorTests(unittest.TestCase):
             fossil_tail_anchor({"hard_fossils": [("声音压得很低", 0.42)]},
                                {"novel": {"fossil_tail_anchor_enabled": False}}),
             "")
+
+
+class PreflightAdvisoryFlagsTests(unittest.TestCase):
+    """Advisory gate flags from prior reviews are read into style_warnings."""
+
+    def _write_review(self, root, chapter_num, payload):
+        import json
+        from engine.checkpoint import CHECKPOINT_VERSION
+        ckpt_dir = root / "logs" / "checkpoints" / f"ch{chapter_num:04d}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        (ckpt_dir / "final_review.json").write_text(
+            json.dumps({
+                "_checkpoint_version": CHECKPOINT_VERSION,
+                "chapter": chapter_num,
+                "saved_at": "2026-07-29T00:00:00",
+                "payload": payload,
+            }, ensure_ascii=False), encoding="utf-8")
+
+    def test_advisory_flags_reach_style_warnings(self):
+        import tempfile
+        from pathlib import Path
+        from engine.write import _preflight_negative_list
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_review(root, 4, {
+                "ai_flavor_health": {
+                    "flags": ["ai_cliche_overload(6.0/k>=4.0)"],
+                    "directives": [],
+                },
+                "paragraph_shape_health": {
+                    "flags": ["single_line_paragraphs(85%>=80%)"],
+                    "directives": [],
+                },
+            })
+            neg = _preflight_negative_list(
+                _make_paths(root), None, {"novel": {}}, 5)
+        self.assertIn("ai_cliche_overload(6.0/k>=4.0)", neg["style_warnings"])
+        self.assertIn("single_line_paragraphs(85%>=80%)", neg["style_warnings"])
+
+    def test_no_advisory_data_produces_empty_warnings(self):
+        import tempfile
+        from pathlib import Path
+        from engine.write import _preflight_negative_list
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_review(root, 4, {"gate_rejects": []})
+            neg = _preflight_negative_list(
+                _make_paths(root), None, {"novel": {}}, 5)
+        self.assertEqual(neg["style_warnings"], [])
 
 
 if __name__ == "__main__":

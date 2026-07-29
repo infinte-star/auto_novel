@@ -626,6 +626,11 @@ def _refined_text_acceptable(
         "rewrite": max(global_ceil, float(config["novel"].get("refine_max_grow_ratio_rewrite", 2.5))),
     }
     max_grow = ceil_by_intensity.get(intensity, global_ceil)
+    if intensity == "rewrite":
+        chapter_min = int(config["novel"].get("chapter_min_chars", 2500))
+        if len(original) < chapter_min:
+            target_grow = chapter_min / max(len(original), 1) * 1.5
+            max_grow = max(max_grow, target_grow)
     if len(refined) > len(original) * max_grow:
         return False, f"grew beyond {max_grow:g}x of original ({len(refined)}/{len(original)}) at intensity={intensity}"
     return True, ""
@@ -812,6 +817,12 @@ def refine_book(
                 debt_problems = "；".join(str(p) for p in (debt.get("problems") or [])[:3])
                 if debt_problems:
                     focus = (focus + " ｜ 欠债项(必须修复): " + debt_problems)[:300]
+            chapter_min = int(config["novel"].get("chapter_min_chars", 2500))
+            if original and len(original) < chapter_min * 0.5:
+                if _INTENSITY_RANK.get(intensity, 0) < _INTENSITY_RANK["rewrite"]:
+                    log(paths, f"Refine Ch{ch}: truncation bump {intensity}->rewrite "
+                               f"(original {len(original)} < {chapter_min}×0.5)")
+                    intensity = "rewrite"
             log(paths, f"Refine Ch{ch} intensity={intensity} focus={focus[:60]!r}")
             if not original:
                 log(paths, f"Refine Ch{ch}: original missing, skip")

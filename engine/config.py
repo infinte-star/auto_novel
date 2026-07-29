@@ -741,3 +741,29 @@ def rebuild_book(paths: Paths) -> None:
     if chunks:
         write_text(paths.book, "\n\n".join(chunks) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# Unified bigram utility
+# ---------------------------------------------------------------------------
+
+_PUNCT_RE = re.compile(r"[\s，。、；：,.;:!?！？「」""\"'''（）()—…·]+")
+_CJK_ALNUM_RE = re.compile(r"[^一-鿿A-Za-z0-9]")
+
+
+def text_bigrams(text: str, strip: str = "cjk_alnum") -> set[str]:
+    """Character-bigram set with configurable cleaning.
+
+    *strip* controls pre-cleaning:
+    - ``"cjk_alnum"`` — keep only CJK + ASCII alphanumerics (default)
+    - ``"punct"``     — remove punctuation/whitespace, keep everything else
+    - ``"none"``      — raw character bigrams, no cleaning
+    """
+    t = text or ""
+    if strip == "cjk_alnum":
+        t = _CJK_ALNUM_RE.sub("", t)
+    elif strip == "punct":
+        t = _PUNCT_RE.sub("", t)
+    if len(t) < 2:
+        return set()
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+

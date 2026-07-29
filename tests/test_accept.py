@@ -15,6 +15,7 @@ import engine.loop as accept
 
 def _cfg(**novel):
     novel.setdefault("style_penalty_block", 2.0)
+    novel.setdefault("chapter_min_chars", 500)
     return {"novel": novel}
 
 
@@ -524,6 +525,59 @@ class EmDashTrendWiringTest(unittest.TestCase):
         r = self._report(self._text(4.0), conn=self.conn)
         self.assertLess(r["style_health"]["penalty"], 2.0)
         self.assertEqual(quality.hard_block_reasons(r, _cfg()), [])
+
+
+class AdvisoryGateDirectivesTest(unittest.TestCase):
+    """Advisory gates run inside acceptance_report and contribute directives."""
+
+    def _report(self, text, **kw):
+        return accept.acceptance_report(5, text, CARD, _cfg(), **kw)
+
+    def test_ai_flavor_health_appears_in_report(self):
+        r = self._report(FULFILLED)
+        self.assertIn("ai_flavor_health", r)
+        self.assertIsInstance(r["ai_flavor_health"], dict)
+
+    def test_advisory_directives_aggregated(self):
+        ai_heavy = (
+            "第5章 铜钥匙\n\n"
+            + "汤舒婷推开顾家老宅后厨的门。" * 10
+            + "她在灶台夹层里摸到一枚刻字的铜钥匙。" * 10
+            + "顾峥站在门口看着她。" * 10
+            + "他的心中涌起一阵复杂的情绪。" * 40
+            + "她的眼眶微微泛红。" * 20
+            + "刻字与母亲遗物对上了。" * 10
+            + "她把铜钥匙插进阁楼那把锁，锁芯只转了半圈就卡死。"
+        )
+        r = self._report(ai_heavy)
+        afh = r.get("ai_flavor_health") or {}
+        if afh.get("directives"):
+            self.assertTrue(
+                any(d in r["writer_directives_for_next_chapter"]
+                    for d in afh["directives"]),
+                "advisory directives must be aggregated into "
+                "writer_directives_for_next_chapter")
+
+    def test_advisory_gates_never_block(self):
+        r = self._report(FULFILLED)
+        self.assertTrue(r["accepted"])
+        self.assertEqual(r["block_reasons"], [])
+
+    def test_dialogue_health_appears_in_report(self):
+        r = self._report(FULFILLED)
+        self.assertIn("dialogue_health", r)
+
+    def test_intra_chapter_repetition_appears(self):
+        r = self._report(FULFILLED)
+        self.assertIn("intra_chapter_repetition", r)
+
+    def test_prose_texture_appears(self):
+        r = self._report(FULFILLED)
+        self.assertIn("prose_texture", r)
+
+    def test_paragraph_shape_health_appears(self):
+        r = self._report(FULFILLED)
+        self.assertIn("paragraph_shape_health", r)
 
 
 if __name__ == "__main__":

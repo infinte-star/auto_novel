@@ -615,6 +615,7 @@ novel:
   # chapter_max_chars: 3600              # 题材profile自动设定;取消注释可手动覆盖
   # length_band_penalty_enabled: true    # 题材profile自动设定;取消注释可手动覆盖
   length_band_block: false
+  # length_band_short_block_ratio: 0.5   # 短于 chapter_min_chars 的此比例即硬block，防截断章commit
   # ── 生成时长度上限（硬约束写手 max_tokens，治"写到收不住"）──
   # 写手 LLM 调用默认继承全局 api.max_tokens（常 64k+），章节会写飞。这里按 chapter_max_chars
   # （题材 profile 已按题材设好）给写手/修订/补 beat 调用一个 max_tokens 预算，物理上限制章长，

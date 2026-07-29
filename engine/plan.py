@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from engine import loop as canon
 
 from engine.checkpoint import save_checkpoint
-from engine.config import Paths, log, read_text
+from engine.config import Paths, log, read_text, text_bigrams
 from engine.llm import call_llm, json_prompt, load_json_with_repair, safe_json_loads
 from engine.store import db_event, validate_plan_continuity
 
@@ -113,22 +113,12 @@ def _as_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
-_PUNCT_RE = re.compile(r"[\s，。、；：,.;:!?！？「」""\"'''（）()—…·]+")
-
-
-def _bigrams(text: str) -> set[str]:
-    t = _PUNCT_RE.sub("", text or "")
-    if len(t) < 2:
-        return {t} if t else set()
-    return {t[i:i + 2] for i in range(len(t) - 1)}
-
-
 def _turn_covered_by_beats(turn: str, beats: list[str], cut: float = 0.6) -> bool:
-    tb = _bigrams(turn)
+    tb = text_bigrams(turn, strip="punct")
     if not tb:
         return True
     windows = list(beats) + [beats[i] + beats[i + 1] for i in range(len(beats) - 1)]
-    return any(len(tb & _bigrams(w)) / len(tb) >= cut for w in windows)
+    return any(len(tb & text_bigrams(w, strip="punct")) / len(tb) >= cut for w in windows)
 
 
 def normalize_card(raw: Any, chapter_num: int) -> dict[str, Any] | None:

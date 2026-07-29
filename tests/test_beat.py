@@ -17,21 +17,11 @@ from engine.config import Paths
 from engine.plan import volume_transition_directive
 import engine.plan as beat
 import engine.loop as canon
+from tests.conftest import make_paths
 
 
 def _paths(root: Path) -> Paths:
-    p = Paths(
-        book=root / "book.md", state=root / "state.md", title=root / "title.txt",
-        bible=root / "b.md", characters=root / "c.md", timeline=root / "t.md",
-        threads=root / "th.md", volume_plan=root / "vp.md", compass=root / "cp.md",
-        voices=root / "vs.md", voice=root / "v.md", contract=root / "ct.md",
-        glossary=root / "g.md", chapters_dir=root / "chapters",
-        logs_dir=root / "logs", database=root / "story_state.db",
-    )
-    p.logs_dir.mkdir(parents=True, exist_ok=True)
-    p.bible.write_text("世界设定", encoding="utf-8")
-    p.characters.write_text("人物表", encoding="utf-8")
-    return p
+    return make_paths(root, seed_files=True)
 
 
 def _config(**over) -> dict:
