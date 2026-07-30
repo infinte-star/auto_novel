@@ -287,12 +287,17 @@ class ChecklistTest(unittest.TestCase):
 
     def test_an_unjudgeable_target_says_so_instead_of_quoting_nothing(self):
         # A field the gate cannot score leaves the CCR denominator. Telling the
-        # writer that is more useful than an empty "verified" line. Nine
-        # unsplittable CJK chars is the real shape of this: every fragment
-        # exceeds the 8-char ceiling, so `_beat_anchor_fragments` returns [].
-        body = write.contract_checklist(_card(where="县医院三楼旧档案室"), _config())
-        self.assertEqual(_loop._anchors("县医院三楼旧档案室"), [])
+        # writer that is more useful than an empty "verified" line. A fully
+        # abstract phrase with only stop tokens/generic fragments produces [].
+        body = write.contract_checklist(_card(where="他突然意识到了其中的问题"), _config())
+        self.assertEqual(_loop._anchors("他突然意识到了其中的问题"), [])
         self.assertIn("验收无法判定", body)
+
+    def test_long_location_fragment_is_judgeable(self):
+        # Compound location names (9-16 chars) must be kept as anchors,
+        # not dropped — the old 8-char ceiling silently skipped them.
+        anchors = _loop._anchors("县医院三楼旧档案室")
+        self.assertEqual(anchors, ["县医院三楼旧档案室"])
 
     def test_an_empty_card_produces_no_block(self):
         self.assertEqual(write.contract_checklist(None, _config()), "")

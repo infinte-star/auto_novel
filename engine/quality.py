@@ -1758,7 +1758,7 @@ def _beat_anchor_fragments(beat: str, max_anchors: int = 6) -> list[str]:
     seen: set[str] = set()
     for frag in _BEAT_SPLIT_RE.split(text):
         frag = (frag or "").strip()
-        if not (2 <= len(frag) <= 8):
+        if not (2 <= len(frag) <= 16):
             continue
         if not re.search(r"[一-鿿]", frag):
             continue
