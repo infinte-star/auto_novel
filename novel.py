@@ -1559,6 +1559,15 @@ def main() -> int:
     p_adopt.add_argument("name")
     p_adopt.add_argument("trial_id", nargs="?", help="trial directory id; defaults to latest")
 
+    p_bench_eval = sub.add_parser("benchmark-eval",
+                                  help="dimensional blind evaluation of a novel's chapters against bestseller benchmarks")
+    p_bench_eval.add_argument("name")
+    p_bench_eval.add_argument("--chapters", type=int, default=10, help="how many recent chapters to evaluate (default 10)")
+    p_bench_eval.add_argument("--genre", default=None, help="filter anchors by genre substring in filename")
+    p_bench_eval.add_argument("--endpoint", default=None, help="use a named endpoint (substring match on base_url)")
+    p_bench_eval.add_argument("--workers", type=int, default=8, help="concurrent LLM workers (default 8)")
+    p_bench_eval.add_argument("--fallback", default=None, help="fallback endpoint: 'base_url,api_key[,model]'")
+
     p_bench = sub.add_parser("benchmark", help="manage local benchmark samples")
     bench_sub = p_bench.add_subparsers(dest="benchmark_command", required=True)
     p_bench_list = bench_sub.add_parser("list", help="list local benchmark samples")
@@ -1642,6 +1651,11 @@ def main() -> int:
         return cmd_trial(args.name, variants=args.variants, chapters=args.chapters)
     if args.command == "adopt-trial":
         return cmd_adopt_trial(args.name, trial_id=args.trial_id)
+    if args.command == "benchmark-eval":
+        from tools.benchmark_eval import run_eval
+        return run_eval(args.name, chapters=args.chapters, genre=args.genre,
+                        endpoint=args.endpoint, fallback=getattr(args, 'fallback', None),
+                        workers=args.workers)
     if args.command == "benchmark":
         if args.benchmark_command == "list":
             return cmd_benchmark_list(platform=args.platform, style=args.style)

@@ -135,9 +135,9 @@ novel:
   # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
   # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
   # 选题材只需改 style_preset（见下方）。
-  # 番茄短章高频钩子：单章 2.5-3k 字（不是长章文学体）。章长硬约束见 chapter_min/max_chars +
-  # length_band_penalty_enabled；超长会被判超长扣分。
-  # chapter_words: 2800            # 题材profile自动设定;取消注释可手动覆盖
+  # 番茄短章高频钩子：篇幅对齐 benchmarks/anchor/ 爆款实测(中位2210字)。
+  # 章长硬约束见 chapter_min/max_chars + length_band_penalty_enabled；超长会被判超长扣分。
+  # chapter_words: 2200            # 题材profile自动设定;取消注释可手动覆盖
   target_words: 2000000
   quality_threshold: 8.0
   # ── 修复阶梯 fix.py（L0 确定性 / L1 有界单次调用）───────────────────────────
@@ -614,8 +614,8 @@ novel:
   # P1-5 章节长度带（番茄短章高频钩子：2.5-3k 字/章）。length_band_penalty_enabled=true 时
   # 出带不只给指令、还扣分（超长按超出比例扣，封顶 2.0）；length_band_block=true 时超长 1.5x 以上硬 block。
   # 旧小说未设 length_band_penalty_enabled 时默认仅给指令（行为不变）。
-  # chapter_min_chars: 2200              # 题材profile自动设定(爽文短/悬疑历史长);取消注释可手动覆盖
-  # chapter_max_chars: 3600              # 题材profile自动设定;取消注释可手动覆盖
+  # chapter_min_chars: 1800              # 题材profile自动设定(爽文1800/悬疑2000/历史2400);取消注释可手动覆盖
+  # chapter_max_chars: 2800              # 题材profile自动设定(爽文2800/悬疑3500/历史4500);取消注释可手动覆盖
   # length_band_penalty_enabled: true    # 题材profile自动设定;取消注释可手动覆盖
   length_band_block: false
   # length_band_short_block_ratio: 0.5   # 短于 chapter_min_chars 的此比例即硬block，防截断章commit

@@ -57,6 +57,53 @@ JUDGE_SYSTEM = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_MATCHED)
 JUDGE_SYSTEM_UNMATCHED = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_UNMATCHED)
 JUDGE_SYSTEM_ANCHOR = JUDGE_SYSTEM_TEMPLATE.format(premise=PREMISE_ANCHOR)
 
+# ---------------------------------------------------------------------------
+# Dimensional evaluation — per-dimension blind comparison
+# ---------------------------------------------------------------------------
+DIMENSIONS = (
+    ("pull", "阅读牵引力：读完哪个更想看下一章；有没有具体悬念而非含糊气氛"),
+    ("dialogue", "对话驱动：信息/冲突/性格是否主要通过对话传递，而非旁白叙述"),
+    ("payoff_visible", "爽点外化：高潮/打脸/翻盘是否有外部可见反应（对手表情/围观者/第三方态度）"),
+    ("hook", "章末钩子：结尾是否落在具体的悬念/反转/危机画面上"),
+    ("pacing", "节奏张弛：是否有明显的压迫→爆发→余韵节奏，而非一条直线"),
+    ("prose_health", "文字健康：句子是否成句、有无碎片化/破折号过多/AI模板感"),
+    ("concreteness", "具体性：场景动作物件是否可拍摄、有无用抽象状态词代替事件"),
+    ("immersion", "代入感：能否代入角色处境、有无具体数字/对比/信息差制造紧张"),
+)
+
+JUDGE_SYSTEM_DIMENSIONAL = """你是一位挑剔的网文读者，不是编辑，也不认识作者。
+{premise}
+
+请逐维度对比两段文字，每个维度独立判断胜者。
+
+维度及判断标准（按重要性排序）：
+{dim_list}
+
+明确不看：篇幅长短本身、辞藻华丽程度、是否"文学性"。
+如果某维度两者差距在你也说不清的范围内，该维度判 tie。
+
+输出 JSON：
+{{"dimensions": {{{dim_schema}}}, "overall": {{"winner": "甲"|"乙"|"tie", "reason": "一句话总结决定性差别"}}}}""".format(
+    premise=PREMISE_ANCHOR,
+    dim_list="\n".join(
+        f"{i+1}. {key} — {desc}" for i, (key, desc) in enumerate(DIMENSIONS)
+    ),
+    dim_schema=", ".join(
+        f'"{key}": {{"winner": "甲"|"乙"|"tie", "note": "一句话"}}'
+        for key, _ in DIMENSIONS
+    ),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class DimensionalVerdict:
+    key: str
+    dims: dict[str, str]
+    overall: str
+    reasons: dict[str, str]
+    overall_reason: str
+    concordant: bool
+
 JUDGE_USER = """【甲】
 {first}
 

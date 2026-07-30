@@ -69,21 +69,22 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
     """
     p = (preset or "").strip().lower()
     # 爽文族基线：高频爽点 / 短章 / 低门槛 / 黄金三句危机开场 / 物证兑现仅建议。
+    # 篇幅校准自 benchmarks/anchor/ 39 本爆款实测：中位 2210，P25 1834，P75 2721。
     shuang = {
         "narrative_mode": "serial",
         "opening_gate_mode": "crisis",
         "payoff_density_min": 0.5,            # ≤2 章一个强爽点
-        "chapter_words": 2800,
-        "chapter_min_chars": 2500,
-        "chapter_max_chars": 3600,
+        "chapter_words": 2200,
+        "chapter_min_chars": 1800,
+        "chapter_max_chars": 2800,
         "length_band_penalty_enabled": True,
         "style_low_barrier_register": True,
         "style_min_avg_sentence_chars": 12.0,
         # 反过度书写锚点（碎句塌缩的镜像）：句长上限 / 对话占比下限 / 伪技术腔。
-        # 阈值由离线回放校准（experiments/replay_style_health.py）：健康对话书
-        # 跑 8-18% 对话占比；塌缩章 0.5-3% + 黑话 ≥12/k。
+        # 对话占比校准自 benchmarks/anchor/ 39本爆款：中位 22.7%，P25 13.1%。
+        # 下限取 P25 附近值，确保生成章至少达到爆款下四分位。
         "style_max_avg_sentence_chars": 38.0,
-        "style_dialogue_ratio_min": 0.08,
+        "style_dialogue_ratio_min": 0.12,
         "style_tech_jargon_per_kchar_warn": 8.0,
         "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
@@ -102,10 +103,10 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         "system_stream": dict(shuang),
         "urban_ability": dict(shuang),
         "wanzu_xuanhuan": {**shuang, "payoff_density_min": 0.4,
-                           "chapter_words": 3000, "chapter_min_chars": 2400,
-                           "chapter_max_chars": 4200,
+                           "chapter_words": 2500, "chapter_min_chars": 2000,
+                           "chapter_max_chars": 3200,
                            "style_max_avg_sentence_chars": 40.0,
-                           "style_dialogue_ratio_min": 0.04,
+                           "style_dialogue_ratio_min": 0.06,
                            "fatigue_words": ["冷笑", "蝼蚁", "倒吸凉气", "瞳孔骤缩", "不可思议",
                                              "震惊", "竟然", "仿佛", "宛如", "不禁", "微微一笑",
                                              "嘴角微扬", "眼中闪过一丝", "气血翻涌", "杀意凛然"]},
@@ -114,14 +115,14 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "reasoning",
             "opening_gate_mode": "clue",
             "payoff_density_min": 0.25,        # ≤4 章
-            "chapter_words": 3500,
-            "chapter_min_chars": 2800,
-            "chapter_max_chars": 6000,
+            "chapter_words": 2500,
+            "chapter_min_chars": 2000,
+            "chapter_max_chars": 3500,
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": False,
             "style_min_avg_sentence_chars": 14.0,
             "style_max_avg_sentence_chars": 48.0,
-            "style_dialogue_ratio_min": 0.03,
+            "style_dialogue_ratio_min": 0.06,
             "style_tech_jargon_per_kchar_warn": 10.0,
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,
@@ -140,14 +141,14 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "balanced",
             "opening_gate_mode": "balanced",
             "payoff_density_min": 0.2,         # ≤5 章
-            "chapter_words": 3500,
-            "chapter_min_chars": 3000,
-            "chapter_max_chars": 6000,
+            "chapter_words": 3000,
+            "chapter_min_chars": 2400,
+            "chapter_max_chars": 4500,
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": False,
             "style_min_avg_sentence_chars": 16.0,
             "style_max_avg_sentence_chars": 52.0,
-            "style_dialogue_ratio_min": 0.06,
+            "style_dialogue_ratio_min": 0.08,
             "style_tech_jargon_per_kchar_warn": 8.0,
             "visual_payoff_blocks_plan": False,
             "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "微微颔首", "眼中闪过一丝"],
@@ -162,14 +163,14 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "serial",
             "opening_gate_mode": "relationship",
             "payoff_density_min": 0.34,        # ≤3 章
-            "chapter_words": 2800,
-            "chapter_min_chars": 2200,
-            "chapter_max_chars": 4000,
+            "chapter_words": 3000,
+            "chapter_min_chars": 2400,
+            "chapter_max_chars": 4200,
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": True,
             "style_min_avg_sentence_chars": 12.0,
             "style_max_avg_sentence_chars": 38.0,
-            "style_dialogue_ratio_min": 0.08,
+            "style_dialogue_ratio_min": 0.15,
             "style_tech_jargon_per_kchar_warn": 6.0,
             "style_tech_jargon_per_kchar_bad": 10.0,
             "visual_payoff_blocks_plan": False,
@@ -192,14 +193,14 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "narrative_mode": "reasoning",
             "opening_gate_mode": "clue",
             "payoff_density_min": 0.4,          # ≤2.5 章（比纯悬疑 0.25 快，贴抖音爽感）
-            "chapter_words": 3000,
-            "chapter_min_chars": 2400,
-            "chapter_max_chars": 5000,
+            "chapter_words": 2200,
+            "chapter_min_chars": 1800,
+            "chapter_max_chars": 2800,
             "length_band_penalty_enabled": True,
             "style_low_barrier_register": False,   # 保留怪谈冷叙事，不强加下沉
             "style_min_avg_sentence_chars": 13.0,
             "style_max_avg_sentence_chars": 44.0,
-            "style_dialogue_ratio_min": 0.04,
+            "style_dialogue_ratio_min": 0.10,
             "style_tech_jargon_per_kchar_warn": 10.0,
             "style_tech_jargon_per_kchar_bad": 14.0,
             "visual_payoff_blocks_plan": True,     # 规则怪谈命脉：规则真伪/破法要落到物证与可见后果
@@ -214,9 +215,9 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
     profiles["guize"] = profiles["infinite_flow"] = profiles["rule_horror"]
     # 未知/未设置题材 → 中性默认（不强加爽文短章/下沉）。
     neutral = {**shuang, "narrative_mode": "balanced", "opening_gate_mode": "balanced",
-               "chapter_words": 3000, "chapter_min_chars": 2400, "chapter_max_chars": 4500,
+               "chapter_words": 2400, "chapter_min_chars": 1800, "chapter_max_chars": 3200,
                "style_low_barrier_register": False, "style_min_avg_sentence_chars": 13.0,
-               "style_max_avg_sentence_chars": 42.0, "style_dialogue_ratio_min": 0.04,
+               "style_max_avg_sentence_chars": 42.0, "style_dialogue_ratio_min": 0.08,
                "style_tech_jargon_per_kchar_warn": 8.0,
                "style_tech_jargon_per_kchar_bad": 12.0,
                "fatigue_words": ["仿佛", "不禁", "宛如", "竟然"],
