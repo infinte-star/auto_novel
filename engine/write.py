@@ -232,6 +232,13 @@ def contract_checklist(card: dict[str, Any] | None,
     payoff = str(card.get("payoff") or "").strip()
     if payoff:
         anchored("payoff", payoff, "（计入兑现率）")
+        lines.append(
+            "  → **外化检查**："
+            "兑现之后，紧跟一段"
+            "他人/对手/环境的可见"
+            "反应（50-150字），"
+            "不能只在主角内心确认。"
+        )
 
     forbid = [str(f).strip() for f in (card.get("forbid") or []) if str(f).strip()]
     if forbid:
