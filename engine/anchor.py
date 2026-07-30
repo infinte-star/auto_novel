@@ -304,10 +304,16 @@ def llm_caller(client, paths, config, *, tag: str = "anchor_judge",
 class AnchorText:
     name: str
     text: str
+    genre: str = ""
 
     @property
     def digest(self) -> str:
         return hashlib.sha1(self.text.encode("utf-8")).hexdigest()[:12]
+
+
+def _genre_from_name(stem: str) -> str:
+    parts = stem.rsplit("_", 1)
+    return parts[-1].lower() if len(parts) >= 2 else ""
 
 
 def anchor_chapters(config: dict | None = None, root: Path | None = None
@@ -333,7 +339,7 @@ def anchor_chapters(config: dict | None = None, root: Path | None = None
         if len(re.sub(r"\s", "", text)) < ANCHOR_MIN_CHARS:
             short.append(p.name)
             continue
-        out.append(AnchorText(p.stem, text))
+        out.append(AnchorText(p.stem, text, _genre_from_name(p.stem)))
     if not out:
         why = f"anchor dir {d.name}/ holds no chapter-length file"
         if short:

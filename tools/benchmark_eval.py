@@ -42,6 +42,15 @@ from engine.anchor import (
     llm_caller,
 )
 
+PRESET_GENRE_MAP: dict[str, tuple[str, ...]] = {
+    "urban_ability": ("dushi", "yineng", "chaoneng"),
+    "rule_horror": ("lingyi", "guize"),
+    "xianxia": ("xianxia", "xuanhuan", "wuxianliu"),
+    "romance_female": ("yanqing", "zhaidou", "gongdou"),
+    "historical": ("lishi", "zhengzhi"),
+    "scifi": ("kehuan", "kesu"),
+}
+
 
 def _parse_dimensional(raw: str, sides: tuple[str, str]) -> tuple[dict, str, dict, str]:
     text = str(raw or "")
@@ -205,6 +214,22 @@ class BenchmarkReport:
 
 
 DEFAULT_WORKERS = 8
+DEFAULT_MAX_ANCHORS = 5
+
+
+def _select_anchors(
+    anchors: list[AnchorText],
+    style_preset: str,
+    max_anchors: int,
+) -> list[AnchorText]:
+    if max_anchors <= 0 or len(anchors) <= max_anchors:
+        return anchors
+    preferred_genres = PRESET_GENRE_MAP.get(style_preset, ())
+    same = [a for a in anchors if a.genre in preferred_genres]
+    other = [a for a in anchors if a.genre not in preferred_genres]
+    if len(same) >= max_anchors:
+        return same[:max_anchors]
+    return same + other[: max_anchors - len(same)]
 
 
 def benchmark_eval(
@@ -214,6 +239,7 @@ def benchmark_eval(
     config: dict | None = None,
     root: Path | None = None,
     genre_filter: str | None = None,
+    max_anchors: int = DEFAULT_MAX_ANCHORS,
     on_verdict=None,
     workers: int = DEFAULT_WORKERS,
 ) -> BenchmarkReport | dict:
@@ -226,6 +252,11 @@ def benchmark_eval(
         filtered = [a for a in anchors if genre_lower in a.name.lower()]
         if filtered:
             anchors = filtered
+
+    style_preset = ""
+    if isinstance(config, dict):
+        style_preset = str((config.get("novel") or {}).get("style_preset", ""))
+    anchors = _select_anchors(anchors, style_preset, max_anchors)
 
     pairs = [(ch_key, ch_text, anchor)
              for ch_key, ch_text in chapters
@@ -383,6 +414,7 @@ def _load_novel_chapters(name: str, n: int) -> list[tuple[str, str]]:
 
 def run_eval(name: str, *, chapters: int = 10, genre: str | None = None,
              endpoint: str | None = None, fallback: str | None = None,
+             max_anchors: int = DEFAULT_MAX_ANCHORS,
              workers: int = DEFAULT_WORKERS) -> int:
     ch = _load_novel_chapters(name, chapters)
     if not ch:
@@ -440,8 +472,10 @@ def run_eval(name: str, *, chapters: int = 10, genre: str | None = None,
         status = "+" if v.concordant else "~"
         print(f"  {status} {v.key}: overall={v.overall}", flush=True)
 
-    print(f"Evaluating {len(ch)} chapters against benchmarks ({workers} workers)...", flush=True)
-    result = benchmark_eval(ch, call=call, genre_filter=genre,
+    print(f"Evaluating {len(ch)} chapters against benchmarks "
+          f"(max_anchors={max_anchors}, {workers} workers)...", flush=True)
+    result = benchmark_eval(ch, call=call, config=config, genre_filter=genre,
+                            max_anchors=max_anchors,
                             on_verdict=on_verdict, workers=workers)
 
     if isinstance(result, dict):
@@ -462,14 +496,19 @@ def main() -> int:
                         help="filter anchors by genre substring")
     parser.add_argument("--endpoint", default=None,
                         help="use a named endpoint from config (substring match on base_url)")
+    parser.add_argument("--max-anchors", type=int, default=DEFAULT_MAX_ANCHORS,
+                        help=f"max anchor samples per chapter (default {DEFAULT_MAX_ANCHORS})")
+    parser.add_argument("--fast", action="store_true",
+                        help="fast mode: --max-anchors 3")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"concurrent LLM workers (default {DEFAULT_WORKERS})")
     parser.add_argument("--fallback", default=None,
                         help="fallback endpoint: 'base_url,api_key[,model]'")
     args = parser.parse_args()
+    ma = 3 if args.fast else args.max_anchors
     return run_eval(args.name, chapters=args.chapters, genre=args.genre,
                     endpoint=args.endpoint, fallback=args.fallback,
-                    workers=args.workers)
+                    max_anchors=ma, workers=args.workers)
 
 
 if __name__ == "__main__":
