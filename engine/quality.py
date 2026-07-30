@@ -611,8 +611,7 @@ def style_health(
     # 这里量化：引号内字符 ÷ 正文字符。阈值题材分档（悬疑/历史容忍低对话）。
     dlg_chars = sum(len(m) for m in re.findall(r"“[^“”]{1,300}”", body))
     dlg_chars += sum(len(m) for m in re.findall(r"「[^「」]{1,300}」", body))
-    if cjk_pairs == 0:
-        dlg_chars += sum(len(m) for m in re.findall(r'"[^"]{1,300}"', body))
+    dlg_chars += sum(len(m) for m in re.findall(r'"[^"]{1,300}"', body))
     dialogue_ratio = dlg_chars / n
     metrics["dialogue_char_ratio"] = round(dialogue_ratio, 3)
     ratio_min = float(cfg.get("style_dialogue_ratio_min", 0.04))
@@ -1343,8 +1342,7 @@ def dialogue_health(
     # --- measure dialogue chars inside “…” / 「…」 / "..." pairs -------------
     dialogue_spans = re.findall(r'“([^”]*?)”', text)
     dialogue_spans += re.findall(r'「([^「」]*?)」', text)
-    if not dialogue_spans:
-        dialogue_spans = re.findall(r'"([^"]*?)"', text)
+    dialogue_spans += re.findall(r'"([^"]*?)"', text)
     dialogue_chars = sum(len(s) for s in dialogue_spans)
     ratio = dialogue_chars / total_chars
 
