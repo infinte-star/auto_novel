@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from engine.config import (
+    PROMPT_FILE,
     Paths,
     chapter_path,
     find_last_chapter,
@@ -61,6 +62,48 @@ def _load_quality_debt(paths: Paths, chapter_num: int) -> dict[str, Any] | None:
     from engine.checkpoint import load_checkpoint as _lc
     debt = _lc(paths, chapter_num, "quality_debt.json")
     return debt if isinstance(debt, dict) else None
+
+
+_BRIEF_SECTIONS_PRIORITY = ["F", "G", "H", "D"]
+
+def _load_creative_brief(max_chars: int = 4000) -> str:
+    """Extract key sections from prompt.md for refine context.
+
+    Priority: §F 铁律 > §G 禁止项 > §H 文风 > §D 爽点 (rules before description).
+    §E (结构大纲) is excluded — too long and redundant with bible/neighbours.
+    """
+    import re
+    try:
+        raw = read_text(PROMPT_FILE)
+    except Exception:
+        return ""
+    section_map: dict[str, list[str]] = {}
+    current: list[str] = []
+    current_key = ""
+    for line in raw.split("\n"):
+        m = re.match(r"^##\s+([A-Z0-9]+)\s", line)
+        if m:
+            if current_key and current:
+                section_map[current_key] = current
+            current = [line]
+            current_key = m.group(1)
+        elif current_key:
+            current.append(line)
+    if current_key and current:
+        section_map[current_key] = current
+    blocks: list[str] = []
+    total = 0
+    for key in _BRIEF_SECTIONS_PRIORITY:
+        if key in section_map:
+            text = "\n".join(section_map[key])
+            if total + len(text) > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    blocks.append(text[:remaining] + "\n...（截断）")
+                break
+            blocks.append(text)
+            total += len(text)
+    return "\n\n".join(blocks)
 
 
 def _debt_min_intensity(debt: dict[str, Any], config: dict[str, Any]) -> str:
@@ -199,7 +242,9 @@ DIAGNOSE_GENRE_DIMS = {
     "romance_female": """3. **情绪张力与关系弧**：本章关系是否有实质推进（拉近/误会/和解）？甜虐节奏是否得当？情绪是否由具体事件支撑而非凭空悬浮？
 4. **对手戏化学反应**：男女主互动是否有潜台词与张力？是否流于直白或工具化？
 5. **配角与代入**：配角是否沦为工具人？女主（或主角）的处境、动机、情绪是否清晰可代入？
-6. **节奏与钩子**：章节是否拖沓或情绪空转？章末是否有让人追读的情绪钩子？""",
+6. **打脸/爽点外部见证**：打脸、翻盘、逆袭时刻是否有旁观者的可见反应（对手变脸、围观反应、弹幕炸裂）？还是只在主角内心完成确认？数字跃迁是否给了具体数字而非概括？
+7. **AI感模式识别**：是否存在以下AI写作痕迹——①弹幕/群众反应过于整齐划一像应援团；②角色以全知视角分析预测对手策略（像在读剧本）；③spreadsheet式数据罗列（逐条列数字/天数/百分比）；④"吃了她做的菜感动到哭"的公式化情绪转折被多次重复；⑤主题由角色直接明说而非留白；⑥所有人在同一章集体发表一句话感言（roll-call式收束）？
+8. **节奏与钩子**：章节是否拖沓或情绪空转？章末是否有让人追读的情绪钩子？""",
     "wanzu_xuanhuan": """3. **境界/战力体系**：境界与战力是否清晰可预期、前后一致？战力跨度是否失控、自相矛盾？
 4. **斗法画面与张力**：斗法/天骄争锋/境界突破是否有画面感和热血张力，还是流于概括陈述？
 5. **力量解题合理性**：主角的取胜是否正比于此前规则铺垫（Sanderson 第一/二定律）？是否凭空开挂？
@@ -270,9 +315,14 @@ REFINE_SYSTEM_BASE_URBAN_ABILITY = """## 本题材精修重点（都市异能/�
 - 打脸/资源碾压/身份反差的爽点落到具体动作与对手反应上，节奏紧、给读者出气感。
 - 打脸要有铺垫、对手不降智；主角先知/重生优势自然融入推演，非全知全能。"""
 
-REFINE_SYSTEM_BASE_ROMANCE_FEMALE = """## 本题材精修重点（女频言情/宠文）
+REFINE_SYSTEM_BASE_ROMANCE_FEMALE = """## 本题材精修重点（女频言情/宠文/大女主打脸爽文）
 - 本章关系弧有实质推进（拉近/误会/和解），甜虐节奏得当，情绪由具体事件支撑而非悬浮。
-- 男女主互动有潜台词与化学反应；配角有独立动机，不做工具人。"""
+- 男女主互动有潜台词与化学反应；配角有独立动机，不做工具人。
+- **打脸锐度与外部见证**：打脸/翻盘/逆袭时刻必须有旁观者的可见反应（对手变脸、围观者倒吸一口气、弹幕炸裂），不能只在女主内心完成"我赢了"；数字跃迁（粉丝数、销售额、投票）给具体数字，别用"暴涨""飙升"概括。
+- **发疯文学语感**：女主"不再忍了"的爆发靠真实的生理反应+行动支撑（摔东西/挂电话/转身就走/声音发抖但一字一顿），不是"她终于爆发了"的旁白；怼人台词要短、准、狠，像刀不像演讲。
+- **弹幕与旁观者嘴替**：弹幕/群众反应要混乱、好笑、有网感（错字、跑题、抢楼、复读），不能写成整齐划一的应援团；弹幕是读者情绪的出口，不是作者的传声筒。
+- **心动破防写法**：写生理反应+嘴硬掩饰（耳朵红/手指僵/声音拐弯）而非"她脸红了"直给；让读者比角色先懂她心动，制造独享的上头感。
+- **去genre特有AI感**：删改"食物感动到流泪"的重复公式（全书最多用两次）；删改角色以全知视角精准预测对手策略的分析独白（改为片段线索+直觉推断）；删改spreadsheet式数据罗列（六家公司逐个列关闭天数→改为概括+一个具体例子）；主题不要通过角色之口明说（"锅气是什么"让读者自己品），多用沉默、动作、留白。"""
 
 REFINE_SYSTEM_BASE_WANZU_XUANHUAN = """## 本题材精修重点（现代玄幻/万族争锋）
 - 境界与战力清晰可预期、前后一致，修复战力跨度失控或自相矛盾。
@@ -468,6 +518,7 @@ def refine_one_chapter(
     bible = read_text(paths.bible)
     characters = read_text(paths.characters)
     voice = read_text(paths.voice).strip()
+    creative_brief = _load_creative_brief()
 
     # Neighbours within group, summarised. The target chapter itself stays full.
     neighbour_blocks: list[str] = []
@@ -563,6 +614,8 @@ def refine_one_chapter(
 
 ## 叙事声音基线（必须遵守的健康文风护栏；精调后的文风须符合此基线，不得引入破折号碎片）
 {voice[:3000] if voice else "（无——以完整成句的小说文风为准，禁止破折号碎片链）"}
+
+{"## 创作纲要核心规则（爽点系统/铁律/禁止项/文风锚，精修必须遵守）" + chr(10) + creative_brief if creative_brief else ""}
 
 {chr(10).join(neighbour_blocks)}
 
