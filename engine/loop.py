@@ -675,8 +675,8 @@ def contract_fulfilment(
         if target:
             add(field, target, *_hit(target, body, grams))
 
-    for name in (card.get("who") or []):
-        name = str(name or "").strip()
+    for raw_name in (card.get("who") or []):
+        name = re.sub(r"[（(][^)）]*[)）]", "", str(raw_name or "")).strip()
         if len(name) >= 2:
             got = name in body
             add("who", name, got, [name], [name] if got else [])
