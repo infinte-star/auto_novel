@@ -233,11 +233,10 @@ def contract_checklist(card: dict[str, Any] | None,
     if payoff:
         anchored("payoff", payoff, "（计入兑现率）")
         lines.append(
-            "  → **外化检查**："
-            "兑现之后，紧跟一段"
-            "他人/对手/环境的可见"
-            "反应（50-150字），"
-            "不能只在主角内心确认。"
+            "- **外化验收（漏写即不及格）**："
+            "兑现 payoff 之后，必须紧跟一段**他人视角反应段**（50-150字）——"
+            "写对手的表情变化/围观者的窃窃私语/第三方态度从轻蔑到忌惮，"
+            "用对话或动作而非叙述体。没有这段反应，爽点等于没写。"
         )
 
     forbid = [str(f).strip() for f in (card.get("forbid") or []) if str(f).strip()]
