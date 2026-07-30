@@ -147,7 +147,7 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
             "style_low_barrier_register": False,
             "style_min_avg_sentence_chars": 16.0,
             "style_max_avg_sentence_chars": 52.0,
-            "style_dialogue_ratio_min": 0.02,
+            "style_dialogue_ratio_min": 0.06,
             "style_tech_jargon_per_kchar_warn": 8.0,
             "visual_payoff_blocks_plan": False,
             "fatigue_words": ["不禁", "仿佛", "宛如", "竟然", "微微颔首", "眼中闪过一丝"],

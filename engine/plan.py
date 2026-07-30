@@ -61,7 +61,10 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
       "world_state_changes": ["本章结束后世界/关系/资源发生的可验证变化"],
       "exit_hook": "章末抛给读者的具体悬念（一个事件，不是一句感叹）",
       "forbid": ["本章明令禁止使用的套路/意象/句式，来自下方已用元素台账"],
-      "opening_type": "physical_action|dialogue|sensory_scene|conflict_inmedias|object_detail|aftermath"
+      "opening_type": "physical_action|dialogue|sensory_scene|conflict_inmedias|object_detail|aftermath",
+      "tension_level": "high|medium|low — 本章情绪张力目标（可选）",
+      "hook_type": "悬念|反转|情绪|信息投放|威胁倒计时|温馨治愈 — exit_hook 的类型（可选，用于轮换检查）",
+      "emotion_target": "热血|紧张|温馨|虐心|爽快|敬畏|释然|好奇 等 — 本章要唤起的主导情绪（可选）"
     }
   ]
 }
@@ -77,7 +80,17 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
    禁止把 N 章写成同一件事的 N 次重复演示。
 6. 伏线错峰：一章最多回收 1 条主线索。逾期未收的伏线必须在本弧内排进具体某一章，不要平均分摊。
 7. `forbid` 必须从下方「已用元素台账」里挑真实存在的条目，不要编造空泛禁令。
-8. 若给定章号包含全书终章，该章 `exit_hook` 改为收束/余韵，不得抛新悬念，且不得引入新人物/新势力。"""
+8. 若给定章号包含全书终章，该章 `exit_hook` 改为收束/余韵，不得抛新悬念，且不得引入新人物/新势力。
+9. 弧线末尾加速：弧的最后2张卡片中，至少有1张的 `tension_level` 为 "high"。
+   禁止在弧线收束前连放2章 "low" 张力的过渡/减压——弧线要以高潮或强转折收束，
+   不要在读者期待最高的位置泄气。
+
+## 情绪与节奏编排（爆款方法论）
+- 情绪张弛交替：不可连续3章高强度（读者疲劳），不可连续3章低强度（读者弃书）。理想模式是高→中→低的波浪形。
+- "憋-炸-余韵"三拍结构：先用2-3章制造压迫（主角被压制/被误解/面临困境），再用1章爆发兑现（反杀/打脸/身份揭示），最后1章呈现余韵（围观者反应/对手崩溃/关系变化）。
+- 章末钩子类型轮换：`exit_hook` 应覆盖多种类型（悬念式/反转式/情绪式/信息投放式/威胁倒计时式/温馨治愈式），连续3章的 `exit_hook` 不得属于同一类型。
+- 爽点铺垫：每个 `payoff` 必须有对应的 `pressure`（压迫/轻视/困境），先压后爽才有感觉——没有铺垫的碾压是空洞的。
+- 弧线末尾加速：弧的最后2章必须有至少1章高张力（high），倒数第二章通常是"炸"（兑现/反杀/真相揭示），最后一章是余韵+收束+下弧钩子。切忌在弧线结尾安排两章连续减压。"""
 
 CARD_REPAIR_SYSTEM = """你是章节卡片的定点修复器。
 你会收到一张 ChapterCard 和一份「必须消除的问题清单」。
@@ -145,6 +158,9 @@ def normalize_card(raw: Any, chapter_num: int) -> dict[str, Any] | None:
         "forbid": _as_list(raw.get("forbid")),
         "opening_type": str(raw.get("opening_type") or "").strip(),
     }
+    card["tension_level"] = str(raw.get("tension_level") or "").strip()
+    card["hook_type"] = str(raw.get("hook_type") or "").strip()
+    card["emotion_target"] = str(raw.get("emotion_target") or "").strip()
     if not card["pressure"]:
         card["pressure"] = card["blocked_by"]
     missing = [f for f in _REQUIRED_CARD_FIELDS if not card.get(f)]
@@ -156,6 +172,8 @@ def normalize_card(raw: Any, chapter_num: int) -> dict[str, Any] | None:
         card["beats"].insert(insert_at, turn)
     if card["opening_type"] not in OPENING_TYPES:
         card["opening_type"] = ""
+    if card["tension_level"] and card["tension_level"] not in ("high", "medium", "low"):
+        card["tension_level"] = ""
     return card
 
 
@@ -178,6 +196,9 @@ def card_to_plan(card: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         "hook": card.get("exit_hook", ""),
         "risk": "；".join(card.get("forbid") or []) or "无",
         "opening_type": card.get("opening_type", ""),
+        "tension_level": card.get("tension_level", ""),
+        "hook_type": card.get("hook_type", ""),
+        "emotion_target": card.get("emotion_target", ""),
         "forbid": list(card.get("forbid") or []),
         "turn": card.get("turn", ""),
         "source": "arc_card",
@@ -247,6 +268,16 @@ def validate_card(
     last3 = [c.get("payoff_type") for c in recent_cards[-2:]]
     if card.get("payoff_type") and len(last3) == 2 and all(t == card["payoff_type"] for t in last3):
         problems.append(f"payoff_type `{card['payoff_type']}` 已连续三章相同；换一种兑现方式。")
+    last_tensions = [c.get("tension_level") for c in recent_cards[-2:]]
+    if card.get("tension_level") and len(last_tensions) == 2 and all(t == card["tension_level"] for t in last_tensions):
+        problems.append(
+            f"tension_level `{card['tension_level']}` 已连续三章相同；"
+            f"调整张力节奏——高→中→低的波浪形更佳。")
+    last_hooks = [c.get("hook_type") for c in recent_cards[-2:]]
+    if card.get("hook_type") and len(last_hooks) == 2 and all(t == card["hook_type"] for t in last_hooks):
+        problems.append(
+            f"hook_type `{card['hook_type']}` 已连续三章相同；"
+            f"轮换钩子类型以维持新鲜感。")
     if scene_sim is not None and scene_sim >= scene_sim_block:
         problems.append(
             f"场景骨架与近期已选章节相似度 {scene_sim:.2f} ≥ {scene_sim_block:.2f}（近乎重写上一章）；"
@@ -255,6 +286,20 @@ def validate_card(
     for v in continuity_violations or []:
         problems.append(f"与既有设定冲突：{v}")
     return problems
+
+
+def check_arc_end_acceleration(cards: list[dict[str, Any]]) -> str | None:
+    """Return a problem string if the last 2 cards of an arc both have low tension."""
+    if len(cards) < 3:
+        return None
+    last_two = [c.get("tension_level", "") for c in cards[-2:]]
+    filled = [t for t in last_two if t]
+    if filled and all(t == "low" for t in filled):
+        return (
+            f"弧线最后两章 (ch {cards[-2].get('ch')}, {cards[-1].get('ch')}) "
+            f"张力均为 low，缺少高潮加速——至少有一章应为 high"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -699,10 +744,34 @@ def generate_arc(
 
     missing = [c for c in chapters if c not in by_ch]
     if missing:
-        # In v1 these chapters fell through to the committee. Here they will each
-        # cost a single-chapter arc call, so the warning names the price.
         log(paths, f"[WARN] arc {start_ch}-{end_ch}: no card for {missing}; "
                    f"each will cost its own single-chapter plan call.")
+
+    # --- cross-card pre-validation: catch repetition problems BEFORE storing ---
+    sorted_chs = sorted(by_ch)
+    for i, ch in enumerate(sorted_chs):
+        recent = [by_ch[c] for c in sorted_chs[:i]]
+        problems = validate_card(by_ch[ch], recent_cards=recent)
+        if problems:
+            log(paths, f"beat: arc pre-validate Ch{ch}: {problems}")
+            fixed = repair_card(client, paths, config, by_ch[ch], problems, ch, call=call)
+            if fixed:
+                by_ch[ch] = fixed
+
+    # --- arc-end acceleration: last 2 cards must include at least one "high" ---
+    arc_end_problem = check_arc_end_acceleration(
+        [by_ch[c] for c in sorted_chs],
+    )
+    if arc_end_problem:
+        penult_ch = sorted_chs[-2]
+        log(paths, f"beat: arc-end acceleration: {arc_end_problem}")
+        fixed = repair_card(
+            client, paths, config, by_ch[penult_ch],
+            [arc_end_problem], penult_ch, call=call,
+        )
+        if fixed:
+            by_ch[penult_ch] = fixed
+
     return {
         "intent": str(data.get("arc_intent") or "").strip(),
         "cards": by_ch,

@@ -14,6 +14,7 @@ from engine.plan import (
     OPENING_TYPES,
     arc_window,
     card_to_plan,
+    check_arc_end_acceleration,
     normalize_card,
     validate_card,
 )
@@ -40,6 +41,9 @@ def _good_card(**over) -> dict:
         "exit_hook": "走廊尽头，护士林正在给某个人打电话，说的是他的名字",
         "forbid": ["再用镜子意象", "再用'他忽然明白了'式顿悟"],
         "opening_type": "physical_action",
+        "tension_level": "high",
+        "hook_type": "悬念",
+        "emotion_target": "紧张",
     }
     card.update(over)
     return card
@@ -117,6 +121,28 @@ class TestNormalizeCard(unittest.TestCase):
         card = normalize_card(_good_card(pressure=""), 27)
         self.assertEqual(card["pressure"], card["blocked_by"])
 
+    def test_advisory_fields_are_optional(self):
+        raw = _good_card()
+        del raw["tension_level"]
+        del raw["hook_type"]
+        del raw["emotion_target"]
+        card = normalize_card(raw, 27)
+        self.assertIsNotNone(card)
+        self.assertEqual(card["tension_level"], "")
+        self.assertEqual(card["hook_type"], "")
+        self.assertEqual(card["emotion_target"], "")
+
+    def test_advisory_fields_are_stripped(self):
+        card = normalize_card(_good_card(
+            tension_level=" high ", hook_type=" 悬念 ", emotion_target=" 紧张 "), 27)
+        self.assertEqual(card["tension_level"], "high")
+        self.assertEqual(card["hook_type"], "悬念")
+        self.assertEqual(card["emotion_target"], "紧张")
+
+    def test_invalid_tension_level_is_cleared(self):
+        card = normalize_card(_good_card(tension_level="极高"), 27)
+        self.assertEqual(card["tension_level"], "")
+
 
 class TestCardToPlan(unittest.TestCase):
     """The projection is what lets writing/review/quality/store stay untouched."""
@@ -167,6 +193,15 @@ class TestCardToPlan(unittest.TestCase):
         self.plan["beats"].append("mutation")
         self.assertNotIn("mutation", self.card["beats"])
 
+    def test_advisory_fields_pass_through_to_plan(self):
+        self.assertEqual(self.plan["tension_level"], "high")
+        self.assertEqual(self.plan["hook_type"], "悬念")
+        self.assertEqual(self.plan["emotion_target"], "紧张")
+
+    def test_advisory_fields_do_not_create_constraints(self):
+        ids = {c["id"] for c in self.decision["required_constraints"]}
+        self.assertFalse(any("tension" in i or "hook_type" in i or "emotion" in i for i in ids))
+
 
 class TestValidateCard(unittest.TestCase):
     def test_clean_card_with_no_history_passes(self):
@@ -208,6 +243,58 @@ class TestValidateCard(unittest.TestCase):
         card = normalize_card(_good_card(), 27)
         problems = validate_card(card, recent_cards=[], continuity_violations=["陈默已在 Ch20 死亡"])
         self.assertTrue(any("陈默已在 Ch20 死亡" in p for p in problems))
+
+    def test_triple_tension_level_is_caught(self):
+        prevs = [normalize_card(_good_card(where=f"地点{i}", tension_level="high"), 25 + i)
+                 for i in range(2)]
+        card = normalize_card(_good_card(where="新地点", tension_level="high"), 27)
+        self.assertTrue(any("tension_level" in p for p in validate_card(card, recent_cards=prevs)))
+
+    def test_two_consecutive_tension_levels_are_allowed(self):
+        prev = normalize_card(_good_card(where="别处", tension_level="high"), 26)
+        card = normalize_card(_good_card(where="新地点", tension_level="high"), 27)
+        self.assertFalse(any("tension_level" in p for p in validate_card(card, recent_cards=[prev])))
+
+    def test_triple_hook_type_is_caught(self):
+        prevs = [normalize_card(_good_card(where=f"地点{i}", hook_type="悬念"), 25 + i)
+                 for i in range(2)]
+        card = normalize_card(_good_card(where="新地点", hook_type="悬念"), 27)
+        self.assertTrue(any("hook_type" in p for p in validate_card(card, recent_cards=prevs)))
+
+    def test_missing_advisory_fields_skip_validation(self):
+        card = normalize_card(_good_card(tension_level="", hook_type="", emotion_target=""), 27)
+        problems = validate_card(card, recent_cards=[])
+        self.assertFalse(any("tension" in p or "hook_type" in p or "emotion" in p for p in problems))
+
+
+class TestArcEndAcceleration(unittest.TestCase):
+    def _make_cards(self, tensions):
+        return [
+            normalize_card(_good_card(
+                ch=i + 1, where=f"地点{i}", tension_level=t,
+            ), i + 1)
+            for i, t in enumerate(tensions)
+        ]
+
+    def test_both_low_is_flagged(self):
+        cards = self._make_cards(["high", "medium", "low", "low"])
+        self.assertIsNotNone(check_arc_end_acceleration(cards))
+
+    def test_one_high_is_ok(self):
+        cards = self._make_cards(["high", "medium", "low", "high"])
+        self.assertIsNone(check_arc_end_acceleration(cards))
+
+    def test_high_low_is_ok(self):
+        cards = self._make_cards(["low", "medium", "high", "low"])
+        self.assertIsNone(check_arc_end_acceleration(cards))
+
+    def test_short_arc_skips_check(self):
+        cards = self._make_cards(["low", "low"])
+        self.assertIsNone(check_arc_end_acceleration(cards))
+
+    def test_empty_tension_not_counted(self):
+        cards = self._make_cards(["high", "medium", "", ""])
+        self.assertIsNone(check_arc_end_acceleration(cards))
 
 
 if __name__ == "__main__":

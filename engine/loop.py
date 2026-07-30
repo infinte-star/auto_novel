@@ -256,6 +256,8 @@ def project_card(card: dict[str, Any] | None, arc_note: str = "",
         ("where", "地点"), ("who", "在场"), ("wants", "目标"),
         ("blocked_by", "阻力"), ("turn", "转折"), ("payoff", "兑现"),
         ("beats", "节拍"), ("exit_hook", "出章钩子"),
+        ("tension_level", "张力目标"), ("hook_type", "钩子类型"),
+        ("emotion_target", "情绪目标"),
     ]
     lines: list[str] = []
     for key, label in labels:

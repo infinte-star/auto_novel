@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -105,7 +106,21 @@ CHARACTERS_CHAIN_SYSTEM = """你是一部 200 万字以上中文网文的人物�
 - 目标 / 恐惧 / 资源 / 关系 / 秘密；
 - 能力边界与**代价**（与世界圣经的力量体系对齐，强调"做不到什么"）；
 - `**人设记忆点**` 子条目：1-3 个具体、可在正文反复复现、彼此区分的标志性记忆点（口头禅/标志动作/外形细节/反差），必须具体可演，禁止"善良/聪明/坚强"这类空泛词，同一记忆点不得多人共用。
-重要反派必须有自洽动机与能力上限，严禁反派降智。篇幅充分（建议 3000-7000 字）。"""
+重要反派必须有自洽动机与能力上限，严禁反派降智。
+
+## 篇幅纪律（严格执行）
+- 全文总计 3000-7000 字，每个人物 800-1500 字。
+- 「能力边界与代价」只写**清单条目**（每条一行，说明"做不到什么"即可），**不得重复世界观圣经中已有的规则细节、数值、等级描述**——那些内容已在圣经里，这里写"参见世界圣经"然后只列本人物独有的限制。
+- 「目标/恐惧/资源/关系/秘密」每条 1-3 句话说清即可，不展开场景描写或内心独白。"""
+
+VOICES_CHAIN_SYSTEM = """你是一部 200 万字以上中文网文的人物声音区分度设计师。
+只输出 markdown 正文，不要 JSON、不要代码块包裹、不要任何前言。
+基于下方「人物档案」与「叙事声音宪章」，为每个已定义的主要人物（主角、核心配角、重要反派）各写一个 `## 人物名` 小节，内容：
+1. **声音指纹**（3-5 条）：此人独有的说话节奏、句式偏好、口头禅、语气词、断句习惯。必须具体到可直接写进对话，禁止"说话干脆""温柔"这类空泛形容。
+2. **标志性言行**（2-3 条）：此人在特定情绪下的标志动作或话术模式（如"生气时不提高音量而是放慢语速""撒谎时先摸后颈"），强调与其他人物的差异。
+3. **行为锚点**（1-2 条）：反复出现、读者可预期的行为习惯（如"永远最后一个离开""喝茶前先闻杯口"），作为人设记忆点的外化载体。
+篇幅纪律：每人 300-600 字，全文总计不超过 5000 字。宁可少写几个次要角色也不要超长——这份表会被每章下发，过长会挤占上下文。
+人物之间的声音指纹必须彼此区分：不允许两个人物共用同一口头禅或同一标志动作。"""
 
 VOICE_CHAIN_SYSTEM = '你是一部 200 万字以上中文网文的文风总监。\n只输出 markdown 正文，不要 JSON、不要代码块包裹、不要任何前言。\n基于下方「世界观圣经」与「人物档案」，写出本书的「叙事声音宪章」——这是全书文风基线，奠定整本书的句子质感，必须健康可读。\n必须显式包含以下“健康文风护栏”，并给出 2-3 段**示范正文片段**（真正的小说叙事，不是说明）：\n- 以完整的主谓宾句子叙事；破折号（——）每千字不超过 3 个，只用作正常插入语，绝不用来粘连碎片。\n- 平均句长保持在正常小说水平（约 15-40 字），不得通篇单词短句，禁止“句子——状态——状态”式破折号短句链。\n- 段落是连贯成句的叙事，不是无标点断行的舞台提示。\n- 保留有潜台词、有话术攻防的人物对话。\n另列：时态/视角、词汇调性、感官锚使用习惯、章节结构惯例。\n示范片段必须亲自示范上述健康文风，因为它会成为全书声音锚被反复下发。'
 
@@ -133,7 +148,8 @@ VOLUME_PLAN_CHAIN_SYSTEM = """你是一部 200 万字以上中文网文的卷纲
 基于下方「世界观圣经」与「人物档案」，写出结构化卷纲。""" + _VOLUME_PLAN_STRUCTURE_SPEC + """
 
 全书要求：卷与卷因果递进（上一卷遗留危机=下一卷核心矛盾来源），主角能力逐卷扩张但始终有约束。
-默认卷长按题材节奏定：快节奏/短章题材一卷约 15-30 章，慢热长篇一卷 40-80 章；无论长短都必须遵守上面的错峰兑现纪律。为控 token，先详写前 2 卷，其余各卷给 1 段概要。
+默认卷长按题材节奏定：快节奏/短章题材一卷约 15-30 章，慢热长篇一卷 40-80 章；无论长短都必须遵守上面的错峰兑现纪律。
+**每卷都完整输出全部结构小节**（卷目标/KR/主题/矛盾/高潮/锚点/兑现/代价/危机/线索兑现表），不要缩写、不要只给概要——逐章排期表（角色高光轮值表、关系线、反转排期、心动破防节拍表、爽点兑现节拍表）将在后续步骤分卷生成，此处**不需要输出**。
 ⚠ 若下方给出明确的总章数上限（max_chapters=N），则必须严格按 N 章规划：章节区间与所有锚点章号都不得超过 N，最后一个高潮/真相锚点必须落在第 N 章或之前，短篇可只写 1 卷，禁止套用 60-80 章模板。"""
 
 # ── 群像/多主角增量（仅当 config novel.ensemble_cast 为真时注入）───────────────
@@ -152,30 +168,50 @@ _ENSEMBLE_CHARACTERS_DELTA = """
 - **一句话声音辨识**：用一句话钉死他说话的质感（如"短而稳""贫而正""柔而清""冷而锐""温而狠""熟而暖"），使全书七人开口即可辨。
 去同质化铁律：多位成员**不得做同一种好、同一件事、说同一类话**；每个人的价值必须由其职业、性格与共同历史唯一决定。反派同样要有自洽动机与能力上限，不得降智。"""
 
-_ENSEMBLE_VOLUME_PLAN_DELTA = """
+# ── 分卷表格生成 prompt（phase 2 of two-phase volume_plan generation）─────────
+# 骨架调用（phase 1）产出全部卷的结构小节但不含逐章表格；detail 调用为每一卷
+# 单独生成 ensemble/shuang 要求的逐章排期表，避免单次输出预算被第一卷表格耗尽
+# 导致后续卷截断或缺失。行粒度约束防止 LLM 把表格行写成微型剧本。
+_VOLUME_DETAIL_SYSTEM = """你是卷纲逐章排期表的生成器。
+只输出 markdown 表格，不要 JSON、不要代码块包裹、不要任何前言，不要重复骨架中已有的结构小节（卷目标/KR/主题/高潮/锚点等）。
+基于下方「卷纲骨架」和「人物档案」，为**指定的一卷**生成逐章排期表。
 
-## ⚠ 群像/多主角卷纲增量（本书为多追求者/群像结构，最高优先级）
-下列四张表**并入每一卷"缺一不可"的必备小节清单**，与卷目标(O)/关键成果(KR)/线索兑现表**同级**：每一卷都必须逐张输出，每张以加粗小节名开头**单独成表**，精确到章号（短篇按 max_chapters 压进 N 章内）。**严禁把它们的内容折叠进大事件锚点/本卷兑现/线索兑现表**——即使内容有重叠也必须另起这四张独立的表：
-- **角色高光轮值表**：逐章列出该章哪些群像成员获得**独立高光瞬间**及其类型（体现各自独特追求方式）。硬约束：①每章至少 N 位成员有独立展示瞬间（N 由简报节奏定，一般≥3）；②任一核心成员**不得连续两章隐形**；③同一章内多位成员**不得做同质化的事**（禁止"七个人一起吃醋/一起送礼"而无区分）。核心成员密集出场，钩子成员错峰后补，不追求每人每章等量分镜。
-- **关系线 / 争宠升级曲线**：逐章标注争宠或关系推进的**强度档位**，且必须**逐章升级**（如隐性较劲 → 关系特权/专业能力碰撞 → 正面同框），严禁三章停在同一水位。每次同框场景都要产出新信息（暴露谁的态度 / 推进哪段关系 / 改变主角对某人的认知），不许只写"大家吃醋"而无后续。
-- **反转做成名场面排期**：把每一个身份/关系/命运反转逐条列出，标注**引爆章号**，且必须**错峰分散、互不撞车**（一章最多引爆一个重量级反转）。每个反转都必须落地为**有对话、有动作、有主角破防反应的当章场景**，严禁写成旁白/背景说明。
-- **心动/情绪破防节拍表**：逐章排布**每章恰好 1 处**"读者独享"的心动破防瞬间——用生理反应 + 嘴硬掩饰呈现（耳朵红、眼眶热、攥紧某物却说别的），让读者比角色先懂她的心动；逐章之间破防的方式要有变化，不得同质复读。
-主权纪律：所有关键决定必须由主角亲自做出，群像成员可助力但不得替她打赢任何一场仗；卷纲不得安排"英雄救美后主角只负责感动"的桥段，每次被帮助后主角必须有后续自主行动。"""
+## 表格格式规则
+- 每张表以加粗小节名开头（如 `- **角色高光轮值表**：`），然后紧跟 markdown 表格。
+- 表格用 `| ChN | 内容 |` 格式，章号必须连续覆盖指定卷的全部章。
+- **每个单元格 ≤ 40 字**：只写「谁 + 做什么 + 类型标签」，禁止写对话台词、生理反应描写、场景细节。
+  示例 OK：「程叙默修厨房不留名（暗守型）；裴执偷拍颠锅（观察型）」
+  示例 NG：「他端着保温桶站在门口看了她三秒，把汤放下说"顺路"，她低头时耳朵红了——这是他第三次说顺路」
+- 超过 25 章的卷，允许每 2-3 章合并一行（如 `Ch5-7`），但不得跳章。"""
 
-# ── 爽点节拍增量（仅当 config novel.shuang_pacing 为真时注入）─────────────────
-# 爽文/番茄免费流的"爽"来自把一个爽点砸到底，而不是罗列名场面清单。通用卷纲 spec 在卷层只有
-# "本卷兑现"一行、没有爽点类型轮换/密度/即时兑现纪律，逐章爽点门在 planning.py。这个 delta 把
-# 爽点蓝图钉进卷纲：错峰轮换 + 每章唯一主爽点写透 + 憋屈不过夜 + 留后手不一次烧光，正面对治
-# "爽点多但爽不透 / 一章硬塞多个名场面导致过载崩章"。慢热悬疑/历史书不注入，行为不变。
-_SHUANG_PACING_VOLUME_PLAN_DELTA = """
+_VOLUME_DETAIL_ENSEMBLE = """
+## 需要生成的表格（群像/多追求者）
+- **角色高光轮值表**：逐章列出哪些群像成员获得独立高光瞬间及类型。硬约束：①每章至少 3 位成员有展示；②核心成员不得连续两章隐形；③同章不同成员不得做同质化的事。
+- **关系线 / 争宠升级曲线**：逐章标注关系推进的强度档位，必须逐章升级，严禁三章停在同一水位。
+- **反转做成名场面排期**：每个身份/关系/命运反转标注引爆章号，错峰分散、一章最多一个重量级反转。
+- **心动/情绪破防节拍表**：逐章排布每章 1 处心动破防瞬间，用类型标签标注（如「耳红嘴硬型」「沉默守护型」），逐章变化不重复。"""
 
-## ⚠ 爽点节拍增量（本书为爽文/快节奏，最高优先级）
-「爽点兑现节拍表」**并入每一卷"缺一不可"的必备小节清单**，与卷目标(O)/线索兑现表同级：每一卷都必须以加粗小节名 `**爽点兑现节拍表**` 开头**单独成表**、逐章精确到章号（短篇压进 max_chapters 内），**严禁把它折叠进大事件锚点/本卷兑现**。表内每章一行，逐条遵守：
-- **爽点类型错峰轮换**：逐章标注该章的**主爽点类型**（打脸反杀 / 逆袭翻盘 / 暴富暴涨 / 装逼扮猪吃虎 / 身份反转苏爆 / 实力碾压 / 打脸回响……）。相邻章的主爽点类型**不得同味连用**，避免读者审美疲劳。
-- **每章唯一主爽点、砸到底**：一章只锁定**一个主爽点**作为当章高潮，用完整弧写透——**憋**（铺垫压抑/被轻视）→ **炸**（当众引爆/碾压兑现）→ **余韵**（打脸回响/地位跃迁/旁观者反应）。其余支线、其他角色高光一律降为**副爽点或钩子**，**严禁一章平均堆 5-8 个名场面**（平均用力=每个都爽不透=过载崩章）。
-- **憋屈不过夜（即时兑现）**：主角当章受的辱、被压制的憋屈，**必须在同一章内给出可见反击/兑现**，不许隔章拖欠；每章读者都要拿到"这口气出了"的当章满足。
-- **可见的跃迁刻度**：每个逆袭/暴富/涨粉类爽点都要有**读者一眼可见的数字或地位变化**（粉丝数、销量、排名、身份），不要只写"她成功了"这类抽象兑现。
-- **不许一次烧光**：全书**最大的爽点/反转严禁在开局一次性用尽**；爽点强度要逐章/逐阶段升级，卷末留更大的钩子和后手。"""
+_VOLUME_DETAIL_SHUANG = """
+## 需要生成的表格（爽点节拍）
+- **爽点兑现节拍表**：逐章标注主爽点类型（打脸反杀/逆袭翻盘/装逼扮猪吃虎/身份反转苏爆/实力碾压/打脸回响…），相邻章不得同味连用。每章一行，格式：`| ChN | 主爽点类型 | 憋（一句话） | 炸（一句话） | 余韵（一句话） |`，每格 ≤ 40 字。"""
+
+
+def _insert_volume_tables(skeleton: str, vol_tables: list[tuple[int, str]]) -> str:
+    """Insert per-volume tables into the skeleton, processing from last to first."""
+    from engine.plan import parse_volume_ranges
+    for vol_idx, tables in sorted(vol_tables, key=lambda x: x[0], reverse=True):
+        ranges = parse_volume_ranges(skeleton)
+        if vol_idx >= len(ranges):
+            continue
+        if vol_idx + 1 < len(ranges):
+            insert_pos = ranges[vol_idx + 1]["pos"]
+        else:
+            insert_pos = len(skeleton)
+        before = skeleton[:insert_pos].rstrip()
+        after = skeleton[insert_pos:]
+        skeleton = before + "\n\n" + tables.strip() + "\n\n" + after
+    return skeleton
+
 
 FRAME_CHAIN_SYSTEM = """你是长篇小说引擎的开篇定稿器。基于下方世界观/人物/卷纲，产出本书启动所需的几个简短字段。
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
@@ -466,7 +502,12 @@ def _bootstrap_chain(
     client: OpenAI, paths: Paths, config: dict[str, Any], brief: str, max_chapters: int,
     contract_md: str = "",
 ) -> dict[str, Any]:
-    """Dependency-ordered foundation: bible → characters → voice → volume_plan → frame.
+    """Dependency-ordered foundation with parallel fan-out where the graph allows.
+
+    Serial:  bible → characters
+    Parallel step 3:  voice ‖ volume_plan_skeleton
+    Parallel step 4:  voices ‖ detail_tables (‖ frame when no details)
+    Serial tail (ensemble only):  assemble volume_plan → frame
 
     Each section is conditioned on the finished upstream sections, so characters are
     grounded in a real bible, voice in both, and the volume_plan in all of them —
@@ -493,11 +534,6 @@ def _bootstrap_chain(
     if shuang:
         log(paths, "Bootstrap chain: shuang_pacing ON — injecting payoff-cadence delta")
     characters_system = CHARACTERS_CHAIN_SYSTEM + (_ENSEMBLE_CHARACTERS_DELTA if ensemble else "")
-    volume_plan_system = (
-        VOLUME_PLAN_CHAIN_SYSTEM
-        + (_ENSEMBLE_VOLUME_PLAN_DELTA if ensemble else "")
-        + (_SHUANG_PACING_VOLUME_PLAN_DELTA if shuang else "")
-    )
 
     # The contract is the brief's own red lines, already machine-extracted. Handing it
     # to the two ability-declaring calls costs zero extra LLM calls and closes the
@@ -512,10 +548,15 @@ def _bootstrap_chain(
             "一律不许写进世界观与人物，哪怕它更好看。若简报明确写了某种能力「没有」，就必须真的没有。"
         )
 
-    log(paths, "Bootstrap chain: bible → characters → voice → volume_plan → frame"
+    detail_note = ""
+    if ensemble or shuang:
+        detail_note = " → volume_detail×N"
+    log(paths, "Bootstrap chain: bible → characters → [voice ‖ volume_plan]"
+               + detail_note + " → [voices ‖ frame]"
                + (" (contract-constrained)" if contract_constraint else ""))
     data: dict[str, Any] = {}
 
+    # ── Step 1-2: bible → characters (serial, strict dependency) ───────────
     bible = _gen_md_section(
         client, paths, config, BIBLE_CHAIN_SYSTEM,
         f"## 创作简报\n{brief}{contract_constraint}", tag="bootstrap_bible", max_tokens=20000,
@@ -526,41 +567,122 @@ def _bootstrap_chain(
         client, paths, config, characters_system,
         f"## 创作简报\n{brief}\n\n## 世界观圣经（必须在此之上设计人物）\n{bible}"
         f"{contract_constraint}",
-        tag="bootstrap_characters", max_tokens=16000,
+        tag="bootstrap_characters", max_tokens=12000,
     )
     data["characters"] = characters
 
-    voice = _gen_md_section(
-        client, paths, config, VOICE_CHAIN_SYSTEM,
-        f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:4000]}\n\n## 人物档案\n{characters[:4000]}",
-        tag="bootstrap_voice", max_tokens=8000,
-    )
-    data["voice"] = voice
+    # ── Step 3+: parallel where the dependency graph allows ──────────────
+    # voice and volume_plan_skeleton both depend only on bible + characters,
+    # not on each other. After both land, voices (needs voice) and detail
+    # tables / frame (need skeleton) can fan out again.
+    voice_user = f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:4000]}\n\n## 人物档案\n{characters[:4000]}"
+    vp_user = f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:5000]}\n\n## 人物档案\n{characters[:5000]}"
 
-    volume_plan = _gen_md_section(
-        client, paths, config, volume_plan_system,
-        f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:5000]}\n\n## 人物档案\n{characters[:5000]}",
-        tag="bootstrap_volume_plan", max_tokens=16000,
-    )
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        # Step 3: voice ‖ volume_plan_skeleton
+        f_voice = pool.submit(
+            _gen_md_section, client, paths, config, VOICE_CHAIN_SYSTEM,
+            voice_user, tag="bootstrap_voice", max_tokens=8000,
+        )
+        f_skeleton = pool.submit(
+            _gen_md_section, client, paths, config, VOLUME_PLAN_CHAIN_SYSTEM,
+            vp_user, tag="bootstrap_volume_plan", max_tokens=16000,
+        )
+        voice = f_voice.result()
+        volume_plan = f_skeleton.result()
+        data["voice"] = voice
+
+        # Step 4: voices ‖ detail_tables (‖ frame when no details needed)
+        # voices depends on voice (ready), details depend on skeleton (ready).
+        f_voices = pool.submit(
+            _gen_md_section, client, paths, config, VOICES_CHAIN_SYSTEM,
+            f"## 人物档案\n{characters}\n\n## 叙事声音宪章\n{voice[:3000]}",
+            tag="bootstrap_voices", max_tokens=8000,
+        )
+
+        detail_futures: list[tuple[int, "concurrent.futures.Future[str]"]] = []
+        if (ensemble or shuang) and volume_plan:
+            from engine.plan import parse_volume_ranges
+            detail_system = _VOLUME_DETAIL_SYSTEM
+            if ensemble:
+                detail_system += _VOLUME_DETAIL_ENSEMBLE
+            if shuang:
+                detail_system += _VOLUME_DETAIL_SHUANG
+            ranges = parse_volume_ranges(volume_plan)
+            detail_n = min(
+                len(ranges),
+                int(config["novel"].get("volume_plan_detail_volumes", 2)),
+            )
+            for i, vol in enumerate(ranges[:detail_n]):
+                label = f"第{vol['label']}卷（第{vol['start']}-{vol['end']}章）"
+                log(paths, f"Bootstrap chain: generating detail tables for {label}")
+                f = pool.submit(
+                    _gen_md_section, client, paths, config, detail_system,
+                    f"## 卷纲骨架\n{volume_plan}\n\n"
+                    f"## 人物档案\n{characters[:4000]}\n\n"
+                    f"## 请为以下卷生成逐章排期表\n{label}",
+                    tag=f"bootstrap_volume_detail_v{vol['label']}", max_tokens=16000,
+                )
+                detail_futures.append((i, f))
+
+        if not detail_futures:
+            # Non-ensemble: frame can run parallel with voices (both inputs ready).
+            frame_user = (
+                f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:3000]}\n\n"
+                f"## 人物档案\n{characters[:3000]}\n\n## 卷纲\n{volume_plan[:3000]}"
+            )
+            f_frame = pool.submit(
+                call_llm, client, paths, config, FRAME_CHAIN_SYSTEM,
+                json_prompt(frame_user), temperature=0.6, tag="bootstrap_frame",
+                max_tokens=8000,
+            )
+
+        voices = f_voices.result()
+        data["voices"] = voices
+
+        if detail_futures:
+            vol_tables: list[tuple[int, str]] = []
+            for i, f in detail_futures:
+                tables = f.result()
+                if tables:
+                    vol_tables.append((i, tables))
+            if vol_tables:
+                volume_plan = _insert_volume_tables(volume_plan, vol_tables)
+                log(paths, f"Bootstrap chain: inserted detail tables for {len(vol_tables)} volume(s)")
+
     data["volume_plan"] = volume_plan
 
-    # Frame: short bookkeeping fields, conditioned on everything above.
-    frame_user = (
-        f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:3000]}\n\n"
-        f"## 人物档案\n{characters[:3000]}\n\n## 卷纲\n{volume_plan[:3000]}"
-    )
-    try:
-        raw = call_llm(
-            client, paths, config, FRAME_CHAIN_SYSTEM, json_prompt(frame_user),
-            temperature=0.6, tag="bootstrap_frame", max_tokens=8000,
+    # ── Frame ────────────────────────────────────────────────────────────
+    # Non-ensemble: already submitted in the pool above.
+    # Ensemble: volume_plan was just assembled with detail tables, so frame
+    # must run after assembly (serial).
+    if detail_futures:
+        frame_user = (
+            f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:3000]}\n\n"
+            f"## 人物档案\n{characters[:3000]}\n\n## 卷纲\n{volume_plan[:3000]}"
         )
-        frame = load_json_with_repair(client, paths, config, raw, fallback={})
-        if isinstance(frame, dict):
-            for k in ("title", "state", "timeline", "threads"):
-                if frame.get(k):
-                    data[k] = frame[k]
-    except Exception as exc:
-        log(paths, f"bootstrap frame failed (non-fatal): {exc}")
+        try:
+            raw = call_llm(
+                client, paths, config, FRAME_CHAIN_SYSTEM, json_prompt(frame_user),
+                temperature=0.6, tag="bootstrap_frame", max_tokens=8000,
+            )
+            frame = load_json_with_repair(client, paths, config, raw, fallback={})
+            if isinstance(frame, dict):
+                for k in ("title", "state", "timeline", "threads"):
+                    if frame.get(k):
+                        data[k] = frame[k]
+        except Exception as exc:
+            log(paths, f"bootstrap frame failed (non-fatal): {exc}")
+    else:
+        try:
+            raw = f_frame.result()  # type: ignore[possibly-undefined]
+            frame = load_json_with_repair(client, paths, config, raw, fallback={})
+            if isinstance(frame, dict):
+                for k in ("title", "state", "timeline", "threads"):
+                    if frame.get(k):
+                        data[k] = frame[k]
+        except Exception as exc:
+            log(paths, f"bootstrap frame failed (non-fatal): {exc}")
     return data
 
 
@@ -775,6 +897,9 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
     voice_charter = _as_markdown(data.get("voice"))
     if voice_charter:
         write_text(paths.voice, voice_charter + "\n")
+    voices_text = _as_markdown(data.get("voices"))
+    if voices_text:
+        write_text(paths.voices, voices_text + "\n")
     db_event(conn, 0, "bootstrap", data)
     # Verification pass: surface (and, for voice, repair) foundation defects before
     # they propagate into every chapter. Advisory/log-only except voice regen.
