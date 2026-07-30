@@ -123,7 +123,8 @@ class BudgetTest(unittest.TestCase):
         # `memory/opening_route.md`, which `adopt-trial` writes and v2 had never
         # read. Both are empty on a book with no adopted route — the declared cap
         # rises, the shipped bytes only rise where the user asked for them.
-        self.assertEqual(sum(canon.BUDGET.values()), 17400)
+        # 17400 -> 18400: `threads` 1000 -> 2000 for mid-to-late-book thread recall
+        self.assertEqual(sum(canon.BUDGET.values()), 18400)
 
     def test_a_flood_of_input_still_lands_near_budget(self):
         st = canon.build_story_state(

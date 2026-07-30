@@ -39,13 +39,10 @@ from engine.quality import (
 # 642 measured reviews); `plan_repairs` simply skips those, so declaring a layer
 # is never the same thing as promising a fixer.
 #
-# `hook_revise` has NO entry, and the reason changed under it. It used to be
-# "already wired as its own pipeline stage (`revise_hook_only`), so an entry here
-# would double the call" — but `revise_hook_only` died with v1, so today the
-# absence is a capability gap, not a de-duplication. v2 answers a weak exit hook
-# at write time (the card's `exit_hook` is a scored CCC field) and nowhere else.
-# Same class as the unwired gates in CLAUDE.md's wiring-gap table: measure before
-# adding a fixer, do not assume the old comment's reason still holds.
+# `hook_revise` fills the capability gap left when v1's `revise_hook_only` was
+# deleted. exit_hook was the #1 CCC acceptance failure (4/4 test failures).
+# The L1 fixer rewrites the chapter tail when `chapter_ending_strength` detects
+# no positive signal (dialogue/question/suspense_punct) in the final ~150 chars.
 # ---------------------------------------------------------------------------
 
 ACTION_BY_GATE: dict[str, str] = {
@@ -58,6 +55,7 @@ ACTION_BY_GATE: dict[str, str] = {
     # L1 — one bounded call, splice-back
     "length_band_check": "expand_to_band",
     "dialogue_health": "inject_dialogue",
+    "chapter_ending_strength": "hook_revise",
 }
 
 # Two gates store their result in the review report under a key that is NOT the
@@ -829,10 +827,81 @@ def em_dash_targeted(
     return candidate
 
 
+_HOOK_REVISE_SYSTEM = (
+    "你是网文章末改写专家。只做一件事：把弱收尾改写为强钩子。\n"
+    "三选一：①对话中抛出新悬念或未解之谜；②用反转/危机的具体动作收束；"
+    "③用悬念提问让读者必须翻下一章。\n"
+    "要求：最后一段独立成段、<=100字、包含正文里没出现过的新信息或新动作。\n"
+    "严禁以下收尾：内心感悟、环境描写沉淀、情绪总结、哲理升华。\n"
+    "保持原文人称视角、叙事腔调、情节走向完全不变。\n"
+    "输出格式：与输入同样的编号列表，每条一行，只输出改写后的段落正文，不要解释。"
+)
+
+
+def hook_revise(
+    client: Any,
+    paths: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    text: str,
+    review: dict[str, Any],
+) -> str:
+    """Rewrite a weak chapter ending into a hook via a focused LLM call."""
+    from engine.config import log
+    from engine.quality_advisory import chapter_ending_strength
+
+    before = chapter_ending_strength(text, config)
+    if before.get("has_hook", True):
+        log(paths, f"L1 hook_revise skipped Ch{chapter_num}: ending already has hook "
+                   f"signals {before.get('signals', [])}")
+        return text
+
+    paras = _paragraphs(text)
+    if not paras:
+        return text
+    picks = paras[-2:] if len(paras) >= 2 else paras[-1:]
+    picks = [p for p in picks if len(p.strip()) >= 10]
+    if not picks:
+        log(paths, f"L1 hook_revise skipped Ch{chapter_num}: tail paragraphs too short")
+        return text
+
+    try:
+        rewrites = _numbered_rewrite(
+            client, paths, config, _HOOK_REVISE_SYSTEM,
+            f"本章结尾缺少钩子，请把以下 {len(picks)} 个结尾段落改写为强钩子收束：",
+            picks, tag="fix_hook", min_ratio=0.3, max_ratio=2.5,
+        )
+    except Exception as exc:
+        log(paths, f"L1 hook_revise call failed Ch{chapter_num} (non-fatal): {exc}")
+        return text
+    if not rewrites:
+        log(paths, f"L1 hook_revise discarded Ch{chapter_num}: no usable rewrite")
+        return text
+
+    candidate = _splice(text, picks, rewrites)
+    after = chapter_ending_strength(candidate, config)
+    if not after.get("has_hook", False):
+        log(paths, f"L1 hook_revise rejected Ch{chapter_num}: rewrite still lacks hook")
+        return text
+    if not (0.85 <= len(candidate) / max(1, len(text)) <= 1.15):
+        log(paths, f"L1 hook_revise rejected Ch{chapter_num}: "
+                   f"length {len(text)} -> {len(candidate)}")
+        return text
+    if float(style_health(candidate, config).get("penalty", 0.0) or 0.0) > float(
+        style_health(text, config).get("penalty", 0.0) or 0.0
+    ):
+        log(paths, f"L1 hook_revise rejected Ch{chapter_num}: style penalty rose")
+        return text
+    log(paths, f"L1 hook_revise Ch{chapter_num}: ending rewritten, "
+               f"signals {after.get('signals', [])}")
+    return candidate
+
+
 _L1_FIXERS = {
     "expand_to_band": expand_to_band,
     "inject_dialogue": inject_dialogue,
     _EM_DASH_L1_ACTION: em_dash_targeted,
+    "hook_revise": hook_revise,
 }
 
 

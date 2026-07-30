@@ -356,6 +356,9 @@ def retrieval_block(
     config: dict[str, Any],
     plan: dict[str, Any],
     chapter_num: int,
+    *,
+    open_threads: list[dict[str, Any]] | None = None,
+    overdue_promises: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build a ready-to-inject '相关历史原文' block from the plan, or '' if disabled/empty."""
     if not bool(config["novel"].get("rag_enabled", True)):
@@ -382,6 +385,14 @@ def retrieval_block(
         v = plan.get(key)
         if isinstance(v, list):
             parts.extend(str(x) for x in v[:6])
+    for th in (open_threads or [])[:8]:
+        desc = str(th.get("description") or th.get("thread") or "").strip()
+        if desc:
+            parts.append(desc)
+    for pr in (overdue_promises or [])[:5]:
+        desc = str(pr.get("description") or pr.get("promise") or "").strip()
+        if desc:
+            parts.append(desc)
     query = " ".join(parts).strip()
     if not query:
         return ""
@@ -495,7 +506,7 @@ def exemplar_block(
     Stays in the variable (non-cacheable) prompt segment, so changing selection
     logic never invalidates the prompt cache.
     """
-    if not bool(config["novel"].get("exemplar_rag_enabled", False)):
+    if not bool(config["novel"].get("exemplar_rag_enabled", True)):
         return ""
     if chapter_num <= int(config["novel"].get("exemplar_rag_min_chapter", 8)):
         return ""

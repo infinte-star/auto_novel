@@ -473,6 +473,15 @@ def load_story_state(
             return default
 
     contract = _canon_read(getattr(paths, "contract", None), 4000)
+    events = _safe(lambda: store.recent_events(conn, limit=12,
+                                               event_types=("story_event",)), [])
+    used = []
+    for ev in events:
+        p = ev.get("payload") if isinstance(ev, dict) else None
+        if isinstance(p, dict):
+            d = str(p.get("description") or p.get("event") or "").strip()
+            if d and len(d) <= 60:
+                used.append(d)
     return build_story_state(
         chapter,
         brief=_canon_read(prompt_file, 8000),
@@ -486,9 +495,9 @@ def load_story_state(
         protagonist=_safe(lambda: latest_protagonist(conn), None),
         open_threads=_safe(lambda: store.get_open_threads(conn, chapter, limit=12), []),
         overdue=_safe(lambda: store.get_overdue_reader_promises(conn, chapter), []),
-        events=_safe(lambda: store.recent_events(conn, limit=12,
-                                                 event_types=("story_event",)), []),
+        events=events,
         metrics=_safe(lambda: store.recent_metrics(conn, 5), []),
+        used_elements=used[:20],
         constraints=_safe(lambda: store.get_active_constraints(conn, chapter), []),
         rag=rag,
         opening_route=_canon_read(opening_route_path(paths), 20000),
@@ -547,6 +556,11 @@ NOT_IN_ACCEPTANCE: dict[str, str] = {
     "narrative_pattern_repetition": "card-phase; see CARD_GATES.",
     "plan_visual_payoff_check": "card-phase; see CARD_GATES.",
     "plan_executability_gate": "card-phase; see CARD_GATES.",
+    "chapter_ending_strength":
+        "L1 repair-only: hook_revise rewrites weak endings but the gate "
+        "carries no penalty and never emits reject level, so it has no "
+        "path into hard_block_reasons. Blocking is via repair improvement, "
+        "not via acceptance rejection.",
 }
 
 CARD_GATES: tuple[str, ...] = (
@@ -1435,7 +1449,10 @@ def _act_write(ctx: Ctx, run: ChapterRun) -> str:
         try:
             from engine.retrieval import retrieval_block
 
-            rag = retrieval_block(ctx.paths, ctx.config, run.plan, run.chapter_num)
+            _threads = store.get_open_threads(ctx.conn, run.chapter_num, limit=12) if ctx.conn else []
+            _overdue = store.get_overdue_reader_promises(ctx.conn, run.chapter_num) if ctx.conn else []
+            rag = retrieval_block(ctx.paths, ctx.config, run.plan, run.chapter_num,
+                                 open_threads=_threads, overdue_promises=_overdue)
         except Exception:
             rag = ""
         run.state = load_story_state(ctx.paths, ctx.conn, ctx.config, run.chapter_num,

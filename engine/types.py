@@ -25,7 +25,7 @@ BUDGET: dict[str, int] = {
     # volatile
     "card": 3000,
     "focus": 800,
-    "threads": 1000,
+    "threads": 2000,
     "recent": 1500,
     "ledger": 1000,
     "rag": 4000,

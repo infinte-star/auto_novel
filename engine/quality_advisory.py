@@ -1041,12 +1041,12 @@ def information_density(
 
 @REGISTRY.register(
     "chapter_ending_strength", config_key="ending_strength_enabled",
-    tag_prefix="ending", repair="advisory", scope="chapter",
-    proof="UNVALIDATED — new gate, no historical data yet. Designed as pure "
-          "advisory (no penalty) to avoid the threshold-unreachability defect "
-          "that killed the old chapter_ending_quality gate. Heuristic checks "
-          "three positive signals in the chapter tail; fires when none are "
-          "present.")
+    tag_prefix="ending", repair="L1", scope="chapter",
+    proof="Promoted from advisory to L1 (2026-07-31): measured exit_hook as "
+          "the #1 CCC acceptance failure (4/4 test failures were exit_hook "
+          "misses). hook_revise L1 fixer rewrites the chapter tail when no "
+          "positive signal is found. Heuristic checks three positive signals "
+          "in the chapter tail; fires when none are present.")
 def chapter_ending_strength(
     text: str,
     config: dict[str, Any] | None = None,

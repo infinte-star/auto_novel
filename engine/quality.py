@@ -1405,10 +1405,12 @@ _STOPWORD_TRIGRAMS = frozenset({
 @REGISTRY.register(
     "descriptor_frequency", config_key="descriptor_freq_enabled",
     tag_prefix="descriptor", repair="L0", scope="chapter",
-    proof="642-review census: ran 22, fired 90.9%, avg pen 1.364 -- by far the "
-          "heaviest per-fire penalty in the library, on the smallest sample. "
-          "Firing on 20 of 22 means the threshold is at or below the typical "
-          "value where it runs; RECALIBRATION CANDIDATE, not a dead key.")
+    proof="642-review census: ran 22, fired 90.9%, avg pen 1.364. "
+          "Recalibrated 2026-07-31: max_density 0.5->1.0, reject_density "
+          "2.0->3.5. Old thresholds sat at or below the typical value, making "
+          "the gate fire on 20/22 runs (noise). New thresholds flag only "
+          "sustained overuse (>1x/chapter) and block only mechanical repetition "
+          "(>3.5x/chapter).")
 def descriptor_frequency(
     texts_by_chapter: dict[int, str],
     config: dict[str, Any] | None = None,
@@ -1422,8 +1424,8 @@ def descriptor_frequency(
         return result
 
     min_spread = int(cfg.get("descriptor_freq_min_spread", 15))
-    max_density = float(cfg.get("descriptor_freq_max_density", 0.5))
-    reject_density = float(cfg.get("descriptor_freq_reject_density", 2.0))
+    max_density = float(cfg.get("descriptor_freq_max_density", 1.0))
+    reject_density = float(cfg.get("descriptor_freq_reject_density", 3.5))
     total = len(texts_by_chapter)
     if total < min_spread:
         return result
@@ -2830,6 +2832,10 @@ def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[s
     sh_pen = float((review.get("style_health") or {}).get("penalty", 0.0) or 0.0)
     if sh_pen >= float(cfg.get("style_penalty_block", 2.0)):
         reasons.append(f"style_collapse(penalty={sh_pen:.1f})")
+
+    af_pen = float((review.get("ai_flavor_health") or {}).get("penalty", 0.0) or 0.0)
+    if af_pen >= float(cfg.get("ai_flavor_penalty_block", 2.5)):
+        reasons.append(f"ai_flavor_block(penalty={af_pen:.1f})")
 
     if bool(cfg.get("factcheck_hard_blocks_accept", True)):
         hard = [c for c in (review.get("contradictions") or [])
