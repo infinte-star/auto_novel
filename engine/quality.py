@@ -617,12 +617,20 @@ def style_health(
     metrics["dialogue_char_ratio"] = round(dialogue_ratio, 3)
     ratio_min = float(cfg.get("style_dialogue_ratio_min", 0.04))
     # Only flag if the chapter is long enough that some dialogue is expected.
+    ratio_target = float(cfg.get("dialogue_char_ratio_target", 0.20))
     if n > 2000 and ratio_min > 0 and dialogue_ratio < ratio_min:
         penalty += 1.0
         flags.append(f"dialogue_starved({dialogue_ratio:.1%}<{ratio_min:.0%})")
         directives.append(
             f"上一章对话占比仅 {dialogue_ratio:.0%}，几乎全是叙述。本章至少 {ratio_min:.0%} 的篇幅"
             "用有潜台词的人物对白推进情节，让信息从人物嘴里说出来而不是叙述灌输。"
+        )
+    elif n > 2000 and ratio_target > 0 and dialogue_ratio < ratio_target:
+        # 对话在 min 和 target 之间：不扣罚但发软提醒，避免 L1 repair 白花钱修补。
+        flags.append(f"dialogue_low({dialogue_ratio:.1%}<{ratio_target:.0%})")
+        directives.append(
+            f"上一章对话占比 {dialogue_ratio:.0%}，低于爆款水平（{ratio_target:.0%}）。"
+            "本章请多用对话推进——让冲突、信息、态度转变从人物嘴里说出来。"
         )
     elif n > 2000 and quote_pairs < 3:
         # 存在性检查是占比检查的真子集，仅在占比检查未触发/被禁用时兜底，不叠加。
