@@ -529,6 +529,33 @@ def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, lim
     except Exception:
         return []
 
+
+def check_thread_dependencies(conn: Any, thread_id) -> list:
+    """Return IDs of unresolved dependencies for a thread (depends_on column)."""
+    try:
+        with db_lock():
+            row = conn.execute(
+                "SELECT depends_on FROM open_threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()
+        if not row or not row["depends_on"]:
+            return []
+        dep_ids = [d.strip() for d in str(row["depends_on"]).split(",") if d.strip()]
+        if not dep_ids:
+            return []
+        placeholders = ",".join("?" for _ in dep_ids)
+        with db_lock():
+            resolved = conn.execute(
+                f"SELECT id FROM open_threads WHERE id IN ({placeholders}) "
+                f"AND status IN ('recovered', 'dropped')",
+                dep_ids,
+            ).fetchall()
+        resolved_ids = {r["id"] for r in resolved}
+        return [d for d in dep_ids if d not in resolved_ids]
+    except Exception:
+        return []
+
+
 def validate_plan_continuity(conn: Any, plan: dict[str, Any], chapter_num: int, config: dict[str, Any] | None = None) -> list[str]:
     violations = []
     deep = True

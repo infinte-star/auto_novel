@@ -1604,10 +1604,10 @@ class LengthBandShortBlockTests(unittest.TestCase):
 
     def test_mildly_short_chapter_does_not_block(self):
         from engine.quality import length_band_check
-        text = "字" * 2000
+        text = "字" * 2200
         cfg = {"novel": {"chapter_min_chars": "2800"}}
         result = length_band_check(text, cfg)
-        self.assertFalse(result["block"], "chapter at 71% of min must not block")
+        self.assertFalse(result["block"], "chapter at 79% of min must not block")
 
     def test_custom_short_block_ratio(self):
         from engine.quality import length_band_check

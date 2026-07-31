@@ -2796,7 +2796,7 @@ def length_band_check(
         )
         if penalty_on and clen < cmin * 0.75:
             result["penalty"] = 0.5
-        short_block_ratio = float(cfg.get("length_band_short_block_ratio", 0.5))
+        short_block_ratio = float(cfg.get("length_band_short_block_ratio", 0.75))
         if clen < cmin * short_block_ratio:
             result["block"] = True
     elif clen > cmax:
@@ -2812,6 +2812,109 @@ def length_band_check(
                 result["block"] = True
     return result
 
+
+# ---------------------------------------------------------------------------
+# Entity consistency — deterministic check for character/entity contradictions
+# ---------------------------------------------------------------------------
+
+_ACTION_VERBS_RE = re.compile(
+    r'(说|道|走|看|笑|怒|问|答|站|坐|跑|打|拿|握|挥|喊|叫|冲|推|拉|抱|踢|'
+    r'扑|点头|摇头|转身|低声|开口|伸手|抬头|皱眉|挡住|举起|拔出|扔|砸|踹)')
+
+_DEAD_STATUSES = frozenset(("dead", "deceased", "killed", "死亡", "已死", "身亡"))
+_CONFINED_STATUSES = frozenset((
+    "imprisoned", "captured", "exiled", "囚禁", "被捕", "流放", "软禁",
+))
+
+_DIALOGUE_BRACKET_RE = re.compile(r'[「""''].+?[」""'']')
+
+
+@REGISTRY.register(
+    "entity_consistency", config_key="entity_consistency_enabled",
+    config_default=True, tag_prefix="entity", repair="advisory", scope="chapter",
+    proof="UNVALIDATED. Advisory. High-confidence checks: dead-character-acting "
+          "(regex name+action_verb when status in dead/deceased/killed), gender "
+          "pronoun mismatch (他/她 within 20 chars of stored-gender character "
+          "name, excluding dialogue brackets).")
+def entity_consistency(
+    text: str,
+    conn: Any,
+    chapter_num: int,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic entity-state consistency check."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result: dict[str, Any] = {
+        "contradictions": [], "flags": [], "directives": [], "penalty": 0.0,
+    }
+    if not bool(cfg.get("entity_consistency_enabled", True)):
+        return result
+    if not text or conn is None:
+        return result
+
+    body = _strip_title_line(text)
+    body_no_dialogue = _DIALOGUE_BRACKET_RE.sub("", body)
+
+    try:
+        rows = conn.execute(
+            "SELECT name, state_json FROM entities WHERE entity_type='character'"
+        ).fetchall()
+    except Exception:
+        return result
+
+    for row in rows:
+        name = str(row["name"] or "").strip()
+        if not name or len(name) < 2 or name not in body:
+            continue
+        try:
+            state = json.loads(row["state_json"]) if row["state_json"] else {}
+        except Exception:
+            continue
+
+        status = str(state.get("status", state.get("状态", ""))).strip().lower()
+
+        # Dead character acting
+        if status in _DEAD_STATUSES:
+            pattern = re.compile(re.escape(name) + r'.{0,8}' + _ACTION_VERBS_RE.pattern)
+            if pattern.search(body_no_dialogue):
+                result["contradictions"].append(
+                    {"type": "dead_acting", "entity": name, "status": status})
+                result["flags"].append(f"dead_acting:{name}")
+                result["directives"].append(
+                    f"已故角色「{name}」在本章中有行动描写——"
+                    f"如非回忆/闪回，请删除或改为他人转述。")
+
+        # Confined character freely acting
+        elif status in _CONFINED_STATUSES:
+            pattern = re.compile(re.escape(name) + r'.{0,8}' + _ACTION_VERBS_RE.pattern)
+            if pattern.search(body_no_dialogue):
+                result["contradictions"].append(
+                    {"type": "confined_acting", "entity": name, "status": status})
+                result["directives"].append(
+                    f"角色「{name}」当前状态为{status}，本章却有自由行动描写——"
+                    f"如已脱困请在正文交代经过。")
+
+        # Gender pronoun mismatch
+        gender = str(state.get("gender", state.get("性别", ""))).strip()
+        if gender:
+            is_male = gender in ("male", "男", "男性", "m")
+            is_female = gender in ("female", "女", "女性", "f")
+            if is_male or is_female:
+                wrong_pronoun = "她" if is_male else "他"
+                window_re = re.compile(
+                    r'(?:' + re.escape(name) + r'.{0,20}' + wrong_pronoun + r'|'
+                    + wrong_pronoun + r'.{0,20}' + re.escape(name) + r')')
+                if window_re.search(body_no_dialogue):
+                    result["contradictions"].append(
+                        {"type": "gender_mismatch", "entity": name,
+                         "expected": "男" if is_male else "女",
+                         "found_pronoun": wrong_pronoun})
+                    result["flags"].append(f"gender_mismatch:{name}")
+                    result["directives"].append(
+                        f"角色「{name}」性别为{'男' if is_male else '女'}，"
+                        f"但正文中出现了错误代词「{wrong_pronoun}」。")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2867,9 +2970,24 @@ def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[s
     if str((review.get("adjacent_repetition") or {}).get("level", "")) == "block":
         reasons.append("adjacent_repeat_block")
 
+    dlg_block_ratio = float(cfg.get("dialogue_hard_block_ratio", 0.03))
+    if dlg_block_ratio > 0:
+        sh = review.get("style_health") or {}
+        dlg_ratio = float(sh.get("metrics", {}).get("dialogue_char_ratio", 1.0))
+        ch_len = int(sh.get("metrics", {}).get("chars", 0))
+        if ch_len > 2000 and dlg_ratio < dlg_block_ratio:
+            reasons.append(f"dialogue_desert(ratio={dlg_ratio:.1%}<{dlg_block_ratio:.0%})")
+
     failed = review.get("constraint_violations_structured") or []
     if len(failed) >= int(cfg.get("constraint_violation_block_count", 3)):
         reasons.append(f"constraints_unmet={len(failed)}")
+
+    to = review.get("thread_overdue") or {}
+    if str(to.get("level", "")) == "block":
+        worst_desc = ""
+        for item in (to.get("overdue_threads") or [])[:1]:
+            worst_desc = str(item.get("description", ""))[:40]
+        reasons.append(f"thread_severely_overdue({worst_desc})")
 
     return reasons
 
@@ -3022,7 +3140,9 @@ from engine.quality_advisory import (  # noqa: F401,E402
     _NEGATIVE_PAIR,
     _TEMPLATE_PIVOT,
     ai_flavor_health,
+    arc_intent_fulfilment,
     chapter_ending_strength,
+    cold_reader_traction,
     hook_tail_repetition,
     information_density,
     intra_chapter_repetition,
@@ -3032,4 +3152,5 @@ from engine.quality_advisory import (  # noqa: F401,E402
     payoff_reaction_check,
     prose_texture,
     shareable_line,
+    thread_overdue,
 )

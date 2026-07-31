@@ -402,6 +402,16 @@ def _validate_config(config: dict[str, Any]) -> None:
                 f"Either set api.{_role}_model or remove api.{_role}_base_url."
             )
 
+    # Independent review model warning: self-review (same model writes and
+    # reviews) causes structural score inflation.  Warn, never error.
+    _review_base = str(api.get("review_base_url", "")).strip()
+    _review_model = str(api.get("review_model", "")).strip()
+    _writing_model = str(api.get("model", "")).strip()
+    if not _review_base and (not _review_model or _review_model == _writing_model):
+        import sys
+        print("[WARN] review_model 未设置独立端点——评审调用将回落到写作模型（自评通胀风险）。"
+              "建议设置 api.review_base_url + api.review_model。", file=sys.stderr)
+
 def configured_api_keys(config: dict[str, Any]) -> list[str]:
     api = config["api"]
     keys: list[str] = []

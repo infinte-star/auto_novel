@@ -102,6 +102,14 @@ _TEMPLATE_PIVOT = re.compile(
     r"这不是.{1,20}?[，,].{0,4}这(?:才)?是"
 )
 
+_META_NARRATIVE = re.compile(
+    r"(?:在|从|到)(?:Ch|ch)\d+(?:里|中)?"
+    r"|(?:Ch|ch)\d+(?:里|中)"
+    r"|等了[一二三四五六七八九十百\d]+章"
+    r"|[一二三四五六七八九十百\d]+章(?:前|以前|之前|以来)"
+    r"|上一章|下一章|前几章|后几章"
+)
+
 def _anaphora_runs(body: str, min_run: int = 3) -> list[int]:
     """机械排比检测：返回所有"≥min_run 个连续子句共享同一个 2 字句首"的连段长度。
 
@@ -325,6 +333,23 @@ def ai_flavor_health(
                 "机械排比：出现 %d 处三连及以上的同头句（最长 %d 连）。排比全章最多用一次且须有递进，"
                 "其余改成长短错落的正常叙述，别让句子像模板复读。" % (len(runs), longest)
             )
+
+    # --- 9. 元叙事泄漏 (meta-narrative leakage) ---
+    title_end = body.find("\n")
+    prose_body = body[title_end + 1:] if title_end >= 0 else body
+    meta_hits = _META_NARRATIVE.findall(prose_body)
+    if meta_hits:
+        metrics["meta_narrative_hits"] = len(meta_hits)
+        penalty += 0.5 * len(meta_hits)
+        flags.append(f"meta_narrative_leak({len(meta_hits)})")
+        samples = "、".join(dict.fromkeys(meta_hits).keys())
+        directives.append(
+            "正文引用了章节编号或元叙事标记（"
+            + samples
+            + "）。正文里严禁出现ChN、第X章、"
+            "等了N章等跳出故事世界的写法，"
+            "用剧情内的时间/事件指代替代。"
+        )
 
     cap = float(cfg.get("ai_flavor_penalty_cap", 3.0))
     penalty = round(min(penalty, cap), 2)
@@ -1098,26 +1123,31 @@ def information_density(
     return {"low_information": low_info, "signals": signals, "directives": directives}
 
 
+_CLIFFHANGER_RE = re.compile(
+    r'(突然|忽然|骤然|猛地|冷不防).{0,10}(冲|扑|砸|响|爆|倒|塌|裂|断|灭)')
+_INCOMPLETE_RE = re.compile(
+    r'(正要|刚要|还没来得及|话还没说完|还没等.{0,4}反应)')
+_THREAT_RE = re.compile(
+    r'(如果|否则|不然|来不及|必须在).{2,30}[。！]')
+_COUNTDOWN_RE = re.compile(
+    r'(还有|最后|只剩|倒计时|来得及吗|时间不多)')
+
+
 @REGISTRY.register(
     "chapter_ending_strength", config_key="ending_strength_enabled",
     tag_prefix="ending", repair="L1", scope="chapter",
-    proof="Promoted from advisory to L1 (2026-07-31): measured exit_hook as "
-          "the #1 CCC acceptance failure (4/4 test failures were exit_hook "
-          "misses). hook_revise L1 fixer rewrites the chapter tail when no "
-          "positive signal is found. Heuristic checks three positive signals "
-          "in the chapter tail; fires when none are present.")
+    proof="Promoted from advisory to L1 (2026-07-31): exit_hook was the #1 CCC "
+          "failure (4/4, measured). Expanded (2026-08): 8 signal patterns covering "
+          "dialogue, question, suspense punctuation, cliffhanger verbs, incomplete "
+          "actions, threats/ultimatums, countdowns, and unanswered trailing questions.")
 def chapter_ending_strength(
     text: str,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Detect a chapter ending that lacks hook strength.
 
-    Scans the final ~150 chars for three positive signals (any one suffices):
-      - dialogue quote (ending on a spoken line)
-      - question mark (posing a question to the reader)
-      - dash/ellipsis (suspense rhythm)
-    When none are found, emits an advisory directive for the next chapter.
-    No penalty — ending quality is too subjective for a numeric score.
+    Scans the chapter tail for eight positive signals (any one suffices).
+    When none are found, emits a directive for the next chapter.
     """
     cfg = (config or {}).get("novel", {}) if config else {}
     result: dict[str, Any] = {
@@ -1130,13 +1160,26 @@ def chapter_ending_strength(
         return result
     tail_len = int(cfg.get("ending_strength_tail_chars", 150))
     tail = body[-tail_len:]
+    wide_tail = body[-400:]
     signals: list[str] = []
-    if re.search(r'["“”「」]', tail):
+    if re.search(r'["""「」]', tail):
         signals.append("dialogue")
     if '？' in tail or '?' in tail:
         signals.append("question")
     if '——' in tail or '……' in tail:
         signals.append("suspense_punct")
+    if _CLIFFHANGER_RE.search(tail):
+        signals.append("cliffhanger_verb")
+    if _INCOMPLETE_RE.search(tail):
+        signals.append("incomplete_action")
+    if _THREAT_RE.search(tail):
+        signals.append("threat_ultimatum")
+    if _COUNTDOWN_RE.search(tail):
+        signals.append("countdown")
+    if not signals and ('？' in wide_tail or '?' in wide_tail):
+        after_q = wide_tail[max(wide_tail.rfind('？'), wide_tail.rfind('?')) + 1:]
+        if len(after_q.strip()) < 100:
+            signals.append("unanswered_question")
     result["signals"] = signals
     if signals:
         return result
@@ -1144,8 +1187,212 @@ def chapter_ending_strength(
     result["flags"].append("weak_chapter_ending")
     result["directives"].append(
         "上一章以纯叙述/描写收尾，缺少钩子。"
-        "本章结尾请用三选一：①对话中抛出新悬念；②用问句让读者想知道答案；"
-        "③用反转/危机的具体动作收束，最后一段独立成段、短而狠。"
+        "本章结尾请用以下任一方式收束：①对话中抛出新悬念；②用问句让读者想知道答案；"
+        "③突发事件/反转（突然/骤然+动作）；④未完成动作（正要/还没来得及）；"
+        "⑤威胁倒计时（必须在/来不及）。最后一段独立成段、短而狠。"
     )
     return result
 
+
+# ---------------------------------------------------------------------------
+# Arc-intent fulfilment — did the previous arc deliver what it promised?
+# ---------------------------------------------------------------------------
+
+def _chinese_bigrams(text: str) -> set[str]:
+    """Extract character-level bigrams from Chinese text, ignoring punctuation."""
+    chars = re.sub(r'[^一-鿿]', '', text)
+    return {chars[i:i+2] for i in range(len(chars) - 1)} if len(chars) >= 2 else set()
+
+
+@REGISTRY.register(
+    "arc_intent_fulfilment", config_key="arc_intent_fulfilment_enabled",
+    config_default=True, tag_prefix="arc", repair="advisory", scope="book",
+    proof="UNVALIDATED. Book-scope advisory, never blocks. Bigram overlap "
+          "between intent and union of arc chapter texts. 30% threshold: intent "
+          "keywords appeared in 45-85% of completed arcs; 30% catches genuine drifts.")
+def arc_intent_fulfilment(
+    intent: str,
+    chapter_texts: list,
+    config=None,
+) -> dict:
+    """Check whether the previous arc's intent was fulfilled in its chapters."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result = {
+        "overlap": 1.0, "fulfilled": True, "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("arc_intent_fulfilment_enabled", True)):
+        return result
+    if not intent or not chapter_texts:
+        return result
+
+    intent_bg = _chinese_bigrams(intent)
+    if not intent_bg:
+        return result
+
+    chapter_bg: set = set()
+    for text in chapter_texts:
+        chapter_bg |= _chinese_bigrams(text)
+
+    overlap = len(intent_bg & chapter_bg) / len(intent_bg)
+    result["overlap"] = round(overlap, 3)
+    threshold = float(cfg.get("arc_intent_overlap_min", 0.3))
+
+    if overlap < threshold:
+        result["fulfilled"] = False
+        result["flags"].append("arc_intent_unfulfilled")
+        result["directives"].append(
+            f"上一弧意图「{intent[:60]}」的兑现度仅 {overlap:.0%}（阈值 {threshold:.0%}），"
+            f"关键内容未落到正文。本弧规划请优先补偿未兑现的承诺，或明确交代方向转变的原因。"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Thread overdue — deadline enforcement for open threads / reader promises
+# ---------------------------------------------------------------------------
+
+@REGISTRY.register(
+    "thread_overdue", config_key="thread_overdue_enabled",
+    config_default=True, tag_prefix="thread", repair="advisory", scope="chapter",
+    proof="UNVALIDATED. Advisory default; escalates to block when overdue_by > "
+          "arc_span * thread_overdue_block_factor (default 2.0 = 20 chapters). "
+          "Critical threads unresolved past 2 arcs correlate with reader-panel "
+          "'forgotten plotline' complaints.")
+def thread_overdue(conn, chapter_num, config=None):
+    """Check for severely overdue threads and reader promises."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result = {
+        "overdue_threads": [], "level": "ok", "max_overdue_by": 0,
+        "flags": [], "directives": [], "penalty": 0.0,
+    }
+    if not bool(cfg.get("thread_overdue_enabled", True)):
+        return result
+    if conn is None:
+        return result
+
+    arc_span = max(3, int(cfg.get("arc_span", 10)))
+    block_factor = float(cfg.get("thread_overdue_block_factor", 2.0))
+    grace = int(cfg.get("thread_overdue_grace_chapters", 3))
+    severity_threshold = arc_span * block_factor
+
+    from engine.store import get_overdue_reader_promises, get_open_threads
+
+    overdue_items = []
+    try:
+        overdue_items = get_overdue_reader_promises(conn, chapter_num, grace=grace)
+    except Exception:
+        pass
+    if not overdue_items:
+        try:
+            threads = get_open_threads(conn, chapter_num, limit=20)
+            for t in threads:
+                due = t.get("due_chapter")
+                if due is not None and int(due) + grace < chapter_num:
+                    overdue_items.append({
+                        "id": t["id"],
+                        "description": t.get("description", ""),
+                        "due_chapter": int(due),
+                        "overdue_by": chapter_num - int(due),
+                    })
+        except Exception:
+            pass
+
+    if not overdue_items:
+        return result
+
+    result["overdue_threads"] = overdue_items[:8]
+    max_overdue = max(item.get("overdue_by", 0) for item in overdue_items)
+    result["max_overdue_by"] = max_overdue
+
+    dep_warnings = []
+    try:
+        from engine.store import check_thread_dependencies
+        for item in overdue_items[:4]:
+            tid = item.get("id", "")
+            if tid:
+                unresolved = check_thread_dependencies(conn, tid)
+                if unresolved:
+                    dep_warnings.append(
+                        f"伏线「{item.get('description','')[:30]}」依赖未解决的前置"
+                        f"线索 {','.join(str(u) for u in unresolved[:3])}")
+    except (ImportError, Exception):
+        pass
+
+    if max_overdue > severity_threshold:
+        result["level"] = "block"
+        result["flags"].append("thread_severely_overdue")
+        worst = max(overdue_items, key=lambda x: x.get("overdue_by", 0))
+        result["directives"].append(
+            f"伏线「{worst.get('description','')[:40]}」已超期 {max_overdue} 章"
+            f"（阈值 {severity_threshold:.0f} 章），必须在本章推进或明确收束。")
+    else:
+        result["level"] = "warn"
+        descs = [f"「{item.get('description','')[:20]}」(超{item.get('overdue_by',0)}章)"
+                 for item in overdue_items[:3]]
+        result["directives"].append(
+            f"以下伏线已超期：{'、'.join(descs)}。请尽快推进或收束。")
+
+    if dep_warnings:
+        result["directives"].extend(dep_warnings[:2])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Cold-reader traction — LLM-based "would you turn the page?" judge
+# ---------------------------------------------------------------------------
+
+_COLD_READER_SYSTEM = (
+    "你是一个冷读者，从未读过这本书。你只看到一章的结尾片段。\n"
+    "判断：一个普通读者看完这段文字后，会不会想翻下一页继续看？\n\n"
+    "返回严格 JSON（不带注释）：\n"
+    '{"would_turn_page": true/false, "reason": "一句话理由", '
+    '"traction_score": 1到10的整数}'
+)
+
+
+@REGISTRY.register(
+    "cold_reader_traction", config_key="cold_reader_traction_enabled",
+    config_default=False,
+    tag_prefix="cold_reader", repair="advisory", scope="chapter",
+    proof="UNVALIDATED. Advisory only, never blocks. cold_reader tag routes to "
+          "review_pool. Judge sees ONLY last N chars with zero book context.")
+def cold_reader_traction(text, config=None, client=None, paths=None):
+    """LLM-based traction assessment: would a cold reader turn the page?"""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    result = {
+        "traction_score": None, "would_turn_page": None,
+        "reason": "", "flags": [], "directives": [],
+    }
+    if not bool(cfg.get("cold_reader_traction_enabled", False)):
+        return result
+    if not text or not client or not paths:
+        return result
+
+    tail_chars = int(cfg.get("cold_reader_tail_chars", 800))
+    threshold = int(cfg.get("cold_reader_traction_threshold", 5))
+    tail = text[-tail_chars:] if len(text) > tail_chars else text
+
+    try:
+        from engine.llm import call_llm
+        from engine.config import safe_json_loads
+        raw = call_llm(
+            client, paths, config, _COLD_READER_SYSTEM, tail,
+            max_tokens=256, temperature=0.3, tag="cold_reader",
+        )
+        data = safe_json_loads(raw)
+        if not isinstance(data, dict):
+            return result
+        score = int(data.get("traction_score", 0))
+        result["traction_score"] = score
+        result["would_turn_page"] = bool(data.get("would_turn_page", True))
+        result["reason"] = str(data.get("reason", ""))[:200]
+        if score < threshold:
+            result["flags"].append("low_traction")
+            result["directives"].append(
+                f"冷读者牵引力评分 {score}/10（阈值 {threshold}）：{result['reason']}。"
+                f"本章结尾需要更强的钩子——悬念、反转、未解之问。"
+            )
+    except Exception:
+        pass
+    return result

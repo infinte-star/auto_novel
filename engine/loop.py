@@ -961,6 +961,12 @@ def acceptance_report(
     if enabled("chapter_ending_strength"):
         report["chapter_ending_strength"] = quality.chapter_ending_strength(
             body, config)
+    if conn and enabled("entity_consistency"):
+        report["entity_consistency"] = quality.entity_consistency(
+            body, conn, chapter_num, config)
+    if conn and enabled("thread_overdue"):
+        report["thread_overdue"] = quality.thread_overdue(
+            conn, chapter_num, config)
 
     # --- directives -------------------------------------------------------
     wd = report["writer_directives_for_next_chapter"]
@@ -973,7 +979,8 @@ def acceptance_report(
                 "prose_texture", "dialogue_health", "long_span_fatigue",
                 "payoff_beat_density", "payoff_reaction_check",
                 "shareable_line", "information_density",
-                "chapter_ending_strength"):
+                "chapter_ending_strength", "entity_consistency",
+                "thread_overdue"):
         for d in (report.get(key) or {}).get("directives", []):
             if d not in wd:
                 wd.append(d)
@@ -1521,6 +1528,14 @@ def _act_write(ctx: Ctx, run: ChapterRun) -> str:
 
 def _act_report(ctx: Ctx, run: ChapterRun) -> str:
     run.report = build_report(ctx, run, run.text)
+    if REGISTRY.is_enabled("cold_reader_traction", ctx.config):
+        crt = quality.cold_reader_traction(
+            run.text, ctx.config, client=ctx.client, paths=ctx.paths)
+        run.report["cold_reader_traction"] = crt
+        wd = run.report.setdefault("writer_directives_for_next_chapter", [])
+        for d in (crt.get("directives") or []):
+            if d not in wd:
+                wd.append(d)
     persist_scan_caches(ctx.paths, run.report)
     if not run.round0_saved:
         # The raw first draft's verdict, archived before any repair touches it.

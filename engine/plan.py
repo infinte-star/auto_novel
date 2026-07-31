@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from engine import loop as canon
 
 from engine.checkpoint import save_checkpoint
-from engine.config import Paths, log, read_text, text_bigrams
+from engine.config import Paths, chapter_path, log, read_text, text_bigrams
 from engine.llm import call_llm, json_prompt, load_json_with_repair, safe_json_loads
 from engine.store import db_event, validate_plan_continuity
 
@@ -712,11 +712,39 @@ def generate_arc(
         nxt_end = min(nxt_end, max_chapters)
     next_chapters = list(range(nxt_start, nxt_end + 1))
 
+    # --- arc-intent fulfilment: check if previous arc delivered its promise ---
+    arc_unfulfilled_note = ""
+    if start_ch > 1:
+        try:
+            from engine.quality_advisory import arc_intent_fulfilment
+            from engine.quality import REGISTRY
+            if REGISTRY.is_enabled("arc_intent_fulfilment", config):
+                _span = arc_span(config)
+                _prev_block = max(1, start_ch - _span)
+                _arc_store = load_cards(paths)
+                _prev_arc = (_arc_store.get("arcs") or {}).get(str(_prev_block))
+                if isinstance(_prev_arc, dict) and _prev_arc.get("intent"):
+                    _prev_start = int(_prev_arc.get("start", _prev_block))
+                    _prev_end = int(_prev_arc.get("end", start_ch - 1))
+                    _texts = []
+                    for _n in range(_prev_start, _prev_end + 1):
+                        try:
+                            _texts.append(read_text(chapter_path(paths, _n)))
+                        except Exception:
+                            pass
+                    if _texts:
+                        _aif = arc_intent_fulfilment(
+                            _prev_arc["intent"], _texts, config)
+                        for _d in (_aif.get("directives") or []):
+                            arc_unfulfilled_note += f"\n\n## 上弧未兑现警告\n{_d}"
+        except Exception:
+            pass
+
     user = arc_user_prompt(
         state, chapters,
         volume_plan=_volume_plan(paths, config, start_ch, span),
         prev_skeleton=skeleton_block(prev_skeleton, chapters),
-        finale_note=finale_note,
+        finale_note=finale_note + arc_unfulfilled_note,
         volume_transition=_volume_transition(paths, config, chapters),
         fingerprints=_fingerprints(conn, config),
     )
@@ -884,6 +912,43 @@ def _problems(paths: Paths, conn: Any, config: dict[str, Any],
         # judged by a stricter line than the tool that settles it.
         scene_sim_block=float(config["novel"].get("scene_dedupe_sim_block", 0.82)),
     )
+
+    # --- Planning gates (CARD_GATES) — were registered but never wired. ---
+    from engine.quality import (
+        plan_executability_gate, plan_visual_payoff_check,
+        narrative_pattern_repetition, REGISTRY,
+    )
+
+    if REGISTRY.is_enabled("plan_executability_gate", config):
+        try:
+            peg = plan_executability_gate(plan, config)
+            if peg.get("blocked"):
+                problems.append(
+                    f"plan_executability: payoff过于抽象，缺少具体动作"
+                    f"（{str(peg.get('evidence', ''))[:80]}）")
+        except Exception:
+            pass
+
+    if REGISTRY.is_enabled("plan_visual_payoff_check", config):
+        try:
+            pvp = plan_visual_payoff_check(plan, config)
+            if pvp.get("blocked"):
+                for d in (pvp.get("directives") or [])[:2]:
+                    problems.append(f"visual_payoff: {d}")
+        except Exception:
+            pass
+
+    if REGISTRY.is_enabled("narrative_pattern_repetition", config):
+        try:
+            recent = [card_to_plan(c)[0]
+                      for c in _recent_cards(store, chapter_num)]
+            npr = narrative_pattern_repetition(plan, recent, config)
+            if str(npr.get("level", "")) == "block":
+                for d in (npr.get("directives") or [])[:2]:
+                    problems.append(f"pattern_repetition: {d}")
+        except Exception:
+            pass
+
     return problems, advisories
 
 

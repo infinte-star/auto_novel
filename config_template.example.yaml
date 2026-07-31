@@ -80,6 +80,8 @@ api:
   length_empty_retry_factor: 2.0
   length_empty_retry_cap: 32000
   # 留空 *_base_url 即关闭该角色路由、走主力模型。
+  # ⚠ 独立评审：review 走主力模型 = 自评通胀（写手和评审是同一个脑子）。
+  # 强烈建议配置独立的 review_base_url + review_model，用不同模型做评审。
   review_base_url: ""
   review_api_key: ""
   review_keys:
@@ -130,7 +132,7 @@ novel:
   #     （LLM canon check、9 advisory gates），每章 ~1.5 次模型调用。
   # v2：v2/run.py 兼容别名，通过 backward compat stub 走同一套代码。
   # v1（已删除）：写 `engine: v1` 会得到明确报错。
-  engine: v3
+  engine: v2
   # ── 题材检测 profile（config.py:genre_detection_profile）───────────────────
   # 下面带「题材profile」标记的键由 style_preset 自动分流设定（爽文/悬疑/言情/历史…），
   # 风格与检测一并题材化。已注释=用 profile 默认；取消注释即手动覆盖该题材默认。
@@ -204,7 +206,7 @@ novel:
   writing_memory_chars: 50000
   cacheable_prefix_chars: 30000
   # refine 是显式的完本后手动步骤（python novel.py refine <name>），不再默认自动烧钱。
-  refine_after_complete: false
+  refine_after_complete: true
   refine_diagnose_max_tokens: 4000
   refine_chapter_max_tokens: 16000
   refine_temperature: 0.5
@@ -270,7 +272,7 @@ novel:
   anaphora_run_warn: 4
   ai_flavor_penalty_cap: 3.0
   # 章节字数下限：低于此值在评审中扣分，并在 writer prompt 中注入扩写要求。
-  chapter_min_chars: 2800
+  # chapter_min_chars: 2800          # 题材profile自动设定;取消注释可手动覆盖
   # 开场多样性：读取近5章开头，注入多样性指令，防止连续同类型开场。
   opening_diversity_enabled: true
   # 文体趋势感知：破折号密度相对近 N 章均值显著上升（即使绝对值未达 warn 阈值）也扣分，
@@ -419,12 +421,10 @@ novel:
   # 禁用模式列表，前置注入本章动笔前（而非事后才在 review 里发现）。
   preflight_constraints_enabled: true
   preflight_constraints_lookback: 5
-  # P0-3 黄金范例：注入本书评分最高章节的原文节选（变量段，不影响 cacheable_prefix），
-  # 让写手模仿具体样本而非抽象文风规则。2026-07 重写（REDESIGN.md L4）：
-  # 排名制选取（原 ≥8.8 绝对阈值在全库 7.4-8.7 的压缩分布下几乎永远选不出东西）、
-  # 取「对白密集 + 动作密集」两段互补范例、有界读盘 + 缓存（原来每次写作全章读盘）。
-  # 仍默认关闭：改动尚未做过 A/B，开启前请单独验证，不要和别的变量一起翻。
-  exemplar_rag_enabled: false
+  # 黄金范例：注入本书评分最高章节的原文节选（变量段，不影响 cacheable_prefix），
+  # 让写手模仿具体样本而非抽象文风规则。排名制选取 + 对白密集/动作密集双范例。
+  # ablation 8 章验证：对话占比 2.1%→6.3%，黑话 0.5-2.6/k，min score 7.41（源书 5.92）。
+  exemplar_rag_enabled: true
   exemplar_rag_min_chapter: 8
   exemplar_rag_top_k: 6          # 候选池大小；最终仍只注入 2 段互补范例
   exemplar_snippet_chars: 800    # 每段范例的字符上限
@@ -496,7 +496,7 @@ novel:
   # 题材预设（驱动写作/评审/精调的题材化提示词）：
   # history / xuanhuan_shuang / system_stream / urban_ability / romance_female / wanzu_xuanhuan
   #   / suspense（悬疑慢烧）/ rule_horror（规则怪谈·民俗无限流，别名 guize/infinite_flow）
-  style_preset: history
+  style_preset: system_stream
   # 群像/多主角开关（正交，默认 false）：多男/多女追一人、团队群像等「多位分量相当的角色错峰争艳」
   # 的书取消下一行注释设为 true。开启后 bootstrap 地基会为全部群像成员各出一档（含一句话声音辨识），
   # 并让卷纲额外产出「角色高光轮值表 / 关系线争宠升级曲线 / 反转做成名场面排期 / 心动破防节拍表」。
@@ -512,7 +512,7 @@ novel:
   # 敏感词规避（正交开关，默认 false）：怪谈/悬疑/黑暗等题材正文多 尸/鬼/血/献祭 等词，
   # 部分中转网关会返回 sensitive_words_detected(500)；开启后在写作/规划层引导意象化表达绕过
   # 内容审核，不改暗黑基调。这类题材建议 true。
-  # sensitive_word_avoidance: true
+  sensitive_word_avoidance: true
   # 叙事模式（与题材预设叠加的可选写法风向）：
   #   balanced  - 默认，沿用既有行为
   #   reasoning - 单密室·精密推理：收敛场景、物证驱动、视觉矛盾、强收束（视觉爽点门槛保持阻断）
@@ -618,7 +618,8 @@ novel:
   # chapter_max_chars: 2800              # 题材profile自动设定(爽文2800/悬疑3500/历史4500);取消注释可手动覆盖
   # length_band_penalty_enabled: true    # 题材profile自动设定;取消注释可手动覆盖
   length_band_block: false
-  # length_band_short_block_ratio: 0.5   # 短于 chapter_min_chars 的此比例即硬block，防截断章commit
+  # length_band_short_block_ratio: 0.75  # 短于 chapter_min_chars 的此比例即硬block，防截断章commit
+  # dialogue_hard_block_ratio: 0.03      # 对话字符占比低于此值硬block(极端对白匮乏);设 0 关闭
   # ── 生成时长度上限（硬约束写手 max_tokens，治"写到收不住"）──
   # 写手 LLM 调用默认继承全局 api.max_tokens（常 64k+），章节会写飞。这里按 chapter_max_chars
   # （题材 profile 已按题材设好）给写手/修订/补 beat 调用一个 max_tokens 预算，物理上限制章长，
@@ -638,6 +639,26 @@ novel:
   shareable_line_enabled: true
   shareable_min_score: 2.0
   shareable_tail_chars: 500
+  # ── 冷读者牵引力（需配置独立 review_model 端点才有意义）──
+  # LLM 评估：只看章尾 N 字，判断冷读者是否想翻页。tag=cold_reader 路由到 review_pool。
+  # 默认关闭——需要设置 api.review_base_url + review_model 使评审独立于写手。
+  cold_reader_traction_enabled: false
+  cold_reader_tail_chars: 800
+  cold_reader_traction_threshold: 5
+  # ── 伏线到期硬闸 ──
+  # 追踪 open_threads 中 due_chapter 已过期的线索。超期 arc_span * block_factor 章
+  # 时从 advisory 升级为 hard_block（默认 10*2=20 章）。grace_chapters 为宽限期。
+  thread_overdue_enabled: true
+  thread_overdue_block_factor: 2.0
+  thread_overdue_grace_chapters: 3
+  # ── 人物一致性确定性校验 ──
+  # 死角色行动/性别代词错配/囚禁角色自由活动，全部 advisory（不阻止提交）。
+  entity_consistency_enabled: true
+  # ── 弧级验收 ──
+  # 新弧规划时检查上一弧 arc_intent 的中文 bigram 兑现度（与弧内各章文本比对）。
+  # overlap < 阈值时注入"上弧未兑现"警告到新弧 prompt。advisory，scope=book。
+  arc_intent_fulfilment_enabled: true
+  arc_intent_overlap_min: 0.3
 
 paths:
   book: "novels/__NOVEL__/book.md"

@@ -475,7 +475,41 @@ def apply_l0(
             applied.append("opening_promote")
             result = stage
 
+    if "style_prose" in actions or True:
+        stage = strip_meta_narrative(result, config)
+        if stage != result:
+            applied.append("strip_meta_narrative")
+            result = stage
+
     return result, applied
+
+
+_META_NARRATIVE_CH = re.compile(
+    r"(?:在|从|到)((?:Ch|ch)\d+(?:里|中)?)"
+)
+_META_NARRATIVE_WAITED = re.compile(
+    r"等了[一二三四五六七八九十百\d]+章"
+)
+_META_NARRATIVE_AGO = re.compile(
+    r"[一二三四五六七八九十百\d]+章(?:前|以前|之前|以来)"
+)
+_META_NARRATIVE_NAV = re.compile(
+    r"上一章|下一章|前几章|后几章"
+)
+
+
+def strip_meta_narrative(text: str, config: dict[str, Any] | None = None) -> str:
+    """L0: remove chapter-number references that leak meta-narrative."""
+    title_end = text.find("\n")
+    if title_end < 0:
+        return text
+    title = text[:title_end]
+    body = text[title_end:]
+    body = _META_NARRATIVE_CH.sub(lambda m: "", body)
+    body = _META_NARRATIVE_WAITED.sub("等了很久", body)
+    body = _META_NARRATIVE_AGO.sub("之前", body)
+    body = _META_NARRATIVE_NAV.sub("之前", body)
+    return title + body
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +528,7 @@ _DIALOGUE_SYSTEM = (
     "你是中文小说编辑。只做一件事：把给定的每个叙述段落改写为「对白为主」的段落——"
     "把段落里被概述掉的交流写成人物真实说出的话，用中文引号“”，"
     "配以简短的动作/神态提示。\n"
-    "不改变段落传达的信息、人物关系与剧情走向，不引入新人物。改写后长度与原段相当（±30% 以内）。\n"
+    "不改变段落传达的信息、人物关系与剧情走向，不引入新人物。改写后长度在原段 0.7-2.0 倍以内。\n"
     "严禁使用破折号（——）连接碎句。\n"
     "禁止回声对话：人物说的话必须传递新信息或推动冲突，"
     "不能把叙述已经写过的内容原样变成台词。\n"
@@ -541,7 +575,7 @@ def _numbered_rewrite(
     def _flush() -> None:
         if current is None:
             return
-        body = " ".join(x.strip() for x in buf if x.strip()).strip()
+        body = "".join(x.strip() for x in buf if x.strip()).strip()
         if not body or not (0 <= current < len(passages)):
             return
         orig = passages[current].strip()
@@ -619,7 +653,7 @@ def expand_to_band(
             # window, which can only shrink the splice and turn a partial gain
             # into the no-growth discard below. The measured problem is calls
             # that return nothing usable, and a higher floor moves toward it.
-            picks, tag="fix_expand", min_ratio=1.0, max_ratio=3.0,
+            picks, tag="fix_expand", min_ratio=0.85, max_ratio=3.0,
         )
     except Exception as exc:
         log(paths, f"L1 expand call failed Ch{chapter_num} (non-fatal): {exc}")
@@ -678,13 +712,13 @@ def inject_dialogue(
         log(paths, f"L1 dialogue skipped Ch{chapter_num}: no quote-free paragraph "
                    f"long enough to turn into dialogue")
         return text
-    picks = sorted(picks, key=lambda p: -len(p))[: int(cfg.get("fix_dialogue_max_paragraphs", 4))]
+    picks = sorted(picks, key=lambda p: -len(p))[: int(cfg.get("fix_dialogue_max_paragraphs", 6))]
     try:
         rewrites = _numbered_rewrite(
             client, paths, config, _DIALOGUE_SYSTEM,
             f"本章对白占比 {before_ratio:.0%}，偏低（目标 {target:.0%}）。"
             f"把以下 {len(picks)} 个叙述段落改写为以对白为主的段落：",
-            picks, tag="fix_dialogue", min_ratio=0.7, max_ratio=1.6,
+            picks, tag="fix_dialogue", min_ratio=0.7, max_ratio=2.0,
         )
     except Exception as exc:
         log(paths, f"L1 dialogue call failed Ch{chapter_num} (non-fatal): {exc}")
