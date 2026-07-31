@@ -367,6 +367,7 @@ def build_user(
     *,
     exemplars: str = "",
     negative: str = "",
+    knowledge: str = "",
     threads: str = "",
     constraints: Iterable[str] = (),
     tail_anchor: str = "",
@@ -383,6 +384,7 @@ def build_user(
     parts = [
         state.volatile_block(),
         exemplars,
+        knowledge,
         negative,
         length_block(config),
         constraints_block(constraints),
@@ -539,6 +541,25 @@ def _capsule(paths: Paths, config: dict[str, Any]) -> str:
         return ""
 
 
+def _knowledge(paths: Paths, config: dict[str, Any], chapter_num: int,
+               card: dict[str, Any] | None) -> str:
+    if not bool(config.get("novel", {}).get("knowledge_injection", True)):
+        return ""
+    try:
+        from engine.knowledge import select_for_writer
+        from engine.config import ROOT
+
+        tension = str((card or {}).get("tension_level", "medium"))
+        genre = str(config.get("novel", {}).get("genre", ""))
+        emotion = str((card or {}).get("emotion_target", ""))
+        hook = str((card or {}).get("hook_type", ""))
+        return select_for_writer(
+            ROOT, chapter_num, tension_level=tension, genre=genre,
+            emotion_target=emotion, hook_type=hook)
+    except Exception:
+        return ""
+
+
 # `_chapter_write_max_tokens` sizes the response for prose ALONE —
 # `chapter_max_chars * ratio + margin`. Under v2 the same response also has to
 # carry the delta, and a delta that runs out of tokens is indistinguishable from
@@ -585,10 +606,12 @@ def write_chapter(
     plan = plan if isinstance(plan, dict) else {}
 
     preflight = _preflight(paths, conn, config, chapter_num)
+    knowledge_block = _knowledge(paths, config, chapter_num, card)
     user = build_user(
         state, card, chapter_num, title, config,
         exemplars=_exemplars(paths, conn, config, plan, chapter_num),
         negative=negative_block(preflight),
+        knowledge=knowledge_block,
         threads=thread_ledger(conn, chapter_num),
         constraints=constraints,
         tail_anchor=fossil_tail_anchor(preflight, config),

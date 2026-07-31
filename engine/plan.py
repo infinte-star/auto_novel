@@ -712,8 +712,19 @@ def generate_arc(
         fingerprints=_fingerprints(conn, config),
     )
 
+    arc_system = ARC_SYSTEM_V2
+    try:
+        from engine.knowledge import select_for_planner
+        from engine.config import ROOT
+        genre = str(config.get("novel", {}).get("genre", ""))
+        kb_block = select_for_planner(ROOT, start_ch, end_ch, genre=genre)
+        if kb_block:
+            arc_system = arc_system + kb_block
+    except Exception:
+        pass
+
     raw = call(
-        client, paths, config, ARC_SYSTEM_V2, json_prompt(user),
+        client, paths, config, arc_system, json_prompt(user),
         max_tokens=int(config["novel"].get("arc_max_tokens", 32000) or 32000),
         temperature=float(config["novel"].get("arc_temperature", 0.75) or 0.75),
         cacheable_prefix=state.stable_prefix(),
