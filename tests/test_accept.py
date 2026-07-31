@@ -305,6 +305,21 @@ class ContractFulfilmentTest(unittest.TestCase):
         self.assertEqual(r["ccr"], 1.0)
 
 
+    def test_arabic_numeral_matches_cjk_in_where(self):
+        card = {"where": "凌晨1点的急诊室走廊", "who": [], "turn": "",
+                "exit_hook": "", "beats": [], "forbid": []}
+        text = "第3章\n\n" + "凌晨一点零三分，她冲进急诊室走廊。" * 20
+        r = accept.contract_fulfilment(card, text, _cfg())
+        self.assertTrue(r["passed"], f"Arabic→CJK numeral should match; misses={r['hard_misses']}")
+
+    def test_compound_location_matches_when_components_are_separate(self):
+        card = {"where": "鼎成科技数据中心外围废弃水塔顶", "who": [], "turn": "",
+                "exit_hook": "", "beats": [], "forbid": []}
+        text = "第7章\n\n" + "他爬上鼎成科技的数据中心旁边那座废弃水塔。" * 20
+        r = accept.contract_fulfilment(card, text, _cfg())
+        self.assertTrue(r["passed"], f"compound location with separate components should match; misses={r['hard_misses']}")
+
+
 class CitationCheckTest(unittest.TestCase):
 
     TEXT = "第3章\n\n她在灶台夹层里摸到一枚刻字的铜钥匙，指腹蹭过那道浅痕。"

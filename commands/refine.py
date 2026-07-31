@@ -25,6 +25,7 @@ pipeline.main() after target_words is reached, gated by config flag
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -713,6 +714,59 @@ def _adjacent_duplicate(
 
 
 # ---------------------------------------------------------------------------
+# Name consistency (zero-LLM)
+# ---------------------------------------------------------------------------
+
+_HEADER_NAME_RE = re.compile(r'[、·]\s*([一-鿿]{2,4})[（(]')
+_TABLE_NAME_RE = re.compile(r'\|\s*([一-鿿]{2,5})\s*\|')
+_LIST_NAME_RE = re.compile(r'^[-*]\s*([一-鿿]{2,4})[：:]', re.MULTILINE)
+_DOT_NAME_RE = re.compile(r'·([一-鿿]{2,5})')
+
+_NON_NAME_WORDS = frozenset({
+    '人物', '关系', '属性', '当前', '状态', '变化', '趋势',
+    '目标', '恐惧', '资源', '秘密', '能力', '主角', '配角',
+    '反派', '长线', '短期', '中期', '深层', '关系属性',
+    '当前状态', '变化趋势',
+})
+
+
+def _extract_character_names(characters_text: str) -> set[str]:
+    """Extract character names from characters.md using positional heuristics."""
+    names: set[str] = set()
+    for m in _HEADER_NAME_RE.finditer(characters_text):
+        names.add(m.group(1))
+    for m in _TABLE_NAME_RE.finditer(characters_text):
+        names.add(m.group(1))
+    for m in _LIST_NAME_RE.finditer(characters_text):
+        names.add(m.group(1))
+    for m in _DOT_NAME_RE.finditer(characters_text):
+        names.add(m.group(1))
+    return names - _NON_NAME_WORDS
+
+
+def _name_consistency_check(
+    original: str, refined: str, characters_text: str,
+) -> tuple[bool, str]:
+    """Reject refined text that drops known character names present in the original.
+
+    A name is flagged only when it appears >=2 times in the original and zero
+    times in the refined — this makes the check conservative enough to avoid
+    false positives from incidental single mentions.
+    """
+    names = _extract_character_names(characters_text)
+    if not names:
+        return True, ""
+    missing = []
+    for name in sorted(names):
+        orig_count = original.count(name)
+        if orig_count >= 2 and name not in refined:
+            missing.append(f"{name}(×{orig_count})")
+    if missing:
+        return False, f"character names lost: {', '.join(missing)}"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
 
@@ -786,6 +840,8 @@ def refine_book(
 
     refined_dir(paths).mkdir(parents=True, exist_ok=True)
     refine_checkpoint_dir(paths).mkdir(parents=True, exist_ok=True)
+
+    characters_text = read_text(paths.characters) if paths.characters.exists() else ""
 
     for start, end in groups:
         group_chapters = load_group_text(paths, start, end)
@@ -898,6 +954,10 @@ def refine_book(
                 ok, reason = _refined_text_acceptable(original, refined, config, intensity)
                 if not ok:
                     log(paths, f"Refine Ch{ch} rejected ({reason}); keeping original")
+                    break
+                name_ok, name_reason = _name_consistency_check(original, refined, characters_text)
+                if not name_ok:
+                    log(paths, f"Refine Ch{ch} rejected ({name_reason}); keeping original")
                     break
                 is_dup, sim = _adjacent_duplicate(
                     refined, prev_refined_text, prev_original_text, config

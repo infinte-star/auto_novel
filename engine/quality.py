@@ -1770,21 +1770,34 @@ def _beat_anchor_fragments(beat: str, max_anchors: int = 6) -> list[str]:
     return fragments[:max_anchors]
 
 
+_ARAB_TO_CJK = str.maketrans("0123456789", "〇一二三四五六七八九")
+
+
 def _fragment_hit(fragment: str, chapter_text: str, chapter_bigrams: set[str], min_bigram_cov: float = 0.7) -> bool:
     """True when the chapter plausibly realizes this anchor fragment.
 
     Exact substring first; for fragments >=3 chars, fall back to bigram
     coverage so loose rewording ("安瓿碎裂方向" vs "安瓿的碎裂方向") still
     counts. A chapter that never mentions the object at all fails both.
+    When the fragment contains Arabic digits, a second substring check
+    runs with digits normalized to CJK ("1点" → "一点").
+    Long fragments (>=8 chars) use a relaxed bigram threshold because
+    compound names like "鼎成科技数据中心外围废弃水塔顶" naturally break
+    into separate components in prose, creating boundary bigrams that
+    never appear.
     """
     if fragment in chapter_text:
+        return True
+    norm_frag = fragment.translate(_ARAB_TO_CJK)
+    if norm_frag != fragment and norm_frag in chapter_text.translate(_ARAB_TO_CJK):
         return True
     if len(fragment) < 3 or not chapter_bigrams:
         return False
     grams = {fragment[i: i + 2] for i in range(len(fragment) - 1)}
     if not grams:
         return False
-    return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= min_bigram_cov
+    threshold = min_bigram_cov if len(fragment) < 8 else min_bigram_cov * 0.7
+    return sum(1 for g in grams if g in chapter_bigrams) / len(grams) >= threshold
 
 
 

@@ -1510,6 +1510,88 @@ class RefinedTextAcceptableTests(unittest.TestCase):
         self.assertFalse(ok, "normal-length original must still use standard grow cap")
 
 
+class RefineNameConsistencyTests(unittest.TestCase):
+    """Tests for refine._name_consistency_check and _extract_character_names."""
+
+    CHARACTERS_GUIXUE = (
+        "## 主角 · 汤舒婷（28岁）\n"
+        "### 关系\n"
+        "| 人物 | 关系属性 | 当前状态 |\n"
+        "| 程叙 | 青梅竹马 | 多年不见 |\n"
+        "| 沈牧白 | 傲慢专家 | 匿名 |\n"
+        "奶奶·汤王秀兰\n"
+        "弟弟·汤舒明\n"
+    )
+
+    CHARACTERS_VALIDATE = (
+        "## 一、陆远洲（主角）\n"
+        "- 贺岩：前同事\n"
+        "- 苏予：前妻\n"
+        "- 方小棠：房东\n"
+    )
+
+    def test_extract_header_dot_name(self):
+        from commands.refine import _extract_character_names
+        names = _extract_character_names(self.CHARACTERS_GUIXUE)
+        self.assertIn("汤舒婷", names)
+
+    def test_extract_table_names(self):
+        from commands.refine import _extract_character_names
+        names = _extract_character_names(self.CHARACTERS_GUIXUE)
+        self.assertIn("程叙", names)
+        self.assertIn("沈牧白", names)
+
+    def test_extract_dot_prefix_names(self):
+        from commands.refine import _extract_character_names
+        names = _extract_character_names(self.CHARACTERS_GUIXUE)
+        self.assertIn("汤王秀兰", names)
+        self.assertIn("汤舒明", names)
+
+    def test_extract_list_names(self):
+        from commands.refine import _extract_character_names
+        names = _extract_character_names(self.CHARACTERS_VALIDATE)
+        self.assertIn("陆远洲", names)
+        self.assertIn("贺岩", names)
+        self.assertIn("苏予", names)
+        self.assertIn("方小棠", names)
+
+    def test_non_name_words_excluded(self):
+        from commands.refine import _extract_character_names
+        names = _extract_character_names(self.CHARACTERS_GUIXUE)
+        self.assertNotIn("人物", names)
+        self.assertNotIn("关系", names)
+
+    def test_name_preserved_passes(self):
+        from commands.refine import _name_consistency_check
+        original = "沈牧白走进来，沈牧白说了一句话。"
+        refined = "沈牧白大步走进来，沈牧白开口说道。"
+        ok, _ = _name_consistency_check(original, refined, self.CHARACTERS_GUIXUE)
+        self.assertTrue(ok)
+
+    def test_name_substituted_fails(self):
+        from commands.refine import _name_consistency_check
+        original = "沈牧白走进来，沈牧白说了一句话。汤舒婷看着他。汤舒婷没说话。"
+        refined = "沈渡走进来，沈渡说了一句话。苏棠看着他。苏棠没说话。"
+        ok, reason = _name_consistency_check(original, refined, self.CHARACTERS_GUIXUE)
+        self.assertFalse(ok)
+        self.assertIn("沈牧白", reason)
+        self.assertIn("汤舒婷", reason)
+
+    def test_single_mention_not_flagged(self):
+        from commands.refine import _name_consistency_check
+        original = "沈牧白走进来。"
+        refined = "沈渡走进来。"
+        ok, _ = _name_consistency_check(original, refined, self.CHARACTERS_GUIXUE)
+        self.assertTrue(ok, "single mention should not trigger rejection")
+
+    def test_empty_characters_passes(self):
+        from commands.refine import _name_consistency_check
+        original = "沈牧白走进来，沈牧白说了一句话。"
+        refined = "沈渡走进来，沈渡说了一句话。"
+        ok, _ = _name_consistency_check(original, refined, "")
+        self.assertTrue(ok, "no known characters means nothing to check")
+
+
 class LengthBandShortBlockTests(unittest.TestCase):
     """Tests for length_band_check short-side blocking."""
 
