@@ -59,6 +59,7 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
       "info_source": "本章推进真相/剧情依赖的主要信息来源",
       "thread_actions": ["本章开启/推进/回收的伏线，写清具体动作"],
       "world_state_changes": ["本章结束后世界/关系/资源发生的可验证变化"],
+      "payoff_reaction": "爽点发生后谁产生外部反应（对手名+反应动作，或围观者+态度变化）——必须是他人视角，不是主角内心",
       "exit_hook": "章末抛给读者的具体悬念（一个事件，不是一句感叹）",
       "forbid": ["本章明令禁止使用的套路/意象/句式，来自下方已用元素台账"],
       "opening_type": "physical_action|dialogue|sensory_scene|conflict_inmedias|object_detail|aftermath",
@@ -157,6 +158,7 @@ def normalize_card(raw: Any, chapter_num: int) -> dict[str, Any] | None:
         "exit_hook": str(raw.get("exit_hook") or "").strip(),
         "forbid": _as_list(raw.get("forbid")),
         "opening_type": str(raw.get("opening_type") or "").strip(),
+        "payoff_reaction": str(raw.get("payoff_reaction") or "").strip(),
     }
     card["tension_level"] = str(raw.get("tension_level") or "").strip()
     card["hook_type"] = str(raw.get("hook_type") or "").strip()
@@ -201,6 +203,7 @@ def card_to_plan(card: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         "emotion_target": card.get("emotion_target", ""),
         "forbid": list(card.get("forbid") or []),
         "turn": card.get("turn", ""),
+        "payoff_reaction": card.get("payoff_reaction", ""),
         "source": "arc_card",
     }
     constraints: list[dict[str, Any]] = []
@@ -215,6 +218,12 @@ def card_to_plan(card: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             "id": "card_payoff", "type": "payoff_delivery",
             "constraint": f"本章兑现必须可见地发生：{card['payoff']}",
             "check_method": "action", "target": card["payoff"],
+        })
+    if card.get("payoff_reaction"):
+        constraints.append({
+            "id": "card_payoff_reaction", "type": "payoff_delivery",
+            "constraint": f"爽点外化反应必须写到页面上：{card['payoff_reaction']}",
+            "check_method": "action", "target": card["payoff_reaction"],
         })
     if card.get("where"):
         constraints.append({

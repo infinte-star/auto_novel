@@ -881,6 +881,65 @@ def payoff_beat_density(
         "directives": directives,
     }
 
+_REACTION_MARKERS = re.compile(
+    r"倒吸|愣[住了在]|呆[住了在]|变[了]脸|后退|张[大开].*嘴|"
+    r"不敢相信|目瞪口呆|震[惊住]|沉默|脸色[骤一]变|傻[眼了]|"
+    r"窃窃私语|议论|侧目|让开|低下.*头|不可思议|难以置信|"
+    r"倒退|哑口无言|无言以对|脸色发白|吓得|惊呼|瞪大"
+)
+
+
+@REGISTRY.register(
+    "payoff_reaction_check", config_key="payoff_reaction_enabled",
+    tag_prefix="payoff_reaction", repair="advisory", scope="chapter",
+    proof="New gate: checks whether payoff moments have visible third-party "
+          "reactions within 300 chars. Benchmark WR shows payoff_visible at "
+          "33.3% — the biggest gap. This gate nudges writers to add reaction "
+          "segments after payoff markers.")
+def payoff_reaction_check(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Check whether payoff moments have visible external reactions nearby."""
+    body = _strip_title_line(text or "")
+    if len(body) < 500:
+        return {"metrics": {}, "flags": [], "directives": []}
+
+    payoff_positions = [m.start() for m in _PAYOFF_MARKERS.finditer(body)]
+    if not payoff_positions:
+        return {
+            "metrics": {"payoff_count": 0, "reacted": 0, "unreacted": 0},
+            "flags": [], "directives": [],
+        }
+
+    window = 300
+    reacted = 0
+    unreacted = 0
+    for pos in payoff_positions:
+        after = body[pos:pos + window]
+        if _REACTION_MARKERS.search(after):
+            reacted += 1
+        else:
+            unreacted += 1
+
+    flags: list[str] = []
+    directives: list[str] = []
+    total = reacted + unreacted
+    if total > 0 and unreacted > reacted:
+        flags.append(f"payoff_no_reaction({unreacted}/{total})")
+        directives.append(
+            f"本章 {total} 处爽点/高潮中有 {unreacted} 处缺少外部反应段。"
+            "爽点之后 200 字内必须有他人的可见反应（表情变化/动作/对话），"
+            "不能只在主角视角完成确认。"
+        )
+
+    return {
+        "metrics": {"payoff_count": total, "reacted": reacted, "unreacted": unreacted},
+        "flags": flags,
+        "directives": directives,
+    }
+
+
 _SHAREABLE_MARKERS = re.compile(
     r"从今(?:天|往)?(?:起|以后)|从现在起|记住|凭什么|我偏|我就是|也配|不过如此|活该|"
     r"早晚|总有一天|莫欺|三十年河|给我跪|你们这些|我说过|谁规定|凭本事|宁可|绝不|"

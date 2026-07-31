@@ -3029,6 +3029,7 @@ from engine.quality_advisory import (  # noqa: F401,E402
     long_span_fatigue,
     paragraph_shape_health,
     payoff_beat_density,
+    payoff_reaction_check,
     prose_texture,
     shareable_line,
 )

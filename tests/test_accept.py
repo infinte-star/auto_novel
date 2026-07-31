@@ -320,6 +320,28 @@ class ContractFulfilmentTest(unittest.TestCase):
         self.assertTrue(r["passed"], f"compound location with separate components should match; misses={r['hard_misses']}")
 
 
+    def test_payoff_reaction_soft_check_lowers_ccr_on_miss(self):
+        card = dict(CARD, payoff_reaction="马叔烟灰散开，愣了三秒")
+        text = ("第10章\n\n"
+                + "汤舒婷推开顾家老宅后厨的门。" * 20
+                + "她在灶台夹层里摸到一枚刻字的铜钥匙。" * 20
+                + "顾峥站在门口看着她。" * 20
+                + "刻字与母亲遗物对上了。" * 20
+                + "铜钥匙插进阁楼那把锁，锁芯只转了半圈就卡死。")
+        r = accept.contract_fulfilment(card, text, _cfg())
+        self.assertTrue(r["passed"], "payoff_reaction miss must not hard-block")
+        miss_fields = {i["field"] for i in r["missing"]}
+        self.assertIn("payoff_reaction", miss_fields)
+        self.assertLess(r["ccr"], 1.0)
+
+    def test_payoff_reaction_hit_when_present(self):
+        card = dict(CARD, payoff_reaction="顾峥愣了三秒")
+        text = FULFILLED + "顾峥愣了三秒，手里的烟差点掉在地上。"
+        r = accept.contract_fulfilment(card, text, _cfg())
+        hit_fields = {i["field"] for i in r["items"] if i["verdict"] == "hit"}
+        self.assertIn("payoff_reaction", hit_fields)
+
+
 class CitationCheckTest(unittest.TestCase):
 
     TEXT = "第3章\n\n她在灶台夹层里摸到一枚刻字的铜钥匙，指腹蹭过那道浅痕。"

@@ -1642,6 +1642,41 @@ class PayoffDensityTests(unittest.TestCase):
         self.assertFalse(res["directives"])
 
 
+class PayoffReactionCheckTests(unittest.TestCase):
+    """Tests for payoff_reaction_check: external reaction after payoff markers."""
+
+    def test_payoff_with_reaction_passes(self):
+        from engine.quality import payoff_reaction_check
+        filler = "他继续往前走着，路上的行人匆匆而过。" * 30
+        text = (filler
+                + "他当众揭穿了对方的伪证，围观的人倒吸一口气，纷纷议论起来。"
+                + filler)
+        res = payoff_reaction_check(text, {"novel": {}})
+        self.assertGreater(res["metrics"]["payoff_count"], 0)
+        self.assertEqual(res["metrics"]["reacted"], res["metrics"]["payoff_count"])
+        self.assertFalse(res["directives"])
+
+    def test_payoff_without_reaction_fires_directive(self):
+        from engine.quality import payoff_reaction_check
+        filler = "他继续往前走着，路上的行人匆匆而过。" * 30
+        text = (filler
+                + "他当众揭穿了对方的伪证，然后转身离开了现场。"
+                + filler
+                + "他一锤定音地做出了判决，随后拿起文件夹走出了大门。"
+                + filler)
+        res = payoff_reaction_check(text, {"novel": {}})
+        self.assertGreater(res["metrics"]["unreacted"], 0)
+        self.assertTrue(res["directives"])
+        self.assertIn("外部反应", res["directives"][0])
+
+    def test_no_payoff_markers_is_clean(self):
+        from engine.quality import payoff_reaction_check
+        text = "他继续往前走着，路上的行人匆匆而过。" * 40
+        res = payoff_reaction_check(text, {"novel": {}})
+        self.assertEqual(res["metrics"].get("payoff_count", 0), 0)
+        self.assertFalse(res["directives"])
+
+
 class InformationDensityTests(unittest.TestCase):
     """Tests for information_density: pure-transition-chapter detection."""
 

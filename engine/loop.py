@@ -675,6 +675,10 @@ def contract_fulfilment(
         if target:
             add(field, target, *_hit(target, body, grams))
 
+    reaction = str(card.get("payoff_reaction") or "").strip()
+    if reaction:
+        add("payoff_reaction", reaction, *_hit(reaction, body, grams))
+
     for raw_name in (card.get("who") or []):
         name = re.sub(r"[（(][^)）]*[)）]", "", str(raw_name or "")).strip()
         if len(name) >= 2:
@@ -946,6 +950,9 @@ def acceptance_report(
     if enabled("payoff_beat_density"):
         report["payoff_beat_density"] = quality.payoff_beat_density(
             body, recent_payoff_types, config)
+    if enabled("payoff_reaction_check"):
+        report["payoff_reaction_check"] = quality.payoff_reaction_check(
+            body, config)
     if enabled("shareable_line"):
         report["shareable_line"] = quality.shareable_line(body, config)
     if enabled("information_density"):
@@ -964,7 +971,8 @@ def acceptance_report(
                 "ai_flavor_health", "paragraph_shape_health",
                 "hook_tail_repetition", "intra_chapter_repetition",
                 "prose_texture", "dialogue_health", "long_span_fatigue",
-                "payoff_beat_density", "shareable_line", "information_density",
+                "payoff_beat_density", "payoff_reaction_check",
+                "shareable_line", "information_density",
                 "chapter_ending_strength"):
         for d in (report.get(key) or {}).get("directives", []):
             if d not in wd:
@@ -1566,6 +1574,13 @@ def _act_rescue(ctx: Ctx, run: ChapterRun) -> str:
              {"attempt": run.rescue_attempts, "block_reasons": reasons})
     extra = ["上一稿被确定性验收判为不合格，原因：" + "；".join(reasons)]
     extra += [d for d in directives[:6]]
+    sh = (run.report or {}).get("style_health") or {}
+    sh_flags = sh.get("flags") or []
+    if any("dialogue_starved" in f or "dialogue_low" in f or "almost_no_dialogue" in f
+           for f in sh_flags):
+        ratio = sh.get("dialogue_char_ratio", 0)
+        extra.append(
+            f"对话占比不足（当前{ratio:.0%}），本次重写必须用更多对话推进剧情，目标≥20%")
     run.constraints = tuple(list(run.constraints or ()) + extra)[:20]
     run.write_attempts = 0
     run.text = ""
