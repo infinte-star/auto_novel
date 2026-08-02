@@ -65,6 +65,8 @@ PINNED = {
         "factcheck_hard_blocks_accept": True,
         "contract_blocks_accept": True,
         "constraint_violation_block_count": 3,
+        "style_em_dash_per_kchar_warn": 6.0,
+        "style_em_dash_per_kchar_bad": 12.0,
     }
 }
 

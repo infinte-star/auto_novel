@@ -377,7 +377,8 @@ class DecisionTableTest(unittest.TestCase):
 
     def test_the_table_rows_are_the_documented_ones_in_the_documented_order(self):
         self.assertEqual([name for name, _, _ in v2run.DECISIONS], [
-            "need_card", "card_invalid", "need_draft", "need_report",
+            "need_card", "card_invalid", "card_refine",
+            "need_draft", "need_report",
             "l0_pending", "l1_pending",
             "rescue", "commit"])
 

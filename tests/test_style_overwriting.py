@@ -15,6 +15,8 @@ def _cfg(**novel_keys):
         "style_dialogue_ratio_min": 0.04,
         "style_tech_jargon_per_kchar_warn": 8.0,
         "style_tech_jargon_per_kchar_bad": 12.0,
+        "style_em_dash_per_kchar_warn": 6.0,
+        "style_em_dash_per_kchar_bad": 12.0,
     }
     base.update(novel_keys)
     return {"novel": base}

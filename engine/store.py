@@ -265,6 +265,25 @@ def init_db(paths: Paths) -> Any:
         """)
     except Exception:
         pass
+    # entity_history: temporal state tracking (v3 Phase 2)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS entity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT NOT NULL,
+                chapter INTEGER NOT NULL,
+                superseded_chapter INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_history_lookup
+                ON entity_history(entity_type, name, field, chapter);
+        """)
+    except Exception:
+        pass
     return conn
 
 def db_event(conn: Any, chapter: int, event_type: str, payload: dict[str, Any]) -> None:
@@ -474,9 +493,26 @@ def get_open_causal_requirements(conn: Any) -> list[dict[str, Any]]:
         return []
 
 def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | None = None) -> dict[str, Any]:
-    """Return an entity's stored state. The entities table only keeps the latest
-    state (no temporal history yet), so `chapter` is accepted for API forward-
-    compatibility but currently ignored; latest state is returned."""
+    """Return an entity's stored state.
+
+    When *chapter* is given and entity_history has data, reconstruct the state
+    as it was at that chapter by replaying history entries.  Falls back to the
+    latest snapshot from the entities table when history is unavailable.
+    """
+    if chapter is not None:
+        try:
+            with db_lock():
+                rows = conn.execute(
+                    "SELECT field, new_value FROM entity_history "
+                    "WHERE entity_type=? AND name=? AND chapter<=? "
+                    "AND (superseded_chapter IS NULL OR superseded_chapter>?) "
+                    "ORDER BY chapter",
+                    (entity_type, name, chapter, chapter),
+                ).fetchall()
+            if rows:
+                return {row["field"]: row["new_value"] for row in rows}
+        except Exception:
+            pass
     try:
         with db_lock():
             row = conn.execute(
@@ -488,6 +524,49 @@ def entity_state_as_of(conn: Any, entity_type: str, name: str, chapter: int | No
     except Exception:
         pass
     return {}
+
+
+def get_entity_facts_at(conn: Any, chapter_num: int,
+                        entity_type: str | None = None,
+                        name: str | None = None,
+                        limit: int = 50) -> list[dict[str, Any]]:
+    """Return entity facts valid at *chapter_num* from the history table."""
+    try:
+        where = ["chapter<=?", "(superseded_chapter IS NULL OR superseded_chapter>?)"]
+        params: list[Any] = [chapter_num, chapter_num]
+        if entity_type is not None:
+            where.append("entity_type=?")
+            params.append(entity_type)
+        if name is not None:
+            where.append("name=?")
+            params.append(name)
+        params.append(limit)
+        sql = (
+            "SELECT entity_type, name, field, new_value, chapter, superseded_chapter "
+            "FROM entity_history WHERE " + " AND ".join(where) +
+            " ORDER BY chapter DESC LIMIT ?"
+        )
+        with db_lock():
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def get_recent_entity_changes(conn: Any, since_chapter: int,
+                              limit: int = 20) -> list[dict[str, Any]]:
+    """Return entity state changes recorded after *since_chapter*."""
+    try:
+        with db_lock():
+            rows = conn.execute(
+                "SELECT entity_type, name, field, old_value, new_value, chapter "
+                "FROM entity_history WHERE chapter>? "
+                "ORDER BY chapter DESC LIMIT ?",
+                (since_chapter, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
 
 def get_overdue_reader_promises(conn: Any, chapter_num: int, grace: int = 0, limit: int = 8) -> list[dict[str, Any]]:
     """Open threads explicitly typed as reader promises whose due_chapter has

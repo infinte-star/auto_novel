@@ -277,6 +277,15 @@ def validate_card(
     last3 = [c.get("payoff_type") for c in recent_cards[-2:]]
     if card.get("payoff_type") and len(last3) == 2 and all(t == card["payoff_type"] for t in last3):
         problems.append(f"payoff_type `{card['payoff_type']}` 已连续三章相同；换一种兑现方式。")
+    tl = card.get("tension_level")
+    if tl and recent_cards:
+        last_t = recent_cards[-1].get("tension_level")
+        if last_t == tl and tl in ("high", "low"):
+            label = "读者疲劳" if tl == "high" else "读者弃书"
+            alts = "medium 或 low" if tl == "high" else "medium 或 high"
+            problems.append(
+                f"tension_level `{tl}` 连续两章——{label}风险。"
+                f"本章换成 {alts} 张力。")
     last_tensions = [c.get("tension_level") for c in recent_cards[-2:]]
     if card.get("tension_level") and len(last_tensions) == 2 and all(t == card["tension_level"] for t in last_tensions):
         problems.append(
@@ -311,6 +320,31 @@ def check_arc_end_acceleration(cards: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def check_arc_tension_distribution(cards: list[dict[str, Any]]) -> list[str]:
+    """Check overall tension distribution across an arc for wave pattern."""
+    if len(cards) < 3:
+        return []
+    problems = []
+    levels = [c.get("tension_level", "") for c in cards if c.get("tension_level")]
+    if not levels:
+        return []
+    from collections import Counter
+    counts = Counter(levels)
+    total = len(levels)
+    if "high" not in counts:
+        problems.append(
+            f"整弧 {total} 章无 high 张力章——缺少高潮，读者无爽点。"
+            f"至少安排 1-2 章 high 张力（弧中段或末尾）。"
+        )
+    for level, cnt in counts.items():
+        if cnt / total > 0.6:
+            problems.append(
+                f"tension_level `{level}` 占弧内 {cnt}/{total}={cnt/total:.0%}，"
+                f"分布过于单调。高→中→低波浪形交替更佳。"
+            )
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # Card store
 # ---------------------------------------------------------------------------
@@ -340,6 +374,113 @@ def save_cards(paths: Paths, data: dict[str, Any]) -> None:
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+# ---------------------------------------------------------------------------
+# JIT card refinement (v3 Phase 2)
+# ---------------------------------------------------------------------------
+
+def refine_card(
+    card: dict[str, Any],
+    conn: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    recent_cards: list[dict[str, Any]] | None = None,
+    feed_forward: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Zero-LLM deterministic card refinement.
+
+    Adapts an arc card to actual story state just before writing.
+    Returns (patched_card, patch_log) where patch_log lists every change made.
+    """
+    from engine.store import entity_state_as_of, get_open_threads
+
+    card = dict(card)
+    patches: list[str] = []
+
+    # 1. Character availability — drop dead/imprisoned characters from who
+    who = list(card.get("who") or [])
+    surviving: list[str] = []
+    for name in who:
+        try:
+            st = entity_state_as_of(conn, "character", name, chapter_num)
+        except Exception:
+            st = {}
+        status = str(st.get("status") or st.get("状态") or "").lower()
+        if status in ("dead", "死亡", "imprisoned", "被囚", "消失"):
+            patches.append(f"移除不可用角色 {name}（状态={status}）")
+        else:
+            surviving.append(name)
+    if len(surviving) != len(who):
+        card["who"] = surviving if surviving else who[:1]
+
+    # 2. Thread freshness — check payoff/thread_actions still open
+    try:
+        open_threads = get_open_threads(conn, chapter_num, limit=50)
+    except Exception:
+        open_threads = []
+    open_names = {str(t.get("thread_name") or t.get("name") or "") for t in open_threads}
+
+    payoff = card.get("payoff", "")
+    stale_actions: list[str] = []
+    for ta in list(card.get("thread_actions") or []):
+        parts = ta.split(":", 1)
+        action_thread = parts[0].strip() if parts else ta.strip()
+        if action_thread and action_thread not in open_names:
+            is_stale = not any(action_thread in n for n in open_names)
+            if is_stale:
+                stale_actions.append(ta)
+                patches.append(f"thread_action '{ta}' 引用的线索已关闭→移除")
+    if stale_actions and "thread_actions" in card:
+        card["thread_actions"] = [
+            ta for ta in card["thread_actions"] if ta not in stale_actions
+        ]
+
+    # 3. Neighbor dedup — opening_type / tension / hook vs recent cards
+    prev = (recent_cards or [])
+    if prev:
+        last = prev[-1] if prev else {}
+        ot = card.get("opening_type", "")
+        if ot and ot == last.get("opening_type"):
+            alts = [t for t in OPENING_TYPES if t != ot]
+            if alts:
+                card["opening_type"] = alts[chapter_num % len(alts)]
+                patches.append(f"opening_type '{ot}' 与上章重复→'{card['opening_type']}'")
+
+        tl = card.get("tension_level", "")
+        arc_span = int((config or {}).get("novel", {}).get("arc_span", 10))
+        arc_pos = (chapter_num - 1) % arc_span if arc_span > 0 else 0
+        prev1_t = prev[-1].get("tension_level") if prev else None
+        prev2 = [c.get("tension_level") for c in prev[-2:]]
+        if tl and prev1_t == tl and tl in ("high", "low"):
+            if tl == "high":
+                new_tl = "medium" if arc_pos >= arc_span * 0.7 else "medium"
+            else:
+                new_tl = "high" if arc_span > 0 and 0.3 <= arc_pos / arc_span <= 0.7 else "medium"
+            card["tension_level"] = new_tl
+            patches.append(f"tension_level '{tl}' 连续两章→'{new_tl}'(弧位{arc_pos}/{arc_span})")
+        elif tl and len(prev2) == 2 and all(t == tl for t in prev2):
+            rotate = {"high": "medium", "medium": "low", "low": "high"}
+            card["tension_level"] = rotate.get(tl, tl)
+            patches.append(f"tension_level '{tl}' 连续三章→'{card['tension_level']}'")
+
+        ht = card.get("hook_type", "")
+        prev2h = [c.get("hook_type") for c in prev[-2:]]
+        if ht and len(prev2h) == 2 and all(t == ht for t in prev2h):
+            patches.append(f"hook_type '{ht}' 连续三章重复")
+
+    # 4. Feed-forward injection
+    for directive in (feed_forward or []):
+        d = directive.strip()
+        if not d:
+            continue
+        forbid = list(card.get("forbid") or [])
+        if d not in forbid:
+            forbid.append(d)
+            card["forbid"] = forbid
+            patches.append(f"注入 feed-forward: {d[:40]}")
+
+    return card, patches
 
 
 # ---------------------------------------------------------------------------
@@ -819,6 +960,12 @@ def generate_arc(
         )
         if fixed:
             by_ch[penult_ch] = fixed
+
+    dist_problems = check_arc_tension_distribution(
+        [by_ch[c] for c in sorted_chs],
+    )
+    for dp in dist_problems:
+        log(paths, f"beat: arc tension distribution: {dp}")
 
     return {
         "intent": str(data.get("arc_intent") or "").strip(),

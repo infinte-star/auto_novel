@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 NOVELS_DIR = PROJECT_DIR / "novels"
 EXPERIMENTS_DIR = PROJECT_DIR / "experiments"
 

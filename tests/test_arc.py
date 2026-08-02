@@ -250,10 +250,15 @@ class TestValidateCard(unittest.TestCase):
         card = normalize_card(_good_card(where="新地点", tension_level="high"), 27)
         self.assertTrue(any("tension_level" in p for p in validate_card(card, recent_cards=prevs)))
 
-    def test_two_consecutive_tension_levels_are_allowed(self):
+    def test_two_consecutive_high_or_low_tension_is_caught(self):
         prev = normalize_card(_good_card(where="别处", tension_level="high"), 26)
         card = normalize_card(_good_card(where="新地点", tension_level="high"), 27)
-        self.assertFalse(any("tension_level" in p for p in validate_card(card, recent_cards=[prev])))
+        self.assertTrue(any("tension_level" in p for p in validate_card(card, recent_cards=[prev])))
+
+    def test_two_consecutive_medium_tension_is_allowed(self):
+        prev = normalize_card(_good_card(where="别处", tension_level="medium"), 26)
+        card = normalize_card(_good_card(where="新地点", tension_level="medium"), 27)
+        self.assertFalse(any("连续两章" in p for p in validate_card(card, recent_cards=[prev])))
 
     def test_triple_hook_type_is_caught(self):
         prevs = [normalize_card(_good_card(where=f"地点{i}", hook_type="悬念"), 25 + i)

@@ -16,6 +16,8 @@ import engine.loop as accept
 def _cfg(**novel):
     novel.setdefault("style_penalty_block", 2.0)
     novel.setdefault("chapter_min_chars", 500)
+    novel.setdefault("style_em_dash_per_kchar_warn", 6.0)
+    novel.setdefault("style_em_dash_per_kchar_bad", 12.0)
     return {"novel": novel}
 
 
@@ -589,11 +591,11 @@ class AdvisoryGateDirectivesTest(unittest.TestCase):
         r = self._report(ai_heavy)
         afh = r.get("ai_flavor_health") or {}
         if afh.get("directives"):
+            wd_joined = "\n".join(r["writer_directives_for_next_chapter"])
             self.assertTrue(
-                any(d in r["writer_directives_for_next_chapter"]
-                    for d in afh["directives"]),
+                any(d in wd_joined for d in afh["directives"]),
                 "advisory directives must be aggregated into "
-                "writer_directives_for_next_chapter")
+                "writer_directives_for_next_chapter (possibly with a priority prefix)")
 
     def test_advisory_gates_never_block(self):
         r = self._report(FULFILLED)

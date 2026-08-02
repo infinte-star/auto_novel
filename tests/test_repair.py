@@ -10,6 +10,7 @@ because every inner check is scored on the metric the fixer was aiming at.
 import unittest
 from unittest import mock
 
+import engine.accept as _accept
 import engine.loop as _loop
 import engine.quality as _quality
 repair = _loop
@@ -216,7 +217,7 @@ class RunLayerTest(unittest.TestCase):
         record of what they bought.
         """
         lines: list[str] = []
-        with mock.patch.object(_loop, "_repair_log", lambda p, m: lines.append(m)):
+        with mock.patch.object(_accept, "_repair_log", lambda p, m: lines.append(m)):
             with mock.patch.object(_quality, "apply_l1", return_value=("原文", [])):
                 ran = self._run("L1", report=_l1_report(), client=object())
             idle = self._run("L1", report=_clean(), client=object())

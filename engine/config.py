@@ -34,6 +34,15 @@ class Paths:
     logs_dir: Path
     database: Path
 
+def _normalize_config_text(text: str) -> str:
+    """Strip BOM and normalize curly quotes to prevent encoding errors."""
+    if text.startswith("﻿"):
+        text = text[1:]
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("‘", "'").replace("’", "'")
+    return text
+
+
 def parse_scalar(value: str) -> Any:
     value = value.strip()
     if not value:
@@ -85,6 +94,9 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
         # 下限取 P25 附近值，确保生成章至少达到爆款下四分位。
         "style_max_avg_sentence_chars": 38.0,
         "style_dialogue_ratio_min": 0.12,
+        "style_dialogue_starved_penalty": 1.5,
+        "dialogue_hard_block_ratio": 0.08,
+        "dialogue_char_ratio_min": 0.12,
         "style_tech_jargon_per_kchar_warn": 8.0,
         "style_tech_jargon_per_kchar_bad": 12.0,
         "visual_payoff_blocks_plan": False,
@@ -107,6 +119,8 @@ def genre_detection_profile(preset: str) -> dict[str, Any]:
                            "chapter_max_chars": 3200,
                            "style_max_avg_sentence_chars": 40.0,
                            "style_dialogue_ratio_min": 0.06,
+                           "dialogue_hard_block_ratio": 0.04,
+                           "dialogue_char_ratio_min": 0.06,
                            "fatigue_words": ["冷笑", "蝼蚁", "倒吸凉气", "瞳孔骤缩", "不可思议",
                                              "震惊", "竟然", "仿佛", "宛如", "不禁", "微微一笑",
                                              "嘴角微扬", "眼中闪过一丝", "气血翻涌", "杀意凛然"]},
@@ -252,6 +266,7 @@ def parse_config_text(text: str) -> dict[str, Any]:
     apart would make telemetry silently disagree with the engine about what a
     config says.
     """
+    text = _normalize_config_text(text)
     config: dict[str, Any] = {}
     section: str | None = None
     for raw_line in text.splitlines():

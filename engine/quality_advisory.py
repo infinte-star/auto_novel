@@ -6,6 +6,7 @@ the directives flow into the next chapter's writer prompt via acceptance_report.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -1131,15 +1132,24 @@ _THREAT_RE = re.compile(
     r'(如果|否则|不然|来不及|必须在).{2,30}[。！]')
 _COUNTDOWN_RE = re.compile(
     r'(还有|最后|只剩|倒计时|来得及吗|时间不多)')
+_REVEAL_RE = re.compile(
+    r'(原来|真相|秘密|其实).{0,10}(是|竟然|居然)')
+_APPEARANCE_RE = re.compile(
+    r'(出现|闯入|来了|站在).{0,10}(门口|面前|身后)')
+_DECISION_RE = re.compile(
+    r'(决定|下定决心|必须|一定要).{2,20}[。！]')
+_DISCOVERY_RE = re.compile(
+    r'(发现|注意到|看到|看见).{2,15}(竟然|居然|不可能)')
 
 
 @REGISTRY.register(
     "chapter_ending_strength", config_key="ending_strength_enabled",
     tag_prefix="ending", repair="L1", scope="chapter",
     proof="Promoted from advisory to L1 (2026-07-31): exit_hook was the #1 CCC "
-          "failure (4/4, measured). Expanded (2026-08): 8 signal patterns covering "
+          "failure (4/4, measured). Expanded (2026-08): 12 signal patterns covering "
           "dialogue, question, suspense punctuation, cliffhanger verbs, incomplete "
-          "actions, threats/ultimatums, countdowns, and unanswered trailing questions.")
+          "actions, threats/ultimatums, countdowns, unanswered trailing questions, "
+          "reveals, appearances, decisions, and discoveries.")
 def chapter_ending_strength(
     text: str,
     config: dict[str, Any] | None = None,
@@ -1158,7 +1168,7 @@ def chapter_ending_strength(
     body = _strip_title_line(text)
     if len(body) < 300:
         return result
-    tail_len = int(cfg.get("ending_strength_tail_chars", 150))
+    tail_len = int(cfg.get("ending_strength_tail_chars", 250))
     tail = body[-tail_len:]
     wide_tail = body[-400:]
     signals: list[str] = []
@@ -1176,6 +1186,14 @@ def chapter_ending_strength(
         signals.append("threat_ultimatum")
     if _COUNTDOWN_RE.search(tail):
         signals.append("countdown")
+    if _REVEAL_RE.search(tail):
+        signals.append("reveal")
+    if _APPEARANCE_RE.search(tail):
+        signals.append("appearance")
+    if _DECISION_RE.search(tail):
+        signals.append("decision")
+    if _DISCOVERY_RE.search(tail):
+        signals.append("discovery")
     if not signals and ('？' in wide_tail or '?' in wide_tail):
         after_q = wide_tail[max(wide_tail.rfind('？'), wide_tail.rfind('?')) + 1:]
         if len(after_q.strip()) < 100:
@@ -1253,11 +1271,11 @@ def arc_intent_fulfilment(
 
 @REGISTRY.register(
     "thread_overdue", config_key="thread_overdue_enabled",
-    config_default=True, tag_prefix="thread", repair="advisory", scope="chapter",
-    proof="UNVALIDATED. Advisory default; escalates to block when overdue_by > "
-          "arc_span * thread_overdue_block_factor (default 2.0 = 20 chapters). "
-          "Critical threads unresolved past 2 arcs correlate with reader-panel "
-          "'forgotten plotline' complaints.")
+    config_default=True, tag_prefix="thread", repair="advisory", scope="book",
+    proof="UNVALIDATED. Advisory only (scope=book, never blocks acceptance). "
+          "Directives steer the writer toward resolving overdue threads. "
+          "Thread accumulation is book-cumulative; extraction models rarely close "
+          "threads, so blocking on overdue count produces systematic false positives.")
 def thread_overdue(conn, chapter_num, config=None):
     """Check for severely overdue threads and reader promises."""
     cfg = (config or {}).get("novel", {}) if config else {}
@@ -1271,32 +1289,39 @@ def thread_overdue(conn, chapter_num, config=None):
         return result
 
     arc_span = max(3, int(cfg.get("arc_span", 10)))
-    block_factor = float(cfg.get("thread_overdue_block_factor", 2.0))
+    block_factor = float(cfg.get("thread_overdue_block_factor", 3.0))
     grace = int(cfg.get("thread_overdue_grace_chapters", 3))
     severity_threshold = arc_span * block_factor
 
     from engine.store import get_overdue_reader_promises, get_open_threads
 
-    overdue_items = []
+    thread_items = []
     try:
-        overdue_items = get_overdue_reader_promises(conn, chapter_num, grace=grace)
+        threads = get_open_threads(conn, chapter_num, limit=30)
+        for t in threads:
+            due = t.get("due_chapter")
+            if due is not None and int(due) + grace < chapter_num:
+                thread_items.append({
+                    "id": t["id"],
+                    "description": t.get("description", ""),
+                    "due_chapter": int(due),
+                    "overdue_by": chapter_num - int(due),
+                    "status": t.get("status", "open"),
+                    "source": "open_threads",
+                })
     except Exception:
         pass
-    if not overdue_items:
-        try:
-            threads = get_open_threads(conn, chapter_num, limit=20)
-            for t in threads:
-                due = t.get("due_chapter")
-                if due is not None and int(due) + grace < chapter_num:
-                    overdue_items.append({
-                        "id": t["id"],
-                        "description": t.get("description", ""),
-                        "due_chapter": int(due),
-                        "overdue_by": chapter_num - int(due),
-                    })
-        except Exception:
-            pass
 
+    promise_items = []
+    try:
+        promise_items = get_overdue_reader_promises(conn, chapter_num, grace=grace)
+        for p in promise_items:
+            p.setdefault("source", "reader_promises")
+    except Exception:
+        pass
+
+    overdue_items = thread_items + [p for p in promise_items
+                                    if not any(t["id"] == p.get("id") for t in thread_items)]
     if not overdue_items:
         return result
 
@@ -1307,7 +1332,7 @@ def thread_overdue(conn, chapter_num, config=None):
     dep_warnings = []
     try:
         from engine.store import check_thread_dependencies
-        for item in overdue_items[:4]:
+        for item in thread_items[:4]:
             tid = item.get("id", "")
             if tid:
                 unresolved = check_thread_dependencies(conn, tid)
@@ -1318,13 +1343,26 @@ def thread_overdue(conn, chapter_num, config=None):
     except (ImportError, Exception):
         pass
 
-    if max_overdue > severity_threshold:
+    thread_severe = sum(1 for item in thread_items
+                        if item.get("overdue_by", 0) > severity_threshold
+                        and item.get("status") == "open")
+    block_min = max(1, int(cfg.get("thread_overdue_block_min_count", 2)))
+    if thread_severe >= block_min:
         result["level"] = "block"
         result["flags"].append("thread_severely_overdue")
+        worst = max(thread_items, key=lambda x: x.get("overdue_by", 0))
+        result["directives"].append(
+            f"伏线「{worst.get('description','')[:40]}」已超期 "
+            f"{worst.get('overdue_by', 0)} 章"
+            f"（阈值 {severity_threshold:.0f} 章，{thread_severe}条超期），"
+            f"必须在本章推进或明确收束。")
+    elif max_overdue > severity_threshold:
+        result["level"] = "warn"
+        result["flags"].append("thread_overdue_warn")
         worst = max(overdue_items, key=lambda x: x.get("overdue_by", 0))
         result["directives"].append(
             f"伏线「{worst.get('description','')[:40]}」已超期 {max_overdue} 章"
-            f"（阈值 {severity_threshold:.0f} 章），必须在本章推进或明确收束。")
+            f"（阈值 {severity_threshold:.0f} 章），建议尽快推进或收束。")
     else:
         result["level"] = "warn"
         descs = [f"「{item.get('description','')[:20]}」(超{item.get('overdue_by',0)}章)"
@@ -1396,3 +1434,220 @@ def cold_reader_traction(text, config=None, client=None, paths=None):
     except Exception:
         pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# V3 Phase 1 — Naturalness advisory gates
+# ---------------------------------------------------------------------------
+
+_SENTENCE_ENDS = re.compile(r"[。！？…]+")
+
+
+def _sentence_length_entropy(text: str) -> float:
+    """Shannon entropy of sentence-length distribution (binned by 10-char buckets)."""
+    segs = [s.strip() for s in _SENTENCE_ENDS.split(text) if len(s.strip()) >= 4]
+    if len(segs) < 5:
+        return 3.0  # too few sentences to judge
+    bins: dict[int, int] = {}
+    for s in segs:
+        b = min(len(s) // 10, 10)
+        bins[b] = bins.get(b, 0) + 1
+    total = sum(bins.values())
+    entropy = 0.0
+    for count in bins.values():
+        p = count / total
+        if p > 0:
+            entropy -= p * math.log2(p)
+    return round(entropy, 3)
+
+
+@REGISTRY.register(
+    "sentence_variety", config_key="sentence_variety_enabled",
+    config_default=True, tag_prefix="sent_var",
+    repair="advisory", scope="chapter",
+    proof="UNVALIDATED: calibration pending on first 50-chapter production run. "
+          "Binned Shannon entropy < 1.5 indicates uniform sentence lengths "
+          "characteristic of AI prose.")
+def sentence_variety(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sentence-length diversity: low Shannon entropy → monotonous AI cadence."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("sentence_variety_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    if len(body) < 500:
+        return {"metrics": {"chars": len(body)}, "penalty": 0.0,
+                "flags": [], "directives": []}
+
+    entropy = _sentence_length_entropy(body)
+    threshold = float(cfg.get("sentence_variety_entropy_min", 1.5))
+    metrics = {"sentence_length_entropy": entropy, "chars": len(body)}
+    flags: list[str] = []
+    directives: list[str] = []
+
+    if entropy < threshold:
+        flags.append(f"low_sentence_variety(entropy={entropy:.2f}<{threshold})")
+        directives.append(
+            f"句式单一度过高（Shannon 熵 {entropy:.2f}，阈值 {threshold}）。"
+            "交替使用长短句：短句推进动作节奏，长句铺开情绪或环境描写。"
+        )
+    return {"metrics": metrics, "penalty": 0.0, "flags": flags,
+            "directives": directives}
+
+
+_CONNECTIVE_ABUSE_RE = re.compile(
+    r"不禁|竟然|赫然|骤然|蓦然|陡然|猛然|"
+    r"忽地|霍然|豁然|悚然|愕然|怔然|"
+    r"然而|不过|尽管如此|与此同时|"
+    r"随即|旋即|继而|紧接着|"
+    r"淡淡|微微|缓缓|轻轻|静静|默默"
+)
+
+
+@REGISTRY.register(
+    "connective_abuse", config_key="connective_abuse_enabled",
+    config_default=True, tag_prefix="conn_abuse",
+    repair="advisory", scope="chapter",
+    proof="UNVALIDATED: calibration pending. Targets AI-typical transition/manner adverbs "
+          "not covered by ai_flavor_health's cliché patterns.")
+def connective_abuse(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """AI-typical connective and manner-adverb density."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("connective_abuse_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    n = len(body)
+    if n < 500:
+        return {"metrics": {"chars": n}, "penalty": 0.0,
+                "flags": [], "directives": []}
+
+    matches = _CONNECTIVE_ABUSE_RE.findall(body)
+    kchars = n / 1000.0
+    density = round(len(matches) / max(kchars, 0.1), 2)
+    threshold = float(cfg.get("connective_abuse_per_kchar_warn", 6.0))
+    metrics = {"connective_count": len(matches),
+               "connective_per_kchar": density, "chars": n}
+    flags: list[str] = []
+    directives: list[str] = []
+
+    if density >= threshold:
+        from collections import Counter
+        top = [w for w, _ in Counter(matches).most_common(5)]
+        flags.append(f"connective_abuse({density:.1f}/k>={threshold})")
+        directives.append(
+            f"过渡/状态副词密度偏高（{density:.1f}/千字）。"
+            f"减少以下词语：{'、'.join(top)}。用具体动作或环境变化替代抽象转折。"
+        )
+    return {"metrics": metrics, "penalty": 0.0, "flags": flags,
+            "directives": directives}
+
+
+_SENSORY_RE = re.compile(
+    r"[看见望瞧瞅盯瞪睨睇瞄瞥]|"
+    r"[听闻嗅]|触[摸碰]|[摸握捏揉搓抚]|[尝品]|"
+    r"光[线芒影]|[影]子|声[音响]|[响]声|"
+    r"气[味息]|[味]道|温[度热暖]|寒[意气冷]|热[浪气]|"
+    r"冰[凉冷]|灼[热烫]|刺[痛鼻耳目]|"
+    r"[酸甜苦辣咸涩腥]"
+)
+
+
+@REGISTRY.register(
+    "sensory_deficit", config_key="sensory_deficit_enabled",
+    config_default=True, tag_prefix="sensory",
+    repair="advisory", scope="chapter",
+    proof="UNVALIDATED: calibration pending. Sensory detail density < 1.0/kchar indicates "
+          "abstract narration lacking concrete physical grounding.")
+def sensory_deficit(
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sensory detail density: low count of perception verbs / sensory nouns."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("sensory_deficit_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    n = len(body)
+    if n < 2000:
+        return {"metrics": {"chars": n}, "penalty": 0.0,
+                "flags": [], "directives": []}
+
+    matches = _SENSORY_RE.findall(body)
+    kchars = n / 1000.0
+    density = round(len(matches) / max(kchars, 0.1), 2)
+    threshold = float(cfg.get("sensory_deficit_per_kchar_min", 1.0))
+    metrics = {"sensory_count": len(matches),
+               "sensory_per_kchar": density, "chars": n}
+    flags: list[str] = []
+    directives: list[str] = []
+
+    if density < threshold:
+        flags.append(f"sensory_deficit({density:.1f}/k<{threshold})")
+        directives.append(
+            f"感官细节密度偏低（{density:.1f}/千字，阈值 {threshold}）。"
+            "在叙事中加入具体的视觉、听觉、触觉、嗅觉描写，"
+            "让读者'体验'场景而非'被告知'场景。"
+        )
+    return {"metrics": metrics, "penalty": 0.0, "flags": flags,
+            "directives": directives}
+
+
+def _bigram_ttr(text: str) -> float:
+    """Character-bigram type-token ratio (unique / total)."""
+    text = re.sub(r"\s+", "", text)
+    if len(text) < 100:
+        return 1.0
+    bigrams = [text[i:i+2] for i in range(len(text) - 1)]
+    return len(set(bigrams)) / len(bigrams) if bigrams else 1.0
+
+
+@REGISTRY.register(
+    "lexical_monotony", config_key="lexical_monotony_enabled",
+    config_default=True, tag_prefix="lex_mono",
+    repair="advisory", scope="chapter",
+    proof="Calibration pending. Bigram TTR drop > 15% vs trailing average "
+          "indicates vocabulary narrowing characteristic of late-chapter "
+          "quality decline (ref: PKU ACL 2025).")
+def lexical_monotony(
+    text: str,
+    config: dict[str, Any] | None = None,
+    prior_ttrs: list[float] | None = None,
+) -> dict[str, Any]:
+    """Lexical diversity decline: bigram TTR drop vs trailing chapters."""
+    cfg = (config or {}).get("novel", {}) if config else {}
+    if not bool(cfg.get("lexical_monotony_enabled", True)):
+        return {"metrics": {}, "penalty": 0.0, "flags": [], "directives": []}
+
+    body = _strip_title_line(text)
+    n = len(body)
+    if n < 1000:
+        return {"metrics": {"chars": n}, "penalty": 0.0,
+                "flags": [], "directives": []}
+
+    ttr = _bigram_ttr(body)
+    metrics: dict[str, Any] = {"bigram_ttr": round(ttr, 4), "chars": n}
+    flags: list[str] = []
+    directives: list[str] = []
+
+    drop_threshold = float(cfg.get("lexical_monotony_drop_pct", 0.15))
+
+    if prior_ttrs and len(prior_ttrs) >= 2:
+        avg_prior = sum(prior_ttrs[-3:]) / len(prior_ttrs[-3:])
+        metrics["trailing_avg_ttr"] = round(avg_prior, 4)
+        if avg_prior > 0 and (avg_prior - ttr) / avg_prior > drop_threshold:
+            drop_pct = (avg_prior - ttr) / avg_prior
+            flags.append(f"lexical_monotony(drop={drop_pct:.0%})")
+            directives.append(
+                f"词汇多样性下降（本章 TTR {ttr:.3f} vs 近章均值 {avg_prior:.3f}，"
+                f"降幅 {drop_pct:.0%}）。注意用新鲜的词汇和表达方式，避免重复用词。"
+            )
+    return {"metrics": metrics, "penalty": 0.0, "flags": flags,
+            "directives": directives}

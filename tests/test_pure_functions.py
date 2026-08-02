@@ -1952,11 +1952,12 @@ class ChapterWriteMaxTokensTests(unittest.TestCase):
         self.assertGreater(loose, tight)
 
     def test_in_band_chapter_fits_within_budget(self):
-        # a complete chapter at the band ceiling (~1 token/char heuristic) should
-        # fit under the budget, so it is not truncated mid-sentence.
+        # CJK text averages ~0.5-0.7 tokens/char; the budget must exceed the
+        # worst-case token count for a chapter at the band ceiling.
         cfg = {"novel": {"chapter_max_chars": 3600}}
         budget = _chapter_write_max_tokens(cfg)
-        self.assertGreaterEqual(budget, 3600)
+        worst_case_tokens = int(3600 * 0.8)
+        self.assertGreaterEqual(budget, worst_case_tokens)
 
 
 class ShuangwenFormulaGateTests(unittest.TestCase):
@@ -2798,6 +2799,440 @@ class PreflightAdvisoryFlagsTests(unittest.TestCase):
             neg = _preflight_negative_list(
                 _make_paths(root), None, {"novel": {}}, 5)
         self.assertEqual(neg["style_warnings"], [])
+
+
+class EscalationFactorTests(unittest.TestCase):
+    """V3 Phase 1: threshold gradient escalation_factor."""
+
+    def test_disabled_when_gradient_one(self):
+        from engine.quality import escalation_factor
+        self.assertEqual(escalation_factor(80, 100, 1.0), 1.0)
+
+    def test_disabled_when_no_max_chapters(self):
+        from engine.quality import escalation_factor
+        self.assertEqual(escalation_factor(80, 0, 0.90), 1.0)
+
+    def test_no_change_in_first_40_pct(self):
+        from engine.quality import escalation_factor
+        self.assertEqual(escalation_factor(30, 100, 0.90), 1.0)
+        self.assertEqual(escalation_factor(40, 100, 0.90), 1.0)
+
+    def test_gradual_tightening_mid_section(self):
+        from engine.quality import escalation_factor
+        f = escalation_factor(55, 100, 0.90)
+        self.assertLess(f, 1.0)
+        self.assertGreater(f, 0.90)
+
+    def test_full_tightening_at_end(self):
+        from engine.quality import escalation_factor
+        self.assertAlmostEqual(escalation_factor(80, 100, 0.90), 0.90)
+        self.assertAlmostEqual(escalation_factor(100, 100, 0.90), 0.90)
+
+    def test_negative_chapter_returns_one(self):
+        from engine.quality import escalation_factor
+        self.assertEqual(escalation_factor(-1, 100, 0.90), 1.0)
+
+
+class ConfigNormalizationTests(unittest.TestCase):
+    """V3 Phase 1: BOM stripping and curly-quote normalization."""
+
+    def test_bom_stripped(self):
+        from engine.config import parse_config_text
+        text = '﻿api:\n  model: gpt-4'
+        config = parse_config_text(text)
+        self.assertEqual(config["api"]["model"], "gpt-4")
+
+    def test_curly_quotes_normalized(self):
+        from engine.config import parse_config_text
+        text = 'api:\n  model: “deepseek-v4”'
+        config = parse_config_text(text)
+        self.assertEqual(config["api"]["model"], "deepseek-v4")
+
+    def test_curly_single_quotes_normalized(self):
+        from engine.config import parse_config_text
+        text = "api:\n  model: ‘test-model’"
+        config = parse_config_text(text)
+        self.assertEqual(config["api"]["model"], "test-model")
+
+    def test_normal_text_unchanged(self):
+        from engine.config import parse_config_text
+        text = 'novel:\n  chapter_words: 3000'
+        config = parse_config_text(text)
+        self.assertEqual(config["novel"]["chapter_words"], 3000)
+
+
+class SentenceVarietyTests(unittest.TestCase):
+    """V3 Phase 1: sentence length Shannon entropy gate."""
+
+    def test_short_text_no_flag(self):
+        from engine.quality_advisory import sentence_variety
+        res = sentence_variety("太短了。", None)
+        self.assertEqual(res["flags"], [])
+
+    def test_uniform_sentences_flagged(self):
+        from engine.quality_advisory import sentence_variety
+        text = "。".join(["他走进了房间看了一下四周"] * 50) + "。"
+        res = sentence_variety(text, None)
+        self.assertTrue(
+            any("low_sentence_variety" in f for f in res["flags"]),
+            f"Expected low_sentence_variety flag, got {res['flags']}")
+
+    def test_varied_sentences_not_flagged(self):
+        from engine.quality_advisory import sentence_variety
+        sentences = [
+            "走。",
+            "他停下了脚步，望向远方。",
+            "这条路已经很久没有人走过了，两旁的杂草长到了齐腰的高度，仿佛要把整条小径都吞没。",
+            "谁？",
+            "风吹过山谷，带来一阵奇异的寒意。他裹紧了衣服。",
+            "转弯。",
+            "远处传来一声清亮的鸟鸣，划破了清晨的寂静，像一把锋利的剑切开了层层叠叠的薄雾。",
+        ] * 5
+        text = "".join(sentences)
+        res = sentence_variety(text, None)
+        self.assertEqual(res["flags"], [])
+
+    def test_penalty_always_zero(self):
+        from engine.quality_advisory import sentence_variety
+        text = "。".join(["他走进了房间看了一下四周"] * 50) + "。"
+        res = sentence_variety(text, None)
+        self.assertEqual(res["penalty"], 0.0)
+
+
+class ConnectiveAbuseTests(unittest.TestCase):
+    """V3 Phase 1: AI connective/adverb density gate."""
+
+    def test_short_text_no_flag(self):
+        from engine.quality_advisory import connective_abuse
+        res = connective_abuse("太短了。", None)
+        self.assertEqual(res["flags"], [])
+
+    def test_heavy_connectives_flagged(self):
+        from engine.quality_advisory import connective_abuse
+        text = ("他不禁微微一笑，然而随即陡然变色。"
+                "猛然转身，竟然看见了缓缓走来的她。"
+                "他淡淡地说，默默低下头。") * 15
+        res = connective_abuse(text, None)
+        self.assertTrue(any("connective_abuse" in f for f in res["flags"]))
+
+    def test_clean_prose_not_flagged(self):
+        from engine.quality_advisory import connective_abuse
+        text = ("他走进房间，看见桌上的信。拿起来读了一遍，"
+                "脸色逐渐变了。她站在门口，不说话。") * 10
+        res = connective_abuse(text, None)
+        self.assertEqual(res["flags"], [])
+
+
+class SensoryDeficitTests(unittest.TestCase):
+    """V3 Phase 1: sensory detail density gate."""
+
+    def test_short_text_no_flag(self):
+        from engine.quality_advisory import sensory_deficit
+        res = sensory_deficit("太短了。", None)
+        self.assertEqual(res["flags"], [])
+
+    def test_abstract_narration_flagged(self):
+        from engine.quality_advisory import sensory_deficit
+        text = ("他的情况发生了变化。事态的发展超出了预期。"
+                "问题的本质在于信任的缺失。他们的关系需要重新定义。"
+                "这个决定将会影响未来的走向。") * 40
+        res = sensory_deficit(text, None)
+        self.assertTrue(any("sensory_deficit" in f for f in res["flags"]))
+
+    def test_sensory_rich_not_flagged(self):
+        from engine.quality_advisory import sensory_deficit
+        text = ("他看见远处的光芒，听见风声呼啸。空气中弥漫着泥土的气息，"
+                "指尖触摸到冰冷的石壁。一股寒意从脚底升起，"
+                "耳边传来清脆的水滴声。他尝了一口苦涩的药汤。") * 10
+        res = sensory_deficit(text, None)
+        self.assertEqual(res["flags"], [])
+
+
+class LexicalMonotonyTests(unittest.TestCase):
+    """V3 Phase 1: bigram TTR decline gate."""
+
+    def test_short_text_no_flag(self):
+        from engine.quality_advisory import lexical_monotony
+        res = lexical_monotony("太短了。", None)
+        self.assertEqual(res["flags"], [])
+
+    def test_no_prior_data_no_flag(self):
+        from engine.quality_advisory import lexical_monotony
+        text = "他走进房间。" * 100
+        res = lexical_monotony(text, None, None)
+        self.assertEqual(res["flags"], [])
+
+    def test_significant_drop_flagged(self):
+        from engine.quality_advisory import lexical_monotony, _bigram_ttr
+        rich_text = ("他走进了古老的城堡，月光照耀着石壁上的壁画。"
+                     "远处传来铠甲碰撞的声响，三位骑士正在庭院中操练。"
+                     "一只黑猫蜷缩在窗台上，懒洋洋地甩着尾巴。") * 10
+        poor_text = "他走。他停。他看。他说。他走。他停。他看。他说。" * 60
+        prior_ttrs = [_bigram_ttr(rich_text)] * 3
+        res = lexical_monotony(poor_text, None, prior_ttrs)
+        self.assertTrue(any("lexical_monotony" in f for f in res["flags"]))
+
+    def test_bigram_ttr_helper(self):
+        from engine.quality_advisory import _bigram_ttr
+        ttr = _bigram_ttr("他走进了古老的城堡，月光照耀着石壁上的壁画。远处传来声响。")
+        self.assertGreater(ttr, 0.5)
+        self.assertLessEqual(ttr, 1.0)
+
+
+class FeedForwardPriorityTests(unittest.TestCase):
+    """V3 Phase 1: priority tagging and sorting of feed-forward directives."""
+
+    def test_priority_sort_order(self):
+        directives = [
+            "[P3] 低优先级建议",
+            "[P1] 阻断门建议",
+            "[P2] 中优先级建议",
+            "[P1] 另一个阻断建议",
+        ]
+        _PRI = {"[P1] ": 0, "[P2] ": 1, "[P3] ": 2}
+        directives.sort(key=lambda d: next(
+            (v for p, v in _PRI.items() if str(d).startswith(p)), 1))
+        self.assertTrue(directives[0].startswith("[P1]"))
+        self.assertTrue(directives[1].startswith("[P1]"))
+        self.assertTrue(directives[2].startswith("[P2]"))
+        self.assertTrue(directives[3].startswith("[P3]"))
+
+    def test_prefix_stripping(self):
+        _PRI = {"[P1] ": 0, "[P2] ": 1, "[P3] ": 2}
+        d = "[P2] 对话占比偏低"
+        for p in _PRI:
+            if d.startswith(p):
+                d = d[len(p):]
+                break
+        self.assertEqual(d, "对话占比偏低")
+
+    def test_unprefixed_directive_unmodified(self):
+        _PRI = {"[P1] ": 0, "[P2] ": 1, "[P3] ": 2}
+        d = "旧格式建议"
+        for p in _PRI:
+            if d.startswith(p):
+                d = d[len(p):]
+                break
+        self.assertEqual(d, "旧格式建议")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Temporal facts + JIT card refinement
+# ---------------------------------------------------------------------------
+
+class ProjectFocusEntityChangesTests(unittest.TestCase):
+    """project_focus renders recent entity changes into the focus section."""
+
+    def test_empty_changes(self):
+        from engine.loop import project_focus
+        out = project_focus({"体力": "充沛"}, recent_entity_changes=[])
+        self.assertIn("体力", out)
+        self.assertNotIn("近期状态变化", out)
+
+    def test_changes_rendered(self):
+        from engine.loop import project_focus
+        changes = [
+            {"chapter": 5, "name": "林默", "field": "status", "old_value": "正常", "new_value": "受伤"},
+            {"chapter": 7, "name": "陈芳", "field": "location", "new_value": "医院"},
+        ]
+        out = project_focus({"体力": "充沛"}, recent_entity_changes=changes)
+        self.assertIn("近期状态变化", out)
+        self.assertIn("Ch5", out)
+        self.assertIn("林默", out)
+        self.assertIn("正常 → 受伤", out)
+        self.assertIn("Ch7", out)
+        self.assertIn("陈芳", out)
+
+    def test_changes_capped_at_eight(self):
+        from engine.loop import project_focus
+        changes = [{"chapter": i, "name": f"角色{i}", "field": "f", "new_value": "v"}
+                   for i in range(20)]
+        out = project_focus({}, recent_entity_changes=changes)
+        self.assertIn("角色7", out)
+        self.assertNotIn("角色8", out)
+
+
+class RefineCardTests(unittest.TestCase):
+    """refine_card deterministic patches."""
+
+    def _base_card(self):
+        return {
+            "ch": 10,
+            "where": "县城广场",
+            "who": ["林默", "陈芳"],
+            "wants": "找到线索",
+            "blocked_by": "守卫拦路",
+            "turn": "意外发现",
+            "payoff": "获得地图",
+            "exit_hook": "新的敌人出现",
+            "beats": ["抵达", "搜索", "发现"],
+            "opening_type": "dialogue",
+            "tension_level": "high",
+            "hook_type": "cliffhanger",
+            "forbid": [],
+            "thread_actions": [],
+        }
+
+    def test_no_patches_when_state_clean(self):
+        from engine.plan import refine_card
+        card = self._base_card()
+        patched, patches = refine_card(card, None, {}, 10)
+        self.assertEqual(patches, [])
+        self.assertEqual(patched["who"], ["林默", "陈芳"])
+
+    def test_opening_type_dedup(self):
+        from engine.plan import refine_card
+        card = self._base_card()
+        recent = [{"opening_type": "dialogue"}]
+        patched, patches = refine_card(card, None, {}, 10, recent_cards=recent)
+        self.assertNotEqual(patched["opening_type"], "dialogue")
+        self.assertTrue(any("opening_type" in p for p in patches))
+
+    def test_tension_level_dedup(self):
+        from engine.plan import refine_card
+        card = self._base_card()
+        recent = [{"tension_level": "high"}, {"tension_level": "high"}]
+        patched, patches = refine_card(card, None, {}, 10, recent_cards=recent)
+        self.assertNotEqual(patched["tension_level"], "high")
+        self.assertTrue(any("tension_level" in p for p in patches))
+
+    def test_feed_forward_injection(self):
+        from engine.plan import refine_card
+        card = self._base_card()
+        ff = ["增加对话密度", "减少心理描写"]
+        patched, patches = refine_card(card, None, {}, 10, feed_forward=ff)
+        self.assertIn("增加对话密度", patched["forbid"])
+        self.assertIn("减少心理描写", patched["forbid"])
+        self.assertEqual(len(patches), 2)
+
+    def test_feed_forward_no_duplicate(self):
+        from engine.plan import refine_card
+        card = self._base_card()
+        card["forbid"] = ["增加对话密度"]
+        ff = ["增加对话密度"]
+        patched, patches = refine_card(card, None, {}, 10, feed_forward=ff)
+        self.assertEqual(patched["forbid"].count("增加对话密度"), 1)
+        self.assertEqual(len(patches), 0)
+
+
+class EntityHistoryStoreTests(unittest.TestCase):
+    """entity_history table creation and query functions."""
+
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS entities (
+            entity_type TEXT NOT NULL, name TEXT NOT NULL,
+            state_json TEXT NOT NULL, updated_chapter INTEGER NOT NULL,
+            PRIMARY KEY (entity_type, name)
+        );
+        CREATE TABLE IF NOT EXISTS entity_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL, name TEXT NOT NULL,
+            field TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL,
+            chapter INTEGER NOT NULL, superseded_chapter INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_history_lookup
+            ON entity_history(entity_type, name, field, chapter);
+    """
+
+    def setUp(self):
+        import sqlite3
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(self._SCHEMA)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_entity_history_table_exists(self):
+        tables = [r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        self.assertIn("entity_history", tables)
+
+    def test_record_and_query_history(self):
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        self.conn.execute(
+            "INSERT INTO entity_history"
+            "(entity_type, name, field, old_value, new_value, chapter, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("character", "林默", "status", None, "正常", 1, now))
+        self.conn.execute(
+            "INSERT INTO entity_history"
+            "(entity_type, name, field, old_value, new_value, chapter, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("character", "林默", "status", "正常", "受伤", 5, now))
+        self.conn.execute(
+            "UPDATE entity_history SET superseded_chapter=5 "
+            "WHERE entity_type='character' AND name='林默' AND field='status' AND chapter=1")
+        self.conn.commit()
+
+        from engine.store import entity_state_as_of
+        state_at_3 = entity_state_as_of(self.conn, "character", "林默", 3)
+        self.assertEqual(state_at_3.get("status"), "正常")
+
+        state_at_6 = entity_state_as_of(self.conn, "character", "林默", 6)
+        self.assertEqual(state_at_6.get("status"), "受伤")
+
+    def test_get_recent_entity_changes(self):
+        from datetime import datetime
+        from engine.store import get_recent_entity_changes
+        now = datetime.now().isoformat(timespec="seconds")
+        self.conn.execute(
+            "INSERT INTO entity_history"
+            "(entity_type, name, field, old_value, new_value, chapter, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("character", "林默", "location", None, "县城", 3, now))
+        self.conn.execute(
+            "INSERT INTO entity_history"
+            "(entity_type, name, field, old_value, new_value, chapter, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("character", "林默", "status", None, "受伤", 8, now))
+        self.conn.commit()
+
+        changes = get_recent_entity_changes(self.conn, 5)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["name"], "林默")
+        self.assertEqual(changes[0]["chapter"], 8)
+
+
+class BuildStoryStateEntityChangesTests(unittest.TestCase):
+    """build_story_state threads recent_entity_changes to project_focus."""
+
+    def test_entity_changes_in_focus_section(self):
+        from engine.loop import build_story_state
+        changes = [
+            {"chapter": 5, "name": "林默", "field": "status",
+             "old_value": "正常", "new_value": "受伤"},
+        ]
+        ss = build_story_state(
+            10, protagonist={"体力": "50%"},
+            recent_entity_changes=changes)
+        focus = ""
+        for sec in ss.sections:
+            if sec.key == "focus":
+                focus = sec.body
+                break
+        self.assertIn("近期状态变化", focus)
+        self.assertIn("林默", focus)
+
+
+class LengthBlockStructuralDialogueTest(unittest.TestCase):
+    """Part 1: length_block includes structural dialogue requirement."""
+
+    def test_contains_scene_dialogue_instruction(self):
+        from engine.write import length_block
+        cfg = {"novel": {"chapter_words": 2200, "chapter_min_chars": 1800,
+                         "chapter_max_chars": 2800}}
+        text = length_block(cfg)
+        self.assertIn("每个场景至少写2轮有来有回的角色对话", text)
+
+    def test_still_contains_percentage(self):
+        from engine.write import length_block
+        cfg = {"novel": {"chapter_words": 2200, "chapter_min_chars": 1800,
+                         "chapter_max_chars": 2800}}
+        text = length_block(cfg)
+        self.assertIn("不低于 20%", text)
 
 
 if __name__ == "__main__":

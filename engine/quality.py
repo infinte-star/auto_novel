@@ -61,50 +61,42 @@ REPAIR_LAYERS = ("L0", "L1", "L2", "advisory")
 GATE_SCOPES = ("chapter", "card", "book")
 
 
+def escalation_factor(chapter_num: int, max_chapters: int,
+                      gradient: float = 1.0) -> float:
+    """Multiplier (gradient..1.0) that tightens blocking thresholds in later chapters.
+
+    Counteracts the measured quality decline in the latter 40-60% of LLM novels.
+    gradient=1.0 (default) disables escalation. gradient=0.90 tightens by up to
+    10% in the final 30% of chapters. The factor is applied to blocking threshold
+    values, so a LOWER factor means a STRICTER threshold.
+    """
+    if gradient >= 1.0 or max_chapters <= 0 or chapter_num <= 0:
+        return 1.0
+    progress = min(chapter_num / max_chapters, 1.0)
+    if progress < 0.4:
+        return 1.0
+    if progress < 0.7:
+        return 1.0 - (1.0 - gradient) * (progress - 0.4) / 0.6
+    return gradient
+
+
+GATES: dict[str, dict[str, Any]] = {}
+
+
 class GateRegistry:
-    """Lightweight registry for deterministic quality gates."""
+    """Registry for deterministic quality gates.
+
+    The module-level ``REGISTRY`` singleton shares the module-level ``GATES``
+    dict.  Fresh instances (e.g. in tests) get their own isolated dict.
+    """
 
     __slots__ = ("_gates",)
 
-    def __init__(self) -> None:
-        self._gates: dict[str, dict[str, Any]] = {}
+    def __init__(self, *, _shared: dict[str, dict[str, Any]] | None = None) -> None:
+        self._gates = _shared if _shared is not None else {}
 
-    def register(
-        self,
-        name: str,
-        *,
-        config_key: str,
-        config_default: bool = True,
-        tag_prefix: str | None = None,
-        phase: str = "review",
-        repair: str = "advisory",
-        scope: str = "chapter",
-        proof: str = "",
-    ):
-        """Decorator: register gate metadata. Preserves function identity.
-
-        *repair* declares HOW a firing of this gate is meant to be fixed, which
-        is what makes `fix.py`'s ladder possible (REDESIGN L6):
-
-        - ``"L0"``  deterministic text transform, zero LLM calls
-        - ``"L1"``  bounded single-call patch on part of the chapter
-        - ``"L2"``  plan-level: fix the plan / the NEXT card, never this prose
-        - ``"advisory"`` directive only; must NOT trigger rework by itself
-
-        *scope* declares whose property the gate measures (see ``GATE_SCOPES``).
-        *proof* is a one-line record of where the gate's threshold sits relative
-        to the MEASURED distribution, and it is **mandatory** — a threshold that
-        was never checked against real data is how this repo shipped two dead
-        keys (`fingerprint_warn_threshold` 0.65 against a measured max of 0.448,
-        never reachable, deleted; `book_fossil_hard_ratio` 0.20 below its own
-        candidacy floor of 0.30, always true). Both took an offline replay to
-        discover. Requiring the number at registration turns a post-mortem into
-        a compile-time obligation.
-
-        `repair`/`scope`/`proof` are metadata, not behaviour: nothing in the v1
-        review path reads them, so annotating a gate cannot change its score.
-        `v2/accept.py` is the first consumer that acts on them.
-        """
+    def register(self, name, *, config_key, config_default=True, tag_prefix=None,
+                 phase="review", repair="advisory", scope="chapter", proof=""):
         if repair not in REPAIR_LAYERS:
             raise ValueError(f"unknown repair layer {repair!r} for gate {name}")
         if scope not in GATE_SCOPES:
@@ -115,82 +107,52 @@ class GateRegistry:
                 f"against the measured distribution (tools/gate_census.py). "
                 f"See REDESIGN_V2 §3.4 ③."
             )
-
         def wrapper(fn):
             self._gates[name] = {
-                "fn": fn,
-                "config_key": config_key,
+                "fn": fn, "config_key": config_key,
                 "config_default": config_default,
                 "tag_prefix": tag_prefix or name.replace("_health", "").replace("_quality", ""),
-                "phase": phase,
-                "repair": repair,
-                "scope": scope,
+                "phase": phase, "repair": repair, "scope": scope,
                 "proof": str(proof).strip(),
             }
             return fn
         return wrapper
 
-    def is_enabled(self, name: str, config: dict[str, Any] | None) -> bool:
-        """Check whether gate *name* is enabled in config."""
+    def is_enabled(self, name, config):
         spec = self._gates.get(name)
         if spec is None:
             return True
         cfg = (config or {}).get("novel", {})
         return bool(cfg.get(spec["config_key"], spec["config_default"]))
 
-    def tag_prefix(self, name: str) -> str:
-        """Return the rhythm_risks tag prefix for gate *name*."""
+    def tag_prefix(self, name):
         spec = self._gates.get(name)
         return spec["tag_prefix"] if spec else name
 
-    def repair(self, name: str) -> str:
-        """Return the declared repair layer for gate *name*.
-
-        Unknown gates are ``"advisory"``: an unregistered signal must never be
-        able to trigger rework or a repair action on its own.
-        """
+    def repair(self, name):
         spec = self._gates.get(name)
         return spec["repair"] if spec else "advisory"
 
-    def scope(self, name: str) -> str:
-        """Return the declared scope for gate *name* (unknown gates: ``"book"``).
-
-        Unknown defaults to the most restrictive scope on purpose — the same
-        reasoning as `repair()` defaulting to advisory. An unregistered signal
-        must not be able to reject a chapter.
-        """
+    def scope(self, name):
         spec = self._gates.get(name)
         return spec["scope"] if spec else "book"
 
-    def proof(self, name: str) -> str:
+    def proof(self, name):
         spec = self._gates.get(name)
         return spec["proof"] if spec else ""
 
-    def may_block(self, name: str) -> bool:
-        """Whether gate *name* is allowed to reject the chapter under review.
-
-        The actionability invariant: a gate may block only if the quantity it
-        measures is one THIS attempt can change. Book-cumulative quantities are
-        not, and advisory gates have no repair to offer, so neither may reject.
-        """
+    def may_block(self, name):
         spec = self._gates.get(name)
         if spec is None:
             return False
         return spec["scope"] != "book" and spec["repair"] != "advisory"
 
-    def get(self, name: str):
-        """Return the registered gate function, or None."""
+    def get(self, name):
         spec = self._gates.get(name)
         return spec["fn"] if spec else None
 
-    def list_gates(
-        self,
-        phase: str | None = None,
-        repair: str | None = None,
-        scope: str | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        """List registered gates, optionally filtered by phase / repair / scope."""
-        items = self._gates.items()
+    def list_gates(self, phase=None, repair=None, scope=None):
+        items = list(self._gates.items())
         if phase is not None:
             items = [(k, v) for k, v in items if v["phase"] == phase]
         if repair is not None:
@@ -200,18 +162,7 @@ class GateRegistry:
         return dict(items)
 
     @staticmethod
-    def accumulate(
-        report: dict[str, Any],
-        result: dict[str, Any],
-        gate_name: str,
-        tag_prefix: str,
-    ) -> float:
-        """Standard gate-result accumulation into a review report.
-
-        Stores *result* under ``report[gate_name]``, appends flags (prefixed)
-        to ``rhythm_risks`` and directives to ``writer_directives_for_next_chapter``.
-        Returns the penalty value so the caller can sum it.
-        """
+    def accumulate(report, result, gate_name, tag_prefix):
         report[gate_name] = result
         penalty = float(result.get("penalty", 0.0))
         wd = report.setdefault("writer_directives_for_next_chapter", [])
@@ -227,7 +178,7 @@ class GateRegistry:
         return penalty
 
 
-REGISTRY = GateRegistry()
+REGISTRY = GateRegistry(_shared=GATES)
 
 
 # Sentence-ending punctuation for Chinese prose.
@@ -328,8 +279,8 @@ def em_dash_penalty(
     penalty = 0.0
     flags: list[str] = []
     directives: list[str] = []
-    em_warn = float(cfg.get("style_em_dash_per_kchar_warn", 6.0))
-    em_bad = float(cfg.get("style_em_dash_per_kchar_bad", 12.0))
+    em_warn = float(cfg.get("style_em_dash_per_kchar_warn", 3.0))
+    em_bad = float(cfg.get("style_em_dash_per_kchar_bad", 6.0))
     if em_per_kchar >= em_bad:
         penalty += 2.0
         flags.append(f"em_dash_overload({em_per_kchar:.1f}/k≥{em_bad})")
@@ -618,7 +569,7 @@ def style_health(
     # Only flag if the chapter is long enough that some dialogue is expected.
     ratio_target = float(cfg.get("dialogue_char_ratio_target", 0.20))
     if n > 2000 and ratio_min > 0 and dialogue_ratio < ratio_min:
-        penalty += 1.0
+        penalty += float(cfg.get("style_dialogue_starved_penalty", 1.0))
         flags.append(f"dialogue_starved({dialogue_ratio:.1%}<{ratio_min:.0%})")
         directives.append(
             f"上一章对话占比仅 {dialogue_ratio:.0%}，几乎全是叙述。本章至少 {ratio_min:.0%} 的篇幅"
@@ -2941,16 +2892,21 @@ def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[s
     cfg = config["novel"]
     reasons: list[str] = []
 
+    chapter_num = int(review.get("chapter", 0))
+    max_ch = int(cfg.get("max_chapters", 0))
+    gradient = float(cfg.get("threshold_gradient", 1.0))
+    esc = escalation_factor(chapter_num, max_ch, gradient)
+
     grs = [g for g in (review.get("gate_rejects") or []) if isinstance(g, dict)]
     if grs:
         reasons.append("gate_rejects=" + ",".join(str(g.get("gate", "?")) for g in grs[:4]))
 
     sh_pen = float((review.get("style_health") or {}).get("penalty", 0.0) or 0.0)
-    if sh_pen >= float(cfg.get("style_penalty_block", 2.0)):
+    if sh_pen >= float(cfg.get("style_penalty_block", 2.0)) * esc:
         reasons.append(f"style_collapse(penalty={sh_pen:.1f})")
 
     af_pen = float((review.get("ai_flavor_health") or {}).get("penalty", 0.0) or 0.0)
-    if af_pen >= float(cfg.get("ai_flavor_penalty_block", 2.5)):
+    if af_pen >= float(cfg.get("ai_flavor_penalty_block", 2.5)) * esc:
         reasons.append(f"ai_flavor_block(penalty={af_pen:.1f})")
 
     if bool(cfg.get("factcheck_hard_blocks_accept", True)):
@@ -2981,13 +2937,6 @@ def hard_block_reasons(review: dict[str, Any], config: dict[str, Any]) -> list[s
     failed = review.get("constraint_violations_structured") or []
     if len(failed) >= int(cfg.get("constraint_violation_block_count", 3)):
         reasons.append(f"constraints_unmet={len(failed)}")
-
-    to = review.get("thread_overdue") or {}
-    if str(to.get("level", "")) == "block":
-        worst_desc = ""
-        for item in (to.get("overdue_threads") or [])[:1]:
-            worst_desc = str(item.get("description", ""))[:40]
-        reasons.append(f"thread_severely_overdue({worst_desc})")
 
     return reasons
 
@@ -3143,14 +3092,18 @@ from engine.quality_advisory import (  # noqa: F401,E402
     arc_intent_fulfilment,
     chapter_ending_strength,
     cold_reader_traction,
+    connective_abuse,
     hook_tail_repetition,
     information_density,
     intra_chapter_repetition,
+    lexical_monotony,
     long_span_fatigue,
     paragraph_shape_health,
     payoff_beat_density,
     payoff_reaction_check,
     prose_texture,
+    sensory_deficit,
+    sentence_variety,
     shareable_line,
     thread_overdue,
 )

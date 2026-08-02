@@ -226,8 +226,8 @@ novel:
   reader_promise_overdue_grace: 15
   # 文体健康度（非 LLM 规则检测，防止破折号/碎句文体塌缩）
   style_health_enabled: true
-  style_em_dash_per_kchar_warn: 6.0
-  style_em_dash_per_kchar_bad: 9.0
+  style_em_dash_per_kchar_warn: 3.0
+  style_em_dash_per_kchar_bad: 6.0
   # style_min_avg_sentence_chars: 12.0   # 题材profile自动设定;取消注释可手动覆盖
   # 反过度书写锚点（碎句塌缩的镜像，v12 huangliang "仪器报告体"教训）：
   # ①平均句长上限带（超 1.3 倍升级 severe）②对话字符占比下限（引号内字符÷正文）
@@ -289,7 +289,7 @@ novel:
   style_em_dash_sustained_block: true
   em_dash_targeted_rewrite_max_sentences: 30
   em_dash_reduce_enabled: true
-  em_dash_reduce_target_per_kchar: 3.0
+  em_dash_reduce_target_per_kchar: 1.5
   # 跨章句式/比喻复读检测（防止"像一颗心脏在缓慢地跳动""不是暂时的，是永久的"等口癖句反复出现）
   style_cross_repeat_enabled: true
   style_cross_repeat_lookback: 6
@@ -326,6 +326,9 @@ novel:
   # O3: 连续低分熔断。连续 N 章 force-accept 且分数低于 floor 时停跑（resume 照常），
   # 防止 premise 枯竭/上下文污染时全速烧 token（v11 曾连烧 5 章 21 次 replan）。设 0 关闭。
   quality_breaker_consecutive: 2
+  # V3 阈值梯度：后半段自动收紧质量阻断阈值，对抗 LLM 小说后期质量下降。
+  # 1.0 = 禁用（默认）。0.90 = 在最后 30% 章节中收紧阈值 10%。
+  threshold_gradient: 1.0
   # 跨书学习层（全局 telemetry 仓库 telemetry/global.db）
   # genre：题材标签，全局库按 genre 分桶。**唯一还被 telemetry 读的键**。
   genre: _default
@@ -429,6 +432,10 @@ novel:
   exemplar_rag_top_k: 6          # 候选池大小；最终仍只注入 2 段互补范例
   exemplar_snippet_chars: 800    # 每段范例的字符上限
   constraint_violation_block_count: 3
+  # JIT 卡片精炼：写章前用实际状态修正 arc 卡片中的过时字段（零LLM）。
+  card_refine_enabled: true
+  # 确定性修正超过此数量的字段时，记录严重漂移警告。
+  card_refine_drift_warn: 3
   # 悬疑/推理视觉爽点检查：防止核心 payoff 只停留在阴影角度/光源方向
   # 等抽象推理上，要求大纲给出读者可见的画面A vs 现实B物证对照。
   visual_payoff_check_enabled: true
@@ -497,6 +504,7 @@ novel:
   # history / xuanhuan_shuang / system_stream / urban_ability / romance_female / wanzu_xuanhuan
   #   / suspense（悬疑慢烧）/ rule_horror（规则怪谈·民俗无限流，别名 guize/infinite_flow）
   style_preset: system_stream
+  # fatigue_words: 系统面板,视野右上角  # 体裁疲劳词，逗号分隔；系统流已有默认值，此处可追加
   # 群像/多主角开关（正交，默认 false）：多男/多女追一人、团队群像等「多位分量相当的角色错峰争艳」
   # 的书取消下一行注释设为 true。开启后 bootstrap 地基会为全部群像成员各出一档（含一句话声音辨识），
   # 并让卷纲额外产出「角色高光轮值表 / 关系线争宠升级曲线 / 反转做成名场面排期 / 心动破防节拍表」。
@@ -617,7 +625,7 @@ novel:
   # chapter_min_chars: 1800              # 题材profile自动设定(爽文1800/悬疑2000/历史2400);取消注释可手动覆盖
   # chapter_max_chars: 2800              # 题材profile自动设定(爽文2800/悬疑3500/历史4500);取消注释可手动覆盖
   # length_band_penalty_enabled: true    # 题材profile自动设定;取消注释可手动覆盖
-  length_band_block: false
+  length_band_block: true
   # length_band_short_block_ratio: 0.75  # 短于 chapter_min_chars 的此比例即硬block，防截断章commit
   # dialogue_hard_block_ratio: 0.03      # 对话字符占比低于此值硬block(极端对白匮乏);设 0 关闭
   # ── 生成时长度上限（硬约束写手 max_tokens，治"写到收不住"）──
@@ -626,8 +634,8 @@ novel:
   # 同时留足余量保证带内章节不会被中途截断。chapter_length_cap_enabled=false 关闭（回退全局上限）。
   # write_token_char_ratio 越小越紧（但过紧会截断未写完的章节）；write_max_tokens>0 则直接定死预算。
   chapter_length_cap_enabled: true
-  write_token_char_ratio: 1.15
-  write_token_margin: 300
+  write_token_char_ratio: 0.9
+  write_token_margin: 200
   write_max_tokens: 12000
   # P2-7 爽点密度检测（近 N 章无强爽点则注入指令）
   # 0.5 ⇒ max_gap=2：番茄追读率要求情绪高峰间隔 ≤2 章（Gap-2 节拍收紧）。
@@ -646,11 +654,14 @@ novel:
   cold_reader_tail_chars: 800
   cold_reader_traction_threshold: 5
   # ── 伏线到期硬闸 ──
-  # 追踪 open_threads 中 due_chapter 已过期的线索。超期 arc_span * block_factor 章
-  # 时从 advisory 升级为 hard_block（默认 10*2=20 章）。grace_chapters 为宽限期。
+  # 追踪 open_threads / reader_promises 中 due_chapter 已过期的线索。
+  # 超期 arc_span * block_factor 章时从 advisory 升级为 hard_block
+  # （默认 10*3=30 章）。block_min_count 要求至少 N 条超阈值才升 block
+  # （防止单条 stale 记录误杀）。grace_chapters 为宽限期。
   thread_overdue_enabled: true
-  thread_overdue_block_factor: 2.0
+  thread_overdue_block_factor: 3.0
   thread_overdue_grace_chapters: 3
+  thread_overdue_block_min_count: 2
   # ── 人物一致性确定性校验 ──
   # 死角色行动/性别代词错配/囚禁角色自由活动，全部 advisory（不阻止提交）。
   entity_consistency_enabled: true

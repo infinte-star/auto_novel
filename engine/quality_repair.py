@@ -166,6 +166,15 @@ def plan_repairs(review: dict[str, Any], config: dict[str, Any]) -> list[dict[st
         if _EM_DASH_L1_ACTION not in seen_actions:
             steps.append({"gate": "style_health", "layer": "L1", "action": _EM_DASH_L1_ACTION})
 
+    # contract_fulfilment is a native check (not in REGISTRY), so the main loop
+    # above skips it. Detect CCC failures directly and plan the L1 patch.
+    ccc = review.get("contract_fulfilment")
+    if isinstance(ccc, dict) and ccc.get("enabled", True) and not ccc.get("passed", True):
+        if "ccc_patch" not in seen_actions:
+            steps.append({"gate": "contract_fulfilment", "layer": "L1",
+                          "action": "ccc_patch"})
+            seen_actions.add("ccc_patch")
+
     l0 = [s for s in steps if s["layer"] == "L0"]
     l1 = [s for s in steps if s["layer"] == "L1"][: max(0, max_l1)]
     return l0 + l1
@@ -187,7 +196,7 @@ def reduce_em_dash_if_needed(text: str, config: dict[str, Any] | None = None) ->
         return text
     try:
         density = float(style_health(text, config).get("metrics", {}).get("em_dash_per_kchar", 0))
-        if density > float(cfg.get("em_dash_reduce_target_per_kchar", 3.0)):
+        if density > float(cfg.get("em_dash_reduce_target_per_kchar", 1.5)):
             return reduce_em_dash_density(text, config)
     except Exception:
         return text
@@ -931,11 +940,165 @@ def hook_revise(
     return candidate
 
 
+_CCC_PATCH_SYSTEM = (
+    "你是网文内容修补专家。任务：在正文中自然地织入指定的关键要素。\n"
+    "要素必须作为具体动作/对白/场景细节出现，而不是干巴巴地提及。\n"
+    "保持原文人称视角、叙事腔调、情节走向完全不变。\n"
+    "只修改需要织入要素的段落，其余段落原样保留。\n"
+    "输出格式：与输入同样的编号列表，每条一行，只输出改写后的段落正文。"
+)
+
+
+def ccc_patch(
+    client: Any,
+    paths: Any,
+    config: dict[str, Any],
+    chapter_num: int,
+    text: str,
+    review: dict[str, Any],
+) -> str:
+    """L1 fixer for contract_fulfilment: weave missing anchors into prose."""
+    from engine.config import log
+    from engine.accept import contract_fulfilment
+
+    ccc = (review or {}).get("contract_fulfilment") or {}
+    if not isinstance(ccc, dict) or ccc.get("passed", True):
+        return text
+    hard_misses = ccc.get("hard_misses") or []
+    if not hard_misses:
+        return text
+
+    hook_misses = [m for m in hard_misses if m.get("field") == "exit_hook"]
+    body_misses = [m for m in hard_misses if m.get("field") in ("where", "turn")]
+
+    candidate = text
+
+    if hook_misses and not body_misses:
+        candidate = hook_revise(client, paths, config, chapter_num, text, review)
+        if candidate != text:
+            card = review.get("_card") or review.get("card")
+            after = contract_fulfilment(card, candidate, config)
+            if after.get("passed", False):
+                log(paths, f"L1 ccc_patch Ch{chapter_num}: exit_hook fixed via hook_revise")
+                return candidate
+            log(paths, f"L1 ccc_patch Ch{chapter_num}: hook_revise applied but CCC still fails, trying anchor weave")
+            tail_paras = _paragraphs(candidate)
+            tail_picks = [p for p in tail_paras[-3:] if len(p.strip()) >= 30][-2:]
+            if tail_picks:
+                hook_anchor_desc = "；".join(
+                    f"【exit_hook】{m.get('target','')}（关键词：{'、'.join((m.get('anchors') or [])[:3])}）"
+                    for m in hook_misses if m.get("anchors")
+                )
+                if hook_anchor_desc:
+                    try:
+                        hook_rewrites = _numbered_rewrite(
+                            client, paths, config, _CCC_PATCH_SYSTEM,
+                            f"以下段落需要自然地织入这些要素：{hook_anchor_desc}\n"
+                            f"请改写这 {len(tail_picks)} 个段落，将要素织入情节中：",
+                            tail_picks, tag="fix_ccc_hook", min_ratio=0.7, max_ratio=2.0,
+                        )
+                    except Exception:
+                        hook_rewrites = []
+                    if hook_rewrites:
+                        candidate2 = _splice(candidate, tail_picks, hook_rewrites)
+                        after2 = contract_fulfilment(card, candidate2, config)
+                        if after2.get("passed", False):
+                            log(paths, f"L1 ccc_patch Ch{chapter_num}: exit_hook fixed via anchor weave after hook_revise")
+                            return candidate2
+                        remaining2 = len(after2.get("hard_misses") or [])
+                        if remaining2 < len(hook_misses):
+                            candidate = candidate2
+                            log(paths, f"L1 ccc_patch Ch{chapter_num}: anchor weave reduced hook misses {len(hook_misses)}->{remaining2}")
+                        else:
+                            candidate = text
+                    else:
+                        candidate = text
+                else:
+                    candidate = text
+            else:
+                candidate = text
+
+    if body_misses:
+        paras = _paragraphs(candidate)
+        if not paras:
+            return text
+        targets = []
+        for miss in body_misses:
+            target = str(miss.get("target") or "")
+            anchors = miss.get("anchors") or []
+            field = str(miss.get("field") or "")
+            if target:
+                targets.append((field, target, anchors))
+        if not targets:
+            return text
+        body_paras = [p for p in paras if len(p.strip()) >= 30
+                      and not p.strip().startswith("第")]
+        if not body_paras:
+            return text
+        anchor_desc = "；".join(
+            f"【{f}】{t}（关键词：{'、'.join(a[:3])}）"
+            for f, t, a in targets if a
+        )
+        has_where = any(f == "where" for f, _, _ in targets)
+        has_turn = any(f == "turn" for f, _, _ in targets)
+        mid = len(body_paras) // 2
+        if has_where and not has_turn:
+            picks = body_paras[:3]
+        elif has_turn and not has_where:
+            picks = body_paras[max(0, mid - 1): mid + 2][:3]
+        else:
+            picks = (body_paras[:1] + body_paras[max(1, mid): mid + 2])[:3]
+        try:
+            rewrites = _numbered_rewrite(
+                client, paths, config, _CCC_PATCH_SYSTEM,
+                f"以下段落需要自然地织入这些要素：{anchor_desc}\n"
+                f"请改写这 {len(picks)} 个段落，将要素织入情节中：",
+                picks, tag="fix_ccc", min_ratio=0.7, max_ratio=2.0,
+            )
+        except Exception as exc:
+            log(paths, f"L1 ccc_patch call failed Ch{chapter_num} (non-fatal): {exc}")
+            return text
+        if not rewrites:
+            log(paths, f"L1 ccc_patch Ch{chapter_num}: no usable rewrite for body misses")
+            return text
+        candidate = _splice(candidate, picks, rewrites)
+
+    if hook_misses and candidate == text:
+        hook_candidate = hook_revise(client, paths, config, chapter_num, candidate, review)
+        if hook_candidate != candidate:
+            candidate = hook_candidate
+
+    if candidate == text:
+        log(paths, f"L1 ccc_patch Ch{chapter_num}: no changes produced")
+        return text
+
+    card = review.get("_card") or review.get("card")
+    after = contract_fulfilment(card, candidate, config)
+    remaining = len(after.get("hard_misses") or [])
+    original = len(hard_misses)
+    if remaining >= original:
+        log(paths, f"L1 ccc_patch rejected Ch{chapter_num}: "
+                   f"hard_misses {original}->{remaining}")
+        return text
+    if not (0.85 <= len(candidate) / max(1, len(text)) <= 1.15):
+        log(paths, f"L1 ccc_patch rejected Ch{chapter_num}: "
+                   f"length {len(text)} -> {len(candidate)}")
+        return text
+    if float(style_health(candidate, config).get("penalty", 0.0) or 0.0) > float(
+        style_health(text, config).get("penalty", 0.0) or 0.0
+    ):
+        log(paths, f"L1 ccc_patch rejected Ch{chapter_num}: style penalty rose")
+        return text
+    log(paths, f"L1 ccc_patch Ch{chapter_num}: hard_misses {original}->{remaining}")
+    return candidate
+
+
 _L1_FIXERS = {
     "expand_to_band": expand_to_band,
     "inject_dialogue": inject_dialogue,
     _EM_DASH_L1_ACTION: em_dash_targeted,
     "hook_revise": hook_revise,
+    "ccc_patch": ccc_patch,
 }
 
 
