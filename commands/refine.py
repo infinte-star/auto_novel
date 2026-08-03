@@ -756,21 +756,27 @@ def _style_regression_check(
     original: str, refined: str, config: dict[str, Any]
 ) -> tuple[bool, str]:
     """Reject a refined chapter that regresses style_health/dialogue_health versus
-    the original. Both are the project's deterministic anti-collapse anchors
-    (em-dash/fragment density, dialogue-ratio starvation); refine's job is
-    line-level improvement, not trading that away for "richer" description. Same
-    revert-if-newly-blocking principle as engine/repair.py's fixer ladder.
+    the original beyond a configurable budget.
+
+    ``refine_style_regression_budget`` (default 2.5) allows a warn-level flag
+    to appear without vetoing the rewrite — otherwise refine rewrites that fix
+    the diagnosed problem (e.g. body_part density) are rejected when they
+    incidentally push em-dash density just past the warn threshold.
     """
+    cfg = config.get("novel", {}) if config else {}
+    budget = float(cfg.get("refine_style_regression_budget", 2.5))
     o_style, r_style = style_health(original, config), style_health(refined, config)
     new_style_flags = _flag_categories(r_style["flags"]) - _flag_categories(o_style["flags"])
-    if new_style_flags and r_style["penalty"] > o_style["penalty"]:
+    increase = r_style["penalty"] - o_style["penalty"]
+    if new_style_flags and increase > budget:
         return False, (
             f"style_health regressed (penalty {o_style['penalty']:.2f}->{r_style['penalty']:.2f}, "
             f"new: {', '.join(sorted(new_style_flags))})"
         )
     o_dlg, r_dlg = dialogue_health(original, config), dialogue_health(refined, config)
     new_dlg_flags = _flag_categories(r_dlg["flags"]) - _flag_categories(o_dlg["flags"])
-    if new_dlg_flags and r_dlg["penalty"] > o_dlg["penalty"]:
+    dlg_increase = r_dlg["penalty"] - o_dlg["penalty"]
+    if new_dlg_flags and dlg_increase > budget:
         return False, (
             f"dialogue_health regressed (penalty {o_dlg['penalty']:.2f}->{r_dlg['penalty']:.2f}, "
             f"new: {', '.join(sorted(new_dlg_flags))})"

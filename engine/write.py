@@ -243,6 +243,29 @@ def contract_checklist(card: dict[str, Any] | None,
     if reaction:
         anchored("payoff_reaction", reaction, "（计入兑现率，紧跟在 payoff 之后写）")
 
+    ptype = str(card.get("payoff_type") or "").strip()
+    if ptype:
+        _PAYOFF_TYPE_GUIDE = {
+            "emotional": "情感兑现——角色间情感关系的突破/和解/决裂，用对话和微表情推动，禁止靠旁白总结",
+            "reveal": "真相揭示——关键信息大白，用证据链/回忆闪回/当面对质，让读者和主角同步恍然大悟",
+            "reversal": "反转——读者和主角的预期被彻底颠覆（以为是A其实是B），用剧情事实反转而非口头说明",
+            "personnel_payoff": "人物兑现——关键配角的态度/立场发生可见转变，用具体行动（而非独白）表现",
+            "strategic_setup": "布局兑现——此前埋下的策略/计谋在本章开花结果，展示因果链条",
+            "military_victory": "战斗/竞技胜利——用动作场面和力量对比变化展示，配合对手反应",
+            "court_breakthrough": "博弈突破——谈判/辩论/权谋中的关键翻盘，用对话交锋而非心理描写",
+            "policy_payoff": "制度/政策层面的成果落地，用具体事件展示影响",
+            "institutional_fix": "体制/组织问题的解决，用可见的变化（人事调动/流程改变）展示",
+        }
+        guide = _PAYOFF_TYPE_GUIDE.get(
+            ptype,
+            f"「{ptype}」类型的兑现——用该类型特有的叙事方式，而非通用的情感理解",
+        )
+        lines.append(
+            f"- **兑现技法（payoff_type={ptype}）**：{guide}\n"
+            "　本章的爽点落地方式必须符合上述技法，"
+            "禁止用「理解对方感受→情感释放」这一种模式通吃所有类型。"
+        )
+
     forbid = [str(f).strip() for f in (card.get("forbid") or []) if str(f).strip()]
     if forbid:
         lines.append("- **本章禁令（出现即判违约）**：" +

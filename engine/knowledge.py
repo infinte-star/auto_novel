@@ -271,7 +271,7 @@ def select_for_planner(
     arc_start: int = 1,
     arc_end: int = 10,
     genre: str = "",
-    budget: int = 800,
+    budget: int = 1200,
 ) -> str:
     """Return a compact knowledge supplement for the arc planner prompt.
 

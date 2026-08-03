@@ -630,6 +630,10 @@ def normalize_chapter(text: str) -> str:
     # ("# 第N章 …" instead of "第N章 …"). Strip it so the title format
     # stays consistent across chapters.
     text = re.sub(r"^#{1,6}\s+", "", text)
+    # Defence in depth: strip delta sentinel and everything after it.
+    # The main write path uses split_response() before normalize_chapter(),
+    # but refine/trial call normalize_chapter() directly on raw LLM output.
+    text = re.sub(r"[\n ]?=+\s*(?:状态增量|STATE[ _]?DELTA)\s*=+.*", "", text, flags=re.DOTALL)
     return text + "\n"
 
 def count_chars(path: Path) -> int:

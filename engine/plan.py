@@ -65,7 +65,8 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
       "opening_type": "physical_action|dialogue|sensory_scene|conflict_inmedias|object_detail|aftermath",
       "tension_level": "high|medium|low — 本章情绪张力目标（可选）",
       "hook_type": "悬念|反转|情绪|信息投放|威胁倒计时|温馨治愈 — exit_hook 的类型（可选，用于轮换检查）",
-      "emotion_target": "热血|紧张|温馨|虐心|爽快|敬畏|释然|好奇 等 — 本章要唤起的主导情绪（可选）"
+      "emotion_target": "热血|紧张|温馨|虐心|爽快|敬畏|释然|好奇 等 — 本章要唤起的主导情绪（可选）",
+      "payoff_level": "small|medium|large — 本章爽点级别：small=路人反应/小胜利/信息揭示，medium=完整打脸/关系突破/实力跃升，large=多伏笔回收/boss级反转/身份曝光"
     }
   ]
 }
@@ -85,6 +86,13 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
 9. 弧线末尾加速：弧的最后2张卡片中，至少有1张的 `tension_level` 为 "high"。
    禁止在弧线收束前连放2章 "low" 张力的过渡/减压——弧线要以高潮或强转折收束，
    不要在读者期待最高的位置泄气。
+10. 爽点密度三级：每章至少有一个小爽点（`payoff_level`="small"），
+    每3-5章安排一个中爽点（"medium"：完整打脸/关系突破/实力跃升），
+    弧末安排一个大爽点（"large"：多伏笔回收/boss级反转/身份曝光）。
+    连续3章无任何爽点 = 追读断崖。弧内必须有≥1张 `payoff_level`="large" 的卡片。
+11. 先压后爽（落差公式）：每个 medium/large 级 payoff 必须有≥1章的铺垫压制，
+    落差 = 压迫深度 × 反转幅度。碾压式胜利只有在之前被压制过才有爽感。
+    弧内至少安排1次"极端落差"（从希望巅峰→绝望谷底→爆发反杀的完整弧段）。
 
 ## 情绪与节奏编排（爆款方法论）
 - 情绪张弛交替：不可连续3章高强度（读者疲劳），不可连续3章低强度（读者弃书）。理想模式是高→中→低的波浪形。
@@ -163,6 +171,8 @@ def normalize_card(raw: Any, chapter_num: int) -> dict[str, Any] | None:
     card["tension_level"] = str(raw.get("tension_level") or "").strip()
     card["hook_type"] = str(raw.get("hook_type") or "").strip()
     card["emotion_target"] = str(raw.get("emotion_target") or "").strip()
+    pl = str(raw.get("payoff_level") or "").strip()
+    card["payoff_level"] = pl if pl in ("small", "medium", "large") else ""
     if not card["pressure"]:
         card["pressure"] = card["blocked_by"]
     missing = [f for f in _REQUIRED_CARD_FIELDS if not card.get(f)]
@@ -204,6 +214,7 @@ def card_to_plan(card: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         "forbid": list(card.get("forbid") or []),
         "turn": card.get("turn", ""),
         "payoff_reaction": card.get("payoff_reaction", ""),
+        "payoff_level": card.get("payoff_level", ""),
         "source": "arc_card",
     }
     constraints: list[dict[str, Any]] = []
@@ -296,6 +307,12 @@ def validate_card(
         problems.append(
             f"hook_type `{card['hook_type']}` 已连续三章相同；"
             f"轮换钩子类型以维持新鲜感。")
+    last_payoff_levels = [c.get("payoff_level") for c in recent_cards[-3:]]
+    filled_pls = [p for p in last_payoff_levels if p]
+    if card.get("payoff_level") == "small" and len(filled_pls) >= 3 and all(p == "small" for p in filled_pls):
+        problems.append(
+            "payoff_level 连续 4 章 small——追读断崖风险。"
+            "安排一次 medium 或 large 级爽点（打脸/反转/突破）。")
     if scene_sim is not None and scene_sim >= scene_sim_block:
         problems.append(
             f"场景骨架与近期已选章节相似度 {scene_sim:.2f} ≥ {scene_sim_block:.2f}（近乎重写上一章）；"
@@ -342,6 +359,31 @@ def check_arc_tension_distribution(cards: list[dict[str, Any]]) -> list[str]:
                 f"tension_level `{level}` 占弧内 {cnt}/{total}={cnt/total:.0%}，"
                 f"分布过于单调。高→中→低波浪形交替更佳。"
             )
+    return problems
+
+
+def check_arc_payoff_distribution(cards: list[dict[str, Any]]) -> list[str]:
+    """Check payoff_level distribution across an arc for density rules."""
+    if len(cards) < 3:
+        return []
+    problems = []
+    levels = [c.get("payoff_level", "") for c in cards if c.get("payoff_level")]
+    if not levels:
+        return []
+    if "large" not in levels:
+        problems.append(
+            f"整弧 {len(cards)} 章无 large 级爽点——缺少弧级高潮。"
+            f"至少安排 1 章 large 级爽点（多伏笔回收/boss级反转/身份曝光）。"
+        )
+    runs = 0
+    for pl in levels:
+        runs = runs + 1 if pl == "small" else 0
+        if runs >= 4:
+            problems.append(
+                "payoff_level 连续 4+ 章 small——追读断崖风险。"
+                "穿插 medium/large 级爽点打破平淡。"
+            )
+            break
     return problems
 
 
@@ -966,6 +1008,12 @@ def generate_arc(
     )
     for dp in dist_problems:
         log(paths, f"beat: arc tension distribution: {dp}")
+
+    payoff_problems = check_arc_payoff_distribution(
+        [by_ch[c] for c in sorted_chs],
+    )
+    for pp in payoff_problems:
+        log(paths, f"beat: arc payoff distribution: {pp}")
 
     return {
         "intent": str(data.get("arc_intent") or "").strip(),

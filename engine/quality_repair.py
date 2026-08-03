@@ -874,7 +874,8 @@ _HOOK_REVISE_SYSTEM = (
     "你是网文章末改写专家。只做一件事：把弱收尾改写为强钩子。\n"
     "三选一：①对话中抛出新悬念或未解之谜；②用反转/危机的具体动作收束；"
     "③用悬念提问让读者必须翻下一章。\n"
-    "要求：最后一段独立成段、<=100字、包含正文里没出现过的新信息或新动作。\n"
+    "要求：最后一段独立成段、<=100字、基于【故事信息】中给出的方向拓展悬念。\n"
+    "严禁引入故事信息所列人物/场景以外的任何新元素（人名、地名、物品）。\n"
     "严禁以下收尾：内心感悟、环境描写沉淀、情绪总结、哲理升华。\n"
     "保持原文人称视角、叙事腔调、情节走向完全不变。\n"
     "输出格式：与输入同样的编号列表，每条一行，只输出改写后的段落正文，不要解释。"
@@ -908,10 +909,32 @@ def hook_revise(
         log(paths, f"L1 hook_revise skipped Ch{chapter_num}: tail paragraphs too short")
         return text
 
+    card = review.get("_card") or review.get("card") or {}
+    context_parts: list[str] = []
+    if card:
+        who = card.get("who")
+        if who:
+            context_parts.append(f"- 在场人物：{'、'.join(str(n) for n in who) if isinstance(who, list) else who}")
+        where = card.get("where")
+        if where:
+            context_parts.append(f"- 场景：{where}")
+        payoff = card.get("payoff")
+        if payoff:
+            context_parts.append(f"- 本章爽点：{payoff}")
+        exit_hook = card.get("exit_hook")
+        if exit_hook:
+            context_parts.append(f"- 期望钩子方向：{exit_hook}")
+    context_block = ""
+    if context_parts:
+        context_block = (
+            "【故事信息】（改写必须严格遵守，不得编造下列人物/场景以外的任何元素）：\n"
+            + "\n".join(context_parts) + "\n\n"
+        )
+
     try:
         rewrites = _numbered_rewrite(
             client, paths, config, _HOOK_REVISE_SYSTEM,
-            f"本章结尾缺少钩子，请把以下 {len(picks)} 个结尾段落改写为强钩子收束：",
+            context_block + f"本章结尾缺少钩子，请把以下 {len(picks)} 个结尾段落改写为强钩子收束：",
             picks, tag="fix_hook", min_ratio=0.3, max_ratio=2.5,
         )
     except Exception as exc:
