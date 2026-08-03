@@ -41,7 +41,7 @@ from engine.config import (
     write_text,
 )
 from engine.llm import call_llm, json_prompt, load_json_with_repair
-from engine.quality import text_similarity
+from engine.quality import dialogue_health, style_health, text_similarity
 
 
 REFINE_LOG_NAME = "refine.log.jsonl"
@@ -129,6 +129,42 @@ def _debt_min_intensity(debt: dict[str, Any], config: dict[str, Any]) -> str:
     return "polish"
 
 
+# ---------------------------------------------------------------------------
+# AI-fingerprint deterministic metrics (no LLM)
+# ---------------------------------------------------------------------------
+
+_BODY_PART_WORDS = re.compile(
+    r'手指|指尖|指节|掌心|手腕|手掌|手背|指甲|'
+    r'膝盖|肩膀|嘴唇|眉头|眼角|下巴|脖颈|脚踝|'
+    r'喉结|虎口|耳垂|脚尖|后脑|手肘|腰侧|锁骨'
+)
+
+_NOT_A_IS_B = re.compile(
+    r'不是[^，。！？“”]{2,20}[，,]\s*(?:而)?是[^。！？“”]{2,30}[。！？]'
+)
+
+_SIMILE_LIKE = re.compile(r'(?<![好不])像(?![是话样子])')
+
+
+def _ai_fingerprint_metrics(text: str) -> dict[str, Any]:
+    """Compute deterministic AI-fingerprint metrics for a chapter."""
+    kchars = max(len(text) / 1000, 0.1)
+    body_parts = _BODY_PART_WORDS.findall(text)
+    not_a_is_b = _NOT_A_IS_B.findall(text)
+    similes = _SIMILE_LIKE.findall(text)
+    in_q, dlg = False, 0
+    for ch in text:
+        if ch in '“”':
+            in_q = not in_q
+        elif in_q:
+            dlg += 1
+    return {
+        'body_part_per_kchar': round(len(body_parts) / kchars, 1),
+        'not_a_is_b_count': len(not_a_is_b),
+        'simile_per_kchar': round(len(similes) / kchars, 1),
+        'dialogue_ratio': round(dlg / max(len(text), 1), 3),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -204,6 +240,9 @@ DIAGNOSE_CORE = """你是一位资深{genre_label}网文编辑。你的任务是
 ## 重点诊断维度（必须逐一检查）
 1. **时间词滥用**：是否用"翌日清晨""这天晚上""午后""次日黄昏"等时间词切换场景？是否每章出现3次以上时间标记？
 2. **文风塌缩（破折号碎片化）**：是否大量出现"句子——状态——状态"式破折号短句链、单词短句堆叠、无标点舞台提示式断行？是否缺乏完整成句的叙事与正常对话？这是最严重的缺陷。
+3. **身体微动作堆砌**：是否高频使用"手指/指尖/膝盖/肩膀/掌心"等身体部位词做动作标签来凑字？每千字超过4次即为严重AI凑字，必须升级为restructure。多余的微动作应替换为对话或环境互动。
+4. **句式模板重复**：是否反复使用"不是X，是Y""与其说X，不如说Y""不仅…更是"等对比转折句式？单章超过3次即为AI文体指纹，必须改写为直接陈述。
+5. **比喻过密与对话不足**：是否"像"引导的比喻每千字超过3个或连续2-3个堆叠？对话（引号台词）占比是否低于15%？群戏场景对话低于15%是严重问题，高潮时刻缺少旁观者可见反应也是缺陷。
 """
 
 DIAGNOSE_COMMON_FOOTER = """
@@ -224,37 +263,37 @@ DIAGNOSE_COMMON_FOOTER = """
 """
 
 DIAGNOSE_GENRE_DIMS = {
-    "history": """3. **文笔和叙事风格**：是否过于白话或缺乏历史感？对话是否缺乏潜台词和话术攻防？是否有"show don't tell"问题？
-4. **情节逻辑**：因果链条是否完整？是否有情节跳跃或交代不清的转场？伏笔是否有对应收线？
-5. **人物塑造**：人物行为是否符合其立场和利益？主角的成长是否来自具体的挫败或推演？配角是否有独立的行动逻辑？
-6. **节奏问题**：章节是否过于碎片化（每次跳转都用时间词）？压迫与兑现的比例是否失衡？""",
-    "xuanhuan_shuang": """3. **爽点密度与兑现**：本章是否有明确的爽点高潮（兑现/打脸/翻盘/识破阴谋/掌权）？爽点是否落到具体动作与对手反应上、还是流于概括？压迫—兑现的节奏是否够紧？
-4. **无脑碾压风险**：主角的胜利是否有铺垫与代价（被猜忌、暴露底牌、消耗人情）？是否存在毫无铺垫的全知全能或对手沦为纸片人？
-5. **现代灵魂代入**：主角的判断是否来自现代见识/情报/挫败的推演，而非"突然顿悟"？是否出现现代名词穿帮、破坏代入感？
-6. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有让读者想立刻看下一章的强钩子？""",
-    "system_stream": """3. **系统反馈节奏**：本章是否有可见的系统反馈（面板/任务/奖励/数值升级/解锁）？升级与解锁是否有节奏感和成就感、还是流于概括？
-4. **金手指代价与平衡**：系统能力是否有代价、冷却或限制？是否出现无脑刷数值、金手指降智解题、成长毫无张力？
-5. **代入与目标**：主角的目标与成长动机是否清晰，读者是否有持续追读的动力？
-6. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
-    "urban_ability": """3. **打脸与碾压兑现**：本章打脸/资源碾压/身份反差的爽点是否落到具体动作与对手反应上？压迫—兑现节奏是否够紧？
-4. **对手智商与铺垫**：打脸是否有铺垫，对手反应是否合理？是否出现配角降智捧哏、爽点凭空降临？
-5. **代入感**：主角的先知/重生优势是否自然融入推演，而非全知全能？情绪与处境是否清晰？
-6. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
-    "romance_female": """3. **情绪张力与关系弧**：本章关系是否有实质推进（拉近/误会/和解）？甜虐节奏是否得当？情绪是否由具体事件支撑而非凭空悬浮？
-4. **对手戏化学反应**：男女主互动是否有潜台词与张力？是否流于直白或工具化？
-5. **配角与代入**：配角是否沦为工具人？女主（或主角）的处境、动机、情绪是否清晰可代入？
-6. **打脸/爽点外部见证**：打脸、翻盘、逆袭时刻是否有旁观者的可见反应（对手变脸、围观反应、弹幕炸裂）？还是只在主角内心完成确认？数字跃迁是否给了具体数字而非概括？
-7. **AI感模式识别**：是否存在以下AI写作痕迹——①弹幕/群众反应过于整齐划一像应援团；②角色以全知视角分析预测对手策略（像在读剧本）；③spreadsheet式数据罗列（逐条列数字/天数/百分比）；④"吃了她做的菜感动到哭"的公式化情绪转折被多次重复；⑤主题由角色直接明说而非留白；⑥所有人在同一章集体发表一句话感言（roll-call式收束）？
-8. **节奏与钩子**：章节是否拖沓或情绪空转？章末是否有让人追读的情绪钩子？""",
-    "wanzu_xuanhuan": """3. **境界/战力体系**：境界与战力是否清晰可预期、前后一致？战力跨度是否失控、自相矛盾？
-4. **斗法画面与张力**：斗法/天骄争锋/境界突破是否有画面感和热血张力，还是流于概括陈述？
-5. **力量解题合理性**：主角的取胜是否正比于此前规则铺垫（Sanderson 第一/二定律）？是否凭空开挂？
-6. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
-    "suspense": """3. **视角越界**：是否写出视角人物当下不可能知道的真相、他人内心、未到场之事？限制视角是否被破坏（这是本类型的致命伤）？
-4. **线索公平性**：关键揭示/反转是否有前文公平铺垫，能否在前文找到伏笔？是否存在凭空掉落的关键信息？
-5. **悬念账本**：悬念是否只开不收、疑点无限堆积？每章是否至少推进或收束1条旧悬念？
-6. **氛围与留白**：诡异/恐惧是否靠反常的具体细节与留白营造，还是靠"恐怖""惊悚"式贴标签形容词？
-7. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有让人追读的悬念钩子？""",
+    "history": """6. **文笔和叙事风格**：是否过于白话或缺乏历史感？对话是否缺乏潜台词和话术攻防？是否有"show don't tell"问题？
+7. **情节逻辑**：因果链条是否完整？是否有情节跳跃或交代不清的转场？伏笔是否有对应收线？
+8. **人物塑造**：人物行为是否符合其立场和利益？主角的成长是否来自具体的挫败或推演？配角是否有独立的行动逻辑？
+9. **节奏问题**：章节是否过于碎片化（每次跳转都用时间词）？压迫与兑现的比例是否失衡？""",
+    "xuanhuan_shuang": """6. **爽点密度与兑现**：本章是否有明确的爽点高潮（兑现/打脸/翻盘/识破阴谋/掌权）？爽点是否落到具体动作与对手反应上、还是流于概括？压迫—兑现的节奏是否够紧？
+7. **无脑碾压风险**：主角的胜利是否有铺垫与代价（被猜忌、暴露底牌、消耗人情）？是否存在毫无铺垫的全知全能或对手沦为纸片人？
+8. **现代灵魂代入**：主角的判断是否来自现代见识/情报/挫败的推演，而非"突然顿悟"？是否出现现代名词穿帮、破坏代入感？
+9. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有让读者想立刻看下一章的强钩子？""",
+    "system_stream": """6. **系统反馈节奏**：本章是否有可见的系统反馈（面板/任务/奖励/数值升级/解锁）？升级与解锁是否有节奏感和成就感、还是流于概括？
+7. **金手指代价与平衡**：系统能力是否有代价、冷却或限制？是否出现无脑刷数值、金手指降智解题、成长毫无张力？
+8. **代入与目标**：主角的目标与成长动机是否清晰，读者是否有持续追读的动力？
+9. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
+    "urban_ability": """6. **打脸与碾压兑现**：本章打脸/资源碾压/身份反差的爽点是否落到具体动作与对手反应上？压迫—兑现节奏是否够紧？
+7. **对手智商与铺垫**：打脸是否有铺垫，对手反应是否合理？是否出现配角降智捧哏、爽点凭空降临？
+8. **代入感**：主角的先知/重生优势是否自然融入推演，而非全知全能？情绪与处境是否清晰？
+9. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
+    "romance_female": """6. **情绪张力与关系弧**：本章关系是否有实质推进（拉近/误会/和解）？甜虐节奏是否得当？情绪是否由具体事件支撑而非凭空悬浮？
+7. **对手戏化学反应**：男女主互动是否有潜台词与张力？是否流于直白或工具化？
+8. **配角与代入**：配角是否沦为工具人？女主（或主角）的处境、动机、情绪是否清晰可代入？
+9. **打脸/爽点外部见证**：打脸、翻盘、逆袭时刻是否有旁观者的可见反应（对手变脸、围观反应、弹幕炸裂）？还是只在主角内心完成确认？数字跃迁是否给了具体数字而非概括？
+10. **AI感模式识别**：是否存在以下AI写作痕迹——①弹幕/群众反应过于整齐划一像应援团；②角色以全知视角分析预测对手策略（像在读剧本）；③spreadsheet式数据罗列（逐条列数字/天数/百分比）；④"吃了她做的菜感动到哭"的公式化情绪转折被多次重复；⑤主题由角色直接明说而非留白；⑥所有人在同一章集体发表一句话感言（roll-call式收束）？
+11. **节奏与钩子**：章节是否拖沓或情绪空转？章末是否有让人追读的情绪钩子？""",
+    "wanzu_xuanhuan": """6. **境界/战力体系**：境界与战力是否清晰可预期、前后一致？战力跨度是否失控、自相矛盾？
+7. **斗法画面与张力**：斗法/天骄争锋/境界突破是否有画面感和热血张力，还是流于概括陈述？
+8. **力量解题合理性**：主角的取胜是否正比于此前规则铺垫（Sanderson 第一/二定律）？是否凭空开挂？
+9. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有强钩子？""",
+    "suspense": """6. **视角越界**：是否写出视角人物当下不可能知道的真相、他人内心、未到场之事？限制视角是否被破坏（这是本类型的致命伤）？
+7. **线索公平性**：关键揭示/反转是否有前文公平铺垫，能否在前文找到伏笔？是否存在凭空掉落的关键信息？
+8. **悬念账本**：悬念是否只开不收、疑点无限堆积？每章是否至少推进或收束1条旧悬念？
+9. **氛围与留白**：诡异/恐惧是否靠反常的具体细节与留白营造，还是靠"恐怖""惊悚"式贴标签形容词？
+10. **节奏与钩子**：章节是否拖沓或碎片化？章末是否有让人追读的悬念钩子？""",
 }
 
 _DIAGNOSE_GENRE_LABELS = {
@@ -297,7 +336,11 @@ REFINE_CORE = """你是一位精调中文网文的资深编辑兼作家（具体
 5. **因果与人物逻辑**：A→B→C 因果链在页面上清晰可见、无跳跃式转场；人物每个决定都有可见的动机/信息/挫败支撑，不许"突然顿悟"。
 6. **一致性与衔接**：人物口吻称谓、世界规则、能力/境界边界前后一致；与上下文衔接自然，保持全书文风统一。
 7. **健康句法**：破折号每千字≤3处且只作正常插入语；以完整主谓宾句子和有潜台词的对话为主，禁止"短语——状态——状态"碎片链、单词短句堆叠、舞台提示式断行。
-8. **时间流转**：删除纯用于切换场景的时间词（翌日清晨/这天晚上），改用情节动作与因果体现时间流逝。"""
+8. **时间流转**：删除纯用于切换场景的时间词（翌日清晨/这天晚上），改用情节动作与因果体现时间流逝。
+9. **微动作节制**：身体部位词（手指/指尖/膝盖/肩膀/掌心/指节等）每千字不超过2次。多余的改为对话、内心独白、环境互动或直接删除。"他手指在桌面上敲了敲"→让他说一句话或做一个有信息量的动作。
+10. **句式去重**："不是X，是Y""与其说X，不如说Y"等对比转折句式全章最多1次。多余的直接改为肯定句陈述。
+11. **比喻克制**："像"引导的比喻每千字不超过1.5个，严禁连续2个以上比喻堆叠（中间必须隔正常叙述句）。比喻的喻体必须来自本场景的感官域，不要跨域取喻。
+12. **对话充实**：每个有2人以上在场的场景至少包含2轮有来有回的角色对话。群戏场景（3人以上）对话占比不低于25%。用角色之口推进信息和冲突，而非用叙述旁白代替人物说话。高潮/打脸时刻必须有旁观者的可见反应（对手变脸、围观者议论、弹幕炸裂），不能只在主角内心完成确认。"""
 
 # 各题材只写"额外/独有"的精修重点；通用准则已在 REFINE_CORE，不再重复。
 REFINE_SYSTEM_BASE_HISTORY = """## 本题材精修重点（历史）
@@ -361,12 +404,18 @@ INTENSITY_INSTRUCTIONS = {
         "本轮精调强度=restructure：允许重写段落、合并/拆分场景、调整节奏；"
         "重点消除时间词切换、补强对话潜台词、修复人物行动逻辑。"
         "不得改变本章标题、关键情节点、人物决策、章末状态。"
+        "重点消除身体微动作堆砌（手指/膝盖/肩膀等每千字≤2处，多余的替换为对话或环境互动）；"
+        "消除'不是X，是Y'重复句式（≤1次/章）；控制'像'比喻密度（≤1.5/千字，禁连续堆叠）；"
+        "补充对话使其占比≥20%，群戏场景≥25%，高潮时刻须有旁观者可见反应。"
     ),
     "rewrite": (
         "本轮精调强度=rewrite：允许重新设计场景顺序、改写大段叙事、补充心理与环境描写。"
         "重点：1)消除所有时间词场景切换；2)重写对话使其有话术攻防；"
         "3)为人物行动补充利益驱动；4)修复因果链断裂。"
         "保持每章的核心目标和章末状态不变。"
+        "重点消除身体微动作堆砌（手指/膝盖/肩膀等每千字≤2处，多余的替换为对话或环境互动）；"
+        "消除'不是X，是Y'重复句式（≤1次/章）；控制'像'比喻密度（≤1.5/千字，禁连续堆叠）；"
+        "补充对话使其占比≥20%，群戏场景≥25%，高潮时刻须有旁观者可见反应。"
     ),
 }
 
@@ -385,7 +434,14 @@ def diagnose_group(
 
     chapter_blocks = []
     for num, text in group_chapters:
-        chapter_blocks.append(f"### Ch{num}\n{text.strip()}")
+        fp = _ai_fingerprint_metrics(text)
+        metrics_line = (
+            f"[AI指纹指标] 身体部位词={fp['body_part_per_kchar']}/千字 "
+            f"不是A是B={fp['not_a_is_b_count']}次 "
+            f"像比喻={fp['simile_per_kchar']}/千字 "
+            f"对话占比={fp['dialogue_ratio']:.0%}"
+        )
+        chapter_blocks.append(f"### Ch{num}\n{metrics_line}\n{text.strip()}")
     chapters_text = "\n\n".join(chapter_blocks)
 
     nums = [n for n, _ in group_chapters]
@@ -690,6 +746,38 @@ def _refined_text_acceptable(
     return True, ""
 
 
+def _flag_categories(flags: list[str]) -> set[str]:
+    """'em_dash_high(3.4/k>=3.0)' -> 'em_dash_high' so a regression check compares
+    problem KINDS, not exact metric values (which shift with length regardless)."""
+    return {f.split("(", 1)[0] for f in flags}
+
+
+def _style_regression_check(
+    original: str, refined: str, config: dict[str, Any]
+) -> tuple[bool, str]:
+    """Reject a refined chapter that regresses style_health/dialogue_health versus
+    the original. Both are the project's deterministic anti-collapse anchors
+    (em-dash/fragment density, dialogue-ratio starvation); refine's job is
+    line-level improvement, not trading that away for "richer" description. Same
+    revert-if-newly-blocking principle as engine/repair.py's fixer ladder.
+    """
+    o_style, r_style = style_health(original, config), style_health(refined, config)
+    new_style_flags = _flag_categories(r_style["flags"]) - _flag_categories(o_style["flags"])
+    if new_style_flags and r_style["penalty"] > o_style["penalty"]:
+        return False, (
+            f"style_health regressed (penalty {o_style['penalty']:.2f}->{r_style['penalty']:.2f}, "
+            f"new: {', '.join(sorted(new_style_flags))})"
+        )
+    o_dlg, r_dlg = dialogue_health(original, config), dialogue_health(refined, config)
+    new_dlg_flags = _flag_categories(r_dlg["flags"]) - _flag_categories(o_dlg["flags"])
+    if new_dlg_flags and r_dlg["penalty"] > o_dlg["penalty"]:
+        return False, (
+            f"dialogue_health regressed (penalty {o_dlg['penalty']:.2f}->{r_dlg['penalty']:.2f}, "
+            f"new: {', '.join(sorted(new_dlg_flags))})"
+        )
+    return True, ""
+
+
 def _adjacent_duplicate(
     refined: str,
     prev_refined: str,
@@ -932,6 +1020,29 @@ def refine_book(
                     log(paths, f"Refine Ch{ch}: truncation bump {intensity}->rewrite "
                                f"(original {len(original)} < {chapter_min}×0.5)")
                     intensity = "rewrite"
+            if original:
+                fp = _ai_fingerprint_metrics(original)
+                fp_needs_restructure = (
+                    fp['body_part_per_kchar'] >= 4.0
+                    or fp['not_a_is_b_count'] >= 4
+                    or fp['simile_per_kchar'] >= 3.5
+                    or fp['dialogue_ratio'] < 0.08
+                )
+                if fp_needs_restructure and _INTENSITY_RANK.get(intensity, 0) < _INTENSITY_RANK["restructure"]:
+                    log(paths, f"Refine Ch{ch}: AI-fingerprint bump {intensity}->restructure "
+                               f"(body={fp['body_part_per_kchar']}/k nab={fp['not_a_is_b_count']} "
+                               f"sim={fp['simile_per_kchar']}/k dlg={fp['dialogue_ratio']:.0%})")
+                    intensity = "restructure"
+                    fp_items = []
+                    if fp['body_part_per_kchar'] >= 4.0:
+                        fp_items.append(f"身体微动作{fp['body_part_per_kchar']}/k→降至≤2")
+                    if fp['not_a_is_b_count'] >= 4:
+                        fp_items.append(f"不是A是B {fp['not_a_is_b_count']}次→≤1")
+                    if fp['simile_per_kchar'] >= 3.5:
+                        fp_items.append(f"像比喻{fp['simile_per_kchar']}/k→≤1.5")
+                    if fp['dialogue_ratio'] < 0.08:
+                        fp_items.append(f"对话{fp['dialogue_ratio']:.0%}→≥20%")
+                    focus = (focus + " ｜ AI指纹(必须修复): " + "；".join(fp_items))[:300]
             log(paths, f"Refine Ch{ch} intensity={intensity} focus={focus[:60]!r}")
             if not original:
                 log(paths, f"Refine Ch{ch}: original missing, skip")
@@ -954,6 +1065,10 @@ def refine_book(
                 ok, reason = _refined_text_acceptable(original, refined, config, intensity)
                 if not ok:
                     log(paths, f"Refine Ch{ch} rejected ({reason}); keeping original")
+                    break
+                style_ok, style_reason = _style_regression_check(original, refined, config)
+                if not style_ok:
+                    log(paths, f"Refine Ch{ch} rejected ({style_reason}); keeping original")
                     break
                 name_ok, name_reason = _name_consistency_check(original, refined, characters_text)
                 if not name_ok:
