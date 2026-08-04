@@ -16,6 +16,7 @@ from engine.config import (
 )
 from engine import quality
 from engine.quality import REGISTRY, hard_block_reasons
+from engine.story_spine import story_spine_adherence
 from engine.state import (
     AcceptanceReport,
     DEFAULT_TAIL_CHARS,
@@ -39,7 +40,9 @@ ACCEPTANCE_GATES: tuple[str, ...] = (
     "opening_hook_gate",
 )
 
-NATIVE_CHECKS: tuple[str, ...] = ("contract_fulfilment", "citation_check")
+NATIVE_CHECKS: tuple[str, ...] = (
+    "contract_fulfilment", "brief_adherence", "citation_check",
+)
 
 NOT_IN_ACCEPTANCE: dict[str, str] = {
     "beat_coverage":
@@ -241,6 +244,34 @@ def contract_fulfilment(
     return out
 
 
+def brief_adherence(
+    story_spine_entry: dict[str, Any] | None,
+    text: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Did the prose honour the author's original chapter schedule?
+
+    Unlike CCC this ruler never reads the generated ChapterCard.  It therefore
+    stays meaningful when volume_plan and card are mutually consistent but both
+    have drifted away from ``prompt.md``.
+    """
+    cfg = (config or {}).get("novel", {}) if config else {}
+    enabled = bool(cfg.get("brief_adherence_enabled", True))
+    if not enabled:
+        return {
+            "enabled": False, "passed": True, "chapter": 0,
+            "hard_anchors": [], "matched_anchors": [], "missing_anchors": [],
+            "requirements": [], "requirement_hits": [], "directives": [],
+        }
+    result = story_spine_adherence(
+        story_spine_entry,
+        _body(text),
+        min_anchor_coverage=float(cfg.get("brief_adherence_min_anchor_coverage", 0.60)),
+    )
+    result["enabled"] = bool(story_spine_entry)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # cite-or-drop
 # ---------------------------------------------------------------------------
@@ -330,6 +361,7 @@ def acceptance_report(
     recent_payoff_types: list[str] | None = None,
     conn: Any = None,
     fossil_whitelist: set[str] | None = None,
+    story_spine_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the acceptance set and emit a v1-schema review payload.
 
@@ -433,6 +465,20 @@ def acceptance_report(
              f"（出自 {c['target'][:40]}…），已豁免")
             for c in ccc["forbid_conflicts"]]
 
+    # --- original-brief story spine (independent of generated card) -------
+    ba = brief_adherence(story_spine_entry, body, config)
+    report["brief_adherence"] = ba
+    if (
+        ba.get("enabled")
+        and not ba.get("passed", True)
+        and bool(cfg.get("brief_adherence_blocks_accept", True))
+    ):
+        report["gate_rejects"].append({
+            "gate": "brief_adherence",
+            "level": "reject",
+            "phrases": list(ba.get("missing_anchors") or [])[:8],
+        })
+
     # --- advisory gates (zero-LLM, directives only) ------------------------
     if enabled("ai_flavor_health"):
         report["ai_flavor_health"] = quality.ai_flavor_health(body, config)
@@ -491,7 +537,7 @@ def acceptance_report(
         "style_health", "length_band", "opening_hook_gate",
         "adjacent_repetition", "cross_chapter_repetition",
         "book_fossils", "descriptor_frequency", "genre_adherence",
-        "contract_fulfilment",
+        "contract_fulfilment", "brief_adherence",
     }
     _ADVISORY_GATES = (
         "ai_flavor_health", "paragraph_shape_health",
@@ -505,7 +551,10 @@ def acceptance_report(
         "sensory_deficit", "lexical_monotony",
     )
     wd = report["writer_directives_for_next_chapter"]
+    _CHAPTER_LOCAL_GATES = {"brief_adherence"}
     for key in (*_BLOCKING_GATES, *_ADVISORY_GATES):
+        if key in _CHAPTER_LOCAL_GATES:
+            continue
         gate_result = report.get(key) or {}
         penalty = float(gate_result.get("penalty", 0.0))
         if key in _BLOCKING_GATES:

@@ -13,8 +13,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from engine.config import PROMPT_FILE, Paths, log, normalize_text, read_text, write_text
+from engine.config import (
+    PROMPT_FILE,
+    Paths,
+    log,
+    normalize_text,
+    read_text,
+    text_bigrams,
+    write_text,
+)
 from engine.llm import call_llm, json_prompt, load_json_with_repair
+from engine.story_spine import build_story_spine, render_story_spine, save_story_spine
 from engine.store import db_event, recent_events, recent_metrics
 
 if TYPE_CHECKING:
@@ -152,6 +161,11 @@ VOLUME_PLAN_CHAIN_SYSTEM = """你是一部 200 万字以上中文网文的卷纲
 **每卷都完整输出全部结构小节**（卷目标/KR/主题/矛盾/高潮/锚点/兑现/代价/危机/线索兑现表），不要缩写、不要只给概要——逐章排期表（角色高光轮值表、关系线、反转排期、心动破防节拍表、爽点兑现节拍表）将在后续步骤分卷生成，此处**不需要输出**。
 ⚠ 若下方给出明确的总章数上限（max_chapters=N），则必须严格按 N 章规划：章节区间与所有锚点章号都不得超过 N，最后一个高潮/真相锚点必须落在第 N 章或之前，短篇可只写 1 卷，禁止套用 60-80 章模板。"""
 
+VOLUME_PLAN_CHAIN_SYSTEM += """
+
+## 故事脊柱优先级
+若输入包含「故事脊柱」，它来自作者原始简报，优先级高于世界观圣经、人物档案与任何候选创意。卷纲必须逐章保留其人物、地点、任务等级、关键对象、事件功能与终章结局；只允许扩写过程和细节，不得换题、换章、换收件人或把终章改成续作钩子。"""
+
 # ── 群像/多主角增量（仅当 config novel.ensemble_cast 为真时注入）───────────────
 # 沿用 writing.py:GENRE_PROFILES 的「共享基座 + 体裁增量」架构：这些 delta 追加到
 # CHARACTERS_CHAIN_SYSTEM / VOLUME_PLAN_CHAIN_SYSTEM 之后，让地基生成把「多追求者/群像」
@@ -222,9 +236,10 @@ FRAME_CHAIN_SYSTEM = """你是长篇小说引擎的开篇定稿器。基于下�
   "threads": "已开启的伏线台账（每条含 introduced/due/status），<=2500 个中文字符；核心长线控制在 3-5 条，少埋多兑"
 }"""
 
-CREATIVE_BOOST_SYSTEM = """你是一位顶尖网文创意策划，擅长跨题材、跨领域联想，把平庸的创作简报升级成有记忆点、有差异化的爆款雏形。
+CREATIVE_BOOST_SYSTEM = """你是一位顶尖网文创意策划，擅长跨题材、跨领域联想，为创作简报提出有记忆点、有差异化的候选增强方案。
 读取下方创作简报，结合多领域知识（历史、科技、神话、社会学、游戏机制、商业、悬疑结构等）做一次创意增强。
-要求：具体、可执行、避免烂大街套路；不偏离简报的题材与核心设定，只在其骨架上注入新意。
+要求：具体、可执行、避免烂大街套路；不偏离简报的题材与核心设定，只在其留白处提出新意。
+这些输出只是**候选创意**，不是作者硬设定：不得修改原简报已经指定的能力边界、人物、章位、事件、结局、禁止项或故事脊柱；与原简报冲突时必须舍弃候选创意。
 
 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。键名如下：
 {
@@ -252,25 +267,26 @@ CONTRACT_SYSTEM = """你是长篇小说引擎的「创作契约」抽取器。�
   ],
   "ability_blacklist": ["主角/关键人物明确做不到、不许做的事，每条一句话（如：不能凭空知道未亲自记录过的内容；记忆不能当法律证据；不能打斗）"],
   "banned_tropes": ["简报里明令禁止的套路，每条一句话（如：反派降智；主角全知全能；靠巧合/天降救兵解决主线；重大胜利零代价；用恐怖等贴标签词代替细节）；若简报中的核心能力/金手指可被反复使用，追加一条“同一能力的使用流程不得逐章原样复用，每次须在机制/代价/约束上有新变化”"],
-  "must_hold": ["其它必须全程维持的硬设定，每条一句话（如：限制视角，只写视角人物当下能感知/推断的；关键揭示必须前文公平出现；终章必须收束不留新危机）"]
+  "must_hold": ["其它必须全程维持的硬设定，每条一句话（如：限制视角，只写视角人物当下能感知/推断的；关键揭示必须前文公平出现；终章必须收束不留新危机）"],
+  "story_spine": [
+    {"ch": 1, "requirement": "只复述简报明确指定给本章的核心事件，不得新增或改写", "hard_anchors": ["从该章原文逐字复制的2-6个短锚点"]}
+  ]
 }
 
 抽取纪律：
 - `iron_rules`（开写铁律）只放最高优先级、每章开写都要自检的 1-3 条——它们会被放到写手提示词注意力最强的末尾锚点。挑「历史/本能最易被漏且违反即毁章」的（题材招牌规则、主角能力硬边界）；与 must_hold 的区别是"每章必检的头等红线"而非泛化硬设定；没有合适的就留空。
 - 宁缺毋滥：只收作者真正钉死的红线；模糊的、探索留白的、风格偏好类内容不要收进来。
 - 能力白名单只列主角及对剧情有关键作用的人物的**核心**能力，不要把普通技能（会开车、会做饭）也列上。
-- **先判断简报到底有没有金手指。** 只有当简报确实建立了一个超出常人的特殊能力/异能/系统/规则外挂时，
-  才写 `ability_whitelist`；此时那个贯穿全书、驱动主线的核心能力必须在列，即使简报只是强烈暗示而未
-  逐字定义，边界/模态/代价不明确也要以最贴近简报的表述钉一条，宁可粗略也不能缺席。
+- **先判断简报到底有没有金手指。** 只有当简报明确建立了超出常人的特殊能力/异能/系统/规则外挂，
+  才写 `ability_whitelist`；仅凭“聪明、专业、经验丰富”或模糊暗示不得推断能力。能力若被明确建立，
+  才记录其名称、模态、作用边界和代价；不确定时留空并交给后续 canon 处理。
 - **写实题材必须让 `ability_whitelist` 留空。** 现代都市/言情/职场/美食/商战这类"主角只是个能力出众的
   普通人"的简报，没有任何异能可抽——此时白名单留空数组，把她的专业本事（味觉灵敏、镜头感、法律常识）
   写进 `must_hold` 或干脆不写。绝对不要因为这个字段存在就发明一个能力：白名单是**逐章 HARD 校验的
   验收红线**，凭空捏一条出来，等于给全书每一章预埋一条永远无法满足的违约——审校每章都会判"能力越界"，
-  写手改任何一个字都清不掉，返工全部白烧。实测：一本 200 章的写实女频，简报第 309 行明写"没有神奇味觉，
-  不是天才厨师"，bootstrap 仍然两头出错——契约把第 147 章的一次情节反转（对比五版食谱各自的错字）升格成
-  全书唯一的能力白名单条目，bible 又另外编出简报明令禁止的「味觉共情」；此后每章"尝味道"都被判 HARD
-  越界（白名单只允许那一条），仅归档语料里就造成 13 章首稿失败。宁缺毋滥在这一条上是硬要求。
+  写手改任何一个字都清不掉，返工全部白烧。白名单为空时不要输出能力越界警告。
 - 每条都要短、具体、可判定（一个审校者读完能直接判断某一章有没有违反）。
+- `story_spine` 只提取简报明确写出章号的排期（如 Ch3/第3章）；没有明确章号就不要猜。`hard_anchors` 必须逐字复制该章原文中的人物、地点、任务等级、关键对象或结局词，禁止同义改写，禁止从其它章节串线。
 - 若简报几乎没有可抽取的硬约束，相应数组留空即可，不要硬凑。"""
 
 def _as_markdown(value: Any) -> str:
@@ -312,7 +328,10 @@ def creative_boost(client: OpenAI, paths: Paths, conn: Any, config: dict[str, An
         if not isinstance(boost, dict) or not boost:
             return ""
         db_event(conn, 0, "creative_boost", boost)
-        lines = ["## 创意增强（请将以下新意自然融入设定，避免平庸化）"]
+        lines = [
+            "## 候选创意（仅填补留白；低于原始简报、创作契约与故事脊柱）",
+            "> 以下内容可以选用、改造或舍弃。不得据此新增硬规则，不得替换原简报指定的人物、能力、章位、事件与结局。",
+        ]
         gf = _as_markdown(boost.get("golden_finger"))
         if gf:
             lines.append(f"- 金手指/核心机制：{gf}")
@@ -336,7 +355,7 @@ def creative_boost(client: OpenAI, paths: Paths, conn: Any, config: dict[str, An
         diff = _as_markdown(boost.get("differentiation"))
         if diff:
             lines.append(f"- 差异化区隔：{diff}")
-        if len(lines) <= 1:
+        if len(lines) <= 2:
             return ""
         return "\n".join(lines)
     except Exception as e:  # never block bootstrap
@@ -393,40 +412,234 @@ def _contract_to_markdown(contract: dict[str, Any]) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _grounded_contract_text(value: Any, source: str, threshold: float = 0.38) -> bool:
+    """Whether an extracted rule has lexical evidence in the original brief."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text in source:
+        return True
+    grams = text_bigrams(text, strip="punct")
+    if not grams:
+        return False
+    source_grams = text_bigrams(source, strip="punct")
+    return len(grams & source_grams) / len(grams) >= threshold
+
+
+def _sanitize_contract(contract: dict[str, Any], source: str) -> dict[str, Any]:
+    """Drop boost-like inventions that cannot be grounded in ``prompt.md``."""
+    if not isinstance(contract, dict):
+        return {}
+    out: dict[str, Any] = {
+        "protagonist": str(contract.get("protagonist") or "").strip(),
+        "iron_rules": [],
+        "ability_whitelist": [],
+        "ability_blacklist": [],
+        "banned_tropes": [],
+        "must_hold": [],
+        # Kept for the separate story-spine normalizer, which independently
+        # restricts chapter numbers and anchors to literal chapter snippets.
+        "story_spine": contract.get("story_spine") or [],
+    }
+    if out["protagonist"] and out["protagonist"] not in source:
+        out["protagonist"] = ""
+    for key in ("iron_rules", "ability_blacklist", "banned_tropes", "must_hold"):
+        values = contract.get(key) or []
+        if isinstance(values, list):
+            out[key] = [
+                str(v).strip() for v in values
+                if str(v).strip() and _grounded_contract_text(v, source)
+            ][:24]
+
+    abilities = contract.get("ability_whitelist") or []
+    if isinstance(abilities, list):
+        for raw in abilities:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name or name not in source:
+                continue
+            scope = str(raw.get("scope") or "").strip()
+            cost = str(raw.get("cost") or "").strip()
+            out["ability_whitelist"].append({
+                "name": name,
+                "modality": str(raw.get("modality") or "other").strip() or "other",
+                "scope": scope if _grounded_contract_text(scope, source, 0.30) else "",
+                "cost": cost if _grounded_contract_text(cost, source, 0.30) else "none",
+            })
+    return out
+
+
+def _brief_section(brief: str, *keywords: str) -> str:
+    """Return markdown sections whose heading contains one of ``keywords``."""
+    lines = str(brief or "").splitlines()
+    chunks: list[str] = []
+    active = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            active = any(k in stripped for k in keywords)
+            continue
+        if active and stripped:
+            chunks.append(stripped)
+    return "\n".join(chunks)
+
+
+def _fallback_contract_from_brief(brief: str, max_chapters: int = 0) -> dict[str, Any]:
+    """Deterministic fail-closed contract for provider/quota failures.
+
+    It intentionally extracts less than the LLM path, never more.  The important
+    property is that a failed API call cannot erase author-declared iron rules and
+    bans for the whole book.
+    """
+    protagonist = ""
+    m = re.search(r"(?:^|\n)\s*[-*]?\s*主角\s*[：:]\s*([^，,。\n]{2,20})", brief)
+    if m:
+        protagonist = m.group(1).strip()
+
+    def items(section: str) -> list[str]:
+        out: list[str] = []
+        for raw in section.splitlines():
+            line = re.sub(r"^\s*(?:[-*]|[①-⑳]|\d+[.、)])\s*", "", raw).strip()
+            if line and line not in out:
+                out.append(line[:260])
+        return out
+
+    iron = items(_brief_section(brief, "开写铁律", "写作铁律"))[:6]
+    bans = items(_brief_section(brief, "硬性禁止", "禁止项", "禁区"))[:16]
+    must_hold = items(_brief_section(brief, "世界规则", "必须全程", "硬设定"))[:16]
+    for label in ("世界规则", "核心机制形态"):
+        inline = re.search(
+            rf"(?:^|\n)\s*[-*]?\s*{re.escape(label)}\s*[：:]\s*([^\n]+)", brief,
+        )
+        if inline:
+            value = inline.group(1).strip()
+            if value and value not in must_hold:
+                must_hold.append(value[:520])
+    if max_chapters:
+        must_hold.append(f"全书总章数上限为 {max_chapters} 章，必须在第 {max_chapters} 章或之前完结收束")
+
+    abilities: list[dict[str, str]] = []
+    ability_match = re.search(
+        r"(?:金手指|核心机制|能力机制)\s*[：:]\s*([^\n]+)", brief, flags=re.IGNORECASE,
+    )
+    if ability_match:
+        raw = ability_match.group(1).strip()
+        quoted = re.search(r"[「『\"]([^」』\"]{2,30})[」』\"]", raw)
+        name = quoted.group(1).strip() if quoted else raw.split("——", 1)[0].strip(" -")[:30]
+        if name:
+            scope = raw
+            cost = "none"
+            cost_match = re.search(r"代价\s*[：:]\s*(.*?)(?=限制\s*[：:]|$)", raw)
+            if cost_match:
+                cost = cost_match.group(1).strip(" ；;") or "none"
+                scope = raw[:cost_match.start()].strip(" ；;")
+            abilities.append({
+                "name": name, "modality": "supernatural",
+                "scope": scope[:260], "cost": cost[:260],
+            })
+
+    return {
+        "protagonist": protagonist,
+        "iron_rules": iron,
+        "ability_whitelist": abilities,
+        "ability_blacklist": bans,
+        "banned_tropes": list(bans),
+        "must_hold": must_hold,
+        "story_spine": [],
+    }
+
+
+def _merge_contract_fallback(
+    contract: dict[str, Any], fallback: dict[str, Any]
+) -> dict[str, Any]:
+    merged = dict(contract or {})
+    if not merged.get("protagonist") and fallback.get("protagonist"):
+        merged["protagonist"] = fallback["protagonist"]
+
+    def dedupe_rules(values: list[Any]) -> list[Any]:
+        out: list[Any] = []
+        seen: set[str] = set()
+        for value in values:
+            key = re.sub(r"[\s\W_]+", "", str(value), flags=re.UNICODE).lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(value)
+        return out
+
+    for key in ("iron_rules", "ability_blacklist", "banned_tropes", "must_hold"):
+        left = merged.get(key) if isinstance(merged.get(key), list) else []
+        right = fallback.get(key) if isinstance(fallback.get(key), list) else []
+        merged[key] = dedupe_rules([*left, *right])
+    left_abilities = merged.get("ability_whitelist")
+    if not isinstance(left_abilities, list):
+        left_abilities = []
+    right_abilities = fallback.get("ability_whitelist")
+    if not isinstance(right_abilities, list):
+        right_abilities = []
+    seen_names = {
+        str(item.get("name") or "").strip()
+        for item in left_abilities if isinstance(item, dict)
+    }
+    merged["ability_whitelist"] = list(left_abilities)
+    merged["ability_whitelist"].extend(
+        item for item in right_abilities
+        if isinstance(item, dict) and str(item.get("name") or "").strip() not in seen_names
+    )
+    merged.setdefault("story_spine", contract.get("story_spine", []) if contract else [])
+    return merged
+
+
 def extract_contract(
-    client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any], brief: str | None = None
+    client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any], brief: str | None = None,
+    *, max_chapters: int = 0,
 ) -> dict[str, Any]:
     """Extract the machine-checkable creative contract from the creative brief.
 
     Writes memory/contract.md and persists a `contract` event so the per-chapter
     write/review path can enforce author-declared hard rules (ability whitelist/
-    blacklist, banned tropes, must-hold settings). Fail-degrades to {} so it can
-    never block bootstrap.
+    blacklist, banned tropes, must-hold settings).  The source is always the
+    ORIGINAL brief. Creative-boost candidates are deliberately invisible here.
 
-    `brief` should be the BOOSTED brief (prompt.md + creative_boost output). When
-    omitted it falls back to raw prompt.md — but then a boost-introduced golden
-    finger would be invisible to the contract, so the enforcement layer could be
-    blind to the very ability the boost invented.
+    Provider failures retry, then fall back to a conservative deterministic
+    extractor. Returning an empty contract while contract enforcement is enabled
+    is forbidden: bootstrap must never fail open.
     """
     if not bool(config["novel"].get("contract_enabled", True)):
         return {}
-    try:
-        source = brief if brief else read_text(PROMPT_FILE)
-        raw = call_llm(
-            client, paths, config, CONTRACT_SYSTEM,
-            json_prompt(source), temperature=0.3, tag="contract",
+    source = brief if brief is not None else read_text(PROMPT_FILE)
+    attempts = max(1, int(config["novel"].get("contract_extract_attempts", 2) or 2))
+    extracted: dict[str, Any] = {}
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = call_llm(
+                client, paths, config, CONTRACT_SYSTEM,
+                json_prompt(source), temperature=0.2, tag="contract",
+            )
+            parsed = load_json_with_repair(client, paths, config, raw, fallback={})
+            extracted = _sanitize_contract(parsed if isinstance(parsed, dict) else {}, source)
+            if _contract_to_markdown(extracted):
+                break
+            last_error = "empty or ungrounded contract"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < attempts:
+            log(paths, f"extract_contract attempt {attempt}/{attempts} failed; retrying: {last_error}")
+
+    fallback = _fallback_contract_from_brief(source, max_chapters)
+    contract = _merge_contract_fallback(extracted, fallback)
+    md = _contract_to_markdown(contract)
+    if not md:
+        raise RuntimeError(
+            "Creative contract extraction and deterministic fallback both returned empty; "
+            "refusing unconstrained bootstrap."
         )
-        contract = load_json_with_repair(client, paths, config, raw, fallback={})
-        if not isinstance(contract, dict) or not contract:
-            return {}
-        md = _contract_to_markdown(contract)
-        if md:
-            write_text(paths.contract, md + "\n")
-        db_event(conn, 0, "contract", contract)
-        return contract
-    except Exception as e:  # never block bootstrap
-        log(paths, f"extract_contract skipped: {e}")
-        return {}
+    if last_error and not _contract_to_markdown(extracted):
+        log(paths, f"extract_contract using deterministic fallback after provider failure: {last_error}")
+    write_text(paths.contract, md + "\n")
+    db_event(conn, 0, "contract", contract)
+    return contract
 
 
 def contract_capsule(paths: Paths, config: dict[str, Any], cap: int = 1200) -> str:
@@ -500,7 +713,7 @@ def _gen_md_section(
 
 def _bootstrap_chain(
     client: OpenAI, paths: Paths, config: dict[str, Any], brief: str, max_chapters: int,
-    contract_md: str = "",
+    contract_md: str = "", story_spine_md: str = "",
 ) -> dict[str, Any]:
     """Dependency-ordered foundation with parallel fan-out where the graph allows.
 
@@ -548,6 +761,14 @@ def _bootstrap_chain(
             "一律不许写进世界观与人物，哪怕它更好看。若简报明确写了某种能力「没有」，就必须真的没有。"
         )
 
+    spine_constraint = ""
+    if story_spine_md:
+        spine_constraint = (
+            "\n\n## 故事脊柱（作者原始排期，最高优先级，不得改写）\n"
+            f"{story_spine_md}\n\n"
+            "卷纲与章节卡只能补全过程和细节，不得替换章位、关键人物、地点、任务等级、对象或终章功能。"
+        )
+
     detail_note = ""
     if ensemble or shuang:
         detail_note = " → volume_detail×N"
@@ -576,7 +797,10 @@ def _bootstrap_chain(
     # not on each other. After both land, voices (needs voice) and detail
     # tables / frame (need skeleton) can fan out again.
     voice_user = f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:4000]}\n\n## 人物档案\n{characters[:4000]}"
-    vp_user = f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:5000]}\n\n## 人物档案\n{characters[:5000]}"
+    vp_user = (
+        f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:5000]}\n\n"
+        f"## 人物档案\n{characters[:5000]}{spine_constraint}"
+    )
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         # Step 3: voice ‖ volume_plan_skeleton
@@ -620,7 +844,8 @@ def _bootstrap_chain(
                     _gen_md_section, client, paths, config, detail_system,
                     f"## 卷纲骨架\n{volume_plan}\n\n"
                     f"## 人物档案\n{characters[:4000]}\n\n"
-                    f"## 请为以下卷生成逐章排期表\n{label}",
+                    f"## 请为以下卷生成逐章排期表\n{label}"
+                    f"{spine_constraint}",
                     tag=f"bootstrap_volume_detail_v{vol['label']}", max_tokens=16000,
                 )
                 detail_futures.append((i, f))
@@ -630,6 +855,7 @@ def _bootstrap_chain(
             frame_user = (
                 f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:3000]}\n\n"
                 f"## 人物档案\n{characters[:3000]}\n\n## 卷纲\n{volume_plan[:3000]}"
+                f"{spine_constraint}"
             )
             f_frame = pool.submit(
                 call_llm, client, paths, config, FRAME_CHAIN_SYSTEM,
@@ -660,6 +886,7 @@ def _bootstrap_chain(
         frame_user = (
             f"## 创作简报\n{brief}\n\n## 世界观圣经\n{bible[:3000]}\n\n"
             f"## 人物档案\n{characters[:3000]}\n\n## 卷纲\n{volume_plan[:3000]}"
+            f"{spine_constraint}"
         )
         try:
             raw = call_llm(
@@ -811,10 +1038,8 @@ def _verify_bootstrap(
 
 def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -> None:
     log(paths, "Bootstrapping layered memory")
-    boost_block = creative_boost(client, paths, conn, config)
-    brief = read_text(PROMPT_FILE)
-    if boost_block:
-        brief = brief + "\n\n" + boost_block
+    original_brief = read_text(PROMPT_FILE)
+    brief = original_brief
     # Short-novel mode: surface the hard chapter cap to the bootstrap LLM so the
     # volume_plan is planned WITHIN N chapters instead of defaulting to the
     # "3 卷 / 每卷 60-80 章" long-novel template. Without this, a 6-chapter
@@ -837,28 +1062,26 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
         val = _as_markdown(data.get(key))
         return val if val else f"# {heading}\n\n（bootstrap 未生成，待连载补全）"
 
-    # Extract the machine-checkable creative contract (ability whitelist/blacklist,
-    # banned tropes, must-hold settings) FIRST, so it can constrain the bible and
-    # characters generation below instead of only being enforced against chapters
-    # written from a bible that already contradicts it. Fail-degrades to {} (never
-    # blocks); an empty contract leaves the chain byte-for-byte as it was.
-    # NOTE: pass the BOOSTED brief so a boost-introduced golden finger is covered.
-    contract = extract_contract(client, paths, conn, config, brief=brief)
+    # P0 ordering: the hard contract and story spine are extracted from the
+    # ORIGINAL author brief (the contract additionally sees the engine's explicit
+    # max-chapter cap) before
+    # any creative expansion exists. Candidate ideas can fill blanks later, but
+    # can never be promoted into author-declared law by construction.
+    contract = extract_contract(
+        client, paths, conn, config, brief=brief, max_chapters=max_chapters,
+    )
     if contract:
         log(paths, "Extracted creative contract -> memory/contract.md")
-    elif bool(config["novel"].get("contract_enabled", True)):
-        # extract_contract fail-degrades to {} on any error (incl. transient 429).
-        # A missing contract.md silently disables the ability-whitelist / modality
-        # enforcement for the ENTIRE book — exactly the guard that caught 5/6 of
-        # v4's breaches. Make the loss loud so it isn't mistaken for a clean run.
-        log(
-            paths,
-            "WARNING: creative contract extraction returned empty — ability-boundary "
-            "enforcement (whitelist/modality/blacklist) will be INACTIVE this run, and "
-            "the bible/characters generation below runs UNCONSTRAINED. This usually "
-            "means the contract LLM call failed (quota/auth). Re-run after keys "
-            "recover to restore contract enforcement.",
-        )
+
+    spine = build_story_spine(original_brief, contract, max_chapters=max_chapters)
+    save_story_spine(paths, spine)
+    story_spine_md = render_story_spine(spine)
+    if story_spine_md:
+        log(paths, f"Extracted original-brief story spine -> {len(spine.get('chapters', {}))} chapter slots")
+
+    boost_block = creative_boost(client, paths, conn, config)
+    if boost_block:
+        brief = brief + "\n\n" + boost_block
 
     if bool(config["novel"].get("bootstrap_chain_enabled", True)):
         # Render from the dict rather than reusing `contract_capsule`: that helper is
@@ -869,11 +1092,15 @@ def bootstrap(client: OpenAI, paths: Paths, conn: Any, config: dict[str, Any]) -
         if len(contract_md) > 6000:
             contract_md = contract_md[:6000] + "\n…（契约过长已截断）"
         data = _bootstrap_chain(
-            client, paths, config, brief, max_chapters, contract_md=contract_md,
+            client, paths, config, brief, max_chapters,
+            contract_md=contract_md, story_spine_md=story_spine_md,
         )
     else:
         # Legacy single-shot path: one JSON completion for all 8 artifacts.
-        raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(brief), temperature=0.7, tag="bootstrap")
+        legacy_brief = brief
+        if story_spine_md:
+            legacy_brief += "\n\n## 故事脊柱（最高优先级，不得改写）\n" + story_spine_md
+        raw = call_llm(client, paths, config, BOOTSTRAP_SYSTEM, json_prompt(legacy_brief), temperature=0.7, tag="bootstrap")
         data = load_json_with_repair(client, paths, config, raw)
 
     title = str(data.get("title") or "").strip()

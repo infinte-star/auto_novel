@@ -9,9 +9,8 @@ The one-call design is unchanged from v2 (REDESIGN_V2 §3.3): the write call
 returns prose first, a sentinel line, then a bare JSON ``ChapterDelta``.  Four
 load-bearing decisions carry over:
 
-1. The prose doctrine (``GENRE_PROFILES``, ``ANTI_FRAGMENT_BAN``, aesthetic
-   presets, ``_build_write_system``) is v1's, unchanged — rewriting style teaching
-   would confound any A/B with a prompt-library variable.
+1. The prose doctrine is shared by every genre and version from one source;
+   changes therefore require prompt-architecture tests and a matched A/B.
 2. The v1 output section is REPLACED, not appended to — two contradictory
    instructions would silently revert to v1's cost profile.
 3. Prose first, JSON last; a parse failure loses the delta, never the prose.
@@ -33,6 +32,8 @@ from engine.config import (
     append_text,
     chapter_path,
     count_chars,
+    ending_zone_distance,
+    is_final_chapter,
     log,
     normalize_chapter,
     read_text,
@@ -102,8 +103,7 @@ DELTA_SCHEMA = """{
 V2_OUTPUT_SECTION = """## 输出要求（两段式，先后顺序不可颠倒）
 
 ### 第一段：章节正文
-- 不少于{chapter_words}个中文字符（低于此数会被判过短返工）。
-- 对话（引号台词）不低于正文篇幅的 20%——用对话推进冲突和信息，不要通篇叙述。
+- 正文目标约 {chapter_words} 个中文字符；严格上下限与对话下限以下方“本章字数与对话区间”为准。
 - 第一行固定格式：第{chapter_num}章 {title}
 - 执行本章卡片与全部约束条件；卡片里的【转折】与【收尾钩子】必须在页面上实演出来，不能只被提及。
 - 正文里严禁出现"写前自我审查"、"Pre-writing Self-Review"、"分析"、"reasoning"、`<analysis>`、`<thinking>`、代码围栏、清单或任何解释性文字。
@@ -116,8 +116,8 @@ V2_OUTPUT_SECTION = """## 输出要求（两段式，先后顺序不可颠倒）
 
 两段式的规则：
 - 分隔符之前的一切都算章节正文；之后的一切都算状态数据。
-- **必须先把正文写完整、把结尾钩子写足，再写 JSON**；不要为了赶去写 JSON 而草草收尾。
-- JSON 只记录本章真正产生的持久变化；某一项本章没有变化就给空数组 []。
+- **必须先把正文与章末状态写完整，再写 JSON**；不要为了赶去写 JSON 而草草收尾。
+- JSON 只记录本章真正产生的持久变化；无变化时数组字段填 []，对象字段填 {{}}。
 - 第二段不计入正文字数。"""
 
 
@@ -140,6 +140,16 @@ def clean_title(card: dict[str, Any] | None, chapter_num: int) -> str:
     raw = str((card or {}).get("title") or "").strip()
     raw = re.sub(r"^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章\s*[:：、\-—\s]*", "", raw)
     return raw.strip() or f"第{chapter_num}章"
+
+
+ENDING_ZONE_BLOCK = """## 收束区（距终章 {remaining} 章）
+- 本章必须减少至少一项未决主线、关系债或承诺；优先兑现既有线索，不开启无法在剩余篇幅内闭环的新主线。
+- 推进来自前文因果与人物选择，不用旁白赶进度；为终章保留明确且有限的最后问题。"""
+
+FINAL_CHAPTER_BLOCK = """## 全书终章（覆盖通用章末钩子规则）
+- 完成章节卡要求的主线兑现，交代核心人物选择的后果，并呈现一个稳定的新局面。
+- 不引入新人物、新能力、新势力或新主线危机；未解释细节可以留白，但核心承诺不得继续拖欠。
+- 末段写收束、呼应或余韵，给读者完成感；不得为了追读另抛下一章悬念。"""
 
 
 def build_system(config: dict[str, Any], chapter_num: int, title: str) -> str:
@@ -167,11 +177,20 @@ def build_system(config: dict[str, Any], chapter_num: int, title: str) -> str:
             "Fix `v2/write.build_system` to match the new assembly.")
     system = system.replace(
         v1_section, v2_output_section(chapter_words, chapter_num, title))
+    extras: list[str] = []
     try:
         swa = sensitive_word_avoidance_block(config)
     except Exception:
         swa = ""
-    return system + ("\n\n" + swa if swa else "")
+    if swa:
+        extras.append(swa)
+    if is_final_chapter(config, chapter_num):
+        extras.append(FINAL_CHAPTER_BLOCK)
+    else:
+        remaining = ending_zone_distance(config, chapter_num)
+        if remaining is not None:
+            extras.append(ENDING_ZONE_BLOCK.format(remaining=remaining))
+    return system + ("\n\n" + "\n\n".join(extras) if extras else "")
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +372,8 @@ def length_block(config: dict[str, Any]) -> str:
             f"正文目标约 {target} 字，必须落在 {lo}-{hi} 字之间。"
             f"低于下限会被判过短、高于上限会被判超长，两种都要返工。\n"
             f"对话（引号内台词）占正文篇幅不低于 {dlg_pct}%——"
-            f"每个场景至少写2轮有来有回的角色对话，"
-            f"关键信息通过人物对白推进，不要通篇叙述。\n"
+            f"多人同场的主要场景至少写2轮有来有回的角色对话；"
+            f"独处、追逐或纯动作场景不强行自言自语，关键信息尽量通过自然互动推进。\n"
             f"（第二段的状态增量 JSON 不计入字数。）")
 
 
@@ -670,7 +689,7 @@ def write_chapter(
 
 BACKFILL_SYSTEM = """你是小说状态提取器。读完给定的章节正文，输出该章产生的持久状态变化。
 只输出**一个** JSON 对象，不要代码围栏、不要解释、不要任何多余文字。
-只记录正文里真正发生的变化；某一项没有变化就给空数组 []。不要编造正文没写的内容。"""
+只记录正文里真正发生的变化；无变化时数组字段填 []，对象字段填 {}。不要编造正文没写的内容。"""
 
 
 def backfill_delta(
@@ -743,6 +762,7 @@ __all__ = [
     "length_block", "constraints_block", "split_response", "parse_delta",
     "write_chapter", "max_tokens", "DELTA_TOKEN_HEADROOM", "DELTA_KEYS",
     "DELTA_TAIL_ANCHOR", "delta_tail_anchor", "backfill_delta", "BACKFILL_SYSTEM",
+    "ENDING_ZONE_BLOCK", "FINAL_CHAPTER_BLOCK",
     # Inlined from writing.py:
     "GENRE_PROFILES", "AESTHETIC_PRESETS", "AESTHETIC_HISTORY",
     "ANTI_FRAGMENT_BAN", "ANTI_PITFALL_BLOCK",

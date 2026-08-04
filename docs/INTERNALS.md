@@ -219,6 +219,9 @@ Refine groups live in `logs/refine/group_NNNN.json`; screenplay segments in
 ## LLM calls (`llm.py`)
 
 `call_llm`:
+- resolves every explicit `tag` through `prompt_role_for_tag()`; the resulting
+  `planning` / `writing` / `extraction` / `review` role drives both the model
+  pool and the role-specific prompt discipline (one source of truth)
 - streams with three timeouts — `stream_timeout` (total), `stream_idle_startup`,
   `stream_idle_steady`
 - salvages partial output past `stream_salvage_min_chars`
@@ -228,14 +231,27 @@ Refine groups live in `logs/refine/group_NNNN.json`; screenplay segments in
   `context_window * 1.8` chars
 
 JSON contracts:
-- `json_prompt(user)` appends the mandatory output-contract block. `call_llm`
-  infers JSON mode from that string's presence and sets
+- `json_prompt(user)` idempotently appends the mandatory output-contract block.
+  `call_llm` infers JSON mode from that string's presence and sets
   `response_format={"type": "json_object"}`, retrying without it when a provider
-  returns 400/404/422 mentioning `response_format`.
+  returns 400/404/422 mentioning `response_format`. When that full user contract
+  is present, the system message does not repeat the compact JSON policy; explicit
+  `json_mode=True` callers without the marker still receive it.
 - `load_json_with_repair` calls `safe_json_loads` (which runs
   `_repair_truncated_json` for cut-off streams) and, on failure, asks the LLM to
   repair the JSON. It returns `fallback` instead of raising when one is given.
   Refusal-prefixed responses skip the repair attempt.
+
+Prompt architecture invariants are executable in
+`tests/test_prompt_architecture.py`: every `call_llm` site must pass a tag,
+literal tags must resolve to a role, and exact role-tag sets must be disjoint.
+Design rationale and the complete audit live in
+`docs/PROMPT_OPTIMIZATION_REPORT.md`.
+
+Prompt assembly order is L0 common policy -> L1 semantic-role policy -> L2 task
+system contract. The task contract therefore keeps the strongest system-message
+recency. Stable canon is prepended separately as the cacheable user prefix; volatile
+cards, recent state, retrieved evidence, and the request follow it.
 
 ---
 
@@ -245,12 +261,13 @@ Editing any of these changes every consumer at once.
 
 | constant | defined in | consumed by |
 | --- | --- | --- |
-| `STYLE_HEALTH_GUARDRAILS` (健康文风护栏) | `memory.py` | `VOICE_CHAIN_SYSTEM` (memory.py). v1's `VOICE_ANCHOR_SYSTEM` was its second consumer and went with `review.py` |
-| `_VOLUME_PLAN_STRUCTURE_SPEC` (OKR structure, 线索兑现表, pacing discipline) | `memory.py` | `VOLUME_PLAN_CHAIN_SYSTEM` (memory.py). v1's `REPLAN_SYSTEM` was its second consumer; v2 does not regenerate volume plans mid-book |
-| `ARC_SYSTEM`, `normalize_card`, `validate_card`, `card_to_plan` (what a ChapterCard *is*) | `arc.py` | `v2/beat.py` — imported, never copied, so there is exactly one definition of the card schema `v2/accept.py:contract_fulfilment` scores |
-| `_SELF_REVIEW_PREAMBLE`, `_SENSORY_DIALOGUE_DEFAULT`, `_TIME_MARKER_BAN_DEFAULT` | `writing.py` | every genre's writer prompt via `_build_write_system()` |
-| `_OUTPUT_SECTION` | `writing.py` | same, **plus `v2/write.py`, which replaces it by exact string match and raises if it has drifted** — v1's version ends with 「严禁输出…JSON」, the exact opposite of what v2 asks for, and an appended override would fail silently (the writer obeys the older rule, no delta parses, and the engine quietly costs an extra call per chapter) |
-| `DIAGNOSE_CORE`, `DIAGNOSE_COMMON_FOOTER` | `refine.py` | every genre's diagnose prompt via `_build_diagnose_system()` |
+| `GLOBAL_PROMPT_HYGIENE`, role policies, `JSON_OUTPUT_CONTRACT` | `engine/llm.py` | every tagged LLM call via `call_llm()` |
+| `_VOLUME_PLAN_STRUCTURE_SPEC` | `engine/bootstrap.py` | volume skeleton and per-volume detail generation |
+| `ARC_SYSTEM`, `normalize_card`, `validate_card`, `card_to_plan` | `engine/plan.py` | arc generation, repair, writer contract, acceptance |
+| `ANTI_FRAGMENT_BAN`, `ANTI_PITFALL_BLOCK`, `_SELF_REVIEW_PREAMBLE`, genre profiles | `engine/genre.py` | every chapter writer prompt via `engine/write.py:_build_write_system()` |
+| `_OUTPUT_SECTION` | `engine/genre.py` | writer assembly, plus `engine/write.py`, which replaces it by exact string match and raises if it drifts; appending would leave contradictory prose-only vs prose+delta contracts |
+| `ENDING_ZONE_BLOCK`, `FINAL_CHAPTER_BLOCK` | `engine/write.py` | deterministic near-finale/finale writer overrides when `max_chapters` is known |
+| `DIAGNOSE_CORE`, `DIAGNOSE_COMMON_FOOTER` | `commands/refine.py` | every genre's diagnose prompt via `_build_diagnose_system()` |
 
 v1's `_EXECUTABILITY_DOCTRINE` (score baseline 6.5, "shootable action", reversal
 requirement) went with `planning.py`. Its content did not vanish: the concreteness

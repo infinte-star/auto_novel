@@ -1,0 +1,8 @@
+{
+  "source": "baokuan_v2",
+  "flip_key": "dialogue_char_ratio_min",
+  "old_value": "0.10",
+  "new_value": "0.12",
+  "max_chapters": 3,
+  "created_at": "2026-08-02T17:46:09"
+}

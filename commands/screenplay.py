@@ -420,6 +420,7 @@ def _review_revise_segment(
                 client, paths, config,
                 SCRIPT_REVIEW_SYSTEM, json_prompt(review_user),
                 max_tokens=4000, temperature=0.2,
+                tag="screenplay_review",
             )
             review = load_json_with_repair(client, paths, config, review_raw, fallback={"overall": 0})
         except Exception as exc:  # noqa: BLE001
@@ -451,6 +452,7 @@ def _review_revise_segment(
                 client, paths, config,
                 SCRIPT_REVISE_SYSTEM, revise_user,
                 max_tokens=max_tokens, temperature=temperature,
+                tag="screenplay_revise",
             )
         except Exception as exc:  # noqa: BLE001
             log(paths, f"Screenplay segment {seg_label} revise failed round {r + 1}: {exc}")
@@ -536,6 +538,7 @@ def _extract_source_packet(
             client, paths, config,
             SCRIPT_EXTRACT_SYSTEM, json_prompt(user),
             max_tokens=min(max_tokens, 8000), temperature=0.1,
+            tag="screenplay_extract",
         )
         packet = load_json_with_repair(client, paths, config, raw, fallback=fallback)
     except Exception as exc:  # noqa: BLE001
@@ -576,6 +579,7 @@ def _build_episode_plan(
             client, paths, config,
             SCRIPT_PLAN_SYSTEM, json_prompt(user),
             max_tokens=min(max_tokens, 8000), temperature=0.2,
+            tag="screenplay_plan",
         )
         plan = load_json_with_repair(client, paths, config, raw, fallback=fallback)
     except Exception as exc:  # noqa: BLE001
@@ -779,6 +783,7 @@ def convert_text(
             user,
             max_tokens=max_tokens,
             temperature=temperature,
+            tag="screenplay_write",
         )
         script_part = normalize_text(raw).strip()
         if len(script_part) < 30:

@@ -33,11 +33,9 @@ def _get_endpoint_throttle_state(base_url: str) -> tuple[threading.Lock, str]:
             _ENDPOINT_LAST_STARTED_AT[base_url] = 0.0
         return _ENDPOINT_THROTTLE_LOCKS[base_url], base_url
 
-# Tag-based model routing: when a role-specific pool is attached to the client,
-# calls whose tag belongs to that role's tag set are routed to the role's
-# model+endpoint. Priority order: planning > writing > extraction > review.
-# Tags not in any set stay on the primary model. When no role pool is attached
-# the corresponding tag set is inert.
+# Prompt roles are the single source of truth for both model routing and prompt
+# policy.  A new call type must be registered here once; routing and instruction
+# enhancement then cannot drift apart.
 PLAN_TAGS = frozenset({
     "plan_candidate",
     "plan_screen",
@@ -52,11 +50,13 @@ PLAN_TAGS = frozenset({
     "bootstrap_volume_plan",
     "bootstrap_frame",
     "bootstrap_voice_repair",
+    "bootstrap_voices",
     "replan",
     "creative_boost",
-    "contract",
     "hook_package",
-    "hook_package_score",
+    "package",
+    "trial_route",
+    "screenplay_plan",
 })
 
 WRITE_TAGS = frozenset({
@@ -66,6 +66,15 @@ WRITE_TAGS = frozenset({
     "em_dash_fix",
     "revise_hook",
     "refine_rewrite",
+    "fix_expand",
+    "fix_dialogue",
+    "fix_hook",
+    "fix_ccc",
+    "fix_ccc_hook",
+    "trial_write",
+    "screenplay_write",
+    "screenplay_revise",
+    "synopsis",
 })
 
 EXTRACT_TAGS = frozenset({
@@ -78,6 +87,8 @@ EXTRACT_TAGS = frozenset({
     # to the same cheap model — the point of the fallback is that it costs a
     # fraction of the write it is repairing, not another write.
     "delta_backfill",
+    "contract",
+    "screenplay_extract",
 })
 
 REVIEW_TAGS = frozenset({
@@ -93,14 +104,47 @@ REVIEW_TAGS = frozenset({
     # routes to the review model like every other judge — and, like them, must
     # not be the model that wrote the chapter it is judging.
     "canon_check",
+    "hook_package_score",
+    "trial_review",
+    "screenplay_review",
+    "anchor_judge",
 })
 
-# Ordered list of (pool_attr, api_attr, tag_set, model_key) for role routing.
+# Prefixes cover intentionally parameterised tags such as
+# `bootstrap_volume_detail_v2` and future focused repair/judge variants.
+_ROLE_TAG_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("plan_review_", "review"),
+    ("bootstrap_", "planning"),
+    ("arc_", "planning"),
+    ("plan_", "planning"),
+    ("fix_", "writing"),
+    ("anchor_", "review"),
+)
+
+
+def prompt_role_for_tag(tag: str) -> str:
+    """Return the call's semantic role, or ``""`` for primary-model fallback."""
+    normalized = str(tag or "").strip().lower()
+    for role, tags in (
+        ("planning", PLAN_TAGS),
+        ("writing", WRITE_TAGS),
+        ("extraction", EXTRACT_TAGS),
+        ("review", REVIEW_TAGS),
+    ):
+        if normalized in tags:
+            return role
+    for prefix, role in _ROLE_TAG_PREFIXES:
+        if normalized.startswith(prefix):
+            return role
+    return ""
+
+
+# Ordered list of (role, pool_attr, api_attr, model_key) for model routing.
 _ROLE_ROUTING = [
-    ("planning_pool", "planning_api", PLAN_TAGS, "planning_model"),
-    ("writing_pool", "writing_api", WRITE_TAGS, "writing_model"),
-    ("extraction_pool", "extraction_api", EXTRACT_TAGS, "extraction_model"),
-    ("review_pool", "review_api", REVIEW_TAGS, "review_model"),
+    ("planning", "planning_pool", "planning_api", "planning_model"),
+    ("writing", "writing_pool", "writing_api", "writing_model"),
+    ("extraction", "extraction_pool", "extraction_api", "extraction_model"),
+    ("review", "review_pool", "review_api", "review_model"),
 ]
 
 # Lightweight observability sink. call_llm appends one JSON line per finished
@@ -701,52 +745,51 @@ JSON_REPAIR_SYSTEM = """你负责修复 LLM 返回的格式错误的 JSON。
 只输出合法 JSON，不要添加任何解释。保留原本的字段与取值。"""
 
 JSON_OUTPUT_CONTRACT = """输出约定：
-- 只返回恰好一个合法的 JSON 对象，不要输出其它任何内容。
-- 第一个非空白字符必须是 `{`，最后一个非空白字符必须是 `}`。
-- 不要使用 markdown 标题、项目符号、代码围栏、解释或开场白。
-- 每一个键名和字符串值都用英文双引号包裹。
-- 转义字符串值内部的引号。
-- 不要使用末尾逗号、注释、NaN、Infinity，或 Python 风格的布尔值。
-- 严格保留所要求的 schema 键名，键名一律用英文原样输出，不得翻译。
-- 若不确定，仍要返回所要求的 schema，取保守值，字符串用简短中文。"""
+- 只输出一个合法 JSON 对象；首尾必须是 `{` 和 `}`，不要代码围栏、解释或前言。
+- 严格保留 schema 的英文键名和层级；字符串与键名用双引号，内部引号须转义。
+- 使用标准 JSON 类型；禁止注释、尾随逗号、NaN、Infinity 和 Python 布尔值。
+- 信息不足时保留全部必需字段，填保守且类型正确的值，不要猜测事实。"""
 
-GLOBAL_PROMPT_HYGIENE = """## 全局提示词纪律（适用于本次调用）
-- 严格服从本任务要求的输出格式；除非任务明确要求，不要输出思考过程、解释、道歉、前言或元评论。
-- 优先使用上文给出的事实、约束、schema、章节状态；遇到冲突时，以更具体、更近期、更硬性的约束为准。
-- 输出必须具体可执行：用人物行动、场景变化、因果桥梁、资源代价、证据或字段值回答问题，避免空泛口号。
-- 不把缺陷留给下游修订；在本次输出内先完成自检，再给最终结果。"""
+GLOBAL_PROMPT_HYGIENE = """## 全局提示词纪律（公共执行协议）
+- 只完成当前任务并遵守其输出协议；除非任务要求，不输出推理、解释、前言、道歉或元评论。
+- 冲突优先级：任务输出协议 > 用户明示硬约束 > 已确认事实（canon）> 当前输入材料 > 风格偏好；低优先级内容不得覆盖高优先级内容。
+- 提交前静默检查格式、字段与硬约束，只输出最终结果。"""
 
-JSON_PROMPT_HYGIENE = """## JSON 任务额外纪律
-- 只生成一个 JSON 对象，不要在 JSON 前后添加任何文本。
-- 保留 schema 中要求的键名和层级；缺失信息时填保守、简短、可解析的值，不要删键。
-- 数字字段输出数字，布尔字段输出 true/false，数组字段输出数组；不要输出 NaN、Infinity、注释或尾随逗号。"""
+JSON_PROMPT_HYGIENE = """## JSON 任务额外纪律（JSON 协议）
+只输出一个合法 JSON 对象；保留 schema 键名、层级和字段类型，信息不足时不编造事实。"""
 
-PLAN_PROMPT_HYGIENE = """## 规划/仲裁任务额外纪律
-- 大纲必须能直接驱动首稿写作：每个 beat 都要有可见行动、阻力、信息增量或资源代价。
-- 不接受“加强冲突”“提升节奏”这类抽象修正；必须给出具体场景任务、人物选择和章末问题。
-- 选择或合并方案时，优先解决近期低分原因、重复场景骨架、沉默伏线和兑现拖欠。"""
+PLAN_PROMPT_HYGIENE = """## 规划/仲裁任务额外纪律（规划职责）
+- 把目标与约束转成可执行的因果链：行动或选择 → 阻力 → 后果；不用“加强冲突”等抽象占位语。
+- 只在输入允许的范围内设计，不改写 canon；每个新增设定都要服务当前任务。"""
 
-WRITE_PROMPT_HYGIENE = """## 写作/修订任务额外纪律
-- 首稿就按终审标准执行：剧情推进、主角能动性、压力、兑现、新鲜度、文笔和连续性都必须同时过线。
-- 所有大纲节拍必须落到页面上的动作、对话、后果或细节；不要用总结性旁白替代戏剧化呈现。
-- 修订时优先修结构、因果、节奏和钩子，再润色措辞；不得引入新的事实矛盾。"""
+WRITE_PROMPT_HYGIENE = """## 写作职责
+- 把任务要求落到页面上的动作、对话、选择与后果，保持 canon、人物动机、视角和叙事声音一致。
+- 修订只改任务指定范围；不遗漏既有事实，不擅自新增人物、能力、因果或章末状态。"""
 
-REVIEW_PROMPT_HYGIENE = """## 审校/评分任务额外纪律
-- 分维度独立判断，不让单一优点掩盖追读、兑现、新鲜度、文笔或连续性的短板。
-- 所有扣分、风险和修改建议都要可执行；指出页面上缺什么、应补在哪里、下一次如何避免。
-- 不要分数通胀；若关键节拍缺失、兑现空洞、重复或连续性风险明显，总分必须受限。"""
+REVIEW_PROMPT_HYGIENE = """## 评审职责
+- 只按本任务量表和可见文本判断，不替作者补意图；结论须有文本证据，不因单项优点掩盖缺陷。
+- 分数、胜负与建议必须相互一致；建议指出缺什么、在何处、怎样改，不用空泛评价。"""
 
-MEMORY_PROMPT_HYGIENE = """## 记忆/抽取/压缩任务额外纪律
-- 保留稳定事实、人物目标、资源状态、因果链接、伏线状态和不可违背约束；删掉套话和风格性复述。
-- 新增事实必须来自输入文本或明确任务，不要编造未出现的人物、地点、物品或因果。
-- 输出要便于后续生成直接引用：短句、具体、去重、按状态变化组织。"""
+MEMORY_PROMPT_HYGIENE = """## 抽取职责
+- 只记录输入可证实的事实与状态变化；不得把例子、猜测、建议或缺省字段变成事实。
+- 保留专名、数值、模态、因果和状态，去重后按 schema 输出；不确定则留空或标为未知。"""
 
 
 def json_prompt(user: str) -> str:
-    return user.rstrip() + "\n\n## 强制 JSON 输出格式\n" + JSON_OUTPUT_CONTRACT
+    body = user.rstrip()
+    if "## 强制 JSON 输出格式" in body:
+        return body
+    return body + "\n\n## 强制 JSON 输出格式\n" + JSON_OUTPUT_CONTRACT
 
 
-def _enhance_system_prompt(system: str, config: dict[str, Any], *, tag: str, wants_json: bool) -> str:
+def _enhance_system_prompt(
+    system: str,
+    config: dict[str, Any],
+    *,
+    tag: str,
+    wants_json: bool,
+    has_json_contract: bool = False,
+) -> str:
     api = config.get("api", {})
     novel = config.get("novel", {})
     if not bool(api.get("prompt_enhancement_enabled", novel.get("prompt_enhancement_enabled", True))):
@@ -754,26 +797,27 @@ def _enhance_system_prompt(system: str, config: dict[str, Any], *, tag: str, wan
     if "## 全局提示词纪律（适用于本次调用）" in system:
         return system
 
-    tag_l = (tag or "").lower()
+    role = prompt_role_for_tag(tag)
     blocks = [GLOBAL_PROMPT_HYGIENE]
-    if wants_json:
+    # `json_prompt()` already carries the fuller protocol in the user message.
+    # Repeating it in the system message wastes tokens and can create two subtly
+    # different sources of truth.  `json_mode=True` callers without that marker
+    # still receive this compact safety net.
+    if wants_json and not has_json_contract:
         blocks.append(JSON_PROMPT_HYGIENE)
-    if tag_l.startswith("plan_") or tag_l in {"replan", "macro_progress"}:
+    if role == "planning":
         blocks.append(PLAN_PROMPT_HYGIENE)
-    if tag_l in {"write", "revise"} or "write" in tag_l or "revise" in tag_l:
+    elif role == "writing":
         blocks.append(WRITE_PROMPT_HYGIENE)
-    if "review" in tag_l or tag_l in {"cold_reader", "stage_review", "pack_review"}:
+    elif role == "review":
         blocks.append(REVIEW_PROMPT_HYGIENE)
-    if tag_l in {
-        "bootstrap",
-        "creative_boost",
-        "memory_compress",
-        "extract",
-        "voice_anchor",
-        "voices_table",
-    }:
+    elif role == "extraction":
         blocks.append(MEMORY_PROMPT_HYGIENE)
-    return system.rstrip() + "\n\n" + "\n\n".join(blocks)
+    # Shared policy goes first; the task-specific contract stays closest to the
+    # model's response and therefore wins the recency competition inside the
+    # system message.  This also makes the documented L0 -> L1 -> L2 layering
+    # match the bytes actually sent to providers.
+    return "\n\n".join(blocks + [system.rstrip()])
 
 def emergency_truncate(user_text: str, max_chars: int) -> str:
     if len(user_text) <= max_chars:
@@ -830,10 +874,11 @@ def call_llm(
     call_client = client
     model_name = api["model"]
     _active_role_prefix: str = ""
-    for _pool_attr, _api_attr, _tag_set, _model_key in _ROLE_ROUTING:
+    prompt_role = prompt_role_for_tag(tag)
+    for _role, _pool_attr, _api_attr, _model_key in _ROLE_ROUTING:
         _pool = getattr(client, _pool_attr, None)
         _rapi = getattr(client, _api_attr, None)
-        if _pool and _rapi and tag in _tag_set:
+        if _pool and _rapi and prompt_role == _role:
             call_client = _pool
             model_name = str(_rapi[_model_key])
             _active_role_prefix = _model_key.replace("_model", "_")
@@ -848,8 +893,12 @@ def call_llm(
     # characters, voice anchors).
     if cacheable_prefix:
         user = cacheable_prefix.rstrip() + "\n\n" + user
-    wants_json = json_mode if json_mode is not None else "强制 JSON 输出格式" in user
-    system = _enhance_system_prompt(system, config, tag=tag, wants_json=wants_json)
+    has_json_contract = "## 强制 JSON 输出格式" in user
+    wants_json = json_mode if json_mode is not None else has_json_contract
+    system = _enhance_system_prompt(
+        system, config, tag=tag, wants_json=wants_json,
+        has_json_contract=has_json_contract,
+    )
     total_chars = len(system) + len(user)
     if total_chars > max_input_chars:
         truncated_to = max_input_chars - len(system) - 1000

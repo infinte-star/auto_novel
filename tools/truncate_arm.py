@@ -275,7 +275,7 @@ def main() -> int:
     os.environ["NOVEL_CONFIG"] = str((nd / "config.yaml").relative_to(ROOT))
     os.environ.setdefault("NOVEL_PROMPT", str((nd / "prompt.md").relative_to(ROOT)))
     import engine.config as _config
-    import retrieval
+    from engine import retrieval
     cfg = _config.load_config()
     paths = _config.get_paths(cfg)
     n_idx = retrieval.backfill_index(paths, cfg)

@@ -192,6 +192,7 @@ def run_opening_trial(variants: int | None = None, chapters: int | None = None) 
             max_tokens=12000,
             temperature=0.85,
             cacheable_prefix=cacheable_prefix(paths, config),
+            tag="trial_route",
         )
         route = load_json_with_repair(client, paths, config, route_raw, fallback={})
         plans = route.get("chapter_plans") if isinstance(route, dict) else []
@@ -223,6 +224,7 @@ def run_opening_trial(variants: int | None = None, chapters: int | None = None) 
             max_tokens=12000,
             temperature=0.75,
             cacheable_prefix=cacheable_prefix(paths, config),
+            tag="package",
         )
         package = load_json_with_repair(client, paths, config, package_raw, fallback={})
         write_text(variant_dir / "package.json", json.dumps(package, ensure_ascii=False, indent=2))
@@ -252,6 +254,7 @@ def run_opening_trial(variants: int | None = None, chapters: int | None = None) 
                 write_user,
                 temperature=float(config["api"].get("temperature", 0.8)),
                 cacheable_prefix=cacheable_prefix(paths, config),
+                tag="trial_write",
             )
             chapter = normalize_chapter(chapter_raw)
             write_text(variant_dir / f"{ch_idx:04d}.md", chapter)
@@ -276,6 +279,7 @@ def run_opening_trial(variants: int | None = None, chapters: int | None = None) 
             json_prompt(review_user),
             max_tokens=12000,
             temperature=0.2,
+            tag="trial_review",
         )
         review = load_json_with_repair(client, paths, config, review_raw, fallback={"overall": 0})
         trial_score = _score_value(review)

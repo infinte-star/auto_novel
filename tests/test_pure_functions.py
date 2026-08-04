@@ -25,7 +25,7 @@ from engine.quality import opening_hook_gate, length_band_check  # noqa: E402
 from engine.config import genre_detection_profile, _apply_genre_detection_profile  # noqa: E402
 from engine.bootstrap import _recency_aware_state  # noqa: E402
 from engine.bootstrap import _contract_to_markdown  # noqa: E402
-from engine.llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, safe_json_loads  # noqa: E402
+from engine.llm import _enhance_system_prompt, _repair_truncated_json, _resolve_reasoning_effort, _resolve_thinking_param, json_prompt, prompt_role_for_tag, safe_json_loads  # noqa: E402
 from engine.write import _beat_needs_concretization, _first_draft_execution_ledger  # noqa: E402
 from engine.write import _chapter_write_max_tokens  # noqa: E402
 from engine.quality import cross_chapter_repetition, descriptor_frequency, genre_adherence  # noqa: E402
@@ -412,6 +412,57 @@ class PromptEnhancementTests(unittest.TestCase):
         system = _enhance_system_prompt("base system", {"api": {}, "novel": {}}, tag="", wants_json=wants_json)
         self.assertTrue(wants_json)
         self.assertIn("JSON 任务额外纪律", system)
+
+    def test_json_prompt_is_idempotent(self):
+        once = json_prompt("please return data")
+        self.assertEqual(json_prompt(once), once)
+        self.assertEqual(once.count("## 强制 JSON 输出格式"), 1)
+
+    def test_json_contract_is_not_repeated_in_system_policy(self):
+        full = _enhance_system_prompt(
+            "task contract", {"api": {}, "novel": {}}, tag="extract",
+            wants_json=True, has_json_contract=True,
+        )
+        compact = _enhance_system_prompt(
+            "task contract", {"api": {}, "novel": {}}, tag="extract",
+            wants_json=True,
+        )
+        self.assertLess(len(full), len(compact))
+        self.assertIn("task contract", full)
+
+    def test_shared_policy_precedes_task_contract(self):
+        system = _enhance_system_prompt(
+            "TASK-SPECIFIC-OUTPUT", {"api": {}, "novel": {}},
+            tag="trial_write", wants_json=False,
+        )
+        self.assertLess(system.index("全局提示词纪律"), system.index("TASK-SPECIFIC-OUTPUT"))
+        self.assertTrue(system.endswith("TASK-SPECIFIC-OUTPUT"))
+
+    def test_prompt_roles_cover_live_pipeline_and_tools(self):
+        expected = {
+            "arc_plan": "planning",
+            "bootstrap_volume_detail_v2": "planning",
+            "trial_route": "planning",
+            "screenplay_plan": "planning",
+            "write": "writing",
+            "fix_dialogue": "writing",
+            "trial_write": "writing",
+            "screenplay_revise": "writing",
+            "contract": "extraction",
+            "delta_backfill": "extraction",
+            "screenplay_extract": "extraction",
+            "hook_package_score": "review",
+            "refine_diagnose": "review",
+            "trial_review": "review",
+            "anchor_judge_dimensional": "review",
+        }
+        for tag, role in expected.items():
+            with self.subTest(tag=tag):
+                self.assertEqual(prompt_role_for_tag(tag), role)
+
+    def test_unknown_prompt_role_uses_primary_fallback(self):
+        self.assertEqual(prompt_role_for_tag(""), "")
+        self.assertEqual(prompt_role_for_tag("future_unregistered_call"), "")
 
 
 class RetrievalShardTests(unittest.TestCase):
@@ -3225,7 +3276,8 @@ class LengthBlockStructuralDialogueTest(unittest.TestCase):
         cfg = {"novel": {"chapter_words": 2200, "chapter_min_chars": 1800,
                          "chapter_max_chars": 2800}}
         text = length_block(cfg)
-        self.assertIn("每个场景至少写2轮有来有回的角色对话", text)
+        self.assertIn("多人同场的主要场景至少写2轮有来有回的角色对话", text)
+        self.assertIn("不强行自言自语", text)
 
     def test_still_contains_percentage(self):
         from engine.write import length_block

@@ -557,7 +557,9 @@ def cmd_fork(name: str, as_name: str, flip_key: str | None, set_value: str | Non
 
     target.mkdir(parents=True)
     (target / "config.yaml").write_text(text, encoding="utf-8")
-    (target / "prompt.md").write_text(prompt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    # prompt.md is the experimental treatment input. Preserve its bytes exactly
+    # (including LF/CRLF and any BOM) so a fork remains hash-identical to source.
+    shutil.copy2(prompt_path, target / "prompt.md")
     for sub_dir in ("memory", "chapters"):
         if (src / sub_dir).is_dir():
             shutil.copytree(src / sub_dir, target / sub_dir)

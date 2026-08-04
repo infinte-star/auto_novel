@@ -7,6 +7,7 @@ The card is the chapter's contract — the same seven fields acceptance scores.
 from __future__ import annotations
 
 import dataclasses
+import copy
 import json
 import re
 from typing import TYPE_CHECKING, Any, Callable
@@ -17,6 +18,11 @@ if TYPE_CHECKING:
 from engine.checkpoint import save_checkpoint
 from engine.config import Paths, chapter_path, log, read_text, text_bigrams
 from engine.llm import call_llm, json_prompt, load_json_with_repair, safe_json_loads
+from engine.story_spine import (
+    story_spine_adherence,
+    story_spine_entry,
+    story_spine_window,
+)
 from engine.store import db_event, validate_plan_continuity
 
 # ---------------------------------------------------------------------------
@@ -83,23 +89,15 @@ ARC_SYSTEM = """你是工业化长篇小说引擎中的「弧级规划 agent」�
 6. 伏线错峰：一章最多回收 1 条主线索。逾期未收的伏线必须在本弧内排进具体某一章，不要平均分摊。
 7. `forbid` 必须从下方「已用元素台账」里挑真实存在的条目，不要编造空泛禁令。
 8. 若给定章号包含全书终章，该章 `exit_hook` 改为收束/余韵，不得抛新悬念，且不得引入新人物/新势力。
-9. 弧线末尾加速：弧的最后2张卡片中，至少有1张的 `tension_level` 为 "high"。
-   禁止在弧线收束前连放2章 "low" 张力的过渡/减压——弧线要以高潮或强转折收束，
-   不要在读者期待最高的位置泄气。
-10. 爽点密度三级：每章至少有一个小爽点（`payoff_level`="small"），
-    每3-5章安排一个中爽点（"medium"：完整打脸/关系突破/实力跃升），
-    弧末安排一个大爽点（"large"：多伏笔回收/boss级反转/身份曝光）。
-    连续3章无任何爽点 = 追读断崖。弧内必须有≥1张 `payoff_level`="large" 的卡片。
-11. 先压后爽（落差公式）：每个 medium/large 级 payoff 必须有≥1章的铺垫压制，
-    落差 = 压迫深度 × 反转幅度。碾压式胜利只有在之前被压制过才有爽感。
-    弧内至少安排1次"极端落差"（从希望巅峰→绝望谷底→爆发反杀的完整弧段）。
+9. 弧内节奏必须形成可见波形：不得连续3章同为 high，也不得连续3章同为 low；最后2章至少1章为 high。
+10. 兑现按 `small / medium / large` 分级：每章至少 small，弧内至少一次 medium 和一次 large；medium/large 前必须有明确 pressure 铺垫，兑现后必须写 `payoff_reaction`。
+11. `hook_type` 必须轮换，连续3章不得相同；不得用同一事件换措辞充当不同章节的 payoff 或 exit_hook。
+12. 若输入含「故事脊柱」，它是作者原始简报的不可改写排期。每张卡必须逐字保留该章的硬锚点，并落实其人物、地点、任务等级、关键对象与结局功能；卷纲、世界观或候选创意与之冲突时一律服从故事脊柱。
 
 ## 情绪与节奏编排（爆款方法论）
-- 情绪张弛交替：不可连续3章高强度（读者疲劳），不可连续3章低强度（读者弃书）。理想模式是高→中→低的波浪形。
-- "憋-炸-余韵"三拍结构：先用2-3章制造压迫（主角被压制/被误解/面临困境），再用1章爆发兑现（反杀/打脸/身份揭示），最后1章呈现余韵（围观者反应/对手崩溃/关系变化）。
-- 章末钩子类型轮换：`exit_hook` 应覆盖多种类型（悬念式/反转式/情绪式/信息投放式/威胁倒计时式/温馨治愈式），连续3章的 `exit_hook` 不得属于同一类型。
-- 爽点铺垫：每个 `payoff` 必须有对应的 `pressure`（压迫/轻视/困境），先压后爽才有感觉——没有铺垫的碾压是空洞的。
-- 弧线末尾加速：弧的最后2章必须有至少1章高张力（high），倒数第二章通常是"炸"（兑现/反杀/真相揭示），最后一章是余韵+收束+下弧钩子。切忌在弧线结尾安排两章连续减压。"""
+- 用“压迫→选择→兑现→外部余波”组织中、大兑现；各阶段必须是页面上可演的事件。
+- 情绪波形服务因果推进，不为凑节奏插入无状态变化的过渡章。
+- 弧末先完成本弧位移，再用一个具体后果连接下一弧；终章例外，以收束余韵结束。"""
 
 CARD_REPAIR_SYSTEM = """你是章节卡片的定点修复器。
 你会收到一张 ChapterCard 和一份「必须消除的问题清单」。
@@ -108,7 +106,61 @@ CARD_REPAIR_SYSTEM = """你是章节卡片的定点修复器。
 修复原则：
 - 具体化优先：把抽象意图改写成"某角色用具体动作操作具体物体、产生可见结果"的可拍句子。
 - 换掉重复的场地/开场/兑现方式时，必须同时改写 beats 让新选择真正落地，不要只改标签。
-- 与既有设定冲突时，服从既有设定改卡片，不要试图改设定。"""
+- 与既有设定冲突时，服从既有设定改卡片，不要试图改设定。
+- 问题若以 `story_spine:` 开头，必须把列出的原始简报锚点逐字写回卡片的 title/where/who/turn/payoff/beats/exit_hook；不得用卷纲新增设定替代。"""
+
+
+def _ground_card_to_story_spine(
+    card: dict[str, Any] | None, spine: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Copy author-supplied chapter facts back into a generated card.
+
+    This is not a creative fallback: every appended line is either a literal
+    requirement from ``prompt.md`` or a structured relation deterministically
+    extracted from it.  Prose is still judged independently, so metadata here
+    cannot self-certify a bad chapter.
+    """
+    if not isinstance(card, dict) or not isinstance(spine, dict) or not spine:
+        return card
+    grounded = copy.deepcopy(card)
+    beats = [str(x).strip() for x in (grounded.get("beats") or []) if str(x).strip()]
+
+    def add_beat(value: str) -> None:
+        value = str(value or "").strip()
+        if value and value not in beats:
+            beats.append(value)
+
+    for requirement in (spine.get("requirements") or []):
+        if str(requirement).strip():
+            add_beat("原始简报钉死事件：" + str(requirement).strip())
+
+    grade = str(spine.get("expected_grade") or "").strip()
+    if grade:
+        add_beat(f"系统面板必须明确显示：本章是{grade}。")
+
+    recipient = str(spine.get("named_recipient") or "").strip()
+    if recipient:
+        card_text = json.dumps(grounded, ensure_ascii=False)
+        assignments: list[str] = []
+        for match in re.finditer(
+            r"(?:目标)?收件人\s*(?:(?:必须|正是|就是|为|是)\s*)?[：:=]?\s*"
+            r"[\"“「『【]?\s*([^\"”」』】，,。；;\n]{1,20})",
+            card_text,
+        ):
+            value = re.sub(r"(?:本人|本身)$", "", match.group(1)).strip()
+            if value:
+                assignments.append(value)
+        # Do not launder an explicit contradiction such as “收件人是父亲”.
+        # Let the normal relation gate reject it and buy a real re-plan.
+        if not assignments or all(recipient in value for value in assignments):
+            add_beat(f"系统面板必须逐字明确：收件人是{recipient}。")
+            who = [str(x).strip() for x in (grounded.get("who") or []) if str(x).strip()]
+            if recipient not in who:
+                who.append(recipient)
+            grounded["who"] = who
+
+    grounded["beats"] = beats
+    return grounded
 
 
 def arc_span(config: dict[str, Any]) -> int:
@@ -833,11 +885,13 @@ def _fingerprints(conn: Any, config: dict[str, Any]) -> str:
 def arc_user_prompt(state: canon.StoryState, chapters: list[int], *,
                     volume_plan: str = "", prev_skeleton: str = "",
                     finale_note: str = "", volume_transition: str = "",
-                    fingerprints: str = "") -> str:
+                    fingerprints: str = "", story_spine: str = "") -> str:
     """The volatile half of the arc prompt. Pure, so its shape is testable."""
     parts = [state.volatile_block()]
     if volume_plan:
         parts.append("## 卷纲（本弧窗口）\n" + volume_plan)
+    if story_spine:
+        parts.append("## 故事脊柱（原始简报硬排期，覆盖卷纲与候选创意）\n" + story_spine)
     if volume_transition:
         parts.append(volume_transition)
     if prev_skeleton:
@@ -854,6 +908,14 @@ def arc_user_prompt(state: canon.StoryState, chapters: list[int], *,
         f"再把它拆成 {len(chapters)} 章的连续推进，每一章都要有自己的兑现，"
         f"同时服务于整段的位移。最后再写出 next_arc 骨架。" + finale_note
     )
+    if story_spine:
+        parts.append(
+            "## 输出前机械自检（不得省略）\n"
+            "1. 对每章逐项检查故事脊柱中的‘必须落地的原文锚点’，每个锚点都必须作为完整连续字符串出现在该章卡片 JSON 中。\n"
+            "2. 若有任务等级，卡片必须明确写成‘S级任务/C级任务’等原值。\n"
+            "3. 若有命名收件人，必须在 beats 中明确写成‘收件人是X’；其他人物只能作为真相、外观或关系线索，不得替换收件人。\n"
+            "4. 终章不得用新订单、新危机或待定周期作 exit_hook。未逐项满足时不要输出。"
+        )
     return "\n\n".join(p for p in parts if p)
 
 
@@ -930,6 +992,7 @@ def generate_arc(
         finale_note=finale_note + arc_unfulfilled_note,
         volume_transition=_volume_transition(paths, config, chapters),
         fingerprints=_fingerprints(conn, config),
+        story_spine=story_spine_window(paths, chapters),
     )
 
     arc_system = ARC_SYSTEM_V2
@@ -1035,11 +1098,17 @@ def repair_card(
 ) -> dict[str, Any] | None:
     """One cheap call to fix a card that failed pre-write validation."""
     call = call or call_llm
+    spine = story_spine_window(paths, [chapter_num])
     user = (
         f"## 待修复的卡片（第 {chapter_num} 章）\n"
         + json.dumps(card, ensure_ascii=False, indent=2)
         + "\n\n## 必须消除的问题（逐条修掉，不要回避）\n"
         + "\n".join(f"{i + 1}. {p}" for i, p in enumerate(problems))
+        + ("\n\n## 原始简报当前章故事脊柱（最高优先级）\n" + spine if spine else "")
+        + ("\n\n## 修复后机械验收\n"
+           "- 每个‘必须落地的原文锚点’都须作为完整连续字符串出现在 JSON 中。\n"
+           "- 命名收件人须在 beats 中逐字写成‘收件人是X’，不得只放进 who 或写成其外观像某人。\n"
+           "- 任务等级须逐字写明；父亲等真相对象不得替换命名收件人。")
         + "\n\n请返回修复后的完整卡片 JSON（保持 ch 不变，保持 schema 字段齐全）。"
     )
     raw = call(client, paths, config, CARD_REPAIR_SYSTEM, json_prompt(user),
@@ -1144,6 +1213,43 @@ def _problems(paths: Paths, conn: Any, config: dict[str, Any],
         except Exception:
             pass
 
+    # The generated card is not allowed to redefine the author's brief.  This
+    # check is independent of volume_plan and of the card itself, so a coherent
+    # but off-brief arc cannot self-certify and reach the writer.
+    spine = story_spine_entry(paths, chapter_num)
+    if spine:
+        spine_check = story_spine_adherence(
+            spine, json.dumps(card, ensure_ascii=False, sort_keys=True),
+            min_anchor_coverage=0.80,
+        )
+        if not spine_check.get("passed", True):
+            missing = spine_check.get("missing_anchors") or []
+            reqs = spine_check.get("requirements") or []
+            detail = "、".join(f"「{x}」" for x in missing[:6])
+            if not detail:
+                detail = "；".join(str(x) for x in reqs[:2])
+            problems.append(
+                f"story_spine: Ch{chapter_num} 偏离原始简报硬排期，必须覆盖 {detail}；"
+                "只可扩写过程，不得替换事件、对象或结局功能"
+            )
+        for relation in (spine_check.get("relation_failures") or []):
+            if relation.get("type") == "named_recipient":
+                problems.append(
+                    f"story_spine: Ch{chapter_num} 收件人必须是「{relation.get('expected')}」；"
+                    "不得改成父亲、主角、系统意志或其他对象"
+                )
+            elif relation.get("type") == "grade":
+                problems.append(
+                    f"story_spine: Ch{chapter_num} 任务等级必须是「{relation.get('expected')}」"
+                )
+            elif relation.get("type") == "final_closure":
+                hooks = "、".join(str(x) for x in (relation.get("open_hooks") or [])[:4])
+                problems.append(
+                    f"story_spine: Ch{chapter_num} 是全书终章，必须封闭收束；"
+                    f"删除续集钩子{('「' + hooks + '」') if hooks else ''}，"
+                    "不得新增订单、下一任务、待定周期、空缺席位或后续危机"
+                )
+
     return problems, advisories
 
 
@@ -1218,6 +1324,9 @@ def ensure_card(
                        state=state, call=call)
         source = "single"
 
+    spine = story_spine_entry(paths, chapter_num)
+    card = _ground_card_to_story_spine(card, spine)
+
     problems, advisories = _problems(paths, conn, config, store, card, chapter_num)
     unresolved: list[str] = []
 
@@ -1240,6 +1349,7 @@ def ensure_card(
         # The advisories are re-read too. They are handed to the writer as
         # `required_constraints`, and the pre-repair card's advisories describe a
         # card the writer will never see.
+        fixed = _ground_card_to_story_spine(fixed, spine)
         still, fixed_advisories = (
             _problems(paths, conn, config, store, fixed, chapter_num) if fixed
             else (["修复调用未返回可用卡片"], []))
@@ -1252,6 +1362,7 @@ def ensure_card(
                        f"re-planning this chapter alone.")
             card = _single(client, paths, conn, config, store, chapter_num,
                            state=state, call=call)
+            card = _ground_card_to_story_spine(card, spine)
             source = "single"
             problems, advisories = _problems(paths, conn, config, store, card, chapter_num)
             if problems:
@@ -1260,6 +1371,11 @@ def ensure_card(
                 # neighbour's opening_type, the book's scene history), so a
                 # fourth try is a latch, not a fix. Carry them to the writer as
                 # obligations and let `accept` judge the prose instead.
+                if any(str(p).startswith("story_spine:") for p in problems):
+                    raise BeatError(
+                        f"Ch{chapter_num}: story spine still violated after card repair "
+                        f"and single-chapter re-plan: {problems}"
+                    )
                 unresolved = list(problems)
                 log(paths, f"beat: card Ch{chapter_num} accepted with unresolved "
                            f"problems (carried to the writer): {unresolved}")

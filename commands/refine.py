@@ -42,6 +42,7 @@ from engine.config import (
 )
 from engine.llm import call_llm, json_prompt, load_json_with_repair
 from engine.quality import dialogue_health, style_health, text_similarity
+from engine.story_spine import story_spine_adherence, story_spine_entry, story_spine_window
 
 
 REFINE_LOG_NAME = "refine.log.jsonl"
@@ -576,6 +577,7 @@ def refine_one_chapter(
     characters = read_text(paths.characters)
     voice = read_text(paths.voice).strip()
     creative_brief = _load_creative_brief()
+    story_spine = story_spine_window(paths, [chapter_num])
 
     # Neighbours within group, summarised. The target chapter itself stays full.
     neighbour_blocks: list[str] = []
@@ -674,6 +676,8 @@ def refine_one_chapter(
 
 {"## 创作纲要核心规则（爽点系统/铁律/禁止项/文风锚，精修必须遵守）" + chr(10) + creative_brief if creative_brief else ""}
 
+{"## 原始简报当前章故事脊柱（最高剧情优先级；精修不得删除、替换或改写关系）" + chr(10) + story_spine if story_spine else ""}
+
 {chr(10).join(neighbour_blocks)}
 
 {chr(10).join(anchor_blocks)}
@@ -744,6 +748,25 @@ def _refined_text_acceptable(
     if len(refined) > len(original) * max_grow:
         return False, f"grew beyond {max_grow:g}x of original ({len(refined)}/{len(original)}) at intensity={intensity}"
     return True, ""
+
+
+def _story_spine_acceptable(
+    entry: dict[str, Any] | None, refined: str
+) -> tuple[bool, str]:
+    """Reject a polish/rewrite that no longer satisfies the original brief."""
+    if not entry:
+        return True, ""
+    result = story_spine_adherence(entry, refined)
+    if result.get("passed"):
+        return True, ""
+    missing = "、".join(str(x) for x in (result.get("missing_anchors") or [])[:6])
+    relations = "、".join(
+        f"{x.get('type')}={x.get('expected')}"
+        for x in (result.get("relation_failures") or [])[:4]
+        if isinstance(x, dict)
+    )
+    details = "；".join(x for x in (f"缺少锚点:{missing}" if missing else "", f"关系失败:{relations}" if relations else "") if x)
+    return False, "original-brief story spine regressed" + (f" ({details})" if details else "")
 
 
 def _flag_categories(flags: list[str]) -> set[str]:
@@ -1079,6 +1102,12 @@ def refine_book(
                 name_ok, name_reason = _name_consistency_check(original, refined, characters_text)
                 if not name_ok:
                     log(paths, f"Refine Ch{ch} rejected ({name_reason}); keeping original")
+                    break
+                spine_ok, spine_reason = _story_spine_acceptable(
+                    story_spine_entry(paths, ch), refined
+                )
+                if not spine_ok:
+                    log(paths, f"Refine Ch{ch} rejected ({spine_reason}); keeping original")
                     break
                 is_dup, sim = _adjacent_duplicate(
                     refined, prev_refined_text, prev_original_text, config

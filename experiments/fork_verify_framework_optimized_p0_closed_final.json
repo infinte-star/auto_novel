@@ -1,0 +1,8 @@
+{
+  "source": "verify_framework_optimized_p0_strict_final",
+  "fork_at_chapter": 5,
+  "chapters_to_write": 1,
+  "flip": null,
+  "budget": "max_chapters: 5 -> 6",
+  "created_at": "2026-08-04T10:51:39"
+}

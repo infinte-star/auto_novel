@@ -66,6 +66,7 @@ from engine import quality
 from engine.quality import REGISTRY, hard_block_reasons
 from engine.plan import ensure_card, CARD_CHECKPOINT, card_to_plan
 from engine.llm import LLMClientPool
+from engine.story_spine import story_spine_adherence, story_spine_entry
 from engine.store import db_event, init_db
 from engine.state import (  # noqa: F401 — re-exported for backward compat
     BUDGET,
@@ -137,11 +138,15 @@ MAX_STEPS = 24
 # A `WriteError` is a refusal or a truncated stream, not a bad draft. Retry the
 # call; do not spend a rescue on it.
 WRITE_ATTEMPTS = 2
-# `rescue` is the only row that buys a second full write. One attempt, then the
-# chapter commits with its blocks recorded — because every blocking reason here
-# is chapter-scoped, a second rescue would be retrying a rule the text already
-# failed to satisfy under the same instructions.
+# `rescue` is the only row that buys a second full write. One attempt, then
+# ordinary chapter-local quality debt may commit with its blocks recorded.
+# Original-brief adherence is the exception: it is author intent, not quality
+# debt, and therefore fails closed after the bounded rescue.
 RESCUE_ATTEMPTS = 1
+
+
+class BriefAdherenceError(RuntimeError):
+    """A chapter still violates the immutable original-brief story spine."""
 
 
 
@@ -265,6 +270,7 @@ class Corpus:
     genre_scores: list[float] = dataclasses.field(default_factory=list)
     payoff_types: list[str] = dataclasses.field(default_factory=list)
     whitelist: set[str] = dataclasses.field(default_factory=set)
+    story_spine: dict[str, Any] | None = None
 
 
 def load_corpus(paths: Paths, conn: Any, config: dict[str, Any],
@@ -289,6 +295,7 @@ def load_corpus(paths: Paths, conn: Any, config: dict[str, Any],
         genre_scores=_genre_scores(conn, config, chapter_num),
         payoff_types=_payoff_types(conn, config, chapter_num),
         whitelist=quality.fossil_whitelist(config, prompt_text),
+        story_spine=story_spine_entry(paths, chapter_num),
     )
 
 
@@ -400,6 +407,7 @@ def build_report(ctx: Ctx, run: ChapterRun, text: str) -> dict[str, Any]:
         recent_payoff_types=corpus.payoff_types,
         conn=ctx.conn,
         fossil_whitelist=corpus.whitelist,
+        story_spine_entry=corpus.story_spine,
     )
 
 
@@ -446,6 +454,18 @@ def _act_fold_constraints(ctx: Ctx, run: ChapterRun) -> str:
         s = str(v).strip()
         if s and s not in items:
             items.append(s)
+
+    spine = run.corpus.story_spine if run.corpus else None
+    if spine:
+        anchors = [str(x).strip() for x in (spine.get("hard_anchors") or []) if str(x).strip()]
+        parts = ["【原始简报当前章硬约束】"]
+        if spine.get("expected_grade"):
+            parts.append(f"任务等级={spine['expected_grade']}")
+        if spine.get("named_recipient"):
+            parts.append(f"收件人必须={spine['named_recipient']}（不得替换为其他人物或系统意志）")
+        if anchors:
+            parts.append("必须在正文真实落地=" + "、".join(anchors))
+        add("；".join(parts))
 
     for c in (run.decision.get("required_constraints") or []):
         add(c)
@@ -495,9 +515,34 @@ def _act_refine_card(ctx: Ctx, run: ChapterRun) -> str:
             if s.startswith("[P1] "):
                 ff.append(s[5:])
 
+    original_card = dict(run.card or {})
     patched, patches = refine_card(
-        run.card or {}, ctx.conn, ctx.config, run.chapter_num,
+        original_card, ctx.conn, ctx.config, run.chapter_num,
         recent_cards=recent, feed_forward=ff)
+
+    # `refine_card` is downstream of the card validator. It may remove a
+    # thread_action because the generated ledger calls it closed, but that action
+    # can simultaneously be an immutable original-brief beat (measured on the P0
+    # validation: Ch4 张医生、Ch5 four finale payoffs were all stripped here).
+    # Refinement is keep-only-if-nonregressive against the independent spine.
+    spine = run.corpus.story_spine if run.corpus else None
+    if spine and patched != original_card:
+        before = story_spine_adherence(
+            spine, json.dumps(original_card, ensure_ascii=False, sort_keys=True),
+            min_anchor_coverage=0.80,
+        )
+        after = story_spine_adherence(
+            spine, json.dumps(patched, ensure_ascii=False, sort_keys=True),
+            min_anchor_coverage=0.80,
+        )
+        before_hits = len(before.get("matched_anchors") or [])
+        after_hits = len(after.get("matched_anchors") or [])
+        if after_hits < before_hits or (before.get("passed") and not after.get("passed")):
+            log(ctx.paths, f"v2.refine_card Ch{run.chapter_num} story-spine guard: "
+                           f"reverted {len(patches)} patch(es), anchors "
+                           f"{before_hits}->{after_hits}")
+            patched = original_card
+            patches = []
 
     if patches:
         run.card = patched
@@ -644,6 +689,8 @@ def _act_rescue(ctx: Ctx, run: ChapterRun) -> str:
              {"attempt": run.rescue_attempts, "block_reasons": reasons})
     extra = ["上一稿被确定性验收判为不合格，原因：" + "；".join(reasons)]
     extra += [d for d in directives[:6]]
+    brief_gate = (run.report or {}).get("brief_adherence") or {}
+    extra += [str(d) for d in (brief_gate.get("directives") or [])[:3]]
     sh = (run.report or {}).get("style_health") or {}
     sh_flags = sh.get("flags") or []
     if (any("dialogue_starved" in f or "dialogue_low" in f or "almost_no_dialogue" in f
@@ -658,6 +705,34 @@ def _act_rescue(ctx: Ctx, run: ChapterRun) -> str:
     run.report = None
     run.layers_run = ()
     return f"rescue[{len(reasons)}]"
+
+
+def _brief_gate_rejected(report: dict[str, Any] | None) -> bool:
+    """Whether the independent original-brief gate explicitly rejected text."""
+    if not isinstance(report, dict):
+        return False
+    return any(
+        isinstance(gate, dict) and gate.get("gate") == "brief_adherence"
+        for gate in (report.get("gate_rejects") or [])
+    )
+
+
+def _act_reject_brief(ctx: Ctx, run: ChapterRun) -> str:
+    """Persist evidence, but never publish prose that changed author intent."""
+    report = run.report or {}
+    save_checkpoint(ctx.paths, run.chapter_num, FINAL_REVIEW_CHECKPOINT, report)
+    brief = report.get("brief_adherence") or {}
+    directives = [str(x) for x in (brief.get("directives") or []) if str(x).strip()]
+    _event(ctx, run.chapter_num, "v2_brief_adherence_rejected", {
+        "rescue_attempts": run.rescue_attempts,
+        "missing_anchors": list(brief.get("missing_anchors") or []),
+        "relation_failures": list(brief.get("relation_failures") or []),
+    })
+    detail = "；".join(directives[:3]) or "正文未落实原始简报当前章故事脊柱"
+    raise BriefAdherenceError(
+        f"Ch{run.chapter_num} failed original-brief adherence after "
+        f"{run.rescue_attempts} rescue(s): {detail}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +871,8 @@ DECISIONS: tuple[tuple[str, Predicate, Action], ...] = (
      _act_layer("L1")),
     ("rescue", lambda ctx, r: bool(r.blocks) and r.rescue_attempts < RESCUE_ATTEMPTS,
      _act_rescue),
+    ("brief_reject", lambda ctx, r: _brief_gate_rejected(r.report),
+     _act_reject_brief),
     ("commit", lambda ctx, r: True, _act_commit),
 )
 

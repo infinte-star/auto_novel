@@ -81,10 +81,10 @@ class AcceptanceSetTest(unittest.TestCase):
                 self.assertEqual(REGISTRY.scope(name), "card")
 
     def test_set_size_matches_the_design(self):
-        # REDESIGN_V2 §3.4 specifies ten decidable acceptance items. Not a magic
+        # The original ten plus independent original-brief adherence. Not a magic
         # number -- a reminder that growth needs a reason, since each member is a
         # way for a first draft to fail.
-        self.assertEqual(len(accept.ACCEPTANCE_GATES) + len(accept.NATIVE_CHECKS), 10)
+        self.assertEqual(len(accept.ACCEPTANCE_GATES) + len(accept.NATIVE_CHECKS), 11)
 
 
 class ContractFulfilmentTest(unittest.TestCase):

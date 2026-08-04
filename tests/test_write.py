@@ -152,6 +152,21 @@ class SystemPromptTest(unittest.TestCase):
         self.assertEqual(write.clean_title({"title": "第七章：旧档案室"}, 7), "旧档案室")
         self.assertEqual(write.clean_title({}, 7), "第7章")
 
+    def test_finale_overrides_the_generic_cliffhanger_rule(self):
+        system = write.build_system(
+            _config(max_chapters=7, ending_aware=True), 7, "归处")
+        self.assertIn("全书终章", system)
+        self.assertIn("不得为了追读另抛下一章悬念", system)
+        self.assertTrue(system.endswith(write.FINAL_CHAPTER_BLOCK))
+
+    def test_ending_zone_converges_without_premature_finale(self):
+        system = write.build_system(
+            _config(max_chapters=10, ending_aware=True, ending_zone_chapters=5),
+            8, "旧债",
+        )
+        self.assertIn("收束区（距终章 2 章）", system)
+        self.assertNotIn("## 全书终章", system)
+
 
 class TokenBudgetTest(unittest.TestCase):
 

@@ -95,6 +95,19 @@ def _l1_advisory() -> dict:
     return {"length_band": result, "block_reasons": [], "accepted": True}
 
 
+def _brief_blocking() -> dict:
+    return {
+        "brief_adherence": {
+            "passed": False,
+            "missing_anchors": ["死亡概率"],
+            "directives": ["必须落实原始简报故事脊柱"],
+        },
+        "gate_rejects": [{"gate": "brief_adherence", "level": "reject"}],
+        "block_reasons": ["gate_rejects=brief_adherence"],
+        "accepted": False,
+    }
+
+
 def _stub_actions(log: list[str], *, after_write=None, after_l0=None,
                   after_l1=None, after_rescue=None) -> dict:
     """Every LLM-spending row replaced by a recorder.
@@ -346,6 +359,18 @@ class DecisionTableTest(unittest.TestCase):
         self.assertTrue(run.committed)
         self.assertEqual(run.blocks, ("length_band(short)",))
 
+    def test_original_brief_failure_never_commits_after_bounded_rescue(self):
+        log: list[str] = []
+        with TemporaryDirectory() as tmp:
+            ctx = _ctx(Path(tmp))
+            actions = _stub_actions(
+                log, after_write=_brief_blocking(), after_rescue=_brief_blocking()
+            )
+            with self.assertRaises(v2run.BriefAdherenceError):
+                v2run.run_chapter(ctx, 3, actions=actions, corpus=v2run.Corpus())
+        self.assertEqual(log.count("rescue"), 1)
+        self.assertNotIn("commit", log)
+
     def test_round0_records_the_raw_first_draft_and_no_later_step_edits_it(self):
         # This payload is what `tools/fpy_prime.py` replays. A rescue that
         # overwrote it would let v2 repair its way to a first-pass rate it did
@@ -380,7 +405,7 @@ class DecisionTableTest(unittest.TestCase):
             "need_card", "card_invalid", "card_refine",
             "need_draft", "need_report",
             "l0_pending", "l1_pending",
-            "rescue", "commit"])
+            "rescue", "brief_reject", "commit"])
 
     def test_commit_is_last_and_unconditional(self):
         # The table is first-match, so the fallthrough row has to be both. A
